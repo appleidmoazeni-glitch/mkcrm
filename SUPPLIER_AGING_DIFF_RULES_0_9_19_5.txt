@@ -1,0 +1,33 @@
+MKCRM 0.9.19.5 - Supplier Aging reference restore audit
+
+Reference: mkcrm_0_9_19_1_ledger_filter_seller_profit_targeted_full
+Base:      mkcrm_0_9_19_4_supplier_aging_search_restore_SAFE
+
+Rules applied:
+1. Supplier Aging UI block must match the healthy 0.9.19.1 block exactly; no fallback/alternate UI state is allowed.
+2. Candidate search must use the 0.9.19.1 /api/supplier-aging/candidates contract: getSupplierPurchaseCandidates only, with selectedDoc mapping.
+3. Do not add general account fallback into Supplier Aging search; it changes table semantics and breaks “accounts with purchase”.
+4. The “accounts with purchase” button must call the same old candidate route and render the same candidate table from 0.9.19.1.
+5. Selected suppliers table must be rendered from /api/supplier-aging/selected and must remain persistent in MongoDB.
+6. Supplier edit must keep the 0.9.19.1 fields: group, paymentMethod, settlementBasis, manualSettlementDays, checkDueDays, goodsDelayDays, isActive.
+7. Report render must use the 0.9.19.1 supplier summary table and item layer table structure.
+8. Supplier layer filter must be populated from active selected suppliers only, as in 0.9.19.1.
+9. Backend buildSupplierAgingReport must use the 0.9.19.1 SQL FIFO engine: purchase summary, ledger summary, sales profit FIFO, inventory aging approx.
+10. supplierAging report must not use the experimental WebService/Kardex reverse-FIFO code from 0.9.20.x.
+11. supplierAging report must not use the later 0.9.19.4 candidate fallback code.
+12. supplierAging report must not use in-memory or run/result/layer experimental tables.
+13. Raw JSON/pre debug output must not appear in the Supplier Aging UI.
+14. SQL connection remains read-only safe through mkcrm_reader and CY000002.
+15. Operational writes remain WebService-based; this restoration only affects reporting/UI logic for Supplier Aging.
+
+Files restored by block-level comparison:
+- src/server.js: Supplier Aging constants/functions restored from 0.9.19.1.
+- src/server.js: Supplier Aging API routes restored from 0.9.19.1.
+- public/assets/app.js: Supplier Aging UI/router block restored from 0.9.19.1.
+
+Safety checks performed:
+- node --check src/server.js
+- node --check public/assets/app.js
+- node --check src/lib/shaygan-sql-read.js
+- node --check src/lib/shaygan.js
+- .env and .env.example checked for PORT=1385, SQL user mkcrm_reader, SQL DB CY000002, Lead ID settings.

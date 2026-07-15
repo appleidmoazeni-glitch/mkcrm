@@ -1,0 +1,120 @@
+const { MongoClient } = require('mongodb');
+const { config } = require('./config');
+let client;
+let db;
+
+async function connectMongo() {
+  if (db) return db;
+  client = new MongoClient(config.mongoUri, { serverSelectionTimeoutMS: 5000, connectTimeoutMS: 5000 });
+  await client.connect();
+  db = client.db();
+  return db;
+}
+
+async function closeMongo() {
+  if (client) await client.close();
+  client = null; db = null;
+}
+
+async function initMongo() {
+  const database = await connectMongo();
+  const collections = await database.listCollections().toArray();
+  const existing = new Set(collections.map(c => c.name));
+  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory'];
+  for (const name of needed) if (!existing.has(name)) await database.createCollection(name);
+  await database.collection('settings').createIndex({ key: 1 }, { unique: true });
+  await database.collection('customers').createIndex({ mobile: 1 });
+  await database.collection('customers').createIndex({ nationalCode: 1 });
+
+  await database.collection('customers').createIndex({ searchText: 1 });
+  await database.collection('customers').createIndex({ purchaseCount: -1, totalPurchaseAmount: -1 });
+  await database.collection('customers').createIndex({ lastPurchaseDate: -1 });
+  await database.collection('customerInvoiceHistory').createIndex({ customerKey: 1, invDate: -1 });
+  await database.collection('customerInvoiceHistory').createIndex({ invNo: 1, invTyp: 1 });
+  await database.collection('customerSyncRuns').createIndex({ startedAt: -1 });
+  await database.collection('leads').createIndex({ leadId: 1 }, { unique: true, sparse: true });
+  await database.collection('invoiceReservations').createIndex({ invType: 1, invoiceNumber: 1 }, { unique: true });
+  await database.collection('invoiceCounters').createIndex({ invType: 1 }, { unique: true });
+  await database.collection('userShayganMappings').createIndex({ username: 1 });
+  await database.collection('userAccountAccesses').createIndex({ username: 1 });
+  await database.collection('proformas').createIndex({ proformaNo: 1 }, { unique: true });
+  await database.collection('itemCatalog').createIndex({ itemCode: 1 }, { unique: true });
+  await database.collection('itemCatalog').createIndex({ itemDescription: 'text', itemCode: 'text' });
+  await database.collection('itemInventoryCatalog').createIndex({ itemCode: 1, stockNumber: 1 }, { unique: true });
+  await database.collection('itemInventoryCatalog').createIndex({ searchText: 1 });
+  await database.collection('itemCatalogAll').createIndex({ itemCode: 1 }, { unique: true });
+  await database.collection('itemCatalogAll').createIndex({ searchText: 1 });
+  await database.collection('accountCatalog').createIndex({ accountNumber: 1 }, { unique: true });
+  await database.collection('accountCatalog').createIndex({ searchText: 1 });
+  await database.collection('searchCache').createIndex({ key: 1 }, { unique: true });
+  await database.collection('searchCache').createIndex({ updatedAt: 1 });
+  await database.collection('users').createIndex({ username: 1 }, { unique: true });
+  await database.collection('roles').createIndex({ code: 1 }, { unique: true });
+  await database.collection('boardEvents').createIndex({ status: 1, createdAt: -1 });
+  await database.collection('boardEvents').createIndex({ eventKey: 1 }, { unique: true, sparse: true });
+  await database.collection('boardEvents').createIndex({ itemCode: 1, status: 1 });
+  await database.collection('sellerPerformanceHistory').createIndex({ type: 1, filterKey: 1 });
+  await database.collection('sellerPerformanceHistory').createIndex({ type: 1, generatedAt: -1 });
+
+  await database.collection('purchaseDrafts').createIndex({ purchaseDraftNo: 1 }, { unique: true });
+  await database.collection('purchaseDrafts').createIndex({ createdBy: 1, createdAt: -1 });
+  await database.collection('purchaseDrafts').createIndex({ createdBy: 1, status: 1, createdAt: -1 });
+  await database.collection('purchaseDrafts').createIndex({ status: 1, updatedAt: -1 });
+  await database.collection('invoiceReservations').createIndex({ invType: 1, status: 1, expiresAt: 1, invoiceNumber: -1 });
+  await database.collection('invoiceReservations').createIndex({ draftId: 1, invType: 1 });
+  await database.collection('appLogs').createIndex({ at: -1 });
+  await database.collection('invoiceAuditLogs').createIndex({ purchaseDraftNo: 1, at: -1 });
+  await database.collection('saleIssueLocks').createIndex({ status: 1, updatedAt: -1 });
+  await database.collection('saleIssueLocks').createIndex({ invoiceNumber: 1, mappingUsername: 1 });
+
+  const defaults = {
+    'customer.requireNationalCode': false,
+    'customer.requireMobile': true,
+    'lead.enableLeadModule': true,
+    'lead.requireLeadIdForSaleInvoice': false,
+    'lead.writeLeadIdToShayganDescription': true,
+    'invoice.warnBelowCostSale': true,
+    'invoice.allowBelowCostSale': true,
+    'invoice.reservationMinutes': 15,
+    'invoice.reuseExpiredNumbers': false,
+    'shaygan.connectionName': 'SampleConnection',
+    'shaygan.activeFiscalYear': '1404'
+  };
+  const roles = [{code:'admin',title:'مدیر سیستم'},{code:'seller',title:'فروشنده'},{code:'accounting',title:'حسابداری'},{code:'warehouse',title:'انبار'},{code:'purchase',title:'بازرگانی'},{code:'seller_buyer',title:'فروشنده-خریدار'}];
+  for (const r of roles) await database.collection('roles').updateOne({code:r.code}, {$setOnInsert:{...r, createdAt:new Date()}}, {upsert:true});
+  await database.collection('users').updateOne({ username:'admin' }, { $setOnInsert: { username:'admin', password:'admin', fullName:'مدیر سیستم', role:'admin', isActive:true, createdAt:new Date() } }, { upsert:true });
+  const sellerSeeds = [
+    { username:'seller01', fullName:'دهنوی', cashboxAccountNumber:'11001001', employeeAccountNumber:'11701006', storeName:'دهنوی' },
+    { username:'seller02', fullName:'امیر ممیزی', cashboxAccountNumber:'11001041', employeeAccountNumber:'11701030', storeName:'پالادیوم' },
+    { username:'seller03', fullName:'کنسول', cashboxAccountNumber:'11001044', employeeAccountNumber:'11701037', storeName:'کنسول' },
+    { username:'seller04', fullName:'مسعود ثانی', cashboxAccountNumber:'11001071', employeeAccountNumber:'11701060', storeName:'جانبی' },
+    { username:'seller05', fullName:'محتشمی', cashboxAccountNumber:'11001015', employeeAccountNumber:'', storeName:'مشهد کالا' },
+    { username:'seller06', fullName:'حسام کرامتی', cashboxAccountNumber:'11001072', employeeAccountNumber:'', storeName:'مشهد کالا' },
+    { username:'seller07', fullName:'پالادیوم', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'پالادیوم' },
+    { username:'seller08', fullName:'نوتبوک سنتر', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'نوتبوک سنتر' },
+    { username:'seller09', fullName:'ایران کاوش', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'ایران کاوش' },
+    { username:'seller10', fullName:'حقیر', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'حقیر' },
+    { username:'seller11', fullName:'عادل مقدم', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'بازرگانی' },
+    { username:'seller12', fullName:'پوستچی', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'بازرگانی' },
+    { username:'seller13', fullName:'محسن خدمتی', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'حسابداری' },
+    { username:'seller14', fullName:'جواد زیدی', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'حسابداری' },
+    { username:'seller15', fullName:'شهمیری', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'حسابداری' },
+    { username:'seller16', fullName:'پناهی', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'حسابداری' },
+    { username:'seller17', fullName:'فروشنده 17', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'' },
+    { username:'seller18', fullName:'فروشنده 18', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'' },
+    { username:'seller19', fullName:'فروشنده 19', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'' },
+    { username:'seller20', fullName:'فروشنده 20', cashboxAccountNumber:'', employeeAccountNumber:'', storeName:'' }
+  ];
+  for (const seed of sellerSeeds) {
+    await database.collection('users').updateOne({ username:seed.username }, { $setOnInsert: { username:seed.username, password:'1234', fullName:seed.fullName, role:'seller', isActive:true, createdAt:new Date() } }, { upsert:true });
+    await database.collection('userShayganMappings').updateOne({ username:seed.username }, { $setOnInsert: { username:seed.username, fullName:seed.fullName, role:'seller', storeName:seed.storeName || '', cashboxAccountNumber:seed.cashboxAccountNumber || '', employeeAccountNumber:seed.employeeAccountNumber || '', canCreateSaleInvoice:true, canViewInventory:true, canViewKardex:true, isActive:true, createdAt:new Date() } }, { upsert:true });
+  }
+  await database.collection('userShayganMappings').updateOne({ username:'admin' }, { $setOnInsert: { username:'admin', fullName:'مدیر سیستم', role:'admin', storeName:'مدیریت', cashboxAccountNumber:'11001001', employeeAccountNumber:'11701006', canCreateSaleInvoice:true, canViewInventory:true, canViewKardex:true, isActive:true, createdAt:new Date() } }, { upsert:true });
+
+  for (const [key, value] of Object.entries(defaults)) {
+    await database.collection('settings').updateOne({ key }, { $setOnInsert: { key, value, updatedAt: new Date(), updatedBy: 'system' } }, { upsert: true });
+  }
+  return { ok: true, collections: needed };
+}
+
+module.exports = { connectMongo, closeMongo, initMongo };

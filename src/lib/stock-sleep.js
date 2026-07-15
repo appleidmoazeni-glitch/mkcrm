@@ -1,0 +1,504 @@
+const crypto = require('crypto');
+const shaygan = require('./shaygan');
+
+const VERSION = '0.9.19.26.3-transfer-pass-through-sale-guard';
+const OPENING_BALANCE_SUPPLIER = {
+  supplierAccountNo: 'OPENING_BALANCE',
+  supplierName: 'منشأ مانده از قبل'
+};
+
+function asNumber(v, d = 0) {
+  const n = Number(v || 0);
+  return Number.isFinite(n) ? n : d;
+}
+function clean(v = '') { return String(v || '').trim(); }
+function normalizeStockNo(v = '') { return clean(v); }
+function normalizeDateKey(v = '') {
+  const s = clean(v);
+  if (!s) return '';
+  const digits = s.replace(/[^0-9]/g, '');
+  if (digits.length >= 8) return digits.slice(0, 8);
+  return s.slice(0, 10);
+}
+function isAfterOrEqualDate(rowDate, fiscalYearStart) {
+  const d = normalizeDateKey(rowDate);
+  const f = normalizeDateKey(fiscalYearStart);
+  if (!d || !f) return true;
+  return d >= f;
+}
+
+function divi(a, b) { return Math.floor(a / b); }
+function jalaliToGregorian(jy, jm, jd) {
+  jy = Number(jy); jm = Number(jm); jd = Number(jd);
+  jy += 1595;
+  let days = -355668 + (365 * jy) + divi(jy, 33) * 8 + divi(((jy % 33) + 3), 4) + jd + (jm < 7 ? (jm - 1) * 31 : ((jm - 7) * 30) + 186);
+  let gy = 400 * divi(days, 146097);
+  days %= 146097;
+  if (days > 36524) { gy += 100 * divi(--days, 36524); days %= 36524; if (days >= 365) days++; }
+  gy += 4 * divi(days, 1461);
+  days %= 1461;
+  if (days > 365) { gy += divi(days - 1, 365); days = (days - 1) % 365; }
+  let gd = days + 1;
+  const sal = [0,31,((gy%4===0 && gy%100!==0)||gy%400===0)?29:28,31,30,31,30,31,31,30,31,30,31];
+  let gm = 1;
+  while (gm <= 12 && gd > sal[gm]) gd -= sal[gm++];
+  return [gy, gm, gd];
+}
+
+function hashArray(arr = []) {
+  return crypto.createHash('sha1').update(JSON.stringify((arr || []).map(String).sort())).digest('hex').slice(0, 12);
+}
+function makeSnapshotId(now = new Date()) {
+  const stamp = now.toISOString().replace(/[-:.TZ]/g, '').slice(0, 14);
+  return `SS-${stamp}-${crypto.randomBytes(3).toString('hex')}`;
+}
+function makeLayerId(snapshotId, itemCode, stockNumber, originType, invoiceNumber, purchaseDate, rank) {
+  const base = [snapshotId, itemCode, stockNumber, originType, invoiceNumber || '', normalizeDateKey(purchaseDate), rank].join('|');
+  return crypto.createHash('sha1').update(base).digest('hex').slice(0, 24);
+}
+function extractInventoryRow(doc = {}) {
+  const itemCode = clean(doc.itemCode || doc.ItemCode || doc.code);
+  const stockNumber = normalizeStockNo(doc.stockNumber || doc.STNumber || doc.StoreNumber || doc.StockNumber);
+  const quantity = asNumber(doc.quantity ?? doc.Quantity1 ?? doc.qty, 0);
+  const remainCost = asNumber(doc.remainCost ?? doc.RemainCost, 0);
+  const averageCost = asNumber(doc.averageCost ?? doc.RemainUnit1Price, 0);
+  const value = remainCost > 0 ? remainCost : Math.round(quantity * averageCost);
+  return {
+    itemCode,
+    itemGuid: clean(doc.itemGuid || doc.ItemGuId || doc.GuId),
+    itemDescription: clean(doc.itemDescription || doc.ItemDescription || doc.name),
+    stockNumber,
+    stockName: clean(doc.stockName || doc.StoreName || doc.STDesc),
+    stockGuid: clean(doc.stockGuid || doc.StockGuId || doc.STGuId),
+    quantity,
+    averageCost,
+    remainCost: value,
+    rawSnapshotId: doc._id,
+    syncedAt: doc.syncedAt || doc.updatedAt || null
+  };
+}
+function normalizeFaText(v = '') {
+  return String(v || '')
+    .replace(/[ي]/g, 'ی')
+    .replace(/[ك]/g, 'ک')
+    .replace(/‌/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function kardexMovementText(row = {}) {
+  const raw = row.raw || {};
+  return normalizeFaText([
+    row.accountName, row.accountNumber, row.invoiceType, row.invoiceNumber, row.description, row.comment,
+    raw.CustomerName, raw.CustomerNumber, raw.AccountName, raw.AccountNumber,
+    raw.InvoiceType, raw.InvType, raw.InvTypeName, raw.InvKind, raw.StateName, raw.StateTitle,
+    raw.Description, raw.Comment, raw.DocDescription, raw.InvDescription, raw.StockName, raw.StoreName
+  ].filter(Boolean).join(' '));
+}
+function isInternalTransferKardexRow(row = {}) {
+  const t = kardexMovementText(row);
+  // انتقال بین انبارها حرکت داخلی است و نباید به عنوان منشا خرید/تامین‌کننده وارد Summary شود.
+  return /انتقال/.test(t) && /انبار/.test(t);
+}
+function isPurchaseKardexRow(row = {}, fiscalYearStart = '') {
+  const raw = row.raw || {};
+  const inQty = asNumber(row.inQty || raw.IncomeQuan1 || raw.IncomeQuan, 0);
+  if (inQty <= 0) return false;
+  if (!isAfterOrEqualDate(row.date || raw.Date, fiscalYearStart)) return false;
+  if (isInternalTransferKardexRow(row)) return false;
+  const invType = clean(row.invoiceType || raw.InvoiceType || raw.InvType);
+  const text = kardexMovementText(row);
+  // خرید در شایگان معمولاً InvType=3 است. اگر نوع سند صریحاً غیرخریدی باشد، نباید positive movement را خرید فرض کنیم.
+  if (invType) {
+    if (['3', '03'].includes(invType) || /خرید/.test(text)) return true;
+    return false;
+  }
+  // بعضی خروجی‌های GetKardex نوع سند را خالی می‌دهند؛ در این حالت فقط ردیف مثبت غیرانتقالی را به‌عنوان خرید احتمالی می‌پذیریم.
+  return true;
+}
+function purchaseUnitCost(row = {}) {
+  const raw = row.raw || {};
+  const qty = Math.max(0, asNumber(row.inQty || raw.IncomeQuan1 || raw.IncomeQuan || raw.Quan, 0));
+  const explicit = asNumber(row.costPrice || raw.InPrice || raw.Price || 0, 0);
+  if (explicit > 0 && explicit < 100000000000) return explicit;
+  const rial = asNumber(raw.Rial || raw.Amount || row.rowAmount || 0, 0);
+  if (qty > 0 && rial > 0) return Math.round(rial / qty);
+  return explicit > 0 ? explicit : 0;
+}
+function extractPurchase(row = {}, fiscalYearStart = '') {
+  const raw = row.raw || {};
+  const qty = Math.max(0, asNumber(row.inQty || raw.IncomeQuan1 || raw.IncomeQuan || raw.Quan, 0));
+  const unitCost = purchaseUnitCost(row);
+  return {
+    originType: 'CURRENT_YEAR_PURCHASE',
+    supplierAccountNo: clean(row.accountNumber || raw.CustomerNumber || raw.AccountNumber),
+    supplierName: clean(row.accountName || raw.CustomerName || raw.AccountName) || 'تأمین‌کننده نامشخص',
+    supplierGuid: clean(raw.AccountGuId || raw.CustomerGuId || raw.CustomerGuid || ''),
+    purchaseInvoiceNo: clean(row.invoiceNumber || raw.InvoiceNumber || raw.InvNo),
+    purchaseInvoiceType: clean(row.invoiceType || raw.InvoiceType || raw.InvType),
+    purchaseDate: clean(row.date || raw.Date),
+    purchaseDateKey: normalizeDateKey(row.date || raw.Date),
+    sourceMovementText: kardexMovementText(row),
+    sourceMovementType: isInternalTransferKardexRow(row) ? 'INTERNAL_TRANSFER' : 'PURCHASE_CANDIDATE',
+    purchaseQty: qty,
+    unitCost,
+    purchaseValue: Math.round(qty * unitCost),
+    fiscalYearStart
+  };
+}
+function reverseFifoAllocate({ snapshotId, inventoryRow, kardexRows, fiscalYearStart, snapshotDate }) {
+  const currentQty = Math.max(0, asNumber(inventoryRow.quantity, 0));
+  const currentValue = Math.max(0, asNumber(inventoryRow.remainCost, 0));
+  const fallbackUnitCost = currentQty > 0 ? Math.round(currentValue / currentQty) : asNumber(inventoryRow.averageCost, 0);
+  let remaining = currentQty;
+  const purchases = (kardexRows || [])
+    .filter(x => isPurchaseKardexRow(x, fiscalYearStart))
+    .map(x => extractPurchase(x, fiscalYearStart))
+    .filter(x => x.purchaseQty > 0)
+    .sort((a, b) => String(b.purchaseDateKey || '').localeCompare(String(a.purchaseDateKey || '')) || Number(b.purchaseInvoiceNo || 0) - Number(a.purchaseInvoiceNo || 0));
+  const layers = [];
+  let rank = 1;
+  for (const p of purchases) {
+    if (remaining <= 0) break;
+    const allocatedQty = Math.min(remaining, p.purchaseQty);
+    const unitCost = p.unitCost || fallbackUnitCost || 0;
+    const allocatedValue = Math.round(allocatedQty * unitCost);
+    const ageDays = calcAgeDays(p.purchaseDate, snapshotDate);
+    const layerId = makeLayerId(snapshotId, inventoryRow.itemCode, inventoryRow.stockNumber, p.originType, p.purchaseInvoiceNo, p.purchaseDate, rank);
+    layers.push({
+      snapshotId,
+      layerId,
+      layerRank: rank++,
+      itemCode: inventoryRow.itemCode,
+      itemGuId: inventoryRow.itemGuid,
+      itemDescription: inventoryRow.itemDescription,
+      warehouseNo: inventoryRow.stockNumber,
+      warehouseName: inventoryRow.stockName,
+      currentQty,
+      currentValue,
+      originType: p.originType,
+      supplierAccountNo: p.supplierAccountNo || 'UNKNOWN_SUPPLIER',
+      supplierName: p.supplierName || 'تأمین‌کننده نامشخص',
+      supplierGuid: p.supplierGuid || '',
+      purchaseInvoiceNo: p.purchaseInvoiceNo,
+      purchaseInvoiceType: p.purchaseInvoiceType,
+      purchaseDate: p.purchaseDate,
+      sourceMovementText: p.sourceMovementText || '',
+      sourceMovementType: p.sourceMovementType || '',
+      purchaseQty: p.purchaseQty,
+      allocatedQty,
+      unitCost,
+      allocatedValue,
+      soldQtyAfterPurchase: Math.max(0, p.purchaseQty - allocatedQty),
+      fifoProfitAmount: null,
+      fifoProfitPercent: null,
+      profitStatus: 'not_calculated',
+      ageDays,
+      createdAt: new Date()
+    });
+    remaining -= allocatedQty;
+  }
+  if (remaining > 0) {
+    const unitCost = fallbackUnitCost || 0;
+    const allocatedValue = Math.round(remaining * unitCost);
+    const layerId = makeLayerId(snapshotId, inventoryRow.itemCode, inventoryRow.stockNumber, 'OPENING_BALANCE', '', fiscalYearStart, rank);
+    layers.push({
+      snapshotId,
+      layerId,
+      layerRank: rank,
+      itemCode: inventoryRow.itemCode,
+      itemGuId: inventoryRow.itemGuid,
+      itemDescription: inventoryRow.itemDescription,
+      warehouseNo: inventoryRow.stockNumber,
+      warehouseName: inventoryRow.stockName,
+      currentQty,
+      currentValue,
+      originType: 'OPENING_BALANCE',
+      supplierAccountNo: OPENING_BALANCE_SUPPLIER.supplierAccountNo,
+      supplierName: OPENING_BALANCE_SUPPLIER.supplierName,
+      supplierGuid: '',
+      purchaseInvoiceNo: '',
+      purchaseInvoiceType: '',
+      purchaseDate: '',
+      purchaseQty: remaining,
+      allocatedQty: remaining,
+      unitCost,
+      allocatedValue,
+      soldQtyAfterPurchase: 0,
+      fifoProfitAmount: null,
+      fifoProfitPercent: null,
+      profitStatus: 'not_applicable_opening_balance',
+      ageDays: null,
+      createdAt: new Date()
+    });
+  }
+  return layers;
+}
+function calcAgeDays(dateValue, snapshotDate = new Date()) {
+  const key = normalizeDateKey(dateValue);
+  if (!key || key.length < 8) return null;
+  let y = Number(key.slice(0, 4));
+  let m = Number(key.slice(4, 6));
+  let d = Number(key.slice(6, 8));
+  if (y < 1700) [y, m, d] = jalaliToGregorian(y, m, d);
+  const t = new Date(Date.UTC(y, m - 1, d));
+  if (Number.isNaN(t.getTime())) return null;
+  return Math.max(0, Math.floor((new Date(snapshotDate).getTime() - t.getTime()) / 86400000));
+}
+async function ensureStockSleepIndexes(db) {
+  const names = ['stockSleepSnapshots', 'stockSleepQueue', 'stockSleepItemLayers', 'stockSleepSupplierSummary', 'stockSleepHistory'];
+  const existing = new Set((await db.listCollections().toArray()).map(c => c.name));
+  for (const name of names) if (!existing.has(name)) await db.createCollection(name);
+  await db.collection('stockSleepSnapshots').createIndex({ snapshotId: 1 }, { unique: true });
+  await db.collection('stockSleepSnapshots').createIndex({ status: 1, startedAt: -1 });
+  await db.collection('stockSleepQueue').createIndex({ snapshotId: 1, status: 1, lockedAt: 1 });
+  await db.collection('stockSleepQueue').createIndex({ snapshotId: 1, itemCode: 1, warehouseNo: 1 }, { unique: true });
+  await db.collection('stockSleepItemLayers').createIndex({ snapshotId: 1, supplierAccountNo: 1 });
+  await db.collection('stockSleepItemLayers').createIndex({ snapshotId: 1, itemCode: 1, warehouseNo: 1 });
+  await db.collection('stockSleepItemLayers').createIndex({ layerId: 1 }, { unique: true });
+  await db.collection('stockSleepSupplierSummary').createIndex({ snapshotId: 1, supplierAccountNo: 1 }, { unique: true });
+  await db.collection('stockSleepSupplierSummary').createIndex({ snapshotId: 1, remainingValue: -1 });
+  await db.collection('stockSleepHistory').createIndex({ snapshotId: 1, at: -1 });
+}
+async function createStockSleepSnapshot(db, opts = {}) {
+  await ensureStockSleepIndexes(db);
+  const now = new Date();
+  const activeWarehouses = (opts.activeWarehouses || []).map(String).filter(Boolean);
+  const set = activeWarehouses.length ? new Set(activeWarehouses) : null;
+  const fiscalYearStart = clean(opts.fiscalYearStart || '14050101');
+  const maxItems = Math.max(0, Number(opts.maxItems || 0));
+  const query = { quantity: { $gt: 0 } };
+  if (set) query.stockNumber = { $in: [...set] };
+  const docs = await db.collection('itemInventoryCatalog').find(query).sort({ itemCode: 1, stockNumber: 1 }).limit(maxItems || 0).toArray();
+  const rows = docs.map(extractInventoryRow).filter(x => x.itemCode && x.stockNumber && x.quantity > 0);
+  const totalActiveInventoryQty = rows.reduce((s, x) => s + asNumber(x.quantity, 0), 0);
+  const totalActiveInventoryValue = rows.reduce((s, x) => s + asNumber(x.remainCost, 0), 0);
+  const snapshotId = makeSnapshotId(now);
+  const snapshot = {
+    snapshotId,
+    version: VERSION,
+    status: 'queued',
+    startedAt: now,
+    finishedAt: null,
+    fiscalYearStart,
+    activeWarehouses,
+    activeWarehousesHash: hashArray(activeWarehouses),
+    totalActiveInventoryValue,
+    totalActiveInventoryQty,
+    totalItemRows: rows.length,
+    processedItems: 0,
+    failedItems: 0,
+    retryCount: 0,
+    webServiceCalls: 0,
+    kardexMaxRows: Number(opts.kardexMaxRows || 80),
+    maxItems,
+    mode: 'background-single-item-kardex-no-sql',
+    createdBy: clean(opts.createdBy || 'system'),
+    createdAt: now,
+    updatedAt: now
+  };
+  await db.collection('stockSleepSnapshots').insertOne(snapshot);
+  if (rows.length) {
+    await db.collection('stockSleepQueue').bulkWrite(rows.map(r => ({
+      updateOne: {
+        filter: { snapshotId, itemCode: r.itemCode, warehouseNo: r.stockNumber },
+        update: { $setOnInsert: {
+          snapshotId,
+          itemCode: r.itemCode,
+          itemGuId: r.itemGuid,
+          itemDescription: r.itemDescription,
+          warehouseNo: r.stockNumber,
+          warehouseName: r.stockName,
+          quantity: r.quantity,
+          remainCost: r.remainCost,
+          averageCost: r.averageCost,
+          status: 'pending',
+          attempts: 0,
+          lastError: '',
+          lockedAt: null,
+          finishedAt: null,
+          createdAt: now
+        } },
+        upsert: true
+      }
+    })), { ordered: false });
+  }
+  await db.collection('stockSleepHistory').insertOne({ snapshotId, event: 'created', at: now, snapshot });
+  return { ok: true, snapshotId, snapshot, queued: rows.length };
+}
+async function claimQueueItem(db, snapshotId) {
+  const now = new Date();
+  const lockTimeout = new Date(Date.now() - 10 * 60 * 1000);
+  const r = await db.collection('stockSleepQueue').findOneAndUpdate(
+    { snapshotId, $or: [{ status: 'pending' }, { status: 'processing', lockedAt: { $lt: lockTimeout } }] },
+    { $set: { status: 'processing', lockedAt: now }, $inc: { attempts: 1 } },
+    { sort: { attempts: 1, createdAt: 1 }, returnDocument: 'after' }
+  );
+  return r && r.value ? r.value : r;
+}
+async function processOneQueueItem(db, snapshot, item) {
+  const started = new Date();
+  const inventoryRow = {
+    itemCode: item.itemCode,
+    itemGuid: item.itemGuId,
+    itemDescription: item.itemDescription,
+    stockNumber: item.warehouseNo,
+    stockName: item.warehouseName,
+    quantity: item.quantity,
+    averageCost: item.averageCost,
+    remainCost: item.remainCost
+  };
+  const kardex = await shaygan.getKardexByItemCode(item.itemCode, item.warehouseNo, {
+    maxRows: Number(snapshot.kardexMaxRows || 80),
+    hardMaxRows: Math.max(Number(snapshot.kardexMaxRows || 80), 80)
+  });
+  await db.collection('stockSleepSnapshots').updateOne({ snapshotId: snapshot.snapshotId }, { $inc: { webServiceCalls: Number(kardex?.meta?.fetchedPages || 1) }, $set: { updatedAt: new Date() } });
+  if (!kardex.ok) throw new Error(kardex.error || 'Kardex failed');
+  const layers = reverseFifoAllocate({ snapshotId: snapshot.snapshotId, inventoryRow, kardexRows: kardex.rows || [], fiscalYearStart: snapshot.fiscalYearStart, snapshotDate: snapshot.startedAt });
+  if (layers.length) {
+    await db.collection('stockSleepItemLayers').bulkWrite(layers.map(layer => ({
+      updateOne: { filter: { layerId: layer.layerId }, update: { $set: layer }, upsert: true }
+    })), { ordered: false });
+  }
+  await db.collection('stockSleepQueue').updateOne({ _id: item._id }, { $set: { status: 'done', finishedAt: new Date(), lastError: '', layerCount: layers.length, durationMs: Date.now() - started.getTime() } });
+  await db.collection('stockSleepSnapshots').updateOne({ snapshotId: snapshot.snapshotId }, { $inc: { processedItems: 1 }, $set: { status: 'running', updatedAt: new Date() } });
+  return { ok: true, itemCode: item.itemCode, warehouseNo: item.warehouseNo, layerCount: layers.length };
+}
+async function aggregateSupplierSummary(db, snapshotId) {
+  const snapshot = await db.collection('stockSleepSnapshots').findOne({ snapshotId });
+  const totalValue = Math.max(1, asNumber(snapshot?.totalActiveInventoryValue, 0));
+  const rows = await db.collection('stockSleepItemLayers').aggregate([
+    { $match: { snapshotId } },
+    { $group: {
+      _id: { supplierAccountNo: '$supplierAccountNo', supplierName: '$supplierName' },
+      remainingQty: { $sum: '$allocatedQty' },
+      remainingValue: { $sum: '$allocatedValue' },
+      periodPurchaseQty: { $sum: { $cond: [{ $eq: ['$originType', 'CURRENT_YEAR_PURCHASE'] }, '$purchaseQty', 0] } },
+      periodPurchaseValue: { $sum: { $cond: [{ $eq: ['$originType', 'CURRENT_YEAR_PURCHASE'] }, '$purchaseValue', 0] } },
+      layerCount: { $sum: 1 },
+      itemCodes: { $addToSet: '$itemCode' },
+      weightedAgeValue: { $sum: { $cond: [{ $ne: ['$ageDays', null] }, { $multiply: ['$ageDays', '$allocatedValue'] }, 0] } },
+      ageValueBase: { $sum: { $cond: [{ $ne: ['$ageDays', null] }, '$allocatedValue', 0] } },
+      fifoProfitAmount: { $sum: { $ifNull: ['$fifoProfitAmount', 0] } }
+    } }
+  ]).toArray();
+  const now = new Date();
+  if (rows.length) {
+    await db.collection('stockSleepSupplierSummary').deleteMany({ snapshotId });
+    await db.collection('stockSleepSupplierSummary').insertMany(rows.map(r => {
+      const remainingValue = asNumber(r.remainingValue, 0);
+      const fifoProfitAmount = asNumber(r.fifoProfitAmount, 0);
+      return {
+        snapshotId,
+        supplierAccountNo: r._id.supplierAccountNo || '',
+        supplierName: r._id.supplierName || '',
+        periodPurchaseQty: asNumber(r.periodPurchaseQty, 0),
+        periodPurchaseValue: asNumber(r.periodPurchaseValue, 0),
+        remainingQty: asNumber(r.remainingQty, 0),
+        remainingValue,
+        fifoProfitAmount,
+        fifoProfitPercent: remainingValue > 0 ? Number(((fifoProfitAmount / remainingValue) * 100).toFixed(2)) : null,
+        averageAgeDays: asNumber(r.ageValueBase, 0) > 0 ? Math.round(asNumber(r.weightedAgeValue, 0) / asNumber(r.ageValueBase, 0)) : null,
+        itemCount: Array.isArray(r.itemCodes) ? r.itemCodes.length : 0,
+        layerCount: asNumber(r.layerCount, 0),
+        shareOfTotalInventoryPercent: Number(((remainingValue / totalValue) * 100).toFixed(2)),
+        createdAt: now
+      };
+    }));
+  }
+  return { ok: true, supplierCount: rows.length };
+}
+async function processSnapshotBatch(db, snapshotId, opts = {}) {
+  await ensureStockSleepIndexes(db);
+  const limit = Math.max(1, Math.min(Number(opts.limit || 5), 500));
+  const snapshot = await db.collection('stockSleepSnapshots').findOne({ snapshotId });
+  if (!snapshot) return { ok: false, error: 'snapshot not found' };
+  if (['completed', 'failed'].includes(snapshot.status)) return { ok: true, snapshotId, status: snapshot.status, done: true };
+  let processed = 0;
+  const errors = [];
+  await db.collection('stockSleepSnapshots').updateOne({ snapshotId }, { $set: { status: 'running', updatedAt: new Date() } });
+  for (let i = 0; i < limit; i++) {
+    const item = await claimQueueItem(db, snapshotId);
+    if (!item) break;
+    try {
+      await processOneQueueItem(db, snapshot, item);
+      processed++;
+    } catch (e) {
+      const msg = String(e.message || e).slice(0, 1000);
+      errors.push({ itemCode: item.itemCode, warehouseNo: item.warehouseNo, error: msg });
+      const attempts = asNumber(item.attempts, 1);
+      const status = attempts >= 3 ? 'failed' : 'pending';
+      await db.collection('stockSleepQueue').updateOne({ _id: item._id }, { $set: { status, lastError: msg, lockedAt: null, finishedAt: status === 'failed' ? new Date() : null } });
+      await db.collection('stockSleepSnapshots').updateOne({ snapshotId }, { $inc: { retryCount: 1, ...(status === 'failed' ? { failedItems: 1 } : {}) }, $set: { updatedAt: new Date() } });
+    }
+  }
+  const counts = await queueCounts(db, snapshotId);
+  if ((counts.pending + counts.processing) === 0) {
+    await aggregateSupplierSummary(db, snapshotId);
+    await db.collection('stockSleepSnapshots').updateOne({ snapshotId }, { $set: { status: counts.failed > 0 ? 'completed_with_errors' : 'completed', finishedAt: new Date(), updatedAt: new Date() } });
+    await db.collection('stockSleepHistory').insertOne({ snapshotId, event: 'completed', counts, at: new Date() });
+  }
+  return { ok: true, snapshotId, processed, errors, counts };
+}
+async function processSnapshotToEnd(db, snapshotId, opts = {}) {
+  const batchLimit = Math.max(1, Math.min(Number(opts.limit || opts.batchLimit || 5), 500));
+  const maxLoops = Math.max(1, Math.min(Number(opts.maxLoops || 200), 2000));
+  let loops = 0;
+  let totalProcessed = 0;
+  let last = null;
+  while (loops < maxLoops) {
+    loops++;
+    last = await processSnapshotBatch(db, snapshotId, { limit: batchLimit });
+    totalProcessed += Number(last.processed || 0);
+    const c = last.counts || await queueCounts(db, snapshotId);
+    if ((Number(c.pending || 0) + Number(c.processing || 0)) === 0) break;
+    if (Number(last.processed || 0) === 0 && Number(c.processing || 0) === 0) break;
+  }
+  return { ok: true, snapshotId, loops, processed: totalProcessed, last, counts: last?.counts || await queueCounts(db, snapshotId) };
+}
+
+async function queueCounts(db, snapshotId) {
+  const rows = await db.collection('stockSleepQueue').aggregate([{ $match: { snapshotId } }, { $group: { _id: '$status', count: { $sum: 1 } } }]).toArray();
+  const out = { pending: 0, processing: 0, done: 0, failed: 0 };
+  for (const r of rows) out[r._id] = r.count;
+  return out;
+}
+async function getSnapshotStatus(db, snapshotId) {
+  const snapshot = snapshotId
+    ? await db.collection('stockSleepSnapshots').findOne({ snapshotId })
+    : await db.collection('stockSleepSnapshots').findOne({}, { sort: { startedAt: -1 } });
+  if (!snapshot) return { ok: true, snapshot: null, counts: null };
+  return { ok: true, snapshot, counts: await queueCounts(db, snapshot.snapshotId) };
+}
+async function listSnapshots(db, limit = 20) {
+  const list = await db.collection('stockSleepSnapshots').find({}).sort({ startedAt: -1 }).limit(Math.max(1, Math.min(Number(limit || 20), 100))).toArray();
+  return { ok: true, list };
+}
+async function getSupplierSummary(db, snapshotId, limit = 200) {
+  const sid = snapshotId || (await db.collection('stockSleepSnapshots').findOne({}, { sort: { startedAt: -1 } }))?.snapshotId;
+  if (!sid) return { ok: true, snapshotId: '', list: [] };
+  const list = await db.collection('stockSleepSupplierSummary').find({ snapshotId: sid }).sort({ remainingValue: -1 }).limit(Math.max(1, Math.min(Number(limit || 200), 1000))).toArray();
+  return { ok: true, snapshotId: sid, list };
+}
+async function getItemLayers(db, snapshotId, filters = {}) {
+  const sid = snapshotId || (await db.collection('stockSleepSnapshots').findOne({}, { sort: { startedAt: -1 } }))?.snapshotId;
+  if (!sid) return { ok: true, snapshotId: '', list: [] };
+  const q = { snapshotId: sid };
+  if (filters.supplierAccountNo) q.supplierAccountNo = clean(filters.supplierAccountNo);
+  if (filters.itemCode) q.itemCode = clean(filters.itemCode);
+  if (filters.warehouseNo) q.warehouseNo = clean(filters.warehouseNo);
+  const list = await db.collection('stockSleepItemLayers').find(q).sort({ supplierName: 1, itemCode: 1, layerRank: 1 }).limit(Math.max(1, Math.min(Number(filters.limit || 500), 3000))).toArray();
+  return { ok: true, snapshotId: sid, list };
+}
+
+module.exports = {
+  VERSION,
+  ensureStockSleepIndexes,
+  createStockSleepSnapshot,
+  processSnapshotBatch,
+  getSnapshotStatus,
+  listSnapshots,
+  getSupplierSummary,
+  getItemLayers,
+  aggregateSupplierSummary,
+  processSnapshotToEnd
+};

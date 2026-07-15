@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>ورود به MKCRM</title>
+  <link rel="stylesheet" href="/assets/style.css" />
+</head>
+<body class="login-mode">
+  <div id="loginRoot" class="login-shell">
+    <div class="login-card">
+      <div class="login-brand">MKCRM</div>
+      <div class="login-subtitle">مشهد کالا - سامانه داخلی فروش و اتصال شایگان</div>
+      <div class="login-note" id="loginAddress"></div>
+      <label>نام کاربری</label>
+      <input id="loginUser" autocomplete="off" autocapitalize="off" spellcheck="false" value="" />
+      <label>رمز عبور</label>
+      <input id="loginPass" type="password" autocomplete="new-password" value="" />
+      <button class="btn primary wide" id="loginBtn">ورود به CRM</button>
+      <div id="loginMsg"></div>
+    </div>
+  </div>
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const esc = (v) => String(v ?? '').replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+    $('#loginAddress').textContent = 'آدرس ورود: ' + location.origin + '/login';
+    async function login(){
+      $('#loginMsg').innerHTML = '<div class="muted">در حال بررسی...</div>';
+      try {
+        const r = await fetch('/api/auth/login', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({username:$('#loginUser').value.trim(), password:$('#loginPass').value})});
+        const j = await r.json();
+        if(!r.ok || !j.ok) throw new Error(j.error || 'ورود ناموفق');
+        localStorage.mkcrmUser = JSON.stringify(j.user);
+        location.href = '/';
+      } catch(e) {
+        $('#loginMsg').innerHTML = '<div class="error">' + esc(e.message) + '</div>';
+      }
+    }
+    $('#loginBtn').onclick = login;
+    $('#loginPass').addEventListener('keydown', e => { if(e.key === 'Enter') login(); });
+    $('#loginUser').addEventListener('keydown', e => { if(e.key === 'Enter') $('#loginPass').focus(); });
+  </script>
+</body>
+</html>
