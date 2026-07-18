@@ -85,6 +85,25 @@
   padding:14px;
   background:#fff;
 }
+.popup-hidden{display:none !important;}
+.popup-open{display:block !important;}
+.popup-option-active,
+.product-row.popup-option-active,
+.account-result.popup-option-active,
+.stock-group.popup-option-active,
+.ps-select-supplier.popup-option-active{
+  background:#eaf4ff !important;
+  outline:2px solid #3b82f6;
+  outline-offset:-2px;
+}
+.floating-list:focus-visible,
+.floating-list [role="option"]:focus-visible,
+.ps-select-supplier:focus-visible{
+  outline:3px solid #2563eb;
+  outline-offset:2px;
+}
+.modal-scroll-lock{overflow:hidden!important}
+.mk-modal[aria-hidden="true"],.mk-modal-overlay[aria-hidden="true"]{display:none!important}
 @media(max-width:900px){
   .floating-list{min-width:100%;}
 }
