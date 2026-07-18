@@ -18,10 +18,15 @@ function loadEnv() {
 
 loadEnv();
 
+function envFlag(value) {
+  return /^(true|1|yes|on)$/i.test(String(value || '').trim());
+}
+
 const config = {
   port: Number(process.env.PORT || 1385),
   host: process.env.APP_HOST || '0.0.0.0',
   publicBaseUrl: process.env.PUBLIC_BASE_URL || '',
+  stagingReadOnly: envFlag(process.env.STAGING_READ_ONLY),
   mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/mkcrm',
   shayganBaseUrl: process.env.SHAYGAN_BASE_URL || 'http://192.168.1.253:2030',
   shayganConnectionName: process.env.SHAYGAN_CONNECTION_NAME || 'SampleConnection',
