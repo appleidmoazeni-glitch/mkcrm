@@ -626,6 +626,9 @@ function buildSaleInvoicePut(input) {
 }
 
 async function putSaleInvoice(input) {
+  if (config.stagingReadOnly) {
+    return { ok:false, status:403, result:[], raw:null, error:'Operation disabled in staging read-only mode', operation:'shaygan.putSaleInvoice' };
+  }
   return await put('/api/Invoice/Put', buildSaleInvoicePut(input));
 }
 
@@ -879,6 +882,9 @@ function buildPurchaseInvoicePut(input) {
 }
 
 async function putPurchaseInvoice(input) {
+  if (config.stagingReadOnly) {
+    return { ok:false, status:403, result:[], raw:null, error:'Operation disabled in staging read-only mode', operation:'shaygan.putPurchaseInvoice' };
+  }
   return await put('/api/Invoice/Put', buildPurchaseInvoicePut(input));
 }
 
