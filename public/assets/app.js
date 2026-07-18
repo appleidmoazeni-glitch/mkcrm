@@ -25,13 +25,67 @@ function cleanDate8(v){return String(v||'').replace(/[^0-9]/g,'').slice(0,8)}
 
 async function api(url, opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const j=await r.json().catch(()=>({ok:false,error:'bad json'}));if(!r.ok) throw new Error(j.error||r.statusText);return j}
 function post(url, body){return api(url,{method:'POST',body:JSON.stringify(body||{})})}
-function setPage(title, html){$('#pageTitle').textContent=title;$('#content').innerHTML=html;$$('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.page===location.hash.slice(1)))}
+function setPage(title, html){popupSuggestionController.close({restoreFocus:false});$('#pageTitle').textContent=title;$('#content').innerHTML=html;$$('.navbtn').forEach(b=>b.classList.toggle('active',b.dataset.page===location.hash.slice(1)))}
 function loginScreen(){document.body.classList.add('login-mode');$('#app').innerHTML=`<div class="login-box"><h2>ورود به MKCRM</h2><p class="muted">نسخه داخلی مشهد کالا - اتصال جدید شایگان</p><label>نام کاربری</label><input id="loginUser" autocomplete="off" autocapitalize="off" spellcheck="false"><label>رمز عبور</label><input id="loginPass" type="password" autocomplete="new-password"><button class="btn red wide" id="loginBtn">ورود</button><div id="loginMsg"></div></div>`;$('#loginBtn').onclick=async()=>{const r=await post('/api/auth/login',{username:$('#loginUser').value,password:$('#loginPass').value});if(r.ok){localStorage.mkcrmUser=JSON.stringify(r.user);location.reload()}else $('#loginMsg').innerHTML=`<div class="error">${esc(r.error||'ورود ناموفق')}</div>`}}
 function shell(){document.body.classList.remove('login-mode');$('#app').innerHTML=`<aside class="sidebar"><div class="brand brand-with-logo"><img class="brand-logo-img" src="/assets/mashhadkala-logo-wide.png" alt="مشهد کالا"><span class="brand-system">MKCRM</span></div><div class="sub">مشهد کالا - نسخه داخلی</div><div class="user-chip">${esc(state.user?.fullName||state.user?.username||'')}</div><nav id="menu"></nav></aside><main class="main"><header class="topbar"><div><b id="pageTitle">داشبورد</b><span id="pageHint"></span></div><div class="top-actions"><div class="status"><span id="healthText">checking...</span></div><button class="btn logout" id="logoutBtn">خروج</button></div></header><section id="content"></section></main>`;renderMenu();$('#logoutBtn').onclick=async()=>{try{await post('/api/auth/logout',{})}catch{} localStorage.removeItem('mkcrmUser');location.href='/login'};health();route()}
 const menu = [['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا-تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها']]]];
 function renderMenu(){let h='';const role=userRole();menu.forEach(([g,items])=>{const allowedItems=items.filter(([id])=>canPage(id));if(!allowedItems.length)return;h+=`<div class="menu-group">${g}</div>`;allowedItems.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`)});$('#menu').innerHTML=h;$$('.navbtn').forEach(b=>b.onclick=()=>{location.hash=b.dataset.page;route()});const chip=document.querySelector('.user-chip');if(chip)chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small>`}
 async function health(){try{const h=await api('/health');$('#healthText').textContent=`online | ${h.node}`;$('.status').classList.add('ok')}catch(e){$('#healthText').textContent=e.message;$('.status').classList.add('bad')}}
 function debounce(fn, ms=350){let t;return (...a)=>{clearTimeout(t);t=setTimeout(()=>fn(...a),ms)}}
+const popupSuggestionController=(()=>{
+  let active=null;
+  function options(){return active?[...active.popup.querySelectorAll(active.optionSelector)].filter(el=>!el.hidden&&!el.disabled):[]}
+  function mark(index){
+    if(!active)return;
+    const list=options();
+    active.index=list.length?((index%list.length)+list.length)%list.length:-1;
+    list.forEach((el,i)=>{const on=i===active.index;el.classList.toggle('popup-option-active',on);el.setAttribute('aria-selected',on?'true':'false');});
+    if(active.index>=0)list[active.index].scrollIntoView({block:'nearest'});
+  }
+  function close(opts={}){
+    if(!active)return;
+    const current=active;active=null;
+    document.removeEventListener('pointerdown',current.onOutside,true);
+    document.removeEventListener('keydown',current.onKey,true);
+    current.popup.classList.remove('popup-open');
+    current.popup.classList.add('popup-hidden');
+    current.popup.setAttribute('aria-hidden','true');
+    current.trigger.setAttribute('aria-expanded','false');
+    [...current.popup.querySelectorAll(current.optionSelector)].forEach(el=>{el.classList.remove('popup-option-active');el.removeAttribute('aria-selected')});
+    const canRestoreFocus=current.trigger.isConnected&&!current.trigger.disabled&&typeof current.trigger.focus==='function'&&current.trigger.getClientRects().length>0;
+    if(opts.restoreFocus!==false&&current.restoreFocus&&canRestoreFocus)current.trigger.focus({preventScroll:true});
+  }
+  function open({popup,trigger,optionSelector,onSelect,restoreFocus=true}){
+    if(!popup||!trigger||!popup.isConnected||!trigger.isConnected)return;
+    if(active&&active.popup!==popup)close({restoreFocus:false});
+    else if(active)close({restoreFocus:false});
+    const current={popup,trigger,optionSelector,onSelect,restoreFocus,index:-1};
+    current.onOutside=e=>{if(!popup.contains(e.target)&&e.target!==trigger)close()};
+    current.onKey=e=>{
+      if(!active||active!==current)return;
+      if(e.key==='Escape'){e.preventDefault();e.stopPropagation();close();return;}
+      if(e.key==='ArrowDown'||e.key==='ArrowUp'){
+        e.preventDefault();e.stopPropagation();
+        const list=options(),direction=e.key==='ArrowDown'?1:-1;
+        mark(current.index<0?(direction>0?0:list.length-1):current.index+direction);return;
+      }
+      if(e.key==='Enter'){
+        const list=options();if(!list.length){e.preventDefault();e.stopPropagation();return;}
+        e.preventDefault();e.stopPropagation();
+        const el=list[current.index>=0?current.index:0];
+        if(onSelect)onSelect(el);else el.click();
+      }
+    };
+    active=current;
+    popup.classList.remove('popup-hidden');popup.classList.add('popup-open');popup.setAttribute('aria-hidden','false');
+    trigger.setAttribute('aria-haspopup','listbox');trigger.setAttribute('aria-expanded','true');popup.setAttribute('role','listbox');
+    options().forEach(el=>el.setAttribute('role','option'));
+    document.addEventListener('pointerdown',current.onOutside,true);
+    document.addEventListener('keydown',current.onKey,true);
+  }
+  function isOpen(popup){return !!active&&active.popup===popup}
+  return {open,close,isOpen};
+})();
 async function loadStocks(){if(state.stocks) return state.stocks;const r=await api('/api/stocks');state.stocks=(r.list||[]).sort((a,b)=>String(a.stockNumber).localeCompare(String(b.stockNumber),'fa'));return state.stocks}
 async function fillStockFilter(prefix){const sel=$(`#${prefix}StockFilter`);if(!sel)return;const stocks=await loadStocks();sel.innerHTML='<option value="">همه انبارها</option>'+stocks.map(s=>`<option value="${esc(s.stockNumber)}">${esc(s.stockNumber)} - ${esc(s.stockName)}</option>`).join('')}
 function getStockFilter(prefix){return $(`#${prefix}StockFilter`)?.value||''}
@@ -90,7 +144,7 @@ function normClient(v=''){return String(v||'').toLowerCase().replace(/[ي]/g,'ی
 function tokensClient(q=''){return normClient(q).split(/\s+/).map(x=>x.trim()).filter(Boolean)}
 function accountMatchesClient(a,tokens){const hay=normClient(accountText(a));return tokens.every(t=>hay.includes(normClient(t)))}
 function accountScoreClient(a,tokens){const hay=normClient(accountText(a));const num=normClient(a.accountNumber||'');const name=normClient(a.accountName||'');let score=0;for(const t of [...new Set(tokens.map(normClient))]){if(num===t)score+=10000;else if(num.startsWith(t))score+=5000;else if(num.includes(t))score+=2000;if(name.startsWith(t))score+=1600;else if(name.includes(t))score+=Math.max(100,900-name.indexOf(t));}score-=Math.min(hay.length,300)/30;return score}
-function renderAccountResults(box,list,onPick,input){box.style.display='block';if(!list.length){box.innerHTML='<div class="floating-empty">نتیجه‌ای پیدا نشد.</div>';return;}box.innerHTML=list.map((a,i)=>`<div class="account-result" data-i="${i}"><b>${esc(a.accountName||'')}</b><span>${esc(a.accountNumber||'')}</span><small>${esc(a.moinNumber||'')}</small></div>`).join('');box.querySelectorAll('.account-result').forEach(el=>el.onclick=()=>{const a=list[Number(el.dataset.i)];onPick({accountNumber:a.accountNumber,accountName:a.accountName,moinNumber:a.moinNumber,guId:a.guId||a.accountGuid||a.raw?.GuId||'',accountGuid:a.guId||a.accountGuid||a.raw?.GuId||'',raw:a.raw});box.style.display='none';if(input)input.value=`${a.accountNumber} - ${a.accountName||''}`;});box._lastList=list;}
+function renderAccountResults(box,list,onPick,input){box.style.display='block';if(!list.length){box.innerHTML='<div class="floating-empty">نتیجه‌ای پیدا نشد.</div>';popupSuggestionController.open({popup:box,trigger:input,optionSelector:'.account-result'});return;}box.innerHTML=list.map((a,i)=>`<div class="account-result" data-i="${i}"><b>${esc(a.accountName||'')}</b><span>${esc(a.accountNumber||'')}</span><small>${esc(a.moinNumber||'')}</small></div>`).join('');box.querySelectorAll('.account-result').forEach(el=>el.onclick=()=>{const a=list[Number(el.dataset.i)];onPick({accountNumber:a.accountNumber,accountName:a.accountName,moinNumber:a.moinNumber,guId:a.guId||a.accountGuid||a.raw?.GuId||'',accountGuid:a.guId||a.accountGuid||a.raw?.GuId||'',raw:a.raw});popupSuggestionController.close();if(input)input.value=`${a.accountNumber} - ${a.accountName||''}`;});box._lastList=list;popupSuggestionController.open({popup:box,trigger:input,optionSelector:'.account-result'});}
 function bindAccountPicker(inputId,listId,onPick,opts={}){const input=$('#'+inputId), box=$('#'+listId);let cacheList=[];let cacheBase='';let requestSeq=0;const limit=Number(opts.limit||100);function filterLocal(q){const tokens=tokensClient(q);if(!tokens.length)return [];return cacheList.filter(a=>accountMatchesClient(a,tokens)).sort((a,b)=>accountScoreClient(b,tokens)-accountScoreClient(a,tokens)).slice(0,limit)}async function liveSearch(q){const seq=++requestSeq;box.style.display='block';box.innerHTML='<div class="floating-empty">در حال جستجو در شایگان...</div>';let r=await api(`/api/accounts/search?q=${encodeURIComponent(q)}&limit=${limit}&pages=${opts.pages||220}`);if(seq!==requestSeq)return;let list=r.list||[];cacheList=list;cacheBase=tokensClient(q)[0]||q;if(!list.length){const toks=tokensClient(q);for(const t of toks){r=await api(`/api/accounts/search?q=${encodeURIComponent(t)}&limit=${limit}&pages=${opts.pages||220}`);list=r.list||[];if(list.length){cacheList=list;cacheBase=t;break;}}}const filtered=filterLocal(q);renderAccountResults(box,filtered.length?filtered:list,onPick,input)}const search=debounce(async()=>{const q=input.value.trim();const tokens=tokensClient(q);if(q.length<2||!tokens.length){box.style.display='none';box.innerHTML='';return;}if(cacheList.length){const filtered=filterLocal(q);if(filtered.length){renderAccountResults(box,filtered,onPick,input);return;}}
 await liveSearch(q);},250);input.addEventListener('input',search);input.addEventListener('keydown',async e=>{if(e.key==='Enter'){e.preventDefault();const list=box._lastList&&box._lastList.length?box._lastList:filterLocal(input.value);if(list.length){const a=list[0];onPick({accountNumber:a.accountNumber,accountName:a.accountName,moinNumber:a.moinNumber,guId:a.guId||a.accountGuid||a.raw?.GuId||'',accountGuid:a.guId||a.accountGuid||a.raw?.GuId||'',raw:a.raw});box.style.display='none';input.value=`${a.accountNumber} - ${a.accountName||''}`;}else if(input.value.trim().length>=2){await liveSearch(input.value.trim());}}});document.addEventListener('click',e=>{if(input&&!input.contains(e.target)&&box&&!box.contains(e.target))box.style.display='none'});}
 async function renderMappingsTable(){const r=await api('/api/user-mappings');state.mappings=r.list||[];let h='<table class="table"><thead><tr><th>کاربر</th><th>نام</th><th>گروه</th><th>فروشگاه</th><th>صندوق</th><th>نماینده</th><th>وضعیت</th></tr></thead><tbody>';h+=state.mappings.map(m=>`<tr><td>${esc(m.username)}</td><td>${esc(m.fullName||'')}</td><td>${esc(m.role||'')}</td><td>${esc(m.storeName||'')}</td><td>${esc(m.cashboxAccountNumber||'')}<br><small>${esc(m.cashboxAccountName||'')}</small></td><td>${esc(m.employeeAccountNumber||'')}<br><small>${esc(m.employeeAccountName||'')}</small></td><td>${m.isActive===false?'غیرفعال':'فعال'}</td></tr>`).join('');$('#mappingList').innerHTML=h+'</tbody></table>'}
@@ -161,6 +215,7 @@ function bindAccountPicker(inputId,listId,onPick,opts={}){
     const seq=++requestSeq;
     box.style.display='block';
     box.innerHTML='<div class="floating-empty">در حال جستجو در شایگان...</div>';
+    popupSuggestionController.open({popup:box,trigger:input,optionSelector:'.account-result'});
     let r=await api(`/api/accounts/search?q=${encodeURIComponent(q)}&limit=${limit}&pages=${opts.pages||220}`);
     if(seq!==requestSeq)return;
     let list=r.list||[];
@@ -180,7 +235,7 @@ function bindAccountPicker(inputId,listId,onPick,opts={}){
   const search=debounce(async()=>{
     const q=input.value.trim();
     const tokens=tokensClient(q);
-    if(q.length<2||!tokens.length){box.style.display='none';box.innerHTML='';cacheList=[];cacheBaseToken='';return;}
+    if(q.length<2||!tokens.length){popupSuggestionController.close({restoreFocus:false});box.innerHTML='';cacheList=[];cacheBaseToken='';return;}
     const ft=firstToken(q);
     if(cacheList.length && cacheBaseToken && ft===cacheBaseToken){
       // Do not rescan Shaygan when user extends the same search. Filter current dropdown locally.
@@ -198,12 +253,11 @@ function bindAccountPicker(inputId,listId,onPick,opts={}){
       if(list.length){
         const a=list[0];
         onPick({accountNumber:a.accountNumber,accountName:a.accountName,moinNumber:a.moinNumber,guId:a.guId||a.accountGuid||a.raw?.GuId||'',accountGuid:a.guId||a.accountGuid||a.raw?.GuId||'',raw:a.raw});
-        box.style.display='none';
+        popupSuggestionController.close();
         input.value=`${a.accountNumber} - ${a.accountName||''}`;
       }else if(input.value.trim().length>=2){await liveSearch(input.value.trim());}
     }
   });
-  document.addEventListener('click',e=>{if(input&&!input.contains(e.target)&&box&&!box.contains(e.target))box.style.display='none'});
 }
 
 async function pageTurnover(){
@@ -642,9 +696,11 @@ if(typeof window!=='undefined'){
     const q=$(`#${prefix}Q`), box=$(`#${prefix}List`), msg=$(`#${prefix}Msg`);
     let cacheList=[], lastQuery='', requestSeq=0;
     const limit=Number(opts.limit||120);
+    const managedPopup=prefix==='cardex';
     async function live(qv){
       const seq=++requestSeq;
       box.style.display='block'; box.innerHTML='<div class="floating-empty">در حال جستجو...</div>'; if(msg)msg.textContent='در حال جستجو...';
+      if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});
       const r=await searchAllItemsRows(qv, limit, false);
       if(seq!==requestSeq) return [];
       cacheList=r.list||[]; lastQuery=qv;
@@ -656,17 +712,18 @@ if(typeof window!=='undefined'){
       if(msg) msg.textContent=`${(items||[]).length} کالا | ${r.source||'cache/local'}${r.cacheCount?' | کش: '+r.cacheCount:''}${r.scannedPages?' | '+r.scannedPages+' صفحه':''}${r.note?' | '+r.note:''}`;
       box.style.display='block';
       box.innerHTML=(items||[]).map(x=>`<div class="product-row" data-code="${esc(x.ItemCode||x.itemCode)}" data-desc="${esc(x.ItemDesc||x.itemDescription)}" data-guid="${esc(x.ItemGuId||x.itemGuid||'')}"><b>${esc(x.ItemDesc||x.itemDescription)}</b><div class="small muted">کد: ${esc(x.ItemCode||x.itemCode)}</div></div>`).join('') || '<div class="floating-empty">نتیجه‌ای پیدا نشد.</div>';
-      box.querySelectorAll('.product-row').forEach(el=>el.onclick=()=>{const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;box.style.display='none';onPick(item,items)});
+      box.querySelectorAll('.product-row').forEach(el=>el.onclick=()=>{const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;if(managedPopup)popupSuggestionController.close();else box.style.display='none';onPick(item,items)});
+      if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});
     }
     const search=debounce(async()=>{
       const val=q.value.trim(); const tokens=tokensClient(val);
-      if(val.length<2||!tokens.length){box.style.display='none';box.innerHTML='';if(msg)msg.textContent='';return;}
+      if(val.length<2||!tokens.length){if(managedPopup)popupSuggestionController.close({restoreFocus:false});else box.style.display='none';box.innerHTML='';if(msg)msg.textContent='';return;}
       if(cacheList.length){ const filtered=_filterProducts(cacheList,val,limit); if(filtered.length){render(filtered,{source:'client-filter'}); return;} }
       await live(val);
     },220);
     q.addEventListener('input',search);
     q.addEventListener('keydown',async e=>{if(e.key==='Enter'){e.preventDefault(); const val=q.value.trim(); const items=cacheList.length?_filterProducts(cacheList,val,limit):await live(val); box.style.display='none'; if(opts.onEnter) opts.onEnter(val,items); else if(items.length===1){const x=items[0];onPick({itemCode:x.ItemCode||x.itemCode,itemDescription:x.ItemDesc||x.itemDescription,itemGuid:x.ItemGuId||x.itemGuid||''},items)}}});
-    document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==q)box.style.display='none'});
+    if(!managedPopup)document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==q)box.style.display='none'});
   };
 
   function _stockMatches(row,tokens){ const hay=normClient(`${row.itemCode||row.ItemCode||''} ${row.itemDescription||row.ItemDesc||''} ${row.stockNumber||row.STNumber||''} ${row.stockName||row.StDesc||''}`); return tokens.every(t=>hay.includes(normClient(t))); }
@@ -675,12 +732,13 @@ if(typeof window!=='undefined'){
 
   window.bindItemSearch = bindItemSearch = function(prefix,onPick,opts={}){
     const q=$(`#${prefix}Q`), box=$(`#${prefix}List`), msg=$(`#${prefix}Msg`); let cacheRows=[], lastStock='', lastGroups=[]; const limit=Number(opts.limit||300);
-    function renderRows(rows,r={}){ let filtered=_filterStockRows(rows,q.value.trim(),opts.getStockFilter?opts.getStockFilter():'',limit); const groups=groupStockRows(filtered); lastGroups=groups; if(msg)msg.textContent=`${groups.length} کالا | ${filtered.length} ردیف انبار | ${r.source||'client-filter'}${r.scannedPages?' | '+r.scannedPages+' صفحه':''}`; box.style.display='block'; box.innerHTML=groups.map(g=>renderStockGroupHtml(g,opts)).join('') || '<div class="floating-empty">نتیجه‌ای پیدا نشد.</div>'; box.querySelectorAll('.stock-group').forEach(el=>el.onclick=(ev)=>{if(ev.target.classList.contains('choose-stock-row'))return;const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;box.style.display='none';onPick(item, groups.find(g=>g.itemCode===item.itemCode))}); box.querySelectorAll('.choose-stock-row').forEach(btn=>btn.onclick=(ev)=>{ev.stopPropagation();const raw=JSON.parse(btn.dataset.row);const {item,stock}=rawToItemStock(raw);$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription} | ${stock.stockNumber} - ${stock.stockName}`;box.style.display='none';if(opts.onStockPick) opts.onStockPick(item,stock); else onPick(item,{rows:[raw],total:stock.quantity})}); return groups; }
-    async function liveSearch(){ const val=q.value.trim(); const stock=opts.getStockFilter?opts.getStockFilter():''; box.style.display='block'; box.innerHTML='<div class="floating-empty">در حال جستجو...</div>'; if(msg)msg.textContent='در حال جستجو...'; const r=await searchStockRows(val, limit, stock); cacheRows=r.list||[]; lastStock=stock; return renderRows(cacheRows,r); }
-    const search=debounce(async()=>{ const val=q.value.trim(); if(val.length<2){box.style.display='none';box.innerHTML='';if(msg)msg.textContent='';return;} const stock=opts.getStockFilter?opts.getStockFilter():''; if(cacheRows.length && stock===lastStock){ const groups=renderRows(cacheRows,{source:'client-filter'}); if(groups.length) return; } await liveSearch(); },220);
+    const managedPopup=prefix==='stock'||prefix==='cardex';
+    function renderRows(rows,r={}){ let filtered=_filterStockRows(rows,q.value.trim(),opts.getStockFilter?opts.getStockFilter():'',limit); const groups=groupStockRows(filtered); lastGroups=groups; if(msg)msg.textContent=`${groups.length} کالا | ${filtered.length} ردیف انبار | ${r.source||'client-filter'}${r.scannedPages?' | '+r.scannedPages+' صفحه':''}`; box.style.display='block'; box.innerHTML=groups.map(g=>renderStockGroupHtml(g,opts)).join('') || '<div class="floating-empty">نتیجه‌ای پیدا نشد.</div>'; box.querySelectorAll('.stock-group').forEach(el=>el.onclick=(ev)=>{if(ev.target.classList.contains('choose-stock-row'))return;const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;if(managedPopup)popupSuggestionController.close();else box.style.display='none';onPick(item, groups.find(g=>g.itemCode===item.itemCode))}); box.querySelectorAll('.choose-stock-row').forEach(btn=>btn.onclick=(ev)=>{ev.stopPropagation();const raw=JSON.parse(btn.dataset.row);const {item,stock}=rawToItemStock(raw);$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription} | ${stock.stockNumber} - ${stock.stockName}`;if(managedPopup)popupSuggestionController.close();else box.style.display='none';if(opts.onStockPick) opts.onStockPick(item,stock); else onPick(item,{rows:[raw],total:stock.quantity})}); if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.stock-group'}); return groups; }
+    async function liveSearch(){ const val=q.value.trim(); const stock=opts.getStockFilter?opts.getStockFilter():''; box.style.display='block'; box.innerHTML='<div class="floating-empty">در حال جستجو...</div>'; if(msg)msg.textContent='در حال جستجو...'; if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.stock-group'}); const r=await searchStockRows(val, limit, stock); cacheRows=r.list||[]; lastStock=stock; return renderRows(cacheRows,r); }
+    const search=debounce(async()=>{ const val=q.value.trim(); if(val.length<2){if(managedPopup)popupSuggestionController.close({restoreFocus:false});else box.style.display='none';box.innerHTML='';if(msg)msg.textContent='';return;} const stock=opts.getStockFilter?opts.getStockFilter():''; if(cacheRows.length && stock===lastStock){ const groups=renderRows(cacheRows,{source:'client-filter'}); if(groups.length) return; } await liveSearch(); },220);
     q.addEventListener('input',search);
     q.addEventListener('keydown',async e=>{if(e.key==='Enter'){e.preventDefault(); const stock=opts.getStockFilter?opts.getStockFilter():''; const groups=(cacheRows.length&&stock===lastStock)?renderRows(cacheRows,{source:'client-filter'}):await liveSearch(); box.style.display='none'; if(opts.onEnter) opts.onEnter(q.value.trim(),groups); else if(groups.length===1){const g=groups[0];onPick({itemCode:g.itemCode,itemDescription:g.itemDescription,itemGuid:g.itemGuid},g)}}});
-    document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==q)box.style.display='none'});
+    if(!managedPopup)document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==q)box.style.display='none'});
     if(opts.filterElement){opts.filterElement.addEventListener('change',()=>{lastGroups=[]; if(q.value.trim().length>=2) liveSearch();});}
   };
 
@@ -1674,11 +1732,12 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
   window.bindItemSearch = bindItemSearch = function(prefix,onPick,opts={}){
     const q=$(`#${prefix}Q`), box=$(`#${prefix}List`), msg=$(`#${prefix}Msg`); if(!q||!box) return;
     const limit=Number(opts.limit||80); let seq=0;
+    const managedPopup=prefix==='stock'||prefix==='cardex';
     async function fastSearch(showBox=true){
       const val=q.value.trim();
-      if(val.length<2){box.innerHTML='';box.style.display='none';if(msg)msg.textContent='';return []}
+      if(val.length<2){box.innerHTML='';if(managedPopup)popupSuggestionController.close({restoreFocus:false});else box.style.display='none';if(msg)msg.textContent='';return []}
       const my=++seq;
-      if(showBox){box.style.display='block';box.innerHTML='<div class="floating-empty">در حال جستجوی سریع کالا...</div>'}
+      if(showBox){box.style.display='block';box.innerHTML='<div class="floating-empty">در حال جستجوی سریع کالا...</div>';if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});}
       if(msg) msg.textContent='جستجوی سریع کالا؛ موجودی بعد از انتخاب کنترل می‌شود.';
       const r=await searchAllItemsRows(val,limit,false); if(my!==seq) return [];
       const list=(r.list||[]).map(productFromRow).filter(x=>x.itemCode);
@@ -1686,7 +1745,8 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
       if(showBox){
         box.style.display='block';
         box.innerHTML=list.map(x=>`<div class="product-row" data-code="${safe(x.itemCode)}" data-desc="${safe(x.itemDescription)}" data-guid="${safe(x.itemGuid)}"><b>${safe(x.itemDescription)}</b><div class="small muted">کد: ${safe(x.itemCode)} | موجودی پس از انتخاب کنترل می‌شود</div></div>`).join('') || '<div class="floating-empty">نتیجه‌ای پیدا نشد.</div>';
-        box.querySelectorAll('.product-row').forEach(el=>el.onclick=()=>{const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;box.style.display='none';onPick(item,list)});
+        box.querySelectorAll('.product-row').forEach(el=>el.onclick=()=>{const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;if(managedPopup)popupSuggestionController.close();else box.style.display='none';onPick(item,list)});
+        if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});
       }
       return list;
     }
@@ -1694,7 +1754,7 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
     q.addEventListener('input',deb);
     q.addEventListener('keydown',async e=>{if(e.key==='Enter'){e.preventDefault();const list=await fastSearch(false);box.style.display='none';if(opts.onEnter) opts.onEnter(q.value.trim(),list);else if(list.length===1) onPick(list[0],list)}});
     if(opts.filterElement){opts.filterElement.addEventListener('change',()=>{const val=q.value.trim(); if(val.length>=2 && opts.onEnter) opts.onEnter(val,[]);});}
-    document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==q)box.style.display='none'});
+    if(!managedPopup)document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==q)box.style.display='none'});
   };
 
   // Capture old inventory-cardex buttons that earlier functions may still render.
@@ -4149,7 +4209,7 @@ async function pageSellerProfit(){
   async function renderSnapshots(){ const box=$s('#psSnapshots'); if(!box)return; try{ const r=await getJson('/api/supplier-sleep/snapshots?limit=30'); box.innerHTML=snapshotTable(r.list||[]); $sa('.ps-pick').forEach(b=>b.onclick=()=>renderSnapshot(b.dataset.id)); $sa('.ps-edit').forEach(b=>b.onclick=async()=>{ const label=prompt('عنوان Snapshot',b.dataset.label||''); if(label===null)return; const note=prompt('یادداشت مدیریتی',b.dataset.note||''); if(note===null)return; try{await postJson('/api/supplier-sleep/snapshot-update',{snapshotId:b.dataset.id,snapshotLabel:label,note}); await renderSnapshots();}catch(e){alert(e.message||e);} }); $sa('.ps-archive').forEach(b=>b.onclick=async()=>{try{await postJson('/api/supplier-sleep/snapshot-update',{snapshotId:b.dataset.id,status:'archived'}); await renderSnapshots();}catch(e){alert(e.message||e);}}); $sa('.ps-delete').forEach(b=>b.onclick=async()=>{if(!confirm('این Snapshot و تمام لایه‌ها، خلاصه‌ها و Diagnosticهای وابسته حذف شود؟'))return; try{await postJson('/api/supplier-sleep/snapshot-delete',{snapshotId:b.dataset.id}); if(window.__psSnapshotId===b.dataset.id)window.__psSnapshotId=''; await renderSnapshots(); await renderSnapshot('');}catch(e){alert(e.message||e);}}); }catch(e){box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
   async function renderLayers(sid,sup,mainGroupCode=''){ const box=$s('#psLayers'); if(!box)return; box.innerHTML='<div class="info">در حال خواندن لایه‌ها...</div>'; try{ let url='/api/supplier-sleep/layers?snapshotId='+encodeURIComponent(sid||'')+'&supplierAccountNo='+encodeURIComponent(sup||'')+'&mainGroupCode='+encodeURIComponent(mainGroupCode||'')+'&limit=2000'; let r=await getJson(url); let list=r.list||[]; if(!list.length && sup){ r=await getJson('/api/supplier-sleep/layers?snapshotId='+encodeURIComponent(sid||'')+'&mainGroupCode='+encodeURIComponent(mainGroupCode||'')+'&limit=2000'); list=r.list||[]; } box.innerHTML=list.length?`<h4>لایه‌های Purchase Layer ${mainGroupCode?'/ گروه '+safe(mainGroupCode):''}</h4><table class="table"><thead><tr><th>LayerId</th><th>کالا</th><th>گروه</th><th>فاکتور خرید</th><th>تاریخ خرید</th><th>تعداد خرید</th><th>مانده</th><th>ارزش مانده</th><th>سن</th><th>روش تخصیص</th></tr></thead><tbody>${list.map(x=>`<tr><td><small>${safe(x.layerId||x.persistentLayerId||'')}</small></td><td>${safe(x.itemCode)}<br>${safe(x.itemName)}</td><td>${safe(x.mainGroup||x.mainGroupName||'')}</td><td>${safe(x.purchaseInvoiceNo||'')}</td><td>${safe(x.purchaseDate||'')}</td><td>${money(x.purchaseQty)}</td><td>${money(x.allocatedRemainingQty)}</td><td>${money(x.allocatedRemainingValue)}</td><td>${x.ageDays==null?'نامشخص':money(x.ageDays)}</td><td><small>${safe(x.allocationMethod||x.status||'')}</small></td></tr>`).join('')}</tbody></table>`:'<div class="muted">لایه‌ای برای این فیلتر پیدا نشد.</div>'; }catch(e){box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
   async function renderSnapshot(sid){ const sum=$s('#psSummary'), inv=$s('#psInvoiceSummary'), grp=$s('#psGroupSummary'), layer=$s('#psLayers'); if(layer)layer.innerHTML=''; let realSid=sid||''; try{ const r=await getJson('/api/supplier-sleep/suppliers?snapshotId='+encodeURIComponent(realSid)+'&limit=500'); realSid=r.snapshotId||realSid; window.__psSnapshotId=realSid; const sup=(r.list&&r.list[0]&&r.list[0].supplierAccountNo)||''; if(sum)sum.innerHTML=summaryTable(r.list||[],realSid); $sa('.ps-layer-btn').forEach(b=>b.onclick=()=>renderLayers(b.dataset.sid,b.dataset.sup,'')); const ri=await getJson('/api/supplier-sleep/invoice-summary?snapshotId='+encodeURIComponent(realSid)+'&limit=1000'); if(inv)inv.innerHTML=invoiceSleepTable(ri.list||[]); const rg=await getJson('/api/supplier-sleep/group-summary?snapshotId='+encodeURIComponent(realSid)+'&limit=500'); if(grp)grp.innerHTML=groupTable(rg.list||[],realSid,sup); $sa('.ps-group-layer-btn').forEach(b=>b.onclick=()=>renderLayers(b.dataset.sid,b.dataset.sup,b.dataset.group)); }catch(e){ if(sum)sum.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
-  async function searchSuppliers(){ const q=($s('#psSupplierSearch')?.value||'').trim(); const box=$s('#psSupplierResults'); if(!box)return; if(q.length<2){box.innerHTML='<div class="warn">حداقل دو حرف یا کد وارد کن.</div>';return;} box.innerHTML='<div class="info">در حال جستجوی حساب...</div>'; try{ const r=await getJson('/api/accounts/search?q='+encodeURIComponent(q)+'&limit=20&pages=220'); const list=r.list||[]; box.innerHTML=list.length?`<table class="table"><thead><tr><th>کد</th><th>نام حساب</th><th>انتخاب</th></tr></thead><tbody>${list.map(x=>`<tr><td>${safe(x.accountNumber||'')}</td><td>${safe(x.accountName||'')}</td><td><button class="mini ps-select-supplier" data-no="${safe(x.accountNumber||'')}" data-name="${safe(x.accountName||'')}" data-guid="${safe(x.accountGuid||x.guId||'')}">انتخاب</button></td></tr>`).join('')}</tbody></table>`:'<div class="muted">حسابی پیدا نشد.</div>'; $sa('.ps-select-supplier').forEach(b=>b.onclick=()=>{window.__psSelectedSupplier={accountNumber:b.dataset.no,accountName:b.dataset.name,accountGuid:b.dataset.guid}; try{localStorage.setItem('mkcrm_supplier_sleep_selected_supplier',JSON.stringify(window.__psSelectedSupplier));}catch{} const s=$s('#psSelectedSupplier'); if(s)s.innerHTML=`<div class="success">تأمین‌کننده انتخاب شد: ${safe(b.dataset.name)} | ${safe(b.dataset.no)}</div>`;}); } catch(e){ box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; } }
+  async function searchSuppliers(){ const input=$s('#psSupplierSearch'), q=(input?.value||'').trim(); const box=$s('#psSupplierResults'); if(!box)return; if(q.length<2){popupSuggestionController.close({restoreFocus:false});box.innerHTML='<div class="warn">حداقل دو حرف یا کد وارد کن.</div>';return;} box.innerHTML='<div class="info">در حال جستجوی حساب...</div>'; popupSuggestionController.open({popup:box,trigger:input,optionSelector:'.ps-select-supplier'}); try{ const r=await getJson('/api/accounts/search?q='+encodeURIComponent(q)+'&limit=20&pages=220'); const list=r.list||[]; box.innerHTML=list.length?`<table class="table"><thead><tr><th>کد</th><th>نام حساب</th><th>انتخاب</th></tr></thead><tbody>${list.map(x=>`<tr><td>${safe(x.accountNumber||'')}</td><td>${safe(x.accountName||'')}</td><td><button class="mini ps-select-supplier" data-no="${safe(x.accountNumber||'')}" data-name="${safe(x.accountName||'')}" data-guid="${safe(x.accountGuid||x.guId||'')}">انتخاب</button></td></tr>`).join('')}</tbody></table>`:'<div class="muted">حسابی پیدا نشد.</div>'; $sa('.ps-select-supplier').forEach(b=>b.onclick=()=>{window.__psSelectedSupplier={accountNumber:b.dataset.no,accountName:b.dataset.name,accountGuid:b.dataset.guid}; try{localStorage.setItem('mkcrm_supplier_sleep_selected_supplier',JSON.stringify(window.__psSelectedSupplier));}catch{} const s=$s('#psSelectedSupplier'); if(s)s.innerHTML=`<div class="success">تأمین‌کننده انتخاب شد: ${safe(b.dataset.name)} | ${safe(b.dataset.no)}</div>`; popupSuggestionController.close();}); popupSuggestionController.open({popup:box,trigger:input,optionSelector:'.ps-select-supplier'}); } catch(e){ popupSuggestionController.close({restoreFocus:false});box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; } }
   async function checkReadJob(showIfMissing=false){ const msg=$s('#psMsg'), box=$s('#psInvoices'), diag=$s('#psDiagnostics'); const jobId=getJob('read'); if(!jobId){ if(showIfMissing&&msg)msg.innerHTML='<div class="muted">Job خواندن فعالی ثبت نشده است.</div>'; return null; } try{ const job=await jobStatus(jobId); if(!job){ if(msg)msg.innerHTML='<div class="warn">Job خواندن پیدا نشد.</div>'; return null; } if(msg)msg.innerHTML=`<div class="info">${jobLine(job)}</div>`; if(job.status==='completed'){ const r=job.result||{}; if(msg)msg.innerHTML=`<div class="success">خواندن فاکتورهای خرید کامل شد: گردش ${money(r.statementRows)} | کاندید ${money(r.invoiceNoCandidates)} | فاکتور معتبر ${money(r.count)} | منبع: ${safe(r.source||'')}</div>`; if(box)box.innerHTML=invoiceTable(r.list||[],null); if(diag)diag.innerHTML=stageView(r.diagnostics||{}); clearJob('read'); return job; } if(job.status==='failed'){ if(box)box.innerHTML=`<div class="error">Job خواندن ناموفق شد: ${safe(job.error||job.result?.error||'')}</div>`; clearJob('read'); return job; } if(box)box.innerHTML=`<div class="info">خواندن فاکتورهای خرید در پس‌زمینه ادامه دارد.<br>${jobLine(job)}</div>`; return job; }catch(e){ if(msg)msg.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; return null; } }
   async function readSelected(){ const sup=window.__psSelectedSupplier||{}; const box=$s('#psInvoices'), msg=$s('#psMsg'); if(!sup.accountNumber&&!sup.accountGuid&&!sup.accountName){ if(box)box.innerHTML='<div class="warn">اول تأمین‌کننده را انتخاب کن.</div>'; return;} if(box)box.innerHTML='<div class="info">Job خواندن فاکتورهای خرید در پس‌زمینه ثبت می‌شود...</div>'; try{const r=await postJson('/api/supplier-sleep/selected-supplier-invoices-job',selectedBody()); setJob('read',r.jobId||''); startSupplierSleepPolling(); if(msg)msg.innerHTML=`<div class="info">Job خواندن ثبت شد: <small>${safe(r.jobId||'')}</small>.</div>`; await checkReadJob(false);}catch(e){if(box)box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
   async function checkBuildJob(showIfMissing=false){ const msg=$s('#psMsg'); const jobId=getJob('build'); if(!jobId){ if(showIfMissing&&msg)msg.innerHTML='<div class="muted">Job تحلیل فعالی ثبت نشده است.</div>'; return null; } try{ const job=await jobStatus(jobId); if(!job){ if(msg)msg.innerHTML='<div class="warn">Job تحلیل پیدا نشد.</div>'; return null; } if(job.status==='completed'){ const sid=job.result?.snapshotId||''; window.__psSnapshotId=sid; if(msg)msg.innerHTML=`<div class="success">تحلیل کامل شد. Snapshot: ${safe(sid)} | فاکتور: ${money(job.result?.purchaseInvoicesSynced||0)} | لایه: ${money(job.result?.purchaseLayerCount||0)} | مانده مرتبط: ${money(job.result?.totalAllocatedValue||0)} | نامشخص: ${money(job.result?.totalUnknownValue||0)}</div>`; clearJob('build'); await renderSnapshot(sid); await renderSnapshots(); return job; } if(job.status==='failed'){ if(msg)msg.innerHTML=`<div class="error">Job تحلیل ناموفق شد: ${safe(job.error||job.result?.error||'')}</div>`; clearJob('build'); return job; } if(msg)msg.innerHTML=`<div class="info">تحلیل هنوز در حال اجراست و به صفحه وابسته نیست.<br>${jobLine(job)}</div>`; return job; }catch(e){ if(msg)msg.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; return null; } }
