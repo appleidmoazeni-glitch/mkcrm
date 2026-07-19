@@ -3103,8 +3103,83 @@ async function readLastPurchaseInvoicesFromShaygan(limit=30) {
   return { ok:true, list, lastPurchaseInvoiceNumber:lastNo, source:'shaygan-webservice-invoice-get-descending' };
 }
 
+function rejectIfStagingReadOnly(req, res, operationName) {
+  if (!config.stagingReadOnly) return false;
+  sendJson(res, 403, {
+    ok: false,
+    error: 'Operation disabled in staging read-only mode',
+    operation: operationName
+  });
+  return true;
+}
+
+function stagingReadOnlyOperation(req, pathname) {
+  const method = String(req.method || 'GET').toUpperCase();
+  const normalizedPathname = pathname.length > 1 ? pathname.replace(/\/+$/, '') : pathname;
+  const key = `${method} ${normalizedPathname}`;
+  const operations = {
+    'POST /api/mongo/init': 'mongo.init',
+    'POST /api/users': 'users.save',
+    'POST /api/users/delete': 'users.delete',
+    'POST /api/users/repair-links': 'users.repair-links',
+    'POST /api/user-mappings': 'user-mappings.save',
+    'DELETE /api/user-mappings': 'user-mappings.delete',
+    'POST /api/user-account-access': 'user-account-access.save',
+    'POST /api/sale-snapshot/init': 'sale-snapshot.init',
+    'POST /api/sale-snapshot/start': 'sale-snapshot.start',
+    'POST /api/supplier-sleep/init': 'supplier-sleep.init',
+    'POST /api/supplier-sleep/sync-purchases': 'supplier-sleep.sync-purchases',
+    'POST /api/supplier-sleep/supplier-index': 'supplier-sleep.supplier-index',
+    'POST /api/supplier-sleep/build': 'supplier-sleep.build',
+    'POST /api/supplier-sleep/selected-supplier-invoices': 'supplier-sleep.selected-supplier-invoices',
+    'POST /api/supplier-sleep/selected-supplier-invoices-job': 'supplier-sleep.selected-supplier-invoices-job',
+    'POST /api/supplier-sleep/build-selected-job': 'supplier-sleep.build-selected-job',
+    'POST /api/supplier-sleep/build-selected': 'supplier-sleep.build-selected',
+    'POST /api/supplier-sleep/snapshot-update': 'supplier-sleep.snapshot-update',
+    'POST /api/supplier-sleep/snapshot-delete': 'supplier-sleep.snapshot-delete',
+    'POST /api/stock-sleep/init': 'stock-sleep.init',
+    'POST /api/stock-sleep/start': 'stock-sleep.start',
+    'POST /api/stock-sleep/process': 'stock-sleep.process',
+    'POST /api/stock-sleep/process-all': 'stock-sleep.process-all',
+    'POST /api/supplier-aging/selected': 'supplier-aging.selected.save',
+    'DELETE /api/supplier-aging/selected': 'supplier-aging.selected.delete',
+    'POST /api/supplier-aging/seed': 'supplier-aging.seed',
+    'POST /api/settings': 'settings.save',
+    'PUT /api/settings': 'settings.save',
+    'PATCH /api/settings': 'settings.save',
+    'POST /api/settings/sale-invoice-extras': 'settings.sale-invoice-extras.save',
+    'POST /api/settings/active-warehouses': 'settings.active-warehouses.save',
+    'POST /api/accounts/sync': 'accounts.sync',
+    'POST /api/inventory/auto-sync/run': 'inventory.auto-sync.run',
+    'POST /api/catalog/sync': 'catalog.sync',
+    'POST /api/catalog/sync-all-items': 'catalog.sync-all-items',
+    'POST /api/catalog/sync-accounts': 'catalog.sync-accounts',
+    'POST /api/invoice-numbers/reserve': 'invoice-numbers.reserve',
+    'POST /api/customers': 'customers.save',
+    'POST /api/customers/sync-sql-fiscal': 'customers.sync-sql-fiscal',
+    'POST /api/customers/repair-channel-tags': 'customers.repair-channel-tags',
+    'POST /api/customers/sync-shaygan-sales': 'customers.sync-shaygan-sales',
+    'POST /api/leads': 'leads.create',
+    'POST /api/board/events/status': 'board.events.status',
+    'POST /api/sales/issue': 'sales.issue',
+    'POST /admin/accounting/putInvoice': 'sales.issue',
+    'POST /api/proformas': 'proformas.create',
+    'POST /api/purchase-drafts': 'purchase-drafts.create'
+  };
+  if (operations[key]) return operations[key];
+  if (normalizedPathname === '/api/settings' && ['POST','PUT','PATCH','DELETE'].includes(method)) return 'settings.save';
+  if (method === 'POST' && /^\/api\/invoices\/\d+\/(annotations|crm-lead)$/.test(normalizedPathname)) return `invoices.${normalizedPathname.endsWith('/annotations') ? 'annotations' : 'crm-lead'}.save`;
+  if (method === 'POST' && /^\/api\/board\/purchase-invoices\/\d+\/announce$/.test(normalizedPathname)) return 'board.purchase-invoices.announce';
+  if ((method === 'PUT' || method === 'PATCH') && /^\/api\/proformas\/\d+$/.test(normalizedPathname)) return 'proformas.update';
+  if (method === 'POST' && /^\/api\/proformas\/\d+\/convert$/.test(normalizedPathname)) return 'proformas.convert';
+  if (method === 'POST' && /^\/api\/purchase-drafts\/\d+\/issue$/.test(normalizedPathname)) return 'purchase-drafts.issue';
+  return '';
+}
+
 async function handleApi(req, res, pathname, query) {
   try {
+    const readOnlyOperation = stagingReadOnlyOperation(req, pathname);
+    if (readOnlyOperation && rejectIfStagingReadOnly(req, res, readOnlyOperation)) return;
     if (pathname === '/health') return sendJson(res, 200, { ok: true, app: 'mkcrm', version: APP_VERSION, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
     if (pathname === '/api/version') return sendJson(res, 200, { ok: true, app: 'mkcrm', version: APP_VERSION, node: process.version, serverTime: time.serverTimePayload() });
     if (pathname === '/api/server-time') return sendJson(res, 200, time.serverTimePayload());
