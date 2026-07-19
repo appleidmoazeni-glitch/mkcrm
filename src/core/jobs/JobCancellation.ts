@@ -1,7 +1,9 @@
-/** Error used to distinguish cooperative cancellation from job failure. */
-export class JobCancelledError extends Error {
+import { JobEngineError, JobErrorCode } from './JobError.js';
+
+/** Error used to acknowledge cooperative cancellation. */
+export class JobCancelledError extends JobEngineError {
   constructor(message = 'Job was cancelled') {
-    super(message);
+    super(JobErrorCode.Cancelled, message);
     this.name = 'JobCancelledError';
   }
 }

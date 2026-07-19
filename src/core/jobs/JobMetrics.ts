@@ -19,11 +19,15 @@ export class JobMetrics {
 
   constructor(now: Date = new Date()) { this.startedAt = now; this.lastUpdatedAt = now; }
 
-  touch(now: Date = new Date()): void { this.lastUpdatedAt = now; }
+  touch(now: Date = new Date()): void { if (!this.finishedAt) this.lastUpdatedAt = now; }
   addProcessedItems(count = 1): void { this.processed += Math.max(0, count); this.touch(); }
   recordError(count = 1): void { this.errorCount += Math.max(0, count); this.touch(); }
   recordRetry(count = 1): void { this.retryCount += Math.max(0, count); this.touch(); }
-  finish(now: Date = new Date()): void { this.finishedAt = now; this.lastUpdatedAt = now; }
+  finish(now: Date = new Date()): void {
+    if (this.finishedAt) return;
+    this.finishedAt = now;
+    this.lastUpdatedAt = now;
+  }
 
   snapshot(now: Date = new Date()): JobMetricsSnapshot {
     const durationEnd = this.finishedAt ?? now;
