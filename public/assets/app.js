@@ -94,15 +94,15 @@ const popupSuggestionController=(()=>{
     const canRestoreFocus=current.trigger.isConnected&&!current.trigger.disabled&&typeof current.trigger.focus==='function'&&current.trigger.getClientRects().length>0;
     if(opts.restoreFocus!==false&&current.restoreFocus&&canRestoreFocus)current.trigger.focus({preventScroll:true});
   }
-  function open({popup,trigger,optionSelector,onSelect,restoreFocus=true}){
+  function open({popup,trigger,optionSelector,onSelect,onEscape,restoreFocus=true}){
     if(!popup||!trigger||!popup.isConnected||!trigger.isConnected)return;
     if(active&&active.popup!==popup)close({restoreFocus:false});
     else if(active)close({restoreFocus:false});
-    const current={popup,trigger,optionSelector,onSelect,restoreFocus,index:-1};
+    const current={popup,trigger,optionSelector,onSelect,onEscape,restoreFocus,index:-1};
     current.onOutside=e=>{if(!popup.contains(e.target)&&e.target!==trigger)close()};
     current.onKey=e=>{
       if(!active||active!==current)return;
-      if(e.key==='Escape'){e.preventDefault();e.stopPropagation();close();return;}
+      if(e.key==='Escape'){e.preventDefault();e.stopPropagation();if(current.onEscape)current.onEscape();close();return;}
       if(e.key==='ArrowDown'||e.key==='ArrowUp'){
         e.preventDefault();e.stopPropagation();
         const list=options(),direction=e.key==='ArrowDown'?1:-1;
@@ -2881,28 +2881,31 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
       }
     }
     const resultBox=qs('#saleCustomerResults');
-    let timer=null,last=[],requestSeq=0,requestController=null;
-    uiPageLifecycle.add(()=>{clearTimeout(timer);requestSeq++;if(requestController)requestController.abort();requestController=null;});
+    let timer=null,last=[],requestSeq=0,requestController=null,dismissedByEscape=false,restoringFocusAfterEscape=false;
+    function cancelCustomerSearch(){clearTimeout(timer);timer=null;requestSeq++;if(requestController)requestController.abort();requestController=null;}
+    function dismissCustomerSearch(){dismissedByEscape=true;restoringFocusAfterEscape=true;cancelCustomerSearch();queueMicrotask(()=>{restoringFocusAfterEscape=false;});}
+    function openCustomerResults(trigger){popupSuggestionController.open({popup:resultBox,trigger,optionSelector:'.customer-pick',onEscape:dismissCustomerSearch});}
+    uiPageLifecycle.add(cancelCustomerSearch);
     async function runCustomerSearch(term,trigger=qs('#saleCustomerSearch')||document.activeElement){
       if(!resultBox) return;
       const q=String(term||'').trim();
       if(q.length<2){popupSuggestionController.close({restoreFocus:false});resultBox.innerHTML='';return;}
       const seq=++requestSeq;if(requestController)requestController.abort();requestController=new AbortController();
       resultBox.style.display='block'; resultBox.innerHTML='<div class="floating-empty">در حال جستجوی مشتری...</div>';
-      popupSuggestionController.open({popup:resultBox,trigger,optionSelector:'.customer-pick'});
+      openCustomerResults(trigger);
       try{
         const r=await api(`/api/customers/search?q=${encodeURIComponent(q)}&limit=30`,{signal:requestController.signal});if(seq!==requestSeq)return;
         last=r.list||[];
         resultBox.innerHTML=customerResultHtml(last);
-        resultBox.querySelectorAll('.customer-pick').forEach(el=>el.onclick=()=>{const c=last[Number(el.dataset.i)]; fillSaleCustomer(c); const si=qs('#saleCustomerSearch'); if(si) si.value=customerLabel(c); popupSuggestionController.close();});
-        popupSuggestionController.open({popup:resultBox,trigger,optionSelector:'.customer-pick'});
+        resultBox.querySelectorAll('.customer-pick').forEach(el=>el.onclick=()=>{const c=last[Number(el.dataset.i)]; dismissedByEscape=false;fillSaleCustomer(c); const si=qs('#saleCustomerSearch'); if(si) si.value=customerLabel(c); popupSuggestionController.close();});
+        openCustomerResults(trigger);
       }catch(e){if(e.name==='AbortError')return;popupSuggestionController.close({restoreFocus:false});resultBox.innerHTML=`<div class="floating-empty error">خطا در جستجوی مشتری: ${safe(e.message||e)}</div>`;}
     }
     function bindLive(id){
       const el=qs('#'+id); if(!el || el.dataset.customerHardBound==='1') return;
       el.dataset.customerHardBound='1';
-      el.addEventListener('input',()=>{clearTimeout(timer); const q=el.value.trim(); timer=setTimeout(()=>runCustomerSearch(q,el),260);});
-      el.addEventListener('blur',()=>{const q=el.value.trim(); if(q.length>=3) timer=setTimeout(()=>runCustomerSearch(q,el),80);});
+      el.addEventListener('input',()=>{dismissedByEscape=false;clearTimeout(timer); const q=el.value.trim(); timer=setTimeout(()=>runCustomerSearch(q,el),260);});
+      el.addEventListener('focus',()=>{if(restoringFocusAfterEscape||!dismissedByEscape)return;dismissedByEscape=false;clearTimeout(timer);const q=el.value.trim();if(q.length>=2)timer=setTimeout(()=>runCustomerSearch(q,el),260);});
     }
     ['saleCustomerSearch','buyerName','buyerMobile','buyerNational'].forEach(bindLive);
   }
