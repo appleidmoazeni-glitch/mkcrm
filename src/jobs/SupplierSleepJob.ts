@@ -43,7 +43,7 @@ export class SupplierSleepJob extends BackgroundJob {
   protected override async run(context: JobContext): Promise<void> {
     this.validateInput();
     const control: SupplierSleepJobControl = {
-      progress: update => { context.reportProgress(update); },
+      progress: update => { context.reportProgress(this.weightedProgress(update)); },
       heartbeat: () => { context.heartbeatNow(); },
       checkCancellation: () => { context.cancellationToken.throwIfCancellationRequested(); }
     };
@@ -84,5 +84,19 @@ export class SupplierSleepJob extends BackgroundJob {
     context.metrics.setCounter('layerCount', layerCount);
     context.metrics.addProcessedItems(invoiceCount + layerCount);
     if (errorCount) context.metrics.recordError(errorCount);
+  }
+
+  private weightedProgress(update: JobProgressUpdate): JobProgressUpdate {
+    const ranges: Readonly<Record<string, readonly [number, number]>> = {
+      'Loading Suppliers': [0, 5],
+      'Reading Purchase Invoices': [5, 40],
+      'Building Layers': [40, 60],
+      'Calculating Remaining Stock': [60, 85],
+      'Saving Snapshot': [85, 99],
+      'Completed': [100, 100]
+    };
+    const [start, end] = ranges[update.phase ?? ''] ?? [0, 99];
+    const localPercent = update.percent ?? ((update.total ?? 0) > 0 ? (Number(update.current ?? 0) / Number(update.total)) * 100 : 0);
+    return { ...update, percent: start + ((end - start) * Math.min(100, Math.max(0, localPercent)) / 100) };
   }
 }

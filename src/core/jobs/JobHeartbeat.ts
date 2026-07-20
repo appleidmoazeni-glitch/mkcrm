@@ -5,7 +5,7 @@ export class JobHeartbeat {
   constructor(now: Date = new Date()) { this.timestamp = now; }
 
   beat(now: Date = new Date()): Date {
-    this.timestamp = now;
+    if (now.getTime() > this.timestamp.getTime()) this.timestamp = now;
     return this.lastHeartbeatAt;
   }
 

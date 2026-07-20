@@ -36,4 +36,8 @@ export class JobEventEmitter {
   }
 
   removeAllListeners(): void { this.listeners.clear(); }
+  listenerCount(event?: JobEventName): number {
+    if (event) return this.listeners.get(event)?.size ?? 0;
+    return [...this.listeners.values()].reduce((count, listeners) => count + listeners.size, 0);
+  }
 }

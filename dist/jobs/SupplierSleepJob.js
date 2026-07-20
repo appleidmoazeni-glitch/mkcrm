@@ -15,7 +15,7 @@ class SupplierSleepJob extends Job_js_1.BackgroundJob {
     async run(context) {
         this.validateInput();
         const control = {
-            progress: update => { context.reportProgress(update); },
+            progress: update => { context.reportProgress(this.weightedProgress(update)); },
             heartbeat: () => { context.heartbeatNow(); },
             checkCancellation: () => { context.cancellationToken.throwIfCancellationRequested(); }
         };
@@ -51,6 +51,19 @@ class SupplierSleepJob extends Job_js_1.BackgroundJob {
         context.metrics.addProcessedItems(invoiceCount + layerCount);
         if (errorCount)
             context.metrics.recordError(errorCount);
+    }
+    weightedProgress(update) {
+        const ranges = {
+            'Loading Suppliers': [0, 5],
+            'Reading Purchase Invoices': [5, 40],
+            'Building Layers': [40, 60],
+            'Calculating Remaining Stock': [60, 85],
+            'Saving Snapshot': [85, 99],
+            'Completed': [100, 100]
+        };
+        const [start, end] = ranges[update.phase ?? ''] ?? [0, 99];
+        const localPercent = update.percent ?? ((update.total ?? 0) > 0 ? (Number(update.current ?? 0) / Number(update.total)) * 100 : 0);
+        return { ...update, percent: start + ((end - start) * Math.min(100, Math.max(0, localPercent)) / 100) };
     }
 }
 exports.SupplierSleepJob = SupplierSleepJob;
