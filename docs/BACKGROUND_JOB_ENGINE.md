@@ -2,7 +2,7 @@
 
 ## Scope
 
-The engine is generic, process-local infrastructure. It does not contain a queue, scheduler, persistence, HTTP routes, database access, or business-feature integration. Restarting the Node.js process clears registrations and execution history.
+The engine is generic, process-local infrastructure. It does not contain a queue, scheduler, persistence, HTTP routes, or database access. Business adapters live outside `src/core/jobs`; restarting the Node.js process clears registrations and execution history.
 
 ## Architecture
 
@@ -47,6 +47,14 @@ registry.register({
   factory: () => new ExampleJob()
 });
 ```
+
+`JobManager.start(name, input)` may pass request-scoped dependencies to a registered factory. The core engine treats this input as opaque; a feature adapter validates it and keeps business services outside the manager.
+
+## Supplier Sleep adapter
+
+`src/jobs/SupplierSleepJob.ts` is the first execution adapter. It delegates unchanged calculations and writes to `src/lib/purchase-sleep.js`. Optional `jobControl` callbacks provide progress, heartbeat and cooperative cancellation checks at safe boundaries. The two existing background endpoints retain their request and response contracts while replacing their local boolean lock and `setImmediate` execution with `JobManager.start()`.
+
+The CommonJS server loads compiled engine JavaScript from the narrowly tracked `dist/core/jobs` and `dist/jobs` directories. `npm run build` regenerates those runtime artifacts without requiring a TypeScript runtime dependency in production.
 
 Jobs receive only `JobContext`; they do not access manager state or locking internals.
 

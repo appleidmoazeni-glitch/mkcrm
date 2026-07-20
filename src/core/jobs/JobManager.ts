@@ -61,12 +61,12 @@ export class JobManager {
     readonly events: JobEventEmitter = new JobEventEmitter()
   ) {}
 
-  start(name: string): JobHandle {
+  start(name: string, input?: unknown): JobHandle {
     const lock = this.lock.acquire(name);
     if (!lock) throw new JobAlreadyRunningError(name);
 
     try {
-      const job = this.registry.create(name);
+      const job = this.registry.create(name, input);
       const id = `${name}:v${job.version}:${Date.now()}:${++this.sequence}`;
       const cancellation = new JobCancellationSource();
       const status = new JobStatusMachine((previous, current) => {

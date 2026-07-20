@@ -3,7 +3,7 @@ import parser from '@typescript-eslint/parser';
 
 export default [
   {
-    files: ['src/core/jobs/**/*.ts'],
+    files: ['src/core/jobs/**/*.ts', 'src/jobs/**/*.ts'],
     languageOptions: {
       parser,
       parserOptions: { project: './tsconfig.jobs.json' }

@@ -1,7 +1,7 @@
 import type { BackgroundJob } from './Job.js';
 import { JobEngineError, JobErrorCode } from './JobError.js';
 
-export type JobFactory = () => BackgroundJob;
+export type JobFactory = (input?: unknown) => BackgroundJob;
 
 /** Versioned definition retained by the in-memory registry. */
 export interface JobDefinition {
@@ -27,11 +27,11 @@ export class JobRegistry {
   names(): readonly string[] { return [...this.definitions.keys()]; }
   getDefinition(name: string): JobDefinition | undefined { return this.definitions.get(name); }
 
-  create(name: string): BackgroundJob {
+  create(name: string, input?: unknown): BackgroundJob {
     const definition = this.definitions.get(name);
     if (!definition) throw new JobEngineError(JobErrorCode.Internal, `Unknown job: ${name}`);
     let job: BackgroundJob;
-    try { job = definition.factory(); }
+    try { job = definition.factory(input); }
     catch (error) { throw new JobEngineError(JobErrorCode.Internal, `Job factory failed: ${name}`, error); }
     if (job.name !== name) throw new JobEngineError(JobErrorCode.Internal, `Registered job name mismatch: expected ${name}, received ${job.name}`);
     if (job.version !== definition.version) throw new JobEngineError(JobErrorCode.Internal, `Registered job version mismatch: expected ${definition.version}, received ${job.version}`);

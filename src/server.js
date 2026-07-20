@@ -11,18 +11,50 @@ const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const saleSnapshot = require('./lib/sale-snapshot');
 const time = require('./lib/time');
+const { JobManager } = require('../dist/core/jobs/JobManager');
+const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
+const { JobStatus } = require('../dist/core/jobs/JobStatus');
+const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
 const publicDir = path.join(process.cwd(), 'public');
 const APP_VERSION = '0.9.19.59-supplier-sleep-operational-control';
-let supplierSleepJobRunning = false;
+const supplierSleepJobRegistry = new JobRegistry();
+supplierSleepJobRegistry.register({ name:'supplier-sleep', version:1, factory:input=>new SupplierSleepJob(input) });
+const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
 
 async function supplierSleepActiveJob(db){
   const now=new Date();
   const cutoff=new Date(now.getTime()-10*60*1000);
   await db.collection('appJobs').updateMany({type:{$in:['supplier-sleep-read-selected-invoices','supplier-sleep-build-selected']},status:{$in:['queued','running']},updatedAt:{$lt:cutoff}},{$set:{status:'failed',phase:'stale-recovered',finishedAt:now,updatedAt:now,error:'Job stale after heartbeat timeout; recovered automatically'}}).catch(()=>{});
   return db.collection('appJobs').findOne({type:{$in:['supplier-sleep-read-selected-invoices','supplier-sleep-build-selected']},status:{$in:['queued','running']},updatedAt:{$gte:cutoff}},{sort:{updatedAt:-1}});
+}
+
+function startSupplierSleepBackgroundJob({ db, jobId, operation, request, mapResult }){
+  let serviceResult=null;
+  const handle=supplierSleepJobManager.start('supplier-sleep',{ operation, db, request, service:purchaseSleep, onResult:result=>{serviceResult=result;} });
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:operation==='read-selected-invoices'?'read-selected-purchase-invoices':'build-selected-snapshot',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const heartbeatTimer=setInterval(()=>{
+    const snapshot=handle.snapshot();
+    db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase}}).catch(()=>{});
+  },15000);
+  heartbeatTimer.unref?.();
+  handle.completion.then(async snapshot=>{
+    clearInterval(heartbeatTimer);
+    await runningUpdate;
+    const completed=snapshot.status===JobStatus.Completed && serviceResult?.ok!==false;
+    const cancelled=snapshot.status===JobStatus.Cancelled;
+    const update={
+      status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,
+      finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,
+      error:snapshot.error?.message||serviceResult?.error||''
+    };
+    if(serviceResult) update.result=mapResult(serviceResult);
+    return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
+  }).catch(()=>{ clearInterval(heartbeatTimer); });
+  return handle;
 }
 
 // CHANGELOG 0.9.19.17-ws-no-sql-audited:
@@ -3523,36 +3555,18 @@ async function handleApi(req, res, pathname, query) {
       const body = await collectBody(req);
       const db = await connectMongo();
       const activeJob = await supplierSleepActiveJob(db);
-      if (supplierSleepJobRunning || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا/خواندن فاکتور خرید در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
+      if (supplierSleepJobManager.isRunning('supplier-sleep') || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا/خواندن فاکتور خرید در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
       const jobId = `JOB-SUPPLIER-SLEEP-READ-${Date.now()}-${Math.random().toString(16).slice(2,8)}`;
       const now = new Date();
       const safeRequest = { ...body, supplierGuid:body?.supplierGuid?'[set]':'', accountGuid:body?.accountGuid?'[set]':'' };
       await db.collection('appJobs').updateOne({ jobId }, { $set:{ jobId, type:'supplier-sleep-read-selected-invoices', status:'queued', createdAt:now, updatedAt:now, request:safeRequest } }, { upsert:true }).catch(()=>{});
-      supplierSleepJobRunning = true;
-      setImmediate(async () => {
-        let jobDb = null;
-        try {
-          jobDb = await connectMongo();
-          const startedAt = new Date();
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'running', startedAt, updatedAt:startedAt, heartbeatAt:startedAt, phase:'read-selected-purchase-invoices' } }).catch(()=>{});
-          const hbTimer = setInterval(() => { jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ heartbeatAt:new Date(), updatedAt:new Date() } }).catch(()=>{}); }, 15000);
-          let result;
-          try { result = await purchaseSleep.readPurchaseInvoicesForSupplier(jobDb, body || {}); } finally { clearInterval(hbTimer); }
+      startSupplierSleepBackgroundJob({ db, jobId, operation:'read-selected-invoices', request:body||{}, mapResult:result=>{
           const slimList = (result.list||[]).slice(0, 1000).map(x => ({
             invNo:x.invNo, invDate:x.invDate, supplierAccountNo:x.supplierAccountNo, supplierName:x.supplierName,
             totalAmount:x.totalAmount, rowCount:x.rowCount
           }));
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{
-            status:result.ok?'completed':'failed', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), phase:'done',
-            result:{ ok:!!result.ok, source:result.source||'', statementRows:result.statementRows||0, invoiceNoCandidates:result.invoiceNoCandidates||0, count:result.count||0, fallbackUsed:!!result.fallbackUsed, list:slimList, diagnostics:result.diagnostics||null, error:result.error||'' }
-          } }).catch(()=>{});
-        } catch (e) {
-          jobDb = jobDb || await connectMongo().catch(()=>null);
-          if (jobDb) await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'failed', phase:'failed', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), error:String(e.message||e) } }).catch(()=>{});
-        } finally {
-          supplierSleepJobRunning = false;
-        }
-      });
+          return { ok:!!result.ok, source:result.source||'', statementRows:result.statementRows||0, invoiceNoCandidates:result.invoiceNoCandidates||0, count:result.count||0, fallbackUsed:!!result.fallbackUsed, list:slimList, diagnostics:result.diagnostics||null, error:result.error||'' };
+      }});
       return sendJson(res, 200, { ok:true, jobId, status:'queued', type:'supplier-sleep-read-selected-invoices', note:'خواندن فاکتورهای خرید به Job پس‌زمینه‌ای منتقل شد. ترک صفحه نباید Job را متوقف کند.' });
     }
     if (pathname === '/api/supplier-sleep/build-selected-job' && req.method === 'POST') {
@@ -3560,27 +3574,13 @@ async function handleApi(req, res, pathname, query) {
       const body = await collectBody(req);
       const db = await connectMongo();
       const activeJob = await supplierSleepActiveJob(db);
-      if (supplierSleepJobRunning || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
+      if (supplierSleepJobManager.isRunning('supplier-sleep') || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
       const jobId = `JOB-SUPPLIER-SLEEP-${Date.now()}-${Math.random().toString(16).slice(2,8)}`;
       const now = new Date();
       await db.collection('appJobs').updateOne({ jobId }, { $set:{ jobId, type:'supplier-sleep-build-selected', status:'queued', phase:'build-selected-snapshot', createdAt:now, updatedAt:now, request:{ ...body, supplierGuid:body?.supplierGuid?'[set]':'', accountGuid:body?.accountGuid?'[set]':'' } } }, { upsert:true }).catch(()=>{});
-      supplierSleepJobRunning = true;
-      setImmediate(async () => {
-        const startedAt = new Date();
-        try {
-          const jobDb = await connectMongo();
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'running', phase:'build-selected-snapshot', startedAt, updatedAt:startedAt, heartbeatAt:startedAt } }).catch(()=>{});
-          const hbTimer = setInterval(() => { jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ heartbeatAt:new Date(), updatedAt:new Date() } }).catch(()=>{}); }, 15000);
-          let result;
-          try { result = await purchaseSleep.buildSelectedSupplierSnapshot(jobDb, body || {}); } finally { clearInterval(hbTimer); }
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:result.ok?'completed':'failed', phase:'done', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), result:{ ok:!!result.ok, snapshotId:result.snapshot?.snapshotId||'', source:result.source||'', summaryCount:result.summary?.length||0, invoiceSummaryCount:result.invoiceSummary?.length||0, groupSummaryCount:result.groupSummary?.length||0, purchaseInvoicesSynced:result.snapshot?.purchaseInvoicesSynced||0, purchaseLayerCount:result.snapshot?.purchaseLayerCount||0, totalAllocatedValue:result.snapshot?.totalAllocatedValue||0, totalUnknownValue:result.snapshot?.totalUnknownValue||0, reconciliation:result.reconciliation||null, error:result.error||'' } } }).catch(()=>{});
-        } catch (e) {
-          const jobDb = await connectMongo().catch(()=>null);
-          if (jobDb) await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'failed', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), error:String(e.message||e) } }).catch(()=>{});
-        } finally {
-          supplierSleepJobRunning = false;
-        }
-      });
+      startSupplierSleepBackgroundJob({ db, jobId, operation:'build-selected-snapshot', request:body||{}, mapResult:result=>{
+        return { ok:!!result.ok, snapshotId:result.snapshot?.snapshotId||'', source:result.source||'', summaryCount:result.summary?.length||0, invoiceSummaryCount:result.invoiceSummary?.length||0, groupSummaryCount:result.groupSummary?.length||0, purchaseInvoicesSynced:result.snapshot?.purchaseInvoicesSynced||0, purchaseLayerCount:result.snapshot?.purchaseLayerCount||0, totalAllocatedValue:result.snapshot?.totalAllocatedValue||0, totalUnknownValue:result.snapshot?.totalUnknownValue||0, reconciliation:result.reconciliation||null, error:result.error||'' };
+      }});
       return sendJson(res, 200, { ok:true, jobId, status:'queued', type:'supplier-sleep-build-selected', note:'Job خواب کالا در پس‌زمینه شروع شد. وضعیت را از /api/jobs/status?jobId=... بگیرید.' });
     }
     if (pathname === '/api/supplier-sleep/build-selected' && req.method === 'POST') {
