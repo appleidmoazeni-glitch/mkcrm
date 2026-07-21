@@ -16,6 +16,7 @@ const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
 const { JobStatus } = require('../dist/core/jobs/JobStatus');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
+const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
@@ -27,6 +28,23 @@ const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
 const saleSnapshotJobRegistry = new JobRegistry();
 saleSnapshotJobRegistry.register({ name:'sale-snapshot', version:1, factory:input=>new SaleSnapshotJob(input) });
 const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
+const inventorySyncJobRegistry=new JobRegistry();
+inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
+const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
+
+async function executeInventorySyncJob(request){
+  let serviceResult=null;
+  let handle;
+  try{
+    handle=inventorySyncJobManager.start('inventory-sync',{request,service:{sync:async input=>syncInventoryReconciliation(Number(input.pages),{...(input.options||{}),jobControl:input.jobControl})},onResult:result=>{serviceResult=result;}});
+  }catch(e){
+    if(e?.code==='JOB_LOCKED') return {ok:false,error:'Sync موجودی در حال اجراست؛ چند دقیقه بعد دوباره تلاش کنید',code:'JOB_LOCKED',running:true};
+    throw e;
+  }
+  const snapshot=await handle.completion;
+  if(serviceResult) return serviceResult;
+  return {ok:false,error:snapshot.error?.message||'Inventory Sync failed',code:snapshot.error?.code||'JOB_FAILED'};
+}
 
 function startSaleSnapshotBackgroundJob({db,jobId,request}){
   let serviceResult=null;
@@ -1379,7 +1397,7 @@ async function readAutoInventoryStatus() {
   return {
     ok:true,
     enabled:Boolean(config.autoInventorySyncEnabled),
-    running:Boolean(inventorySyncRunning),
+    running:Boolean(inventorySyncRunning || inventorySyncJobManager.isRunning('inventory-sync')),
     intervalMs:Number(config.autoInventorySyncIntervalMs || 300000),
     serverNowUtc:now.toISOString(),
     serverNowTehran:time.formatTehranDateTime(now),
@@ -1391,7 +1409,7 @@ async function readAutoInventoryStatus() {
     serverNow:now,
     ...value,
     enabled:Boolean(config.autoInventorySyncEnabled),
-    running:Boolean(inventorySyncRunning),
+    running:Boolean(inventorySyncRunning || inventorySyncJobManager.isRunning('inventory-sync')),
     nextStockNumber: value.nextStockNumber || nextStockNumber
   };
 }
@@ -1405,8 +1423,11 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
   const startedAt = new Date();
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, lastStockNumber:st, lastStartedAt:startedAt, lastError:'', lastResult:null });
   let total = 0, page = 0, endedNaturally = false;
+  const jobControl=opts.jobControl;
   try {
     for (let rowStart = 0; page < safePages; page++, rowStart += 100) {
+      jobControl?.progress?.({phase:'Reading Shaygan pages',current:page,total:safePages,message:`Reading warehouse ${st}, page ${page+1}`});
+      jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
       const res = await shaygan.getInventoryPage(rowStart, 100, { stockNumber:st });
       if (!res.ok) {
         const result = { ok:false, stockNumber:st, total, pages:page, error:res.error, batchId, completed:false, mode:'inventory-stock-positive-snapshot' };
@@ -1415,9 +1436,12 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
         return result;
       }
       if (!res.list.length) { endedNaturally = true; break; }
+      jobControl?.checkCancellation?.();
       const rows = (res.list || []).map(x => ({ ...x, stockNumber:String(x.stockNumber || st), syncBatchId:batchId, syncStockNumber:st, syncSource:opts.source || 'stock-filter-positive-sync' }));
       await upsertInventoryRows(db, rows);
       total += rows.length;
+      jobControl?.progress?.({phase:'Persist inventory',current:page+1,total:safePages,message:`Persisted warehouse ${st}, page ${page+1}`});
+      jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
       if (res.list.length < 100) { endedNaturally = true; break; }
     }
     const completed = Boolean(endedNaturally && page < safePages);
@@ -1428,6 +1452,8 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     // 0.9.19.58: when a previously-positive row is absent from a completed warehouse sync,
     // exact live item GetRemain becomes authoritative. Missing active-warehouse rows are zeroed.
     if (completed) {
+      jobControl?.progress?.({phase:'Live repair queue',current:0,total:1,message:`Reconciling missing rows for warehouse ${st}`});
+      jobControl?.checkCancellation?.();
       liveMissingVerify = await verifyMissingStockRowsLive(db, st, batchId, 'completed-stock-sync-missing-row').catch(e => ({ checked:0, zeroedCount:0, failed:1, remainingQueued:0, results:[], error:String(e.message||e) }));
       removedStale = Number(liveMissingVerify.zeroedCount || 0);
       queuedForLiveVerify = Number(liveMissingVerify.remainingQueued || 0);
@@ -1441,6 +1467,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     const result = { ok:false, stockNumber:st, total, pages:page, error:err, batchId, completed:false, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-positive-snapshot-exception' };
     await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_exception', stockNumber:st, total, pages:page, error:err, batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
     await saveAutoInventoryStatus({ running:false, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:err });
+    if(e?.code==='JOB_CANCELLED') throw e;
     return result;
   }
 }
@@ -1518,10 +1545,7 @@ async function syncInventoryGlobal(pages = config.inventoryCatalogSyncPages, opt
 async function syncCatalog(pages = config.inventoryCatalogSyncPages) {
   // 0.9.19.48: Swagger/GetRemain with STNumber filter omits a few rows per warehouse in this installation.
   // Manual catalog sync therefore uses one global GetRemain scan and trusts StoreNumber from each row.
-  if (inventorySyncRunning) return { ok:false, error:'Sync موجودی در حال اجراست؛ چند دقیقه بعد دوباره تلاش کنید', mode:'global-getremain-no-stock-filter', running:true };
-  inventorySyncRunning = true;
-  try { return await syncInventoryReconciliation(pages || config.inventoryCatalogSyncPages, { source:'manual-catalog-sync-reconciliation', batchPrefix:'manual-recon-inv' }); }
-  finally { inventorySyncRunning = false; }
+  return executeInventorySyncJob({pages:pages||config.inventoryCatalogSyncPages,options:{source:'manual-catalog-sync-reconciliation',batchPrefix:'manual-recon-inv'}});
 
   // Legacy fallback retained below but intentionally unreachable unless this function is manually edited.
   let total = 0, page = 0;
@@ -1553,41 +1577,51 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   const db = await connectMongo();
   const startedAt = new Date();
   const active = await getActiveWarehouseNumbers(db).catch(()=>[]);
+  const jobControl=opts.jobControl;
+  jobControl?.progress?.({phase:'Reading warehouses',current:0,total:active.length||1,message:'Loaded active warehouses'});
+  jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
   const batchId = `${opts.batchPrefix || 'active-stock-inv'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, mode:'active-stock-sync-positive-only', lastStartedAt:startedAt, currentStockNumber:'ACTIVE', lastError:'', lastResult:null, activeWarehouseNumbers:active });
   const stockResults = [];
   let stockTotal = 0;
   let stockCompleted = 0;
   let protectedFromStale = 0;
-  for (const st of active || []) {
+  for (let warehouseIndex=0; warehouseIndex<(active||[]).length; warehouseIndex++) {
+    const st=active[warehouseIndex];
+    jobControl?.progress?.({phase:'Reading warehouses',current:warehouseIndex,total:active.length,message:`Starting warehouse ${st}`});
+    jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     await saveAutoInventoryStatus({ running:true, mode:'active-stock-sync-positive-only', currentStockNumber:String(st), lastStockNumber:String(st) });
-    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock` });
+    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock`, jobControl });
     stockTotal += Number(r.total || 0);
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
     stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, error:r.error||'' });
+    jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
+    jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
   }
   const result = { ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active, stockRows:stockTotal, stockCompleted, protectedFromStale, queuedForLiveVerify:protectedFromStale, durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-no-global-no-delete', atTehran:time.formatTehranDateTime(new Date()) };
+  jobControl?.progress?.({phase:'Finalize',current:0,total:1,message:'Finalizing inventory synchronization'});
+  jobControl?.checkCancellation?.();
   await db.collection('appLogs').insertOne({ type:'inventory_active_stock_sync', ...result, at:new Date(), source:opts.source || 'auto' }).catch(()=>{});
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:false, mode:result.mode, lastRunAt:new Date(), lastStockNumber:'ACTIVE', currentStockNumber:'', nextStockNumber:'ACTIVE', lastResult:result, lastError:'' });
   return result;
 }
 
-async function runAutoInventorySyncTick() {
+async function runAutoInventorySyncTick(options = {}) {
   const db = await connectMongo().catch(()=>null);
   if (!config.autoInventorySyncEnabled) {
     await saveAutoInventoryStatus({ enabled:false, running:false, lastSkippedAt:new Date(), lastSkipReason:'disabled' });
     return { ok:true, skipped:true, reason:'disabled' };
   }
-  if (inventorySyncRunning) {
+  if (inventorySyncJobManager.isRunning('inventory-sync')) {
     await saveAutoInventoryStatus({ enabled:true, running:true, lastSkippedAt:new Date(), lastSkipReason:'previous-sync-running' });
-    return { ok:true, skipped:true, reason:'previous sync still running' };
+    if(options.scheduled===true) return { ok:true, skipped:true, reason:'previous sync still running' };
+    return {ok:false,error:'Sync موجودی در حال اجراست؛ چند دقیقه بعد دوباره تلاش کنید',code:'JOB_LOCKED',running:true};
   }
-  inventorySyncRunning = true;
   try {
-    const result = await syncInventoryReconciliation(Number(config.autoInventorySyncPageLimit || config.inventoryCatalogSyncPages || 5000), { source:'auto-reconciliation-sync', batchPrefix:'auto-recon-inv' });
+    const result = await executeInventorySyncJob({pages:Number(config.autoInventorySyncPageLimit || config.inventoryCatalogSyncPages || 5000),options:{source:'auto-reconciliation-sync',batchPrefix:'auto-recon-inv'}});
     if (db) await db.collection('appLogs').insertOne({ type:'auto_inventory_reconciliation_sync', ...result, at:new Date() }).catch(()=>{});
     return result;
   } catch (e) {
@@ -1595,8 +1629,6 @@ async function runAutoInventorySyncTick() {
     if (db) await db.collection('appLogs').insertOne({ type:'auto_inventory_sync_global_error', error:err, at:new Date() }).catch(()=>{});
     await saveAutoInventoryStatus({ enabled:true, running:false, lastRunAt:new Date(), lastError:err, lastResult:{ ok:false, error:err, mode:'auto-reconciliation-error' } });
     return { ok:false, error:err };
-  } finally {
-    inventorySyncRunning = false;
   }
 }
 
@@ -1605,9 +1637,9 @@ function startAutoInventorySyncWorker() {
   if (!config.autoInventorySyncEnabled || autoInventoryTimer) return;
   const interval = Math.max(60000, Number(config.autoInventorySyncIntervalMs || 300000));
   // اجرای اولیه با تأخیر کوتاه؛ منتظر اولین ۵ دقیقه نمی‌مانیم.
-  setTimeout(() => runAutoInventorySyncTick().catch(e => console.error('auto inventory sync initial warning:', e.message)), 15000);
+  setTimeout(() => runAutoInventorySyncTick({scheduled:true}).catch(e => console.error('auto inventory sync initial warning:', e.message)), 15000);
   autoInventoryTimer = setInterval(() => {
-    runAutoInventorySyncTick().catch(e => console.error('auto inventory sync warning:', e.message));
+    runAutoInventorySyncTick({scheduled:true}).catch(e => console.error('auto inventory sync warning:', e.message));
   }, interval);
   console.log(`auto inventory sync enabled: reconciliation cycle every ${interval}ms, pageLimit=${config.autoInventorySyncPageLimit}`);
 }
