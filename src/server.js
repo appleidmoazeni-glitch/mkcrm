@@ -10,6 +10,7 @@ const shaygan = require('./lib/shaygan');
 const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const saleSnapshot = require('./lib/sale-snapshot');
+const mongoBackup = require('./lib/mongo-backup');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -17,6 +18,7 @@ const { JobStatus } = require('../dist/core/jobs/JobStatus');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
 const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
+const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
@@ -31,6 +33,10 @@ const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
 const inventorySyncJobRegistry=new JobRegistry();
 inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
 const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
+const mongoBackupJobRegistry=new JobRegistry();
+mongoBackupJobRegistry.register({name:'mongo-backup',version:1,factory:input=>new MongoBackupJob(input)});
+const mongoBackupJobManager=new JobManager(mongoBackupJobRegistry);
+let mongoBackupLastResult=null;
 
 async function executeInventorySyncJob(request){
   let serviceResult=null;
@@ -44,6 +50,11 @@ async function executeInventorySyncJob(request){
   const snapshot=await handle.completion;
   if(serviceResult) return serviceResult;
   return {ok:false,error:snapshot.error?.message||'Inventory Sync failed',code:snapshot.error?.code||'JOB_FAILED'};
+}
+function startMongoBackupJob(request){
+  const handle=mongoBackupJobManager.start('mongo-backup',{request,service:mongoBackup,onResult:r=>{mongoBackupLastResult=r;}});
+  handle.completion.then(async snapshot=>{const db=await connectMongo().catch(()=>null);if(db)await db.collection('appLogs').insertOne({type:'mongo_backup',jobId:handle.id,status:snapshot.status,database:mongoBackupLastResult?.database||mongoBackup.databaseName(),destinationId:mongoBackupLastResult?.destinationId||request.destinationId,folder:mongoBackupLastResult?.folder||'',sizeBytes:Number(mongoBackupLastResult?.sizeBytes||0),durationMs:Number(mongoBackupLastResult?.durationMs||snapshot.metrics.duration||0),error:snapshot.error?.message||'',at:new Date()}).catch(()=>{});}).catch(()=>{});
+  return handle;
 }
 
 function startSaleSnapshotBackgroundJob({db,jobId,request}){
@@ -1745,6 +1756,13 @@ async function getUserMapping(username) {
   const db = await connectMongo();
   if (!username) return null;
   return await db.collection('userShayganMappings').findOne({ username, isActive: { $ne:false } });
+}
+async function sellerCanAccessInvoice(user,inv){
+  if(!['seller','seller_buyer'].includes(String(user?.role||'')))return true;
+  const db=await connectMongo(),mapping=await getUserMapping(user.username),extra=await db.collection('userAccountAccesses').find({username:user.username}).toArray();
+  const allowed=[mapping?.cashboxAccountNumber,mapping?.employeeAccountNumber,...extra.map(x=>x.accountNumber)].filter(Boolean).map(String);
+  const invoiceAccounts=[inv?.AccountNumber,inv?.SAccountNumber,inv?.SellerAccountNumber,inv?.CashboxAccountNumber,inv?.CashBoxAccountNumber].filter(Boolean).map(String);
+  return String(inv?.FirstIssuerUsername||'')===String(user.username||'')||invoiceAccounts.some(x=>allowed.includes(x));
 }
 
 async function resolveInvoiceMapping(body, user = null) {
@@ -3962,6 +3980,9 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req, res, ['admin','accounting','warehouse','purchase'])) return;
       return sendJson(res, 200, await readAutoInventoryStatus());
     }
+    if(pathname==='/api/admin/backups/status'&&req.method==='GET'){if(!requireRole(req,res,['admin']))return;const running=mongoBackupJobManager.getRunning('mongo-backup');return sendJson(res,200,{ok:true,...mongoBackup.status(),running:running?{id:running.id,status:running.status,progress:running.progress,heartbeatAt:running.heartbeatAt}:null,lastResult:mongoBackupLastResult});}
+    if(pathname==='/api/admin/backups/destinations'&&req.method==='GET'){if(!requireRole(req,res,['admin']))return;return sendJson(res,200,{ok:true,database:mongoBackup.databaseName(),list:mongoBackup.status().destinations});}
+    if(pathname==='/api/admin/backups/start'&&req.method==='POST'){if(!requireRole(req,res,['admin']))return;const body=await collectBody(req);if(!mongoBackup.status().configured)return sendJson(res,409,{ok:false,error:'MONGO_BACKUP_ALLOWED_ROOTS تنظیم نشده است'});try{mongoBackup.resolveDestination(body.destinationId,body.subfolder);const handle=startMongoBackupJob({destinationId:String(body.destinationId),subfolder:String(body.subfolder||''),jobId:`BACKUP-${Date.now()}`});return sendJson(res,202,{ok:true,jobId:handle.id,status:'queued'});}catch(e){return sendJson(res,e?.code==='JOB_LOCKED'?409:400,{ok:false,code:e?.code||'BACKUP_INVALID',error:String(e.message||e)});}}
     if (pathname === '/api/inventory/auto-sync/run' && req.method === 'POST') {
       if (!requireRole(req, res, ['admin'])) return;
       return sendJson(res, 200, await runAutoInventorySyncTick());
@@ -4070,7 +4091,26 @@ async function handleApi(req, res, pathname, query) {
     }
 
     const invoiceMatch = pathname.match(/^\/api\/invoices\/(\d+)$/) || pathname.match(/^\/api\/shaygan\/invoice\/(\d+)$/);
-    if (invoiceMatch) { const r = await shaygan.getInvoice(invoiceMatch[1], query.invType || 2); return sendJson(res, 200, { ok: r.ok, list: r.list || [], error: r.error || '' }); }
+    if (invoiceMatch) {
+      if (!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer'])) return;
+      const invType=Number(query.invType||0);if(![2,3,6,7].includes(invType))return sendJson(res,400,{ok:false,error:'نوع سند معتبر الزامی است',code:'INVOICE_TYPE_REQUIRED'});
+      const r = await shaygan.getInvoice(invoiceMatch[1],invType);const list=(r.list||[]).filter(x=>Number(x.InvTyp||x.InvoiceType||0)===invType&&Number(x.InvNo||x.InvoiceNumber||0)===Number(invoiceMatch[1]));
+      const user=currentUser(req)||{};const permitted=[];for(const inv of list)if(await sellerCanAccessInvoice(user,inv))permitted.push(inv);if(list.length&&!permitted.length)return deny(res,'برای مشاهده این سند دسترسی ندارید');
+      return sendJson(res, 200, { ok:r.ok,invType,list:permitted,error:r.error||'' });
+    }
+    const invoiceKardexMatch=pathname.match(/^\/api\/invoices\/(\d+)\/items\/([^/]+)\/kardex$/);
+    if(invoiceKardexMatch){
+      if(!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer']))return;
+      const invNo=Number(invoiceKardexMatch[1]),code=decodeURIComponent(invoiceKardexMatch[2]),invType=Number(query.invType||0);
+      if(invType!==2)return sendJson(res,400,{ok:false,error:'کاردکس از این نما فقط برای فاکتور فروش مجاز است'});
+      const invoiceResult=await shaygan.getInvoice(invNo,2);const inv=(invoiceResult.list||[]).find(x=>Number(x.InvTyp||0)===2&&Number(x.InvNo||0)===invNo);
+      if(!inv)return sendJson(res,404,{ok:false,error:'فاکتور فروش پیدا نشد'});
+      const user=currentUser(req)||{};
+      if(!await sellerCanAccessInvoice(user,inv))return deny(res,'برای کاردکس اقلام این فاکتور دسترسی ندارید');
+      const body=Array.isArray(inv.Body)?inv.Body:(Array.isArray(inv.InvoiceBody)?inv.InvoiceBody:[]);const line=body.find(x=>String(x.ItemNumber||x.ItemCode||'')===code);if(!line)return sendJson(res,403,{ok:false,error:'کالا در فاکتور مجاز وجود ندارد'});
+      const role=String(user.role||'seller'),requested=Number(query.maxRows||0),hard=role==='admin'?config.kardexAdminFullMaxRows:config.kardexSellerMaxRows,maxRows=requested?Math.min(requested,hard):(role==='admin'?config.kardexAdminQuickMaxRows:config.kardexSellerMaxRows);
+      const r=await shaygan.getKardexByItemCode(code,'',{maxRows,hardMaxRows:hard});return sendJson(res,200,{ok:r.ok,item:r.item,rows:r.rows||[],meta:r.meta||{},invoice:{invNo,invType:2},error:r.error||''});
+    }
     if (pathname === '/api/invoices/last-sale') return sendJson(res, 200, await shaygan.getLastSaleInvoiceNumber());
     if (pathname === '/api/invoice-numbers/reserve' && req.method === 'POST') return sendJson(res, 200, await reserveInvoiceNumber(await collectBody(req)));
     if (pathname === '/api/invoice-numbers/reservations') { const db = await connectMongo(); return sendJson(res, 200, { ok: true, list: await db.collection('invoiceReservations').find({}).sort({ reservedAt: -1 }).limit(50).toArray() }); }

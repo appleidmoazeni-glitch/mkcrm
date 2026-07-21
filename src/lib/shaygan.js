@@ -702,7 +702,7 @@ function flattenStatementResult(result = []) {
       // Skip completely empty wrapper rows, but keep opening-balance rows.
       const hasMeaning = r.RowNo !== undefined || r.RowDesc || r.Description || r.DebitAmount !== undefined || r.CreditAmount !== undefined || r.Remain !== undefined || r.DocumentNumber !== undefined;
       if (!hasMeaning) continue;
-      out.push({ ...r, AccountNumber: r.AccountNumber || accountNumber, AccountName: r.AccountName || accountName, AccountGuId: r.AccountGuId || accountGuId });
+      out.push({ ...r, InvNo:r.InvNo ?? r.InvoiceNumber ?? '', InvTyp:Number(r.InvTyp ?? r.InvoiceType ?? 0)||0, AccountNumber: r.AccountNumber || accountNumber, AccountName: r.AccountName || accountName, AccountGuId: r.AccountGuId || accountGuId });
     }
   }
   return out;
