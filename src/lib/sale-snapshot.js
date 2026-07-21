@@ -308,9 +308,17 @@ async function latestInvNoByType(db, invTyp, dateFrom='', dateTo=''){
   const doc=await db.collection('saleInvoiceHeaders').findOne(q,{ sort:{ invNo:-1 } }).catch(()=>null);
   return Number(doc?.invNo || 0);
 }
+function saleInvoicesOnly(rows, typ=2){
+  return (Array.isArray(rows)?rows:[]).filter(inv=>Number(inv.InvTyp || inv.InvoiceType || 0)===Number(typ));
+}
 
 async function buildSaleSnapshot(db, opts={}){
   await ensureIndexes(db);
+  const jobControl=opts.jobControl;
+  const progress=(phase,current,total,message)=>jobControl?.progress?.({phase,current,total,message});
+  const checkpoint=()=>{ jobControl?.heartbeat?.(); jobControl?.checkCancellation?.(); };
+  progress('Resolving Salespeople and Cashiers',0,1,'Loading salesperson and cashier mappings');
+  checkpoint();
   const sid=snapshotId(); const now=new Date();
   const dateFrom=clean(opts.dateFrom || '14050101').replace(/-/g,'');
   const dateTo=clean(opts.dateTo || '').replace(/-/g,'');
@@ -319,6 +327,7 @@ async function buildSaleSnapshot(db, opts={}){
   const reset = opts.reset === true || opts.reset === 'true' || opts.mode === 'full';
   const scopeKey = scopeKeyFor(dateFrom, dateTo);
   const sellerMaps = await getSellerMaps(db);
+  checkpoint();
   const snap={ snapshotId:sid, version:VERSION, status:'running', dateFrom, dateTo, pageSize, maxPages, incremental:!reset, mode: reset?'full-sale-type2-scan':'new-sale-type2-by-invno', scopeKey, createdAt:now, updatedAt:now, invoiceHeadersFound:0, invoiceBodiesLoaded:0, saleLinesParsed:0, emptyBodyInvoices:0, errors:[] };
   await db.collection('saleSnapshots').insertOne(snap);
 
@@ -367,21 +376,30 @@ async function buildSaleSnapshot(db, opts={}){
       typeStats[key].nextInvNoFrom=lastNo+1;
       let typeReachedEnd=false;
       for(let page=0,rowStart=0; page<maxPages; page++, rowStart+=pageSize){
+        progress('Reading Sale Invoices',page,maxPages,`Reading sale invoice page ${page+1}`);
+        checkpoint();
         const r=await shaygan.getInvoicePageByTypeNumberRange(rowStart, typ, invNoFrom, '', dateFrom, dateTo, pageSize).catch(e=>({ok:false,error:String(e.message||e),result:[]}));
         pagesScanned++; typeStats[key].pagesScanned++;
         if(!r.ok){ errors.push({ stage:'sale-invoice-page', typ, page, rowStart, invNoFrom, error:r.error||`Invoice/Get type ${typ} page failed` }); break; }
-        const rows=Array.isArray(r.result)?r.result:[];
+        const rows=saleInvoicesOnly(r.result,typ);
         if(!rows.length){ typeReachedEnd=true; typeStats[key].reachedEnd=true; break; }
         const pageItemCodes=[]; for(const inv of rows){ for(const b of invBody(inv)) pageItemCodes.push(lineItemCode(b)); }
         const pageGroupMap=await loadMainGroupMap(db, pageItemCodes);
-        for(const inv of rows) await processInvoice(inv, pageGroupMap);
+        for(let index=0; index<rows.length; index++){
+          await processInvoice(rows[index], pageGroupMap);
+          if((index+1)%10===0 || index===rows.length-1) checkpoint();
+        }
         // Do not stop on short pages. Shaygan sometimes returns short pages before the real end.
         await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ updatedAt:new Date(), pagesScanned, startNoByType, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
       }
       if(!typeReachedEnd && typeStats[key].pagesScanned>=maxPages) errors.push({ stage:'max-pages-reached', typ, maxPages, note:'برای خواندن ادامه، maxPages را بالاتر بگذار یا دوباره اجرا کن.' });
     }
 
+    progress('Calculating Snapshot',1,1,'Finalizing Sale Snapshot counters');
+    checkpoint();
     const reachedEnd = !!(typeStats['2'] && typeStats['2'].reachedEnd);
+    progress('Saving Snapshot',0,1,'Saving final Sale Snapshot');
+    checkpoint();
     await db.collection('saleSnapshotState').updateOne({ scopeKey }, { $set:{ scopeKey, dateFrom, dateTo, reachedEnd, updatedAt:new Date(), lastSnapshotId:sid, lastHeadersFound:headersFound, lastLinesParsed:linesParsed, latestType2: await latestInvNoByType(db,2,dateFrom,dateTo), invoiceTypes:{ sale:2, buy:3, saleReturn:6, purchaseReturn:7 } } }, { upsert:true });
     const status=errors.length && !linesParsed ? 'completed_with_errors' : 'completed';
     await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ status, finishedAt:new Date(), updatedAt:new Date(), pagesScanned, reachedEnd, startNoByType, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100), samples } });
@@ -389,6 +407,7 @@ async function buildSaleSnapshot(db, opts={}){
     return { ok:true, snapshotId:sid, status, incremental:!reset, mode:reset?'full-sale-type2-scan':'new-sale-type2-by-invno', reachedEnd, startNoByType, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,20), samples };
   }catch(e){
     await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ status:'failed', error:String(e.message||e), updatedAt:new Date(), finishedAt:new Date(), pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
+    if(e?.code==='JOB_CANCELLED') throw e;
     return { ok:false, snapshotId:sid, error:String(e.message||e), incremental:!reset, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,20) };
   }
 }
@@ -447,4 +466,4 @@ async function sellerPerformance(db, filters={}){
   return { ok:true, sellerAccountNumber:seller, dateFrom:clean(filters.dateFrom||''), dateTo:clean(filters.dateTo||''), invoiceCount:invoices.length, lineCount:lines.length, qty, totalSales:Math.round(total), fifoCost:profit.totals.fifoCost, estimatedProfit:profit.totals.fifoProfit, fifoProfit:profit.totals.fifoProfit, roiPercent:profit.totals.roiPercent, profitStatus:profit.totals.profitStatus, profitLineStats:{ calculated:profit.totals.calculatedLines, partial:profit.totals.partialLines, unknown:profit.totals.unknownLines }, profitDiagnostics:profit.diagnostics, groups, invoices:invoices.slice(0,Math.min(Number(filters.invoiceLimit||500),2000)), lines:lines.slice(0,Math.min(Number(filters.lineLimit||500),2000)) };
 }
 
-module.exports={ VERSION, init, buildSaleSnapshot, listSnapshots, status, lines, sellerPerformance };
+module.exports={ VERSION, init, buildSaleSnapshot, listSnapshots, status, lines, sellerPerformance, _saleInvoicesOnly:saleInvoicesOnly };
