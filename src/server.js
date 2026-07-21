@@ -15,6 +15,7 @@ const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
 const { JobStatus } = require('../dist/core/jobs/JobStatus');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
+const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
@@ -23,6 +24,20 @@ const APP_VERSION = '0.9.19.59-supplier-sleep-operational-control';
 const supplierSleepJobRegistry = new JobRegistry();
 supplierSleepJobRegistry.register({ name:'supplier-sleep', version:1, factory:input=>new SupplierSleepJob(input) });
 const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
+const saleSnapshotJobRegistry = new JobRegistry();
+saleSnapshotJobRegistry.register({ name:'sale-snapshot', version:1, factory:input=>new SaleSnapshotJob(input) });
+const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
+
+function startSaleSnapshotBackgroundJob({db,jobId,request}){
+  let serviceResult=null;
+  const handle=saleSnapshotJobManager.start('sale-snapshot',{db,request,service:saleSnapshot,onResult:result=>{serviceResult=result;}});
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase}}).catch(()=>{});},15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{clearInterval(timer);await runningUpdate;const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;const cancelled=snapshot.status===JobStatus.Cancelled;const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};if(serviceResult)update.result=serviceResult;return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});}).catch(()=>clearInterval(timer));
+  return handle;
+}
 
 async function supplierSleepActiveJob(db){
   const now=new Date();
@@ -3429,7 +3444,7 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
       const body = await collectBody(req);
       const db = await connectMongo();
-      return sendJson(res, 200, await saleSnapshot.buildSaleSnapshot(db, {
+      const request={
         dateFrom: body.dateFrom || query.dateFrom || '14050101',
         dateTo: body.dateTo || query.dateTo || '',
         maxPages: Number(body.maxPages || query.maxPages || 300),
@@ -3437,7 +3452,14 @@ async function handleApi(req, res, pathname, query) {
         maxDetailInvoices: Number(body.maxDetailInvoices || query.maxDetailInvoices || 0),
         reset: body.reset === true || body.reset === 'true' || query.reset === 'true',
         mode: body.mode || query.mode || 'incremental'
-      }));
+      };
+      if(saleSnapshotJobManager.isRunning('sale-snapshot')){const running=saleSnapshotJobManager.getRunning('sale-snapshot');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Sale Snapshot job is already running',jobId:running?.id||''});}
+      const jobId=`JOB-SALE-SNAPSHOT-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const now=new Date();
+      await db.collection('appJobs').updateOne({jobId},{$set:{jobId,type:'sale-snapshot',status:'queued',phase:'pending',createdAt:now,updatedAt:now,request}},{upsert:true});
+      try{startSaleSnapshotBackgroundJob({db,jobId,request});}
+      catch(e){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',finishedAt:new Date(),updatedAt:new Date(),error:String(e.message||e)}}).catch(()=>{});if(e?.code==='JOB_LOCKED')return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:e.message,jobId});throw e;}
+      return sendJson(res,200,{ok:true,jobId,status:'queued',type:'sale-snapshot',note:'Sale Snapshot job started in background'});
     }
     if (pathname === '/api/sale-snapshot/snapshots' && req.method === 'GET') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;

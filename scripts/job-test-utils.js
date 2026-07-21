@@ -4,6 +4,7 @@ const { JobCancelledError } = require('../dist/core/jobs/JobCancellation.js');
 const { JobManager } = require('../dist/core/jobs/JobManager.js');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry.js');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob.js');
+const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob.js');
 
 class FakeHeartbeat {
   constructor(at = new Date(0)) { this.at = at; this.beats = []; }
@@ -67,6 +68,11 @@ function createSupplierManager() {
   registry.register(new MockJobFactory('supplier-sleep', 1, input => new SupplierSleepJob(input)).definition());
   return { registry, manager:new JobManager(registry) };
 }
+function createSaleSnapshotManager() {
+  const registry = new JobRegistry();
+  registry.register(new MockJobFactory('sale-snapshot', 1, input => new SaleSnapshotJob(input)).definition());
+  return { registry, manager:new JobManager(registry) };
+}
 
 module.exports = {
   FakeHeartbeat,
@@ -77,5 +83,6 @@ module.exports = {
   MockJobFactory,
   deferred,
   delay,
-  createSupplierManager
+  createSupplierManager,
+  createSaleSnapshotManager
 };
