@@ -1,5 +1,11 @@
 # Account Turnover Root-Cause Analysis
 
+## Typed invoice-link regression after PR #10
+
+PR #10 made link creation conditional on both an invoice number and a known four-type label. `invoiceTypeOf(undefined)` became `0`, so a turnover row without `InvTyp` was rendered as a non-interactive `<span>` with `نوع سند نامشخص`. In addition, `flattenStatementResult()` and the active UI helper ignored `DocumentNumber` even though real statement rows may use that field. The invoice API was not the source of the defect: an exact `Invoice/Get` for document 137 returns `InvTyp=6`.
+
+The hotfix preserves `DocumentNumber`, makes every valid document number clickable, uses a central 2/3/4/5/6/7/10 registry, and resolves a missing type by querying exact `(InvNo, InvTyp)` candidates through Shaygan WebService. One candidate opens directly, zero shows a specific not-found message, and multiple candidates require an explicit user choice. No description-text inference or Sale fallback is used.
+
 ## Reproduction and evidence
 
 The active `pageTurnover()` implementation in `public/assets/app.js` owns `picked`, `lastList`, a debounced `doSearch()`, and `renderResults()`. With a delayed `/api/accounts/search` response:

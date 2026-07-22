@@ -1,8 +1,8 @@
 {
   "name": "mkcrm",
-  "version": "0.9.19.59",
+  "version": "0.9.19.60",
   "private": true,
-  "description": "MKCRM 0.9.19.56 Board v49 live reconcile fix",
+  "description": "MKCRM 0.9.19.60 typed turnover invoice routing hotfix",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
