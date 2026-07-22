@@ -11,6 +11,8 @@ const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
+const invoiceTypes = require('../public/assets/invoice-types');
+const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -37,6 +39,7 @@ const mongoBackupJobRegistry=new JobRegistry();
 mongoBackupJobRegistry.register({name:'mongo-backup',version:1,factory:input=>new MongoBackupJob(input)});
 const mongoBackupJobManager=new JobManager(mongoBackupJobRegistry);
 let mongoBackupLastResult=null;
+const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan.getInvoice(invNo,invType),supportedTypes:invoiceTypes.supportedTypes});
 
 async function executeInventorySyncJob(request){
   let serviceResult=null;
@@ -4090,10 +4093,22 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok:true, leadId:newLeadId, log });
     }
 
+    const invoiceResolveMatch=pathname.match(/^\/api\/invoices\/(\d+)\/resolve$/);
+    if(invoiceResolveMatch&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer']))return;
+      const invNo=Number(invoiceResolveMatch[1]);if(!Number.isSafeInteger(invNo)||invNo<=0)return sendJson(res,400,{ok:false,error:'شماره سند معتبر نیست'});
+      try{
+        const user=currentUser(req)||{},all=await invoiceResolver.resolve(invNo),candidates=[];
+        for(const candidate of all)if(await sellerCanAccessInvoice(user,candidate.invoice))candidates.push({invNo:candidate.invNo,invType:candidate.invType,invDate:candidate.invDate,accountName:candidate.accountName,label:invoiceTypes.getInvoiceTypeLabel(candidate.invType)});
+        if(all.length&&!candidates.length)return deny(res,'برای مشاهده این سند دسترسی ندارید');
+        return sendJson(res,200,{ok:true,invNo,candidates});
+      }catch(e){if(String(e.message||e)==='INVOICE_RESOLUTION_SERVICE_FAILED')return sendJson(res,502,{ok:false,code:'INVOICE_RESOLUTION_FAILED',error:'شناسایی نوع سند با خطا مواجه شد. دوباره تلاش کنید.'});throw e;}
+    }
     const invoiceMatch = pathname.match(/^\/api\/invoices\/(\d+)$/) || pathname.match(/^\/api\/shaygan\/invoice\/(\d+)$/);
     if (invoiceMatch) {
+      if(req.method!=='GET')return sendJson(res,405,{ok:false,error:'Method not allowed'});
       if (!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer'])) return;
-      const invType=Number(query.invType||0);if(![2,3,6,7].includes(invType))return sendJson(res,400,{ok:false,error:'نوع سند معتبر الزامی است',code:'INVOICE_TYPE_REQUIRED'});
+      const invType=invoiceTypes.normalizeInvTyp(query.invType);if(!invoiceTypes.isSupportedInvoiceType(invType))return sendJson(res,400,{ok:false,error:'نوع سند معتبر الزامی است',code:'INVOICE_TYPE_REQUIRED'});
       const r = await shaygan.getInvoice(invoiceMatch[1],invType);const list=(r.list||[]).filter(x=>Number(x.InvTyp||x.InvoiceType||0)===invType&&Number(x.InvNo||x.InvoiceNumber||0)===Number(invoiceMatch[1]));
       const user=currentUser(req)||{};const permitted=[];for(const inv of list)if(await sellerCanAccessInvoice(user,inv))permitted.push(inv);if(list.length&&!permitted.length)return deny(res,'برای مشاهده این سند دسترسی ندارید');
       return sendJson(res, 200, { ok:r.ok,invType,list:permitted,error:r.error||'' });
@@ -4102,14 +4117,14 @@ async function handleApi(req, res, pathname, query) {
     if(invoiceKardexMatch){
       if(!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer']))return;
       const invNo=Number(invoiceKardexMatch[1]),code=decodeURIComponent(invoiceKardexMatch[2]),invType=Number(query.invType||0);
-      if(invType!==2)return sendJson(res,400,{ok:false,error:'کاردکس از این نما فقط برای فاکتور فروش مجاز است'});
-      const invoiceResult=await shaygan.getInvoice(invNo,2);const inv=(invoiceResult.list||[]).find(x=>Number(x.InvTyp||0)===2&&Number(x.InvNo||0)===invNo);
-      if(!inv)return sendJson(res,404,{ok:false,error:'فاکتور فروش پیدا نشد'});
+      if(![2,6].includes(invType))return sendJson(res,400,{ok:false,error:'کاردکس از این نما فقط برای فاکتور فروش یا برگشت از فروش مجاز است'});
+      const invoiceResult=await shaygan.getInvoice(invNo,invType);const inv=(invoiceResult.list||[]).find(x=>Number(x.InvTyp||0)===invType&&Number(x.InvNo||0)===invNo);
+      if(!inv)return sendJson(res,404,{ok:false,error:'سند فروش پیدا نشد'});
       const user=currentUser(req)||{};
       if(!await sellerCanAccessInvoice(user,inv))return deny(res,'برای کاردکس اقلام این فاکتور دسترسی ندارید');
       const body=Array.isArray(inv.Body)?inv.Body:(Array.isArray(inv.InvoiceBody)?inv.InvoiceBody:[]);const line=body.find(x=>String(x.ItemNumber||x.ItemCode||'')===code);if(!line)return sendJson(res,403,{ok:false,error:'کالا در فاکتور مجاز وجود ندارد'});
       const role=String(user.role||'seller'),requested=Number(query.maxRows||0),hard=role==='admin'?config.kardexAdminFullMaxRows:config.kardexSellerMaxRows,maxRows=requested?Math.min(requested,hard):(role==='admin'?config.kardexAdminQuickMaxRows:config.kardexSellerMaxRows);
-      const r=await shaygan.getKardexByItemCode(code,'',{maxRows,hardMaxRows:hard});return sendJson(res,200,{ok:r.ok,item:r.item,rows:r.rows||[],meta:r.meta||{},invoice:{invNo,invType:2},error:r.error||''});
+      const r=await shaygan.getKardexByItemCode(code,'',{maxRows,hardMaxRows:hard});return sendJson(res,200,{ok:r.ok,item:r.item,rows:r.rows||[],meta:r.meta||{},invoice:{invNo,invType},error:r.error||''});
     }
     if (pathname === '/api/invoices/last-sale') return sendJson(res, 200, await shaygan.getLastSaleInvoiceNumber());
     if (pathname === '/api/invoice-numbers/reserve' && req.method === 'POST') return sendJson(res, 200, await reserveInvoiceNumber(await collectBody(req)));
