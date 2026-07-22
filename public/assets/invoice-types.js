@@ -15,5 +15,15 @@
   });
   function normalizeInvTyp(value){const n=Number(value);return Number.isInteger(n)&&n>0?n:null;}
   function definition(value){const n=normalizeInvTyp(value);return n?registry[n]||null:null;}
-  return Object.freeze({registry,normalizeInvTyp,getInvoiceFamily:v=>definition(v)?.family||'unknown',getInvoiceTypeLabel:v=>definition(v)?.label||'نوع سند نامشخص',isSupportedInvoiceType:v=>!!definition(v),isWarehouseTransferType:v=>definition(v)?.family==='warehouse-transfer',getInvoiceViewerRoute:v=>definition(v)?.viewer||null,supportedTypes:Object.freeze(Object.keys(registry).map(Number))});
+  function normalizePersianText(value){return String(value??'').replace(/[يى]/g,'ی').replace(/ك/g,'ک').trim().replace(/\s+/g,' ');}
+  function turnoverDescription(row={}){return normalizePersianText([row.RowDesc,row.Description,row.Des,row.Comment,row.RowDescription,row.Detail,row.DetailDesc].filter(Boolean).join(' '));}
+  function classifyTurnoverInvoiceType(row){
+    const text=typeof row==='object'&&row!==null?turnoverDescription(row):normalizePersianText(row);
+    if(text.includes('برگشت از فروش'))return 6;
+    if(text.includes('برگشت از خرید'))return 7;
+    if(text.includes('فاکتور فروش'))return 2;
+    if(text.includes('فاکتور خرید'))return 3;
+    return null;
+  }
+  return Object.freeze({registry,normalizeInvTyp,normalizePersianText,turnoverDescription,classifyTurnoverInvoiceType,getInvoiceFamily:v=>definition(v)?.family||'unknown',getInvoiceTypeLabel:v=>definition(v)?.label||'نوع سند نامشخص',isSupportedInvoiceType:v=>!!definition(v),isWarehouseTransferType:v=>definition(v)?.family==='warehouse-transfer',getInvoiceViewerRoute:v=>definition(v)?.viewer||null,supportedTypes:Object.freeze(Object.keys(registry).map(Number)),turnoverTypes:Object.freeze([2,3,6,7])});
 });

@@ -4109,6 +4109,7 @@ async function handleApi(req, res, pathname, query) {
       if(req.method!=='GET')return sendJson(res,405,{ok:false,error:'Method not allowed'});
       if (!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer'])) return;
       const invType=invoiceTypes.normalizeInvTyp(query.invType);if(!invoiceTypes.isSupportedInvoiceType(invType))return sendJson(res,400,{ok:false,error:'نوع سند معتبر الزامی است',code:'INVOICE_TYPE_REQUIRED'});
+      if(query.source==='turnover'&&!invoiceTypes.turnoverTypes.includes(invType))return sendJson(res,400,{ok:false,error:'این نوع سند از گردش حساب قابل مشاهده نیست',code:'TURNOVER_INVOICE_TYPE_UNSUPPORTED'});
       const r = await shaygan.getInvoice(invoiceMatch[1],invType);const list=(r.list||[]).filter(x=>Number(x.InvTyp||x.InvoiceType||0)===invType&&Number(x.InvNo||x.InvoiceNumber||0)===Number(invoiceMatch[1]));
       const user=currentUser(req)||{};const permitted=[];for(const inv of list)if(await sellerCanAccessInvoice(user,inv))permitted.push(inv);if(list.length&&!permitted.length)return deny(res,'برای مشاهده این سند دسترسی ندارید');
       return sendJson(res, 200, { ok:r.ok,invType,list:permitted,error:r.error||'' });

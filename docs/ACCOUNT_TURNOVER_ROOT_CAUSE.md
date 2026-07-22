@@ -6,6 +6,12 @@ PR #10 made link creation conditional on both an invoice number and a known four
 
 The hotfix preserves `DocumentNumber`, makes every valid document number clickable, uses a central 2/3/4/5/6/7/10 registry, and resolves a missing type by querying exact `(InvNo, InvTyp)` candidates through Shaygan WebService. One candidate opens directly, zero shows a specific not-found message, and multiple candidates require an explicit user choice. No description-text inference or Sale fallback is used.
 
+## Classification correction after staging validation
+
+Real Account Turnover rows proved that `DocumentNumber` is an accounting-document number, not necessarily an invoice number. Commit `6ef0e48` rendered every positive numeric `DocumentNumber` as clickable and its resolver queried every generic registry type (2/3/4/5/6/7/10). `src/lib/invoice-resolution.js` also deliberately rejected the whole resolution when any candidate request failed, so an unrelated type failure could produce `INVOICE_RESOLUTION_FAILED` for a valid purchase invoice.
+
+The Account Turnover workflow now classifies only explicit normalized phrases in `RowDesc`, `Description`, `Des`, `Comment`, `RowDescription`, `Detail`, or `DetailDesc`. Priority is Sale Return (6), Purchase Return (7), Sale (2), then Purchase (3). All other descriptions—including generic `فاکتور`, `ف ف`, receipts, payments, checks and warehouse transfers—remain plain text. A click makes one exact typed read with `source=turnover`; the backend restricts that source to 2/3/6/7 and the response must match both `InvNo` and `InvTyp`.
+
 ## Reproduction and evidence
 
 The active `pageTurnover()` implementation in `public/assets/app.js` owns `picked`, `lastList`, a debounced `doSearch()`, and `renderResults()`. With a delayed `/api/accounts/search` response:
