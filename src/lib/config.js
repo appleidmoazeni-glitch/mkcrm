@@ -28,6 +28,8 @@ const config = {
   publicBaseUrl: process.env.PUBLIC_BASE_URL || '',
   stagingReadOnly: envFlag(process.env.STAGING_READ_ONLY),
   mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/mkcrm',
+  mongoBackupAllowedRoots: String(process.env.MONGO_BACKUP_ALLOWED_ROOTS || process.env.MONGO_BACKUP_ROOT || '').split(',').map(x=>x.trim()).filter(Boolean),
+  mongoDumpBinary: process.env.MONGODUMP_BINARY || 'mongodump',
   shayganBaseUrl: process.env.SHAYGAN_BASE_URL || 'http://192.168.1.253:2030',
   shayganConnectionName: process.env.SHAYGAN_CONNECTION_NAME || 'SampleConnection',
   shayganApiVersion: process.env.SHAYGAN_API_VERSION || '1.0',

@@ -8,6 +8,8 @@ function faToEn(v){ const m={'۰':'0','۱':'1','۲':'2','۳':'3','۴':'4','۵':'
 function normDigits(v){ return faToEn(v).replace(/[^0-9]/g,'').replace(/^0+/,''); }
 function num(v, d=0){ const n = Number(String(v ?? '').replace(/[,،\s]/g,'')); return Number.isFinite(n) ? n : d; }
 function pct(a,b){ return b ? Math.round((Number(a||0)*10000)/Number(b||1))/100 : 0; }
+function jobProgress(opts, phase, current, total, message){ opts?.jobControl?.progress?.({ phase, current, total, message }); }
+function jobCheckpoint(opts){ opts?.jobControl?.heartbeat?.(); opts?.jobControl?.checkCancellation?.(); }
 function snapshotId(){ const d=new Date(); const p=n=>String(n).padStart(2,'0'); return `PS-${d.getFullYear()}${p(d.getMonth()+1)}${p(d.getDate())}${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}-${Math.random().toString(16).slice(2,8)}`; }
 function parseDateScore(v){ const s=clean(v).replace(/[^0-9]/g,''); return Number(s.slice(0,8) || 0); }
 function ageDays(dateStr){ const s=clean(dateStr).replace(/[^0-9]/g,''); if(s.length < 8) return null; // Shaygan may be Jalali; use rough age by numeric year only for sorting-safe management view.
@@ -481,6 +483,7 @@ async function scanPurchaseInvoicesForSupplierDescending(db, supplier, opts={}){
   const list=[]; const errors=[]; const checked=[]; let scanned=0;
   if(!last.ok || !lastNo) return { ok:false, source:'descending-supplier-scan-last-no-failed', count:0, list, errors:[{error:last.error||'last purchase invoice failed'}], scannedNumbers:0, checkedInvoices:[] };
   for(let no=lastNo; no>0 && scanned<maxScanNumbers && list.length<maxInvoices; no--, scanned++){
+    if(scanned%10===0){ jobCheckpoint(opts); jobProgress(opts,'Reading Purchase Invoices',scanned,maxScanNumbers,'Scanning purchase invoices for the selected supplier'); }
     const gr=await shaygan.getInvoice(no,3).catch(e=>({ok:false,error:String(e.message||e),list:[]}));
     if(!gr.ok){ if(errors.length<30) errors.push({invNo:no,error:gr.error||'getInvoice failed'}); continue; }
     const inv=(gr.list||[])[0]; if(!inv) continue;
@@ -504,6 +507,9 @@ async function scanPurchaseInvoicesForSupplierDescending(db, supplier, opts={}){
 
 async function readPurchaseInvoicesForSupplier(db, opts={}){
   await ensureIndexes(db);
+  jobCheckpoint(opts);
+  const buildMode=opts.jobOperation==='build-selected-snapshot';
+  jobProgress(opts,'Loading Suppliers',0,buildMode?5:2,'Loading selected supplier');
   const dateFrom=clean(opts.dateFrom||'14050101');
   const dateTo=clean(opts.dateTo||'');
   const supplier={ accountNumber:clean(opts.supplierAccountNo||opts.accountNumber||opts.supplierNumber||''), accountGuid:clean(opts.supplierGuid||opts.accountGuid||''), accountName:clean(opts.supplierName||opts.accountName||'') };
@@ -523,10 +529,14 @@ async function readPurchaseInvoicesForSupplier(db, opts={}){
     for(const n of c) candidates.push(n);
   }
   const invoiceNos=[...new Set(candidates)].sort((a,b)=>b-a).slice(0, Number(opts.maxInvoices||300));
+  jobProgress(opts,'Reading Purchase Invoices',0,invoiceNos.length||1,'Reading selected supplier purchase invoices');
   diagnostics.stages.push({ stage:'extract-invoice-numbers-from-statement', ok:invoiceNos.length>0, candidateCount:invoiceNos.length, firstCandidates:invoiceNos.slice(0,80), rowDiagnostics });
 
   const list=[]; const errors=[]; const validations=[];
+  let invoiceIndex=0;
   for(const no of invoiceNos){
+    invoiceIndex++;
+    if(invoiceIndex===1||invoiceIndex%10===0){ jobCheckpoint(opts); jobProgress(opts,'Reading Purchase Invoices',invoiceIndex,invoiceNos.length||1,'Reading selected supplier purchase invoices'); }
     const gr=await shaygan.getInvoice(no,3).catch(e=>({ok:false,error:String(e.message||e),list:[]}));
     if(!gr.ok){ errors.push({invNo:no,error:gr.error||'getInvoice failed'}); continue; }
     const inv=(gr.list||[])[0];
@@ -554,6 +564,7 @@ async function readPurchaseInvoicesForSupplier(db, opts={}){
   }
 
   const result={ ok:true, source: finalList.length && list.length ? 'account-statement-exact-supplier-to-invoice-get' : (fallback?.source || 'account-statement-no-valid-invoice'), supplier, statementRows:rows.length, invoiceNoCandidates:invoiceNos.length, count:finalList.length, list:finalList, errors, statementMeta:{ source:st.source||st.domainUsed||'', attempts:st.attempts||st.diagnostics||[] }, fallbackUsed:!!fallback, diagnostics };
+  jobCheckpoint(opts);
   await db.collection('supplierSleepDiagnostics').insertOne({ type:'selected-supplier-invoices', at:new Date(), supplier, dateFrom, dateTo, resultSummary:{ source:result.source, statementRows:result.statementRows, invoiceNoCandidates:result.invoiceNoCandidates, count:result.count, fallbackUsed:result.fallbackUsed }, diagnostics }).catch(()=>{});
   return result;
 }
@@ -576,6 +587,7 @@ async function readGlobalPurchaseLayersForItems(db, itemCodes=[], itemInv=new Ma
   const lastNo=Number(last.last||last.lastInvoiceNumber||last.invoiceNumber||0);
   if(!last.ok || !lastNo) return { ok:false, layers:[], scannedNumbers:0, matchedInvoices:[], errors:[{error:last.error||'last purchase invoice failed'}], source:'global-all-supplier-last-no-failed' };
   for(let no=lastNo; no>0 && scanned<maxScanNumbers && matchedInvoices.length<maxMatchedInvoices; no--, scanned++){
+    if(scanned%10===0){ jobCheckpoint(opts); jobProgress(opts,'Calculating Remaining Stock',scanned,maxScanNumbers,'Reading purchase layers for remaining stock'); }
     if(!opts.collectAllForProfit && enough() && matchedInvoices.length>0) break;
     const gr=await shaygan.getInvoice(no,3).catch(e=>({ok:false,error:String(e.message||e),list:[]}));
     if(!gr.ok){ if(errors.length<30) errors.push({ invNo:no, error:gr.error||'getInvoice failed' }); continue; }
@@ -609,14 +621,19 @@ async function readGlobalPurchaseLayersForItems(db, itemCodes=[], itemInv=new Ma
 
 async function buildSelectedSupplierSnapshot(db, opts={}){
   await ensureIndexes(db);
+  jobCheckpoint(opts);
   const sid=snapshotId(); const now=new Date();
   const dateFrom=clean(opts.dateFrom||'14050101'); const dateTo=clean(opts.dateTo||'');
   const supplier={ accountNumber:clean(opts.supplierAccountNo||opts.accountNumber||opts.supplierNumber||''), accountGuid:clean(opts.supplierGuid||opts.accountGuid||''), accountName:clean(opts.supplierName||opts.accountName||'') };
   const sync=await readPurchaseInvoicesForSupplier(db,{...opts,dateFrom,dateTo,maxInvoices:Number(opts.maxInvoices||300)});
   const invs=sync.list||[];
+  jobProgress(opts,'Building Layers',0,invs.length||1,'Building purchase layers');
   const activeWarehouses=await getActiveWarehouses(db); const activeSet=activeWarehouses.length?new Set(activeWarehouses):null;
   const purchaseLayers=[];
+  let builtInvoiceCount=0;
   for(const inv of invs){
+    builtInvoiceCount++;
+    if(builtInvoiceCount===1||builtInvoiceCount%10===0){ jobCheckpoint(opts); jobProgress(opts,'Building Layers',builtInvoiceCount,invs.length||1,'Building purchase layers'); }
     for(const it of inv.items||[]){
       const qty=num(it.qty,0); if(!it.itemCode||qty<=0) continue;
       const unit=num(it.unitCost || (it.lineAmount && qty ? it.lineAmount/qty : 0),0);
@@ -627,6 +644,8 @@ async function buildSelectedSupplierSnapshot(db, opts={}){
   }
   applyMainGroupsToLayers(purchaseLayers, await loadMainGroupMap(db, purchaseLayers.map(x=>x.itemCode)));
   const itemCodes=[...new Set(purchaseLayers.map(x=>x.itemCode))];
+  jobCheckpoint(opts);
+  jobProgress(opts,'Calculating Remaining Stock',0,itemCodes.length||1,'Calculating remaining stock');
   const invQuery={ quantity:{ $gt:0 } }; if(itemCodes.length) invQuery.itemCode={ $in:itemCodes }; if(activeSet) invQuery.stockNumber={ $in:[...activeSet] };
   const invDocs=await db.collection('itemInventoryCatalog').find(invQuery).limit(0).toArray();
   const itemInv=new Map();
@@ -660,7 +679,10 @@ async function buildSelectedSupplierSnapshot(db, opts={}){
   const writtenLayers=[]; const allocations=[]; const unknownInventoryLayers=[];
   let totalUnallocatedCurrentQty=0, totalUnallocatedCurrentValue=0;
   let fullCoverageItemCount=0, partialCoverageItemCount=0, noCoverageItemCount=0;
+  let processedItemCount=0;
   for(const code of itemCodes){
+    processedItemCount++;
+    if(processedItemCount===1||processedItemCount%25===0){ jobCheckpoint(opts); jobProgress(opts,'Calculating Remaining Stock',processedItemCount,itemCodes.length||1,'Calculating remaining stock'); }
     const inv=itemInv.get(code)||{itemCode:code,itemName:(selectedPurchaseByItem.get(code)||[])[0]?.itemName||'',currentQty:0,currentValue:0,warehouses:new Set()};
     let remainingCurrent=inv.currentQty;
     const allLayers=globalByItem.get(code)||[];
@@ -701,6 +723,8 @@ async function buildSelectedSupplierSnapshot(db, opts={}){
   }
   const coverageDiagnostic={ fullCoverageItemCount, partialCoverageItemCount, noCoverageItemCount, totalUnallocatedCurrentQty, totalUnallocatedCurrentValue, unknownInventoryLayerCount:unknownInventoryLayers.length };
   profitDiagnostic.globalAllocation.coverage = coverageDiagnostic;
+  jobCheckpoint(opts);
+  jobProgress(opts,'Saving Snapshot',0,1,'Saving Supplier Sleep snapshot');
   await db.collection('supplierPurchaseLayers').deleteMany({ snapshotId:sid }); if(writtenLayers.length) await db.collection('supplierPurchaseLayers').insertMany(writtenLayers,{ordered:false});
   await db.collection('supplierInventoryAllocation').deleteMany({ snapshotId:sid }); if(allocations.length) await db.collection('supplierInventoryAllocation').insertMany(allocations,{ordered:false});
   // 0.9.19.27.5: Separate accounting purchase total from analyzed goods-layer total.
@@ -820,6 +844,8 @@ async function buildSelectedSupplierSnapshot(db, opts={}){
   await db.collection('supplierSleepSnapshots').insertOne(snap);
   await db.collection('supplierSleepDiagnostics').insertOne({ type:'selected-supplier-reconciliation', at:new Date(), snapshotId:sid, supplier:{accountNumber:supNo,accountName:supName}, periodInvoiceTotalValue, periodLayerGoodsValue, totalReconciliationDiff, totalReconciliationDiffPercent, reconciliationStatus, invoiceReconciliation }).catch(()=>{});
   await db.collection('supplierSleepDiagnostics').insertOne({ type:'selected-supplier-profit-diagnostic-v34-paused', at:new Date(), snapshotId:sid, supplier:{accountNumber:supNo,accountName:supName}, profitDiagnostic }).catch(()=>{});
+  opts?.jobControl?.heartbeat?.();
+  jobProgress(opts,'Saving Snapshot',1,1,'Supplier Sleep snapshot saved');
   return { ok:true, snapshot:snap, summary:[summary], invoiceSummary:invoiceSleepRows, groupSummary:groupRows, invoices:invs.map(x=>{ const rec=invoiceReconciliation.find(r=>Number(r.invNo)===Number(x.invNo))||{}; return {invNo:x.invNo,invDate:x.invDate,totalAmount:x.totalAmount,rowCount:x.rowCount,supplierName:x.supplierName,supplierAccountNo:x.supplierAccountNo, layerValue:rec.layerValue, difference:rec.difference, differencePercent:rec.differencePercent, reconciliationStatus:rec.status, layerCount:rec.layerCount}; }), reconciliation:{ periodInvoiceTotalValue, periodLayerGoodsValue, difference:totalReconciliationDiff, differencePercent:totalReconciliationDiffPercent, status:reconciliationStatus, invoices:invoiceReconciliation }, source:'selected-supplier-true-reverse-fifo-stability-v45' };
 }
 

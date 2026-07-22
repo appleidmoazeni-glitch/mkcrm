@@ -10,19 +10,98 @@ const shaygan = require('./lib/shaygan');
 const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const saleSnapshot = require('./lib/sale-snapshot');
+const mongoBackup = require('./lib/mongo-backup');
+const invoiceTypes = require('../public/assets/invoice-types');
+const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const time = require('./lib/time');
+const { JobManager } = require('../dist/core/jobs/JobManager');
+const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
+const { JobStatus } = require('../dist/core/jobs/JobStatus');
+const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
+const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
+const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
+const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
 const publicDir = path.join(process.cwd(), 'public');
 const APP_VERSION = '0.9.19.59-supplier-sleep-operational-control';
-let supplierSleepJobRunning = false;
+const supplierSleepJobRegistry = new JobRegistry();
+supplierSleepJobRegistry.register({ name:'supplier-sleep', version:1, factory:input=>new SupplierSleepJob(input) });
+const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
+const saleSnapshotJobRegistry = new JobRegistry();
+saleSnapshotJobRegistry.register({ name:'sale-snapshot', version:1, factory:input=>new SaleSnapshotJob(input) });
+const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
+const inventorySyncJobRegistry=new JobRegistry();
+inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
+const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
+const mongoBackupJobRegistry=new JobRegistry();
+mongoBackupJobRegistry.register({name:'mongo-backup',version:1,factory:input=>new MongoBackupJob(input)});
+const mongoBackupJobManager=new JobManager(mongoBackupJobRegistry);
+let mongoBackupLastResult=null;
+const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan.getInvoice(invNo,invType),supportedTypes:invoiceTypes.supportedTypes});
+
+async function executeInventorySyncJob(request){
+  let serviceResult=null;
+  let handle;
+  try{
+    handle=inventorySyncJobManager.start('inventory-sync',{request,service:{sync:async input=>syncInventoryReconciliation(Number(input.pages),{...(input.options||{}),jobControl:input.jobControl})},onResult:result=>{serviceResult=result;}});
+  }catch(e){
+    if(e?.code==='JOB_LOCKED') return {ok:false,error:'Sync موجودی در حال اجراست؛ چند دقیقه بعد دوباره تلاش کنید',code:'JOB_LOCKED',running:true};
+    throw e;
+  }
+  const snapshot=await handle.completion;
+  if(serviceResult) return serviceResult;
+  return {ok:false,error:snapshot.error?.message||'Inventory Sync failed',code:snapshot.error?.code||'JOB_FAILED'};
+}
+function startMongoBackupJob(request){
+  const handle=mongoBackupJobManager.start('mongo-backup',{request,service:mongoBackup,onResult:r=>{mongoBackupLastResult=r;}});
+  handle.completion.then(async snapshot=>{const db=await connectMongo().catch(()=>null);if(db)await db.collection('appLogs').insertOne({type:'mongo_backup',jobId:handle.id,status:snapshot.status,database:mongoBackupLastResult?.database||mongoBackup.databaseName(),destinationId:mongoBackupLastResult?.destinationId||request.destinationId,folder:mongoBackupLastResult?.folder||'',sizeBytes:Number(mongoBackupLastResult?.sizeBytes||0),durationMs:Number(mongoBackupLastResult?.durationMs||snapshot.metrics.duration||0),error:snapshot.error?.message||'',at:new Date()}).catch(()=>{});}).catch(()=>{});
+  return handle;
+}
+
+function startSaleSnapshotBackgroundJob({db,jobId,request}){
+  let serviceResult=null;
+  const handle=saleSnapshotJobManager.start('sale-snapshot',{db,request,service:saleSnapshot,onResult:result=>{serviceResult=result;}});
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase}}).catch(()=>{});},15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{clearInterval(timer);await runningUpdate;const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;const cancelled=snapshot.status===JobStatus.Cancelled;const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};if(serviceResult)update.result=serviceResult;return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});}).catch(()=>clearInterval(timer));
+  return handle;
+}
 
 async function supplierSleepActiveJob(db){
   const now=new Date();
   const cutoff=new Date(now.getTime()-10*60*1000);
   await db.collection('appJobs').updateMany({type:{$in:['supplier-sleep-read-selected-invoices','supplier-sleep-build-selected']},status:{$in:['queued','running']},updatedAt:{$lt:cutoff}},{$set:{status:'failed',phase:'stale-recovered',finishedAt:now,updatedAt:now,error:'Job stale after heartbeat timeout; recovered automatically'}}).catch(()=>{});
   return db.collection('appJobs').findOne({type:{$in:['supplier-sleep-read-selected-invoices','supplier-sleep-build-selected']},status:{$in:['queued','running']},updatedAt:{$gte:cutoff}},{sort:{updatedAt:-1}});
+}
+
+function startSupplierSleepBackgroundJob({ db, jobId, operation, request, mapResult }){
+  let serviceResult=null;
+  const handle=supplierSleepJobManager.start('supplier-sleep',{ operation, db, request, service:purchaseSleep, onResult:result=>{serviceResult=result;} });
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:operation==='read-selected-invoices'?'read-selected-purchase-invoices':'build-selected-snapshot',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const heartbeatTimer=setInterval(()=>{
+    const snapshot=handle.snapshot();
+    db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase}}).catch(()=>{});
+  },15000);
+  heartbeatTimer.unref?.();
+  handle.completion.then(async snapshot=>{
+    clearInterval(heartbeatTimer);
+    await runningUpdate;
+    const completed=snapshot.status===JobStatus.Completed && serviceResult?.ok!==false;
+    const cancelled=snapshot.status===JobStatus.Cancelled;
+    const update={
+      status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,
+      finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,
+      error:snapshot.error?.message||serviceResult?.error||''
+    };
+    if(serviceResult) update.result=mapResult(serviceResult);
+    return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
+  }).catch(()=>{ clearInterval(heartbeatTimer); });
+  return handle;
 }
 
 // CHANGELOG 0.9.19.17-ws-no-sql-audited:
@@ -1332,7 +1411,7 @@ async function readAutoInventoryStatus() {
   return {
     ok:true,
     enabled:Boolean(config.autoInventorySyncEnabled),
-    running:Boolean(inventorySyncRunning),
+    running:Boolean(inventorySyncRunning || inventorySyncJobManager.isRunning('inventory-sync')),
     intervalMs:Number(config.autoInventorySyncIntervalMs || 300000),
     serverNowUtc:now.toISOString(),
     serverNowTehran:time.formatTehranDateTime(now),
@@ -1344,7 +1423,7 @@ async function readAutoInventoryStatus() {
     serverNow:now,
     ...value,
     enabled:Boolean(config.autoInventorySyncEnabled),
-    running:Boolean(inventorySyncRunning),
+    running:Boolean(inventorySyncRunning || inventorySyncJobManager.isRunning('inventory-sync')),
     nextStockNumber: value.nextStockNumber || nextStockNumber
   };
 }
@@ -1358,8 +1437,11 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
   const startedAt = new Date();
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, lastStockNumber:st, lastStartedAt:startedAt, lastError:'', lastResult:null });
   let total = 0, page = 0, endedNaturally = false;
+  const jobControl=opts.jobControl;
   try {
     for (let rowStart = 0; page < safePages; page++, rowStart += 100) {
+      jobControl?.progress?.({phase:'Reading Shaygan pages',current:page,total:safePages,message:`Reading warehouse ${st}, page ${page+1}`});
+      jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
       const res = await shaygan.getInventoryPage(rowStart, 100, { stockNumber:st });
       if (!res.ok) {
         const result = { ok:false, stockNumber:st, total, pages:page, error:res.error, batchId, completed:false, mode:'inventory-stock-positive-snapshot' };
@@ -1368,9 +1450,12 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
         return result;
       }
       if (!res.list.length) { endedNaturally = true; break; }
+      jobControl?.checkCancellation?.();
       const rows = (res.list || []).map(x => ({ ...x, stockNumber:String(x.stockNumber || st), syncBatchId:batchId, syncStockNumber:st, syncSource:opts.source || 'stock-filter-positive-sync' }));
       await upsertInventoryRows(db, rows);
       total += rows.length;
+      jobControl?.progress?.({phase:'Persist inventory',current:page+1,total:safePages,message:`Persisted warehouse ${st}, page ${page+1}`});
+      jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
       if (res.list.length < 100) { endedNaturally = true; break; }
     }
     const completed = Boolean(endedNaturally && page < safePages);
@@ -1381,6 +1466,8 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     // 0.9.19.58: when a previously-positive row is absent from a completed warehouse sync,
     // exact live item GetRemain becomes authoritative. Missing active-warehouse rows are zeroed.
     if (completed) {
+      jobControl?.progress?.({phase:'Live repair queue',current:0,total:1,message:`Reconciling missing rows for warehouse ${st}`});
+      jobControl?.checkCancellation?.();
       liveMissingVerify = await verifyMissingStockRowsLive(db, st, batchId, 'completed-stock-sync-missing-row').catch(e => ({ checked:0, zeroedCount:0, failed:1, remainingQueued:0, results:[], error:String(e.message||e) }));
       removedStale = Number(liveMissingVerify.zeroedCount || 0);
       queuedForLiveVerify = Number(liveMissingVerify.remainingQueued || 0);
@@ -1394,6 +1481,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     const result = { ok:false, stockNumber:st, total, pages:page, error:err, batchId, completed:false, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-positive-snapshot-exception' };
     await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_exception', stockNumber:st, total, pages:page, error:err, batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
     await saveAutoInventoryStatus({ running:false, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:err });
+    if(e?.code==='JOB_CANCELLED') throw e;
     return result;
   }
 }
@@ -1471,10 +1559,7 @@ async function syncInventoryGlobal(pages = config.inventoryCatalogSyncPages, opt
 async function syncCatalog(pages = config.inventoryCatalogSyncPages) {
   // 0.9.19.48: Swagger/GetRemain with STNumber filter omits a few rows per warehouse in this installation.
   // Manual catalog sync therefore uses one global GetRemain scan and trusts StoreNumber from each row.
-  if (inventorySyncRunning) return { ok:false, error:'Sync موجودی در حال اجراست؛ چند دقیقه بعد دوباره تلاش کنید', mode:'global-getremain-no-stock-filter', running:true };
-  inventorySyncRunning = true;
-  try { return await syncInventoryReconciliation(pages || config.inventoryCatalogSyncPages, { source:'manual-catalog-sync-reconciliation', batchPrefix:'manual-recon-inv' }); }
-  finally { inventorySyncRunning = false; }
+  return executeInventorySyncJob({pages:pages||config.inventoryCatalogSyncPages,options:{source:'manual-catalog-sync-reconciliation',batchPrefix:'manual-recon-inv'}});
 
   // Legacy fallback retained below but intentionally unreachable unless this function is manually edited.
   let total = 0, page = 0;
@@ -1506,41 +1591,51 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   const db = await connectMongo();
   const startedAt = new Date();
   const active = await getActiveWarehouseNumbers(db).catch(()=>[]);
+  const jobControl=opts.jobControl;
+  jobControl?.progress?.({phase:'Reading warehouses',current:0,total:active.length||1,message:'Loaded active warehouses'});
+  jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
   const batchId = `${opts.batchPrefix || 'active-stock-inv'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, mode:'active-stock-sync-positive-only', lastStartedAt:startedAt, currentStockNumber:'ACTIVE', lastError:'', lastResult:null, activeWarehouseNumbers:active });
   const stockResults = [];
   let stockTotal = 0;
   let stockCompleted = 0;
   let protectedFromStale = 0;
-  for (const st of active || []) {
+  for (let warehouseIndex=0; warehouseIndex<(active||[]).length; warehouseIndex++) {
+    const st=active[warehouseIndex];
+    jobControl?.progress?.({phase:'Reading warehouses',current:warehouseIndex,total:active.length,message:`Starting warehouse ${st}`});
+    jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     await saveAutoInventoryStatus({ running:true, mode:'active-stock-sync-positive-only', currentStockNumber:String(st), lastStockNumber:String(st) });
-    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock` });
+    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock`, jobControl });
     stockTotal += Number(r.total || 0);
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
     stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, error:r.error||'' });
+    jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
+    jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
   }
   const result = { ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active, stockRows:stockTotal, stockCompleted, protectedFromStale, queuedForLiveVerify:protectedFromStale, durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-no-global-no-delete', atTehran:time.formatTehranDateTime(new Date()) };
+  jobControl?.progress?.({phase:'Finalize',current:0,total:1,message:'Finalizing inventory synchronization'});
+  jobControl?.checkCancellation?.();
   await db.collection('appLogs').insertOne({ type:'inventory_active_stock_sync', ...result, at:new Date(), source:opts.source || 'auto' }).catch(()=>{});
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:false, mode:result.mode, lastRunAt:new Date(), lastStockNumber:'ACTIVE', currentStockNumber:'', nextStockNumber:'ACTIVE', lastResult:result, lastError:'' });
   return result;
 }
 
-async function runAutoInventorySyncTick() {
+async function runAutoInventorySyncTick(options = {}) {
   const db = await connectMongo().catch(()=>null);
   if (!config.autoInventorySyncEnabled) {
     await saveAutoInventoryStatus({ enabled:false, running:false, lastSkippedAt:new Date(), lastSkipReason:'disabled' });
     return { ok:true, skipped:true, reason:'disabled' };
   }
-  if (inventorySyncRunning) {
+  if (inventorySyncJobManager.isRunning('inventory-sync')) {
     await saveAutoInventoryStatus({ enabled:true, running:true, lastSkippedAt:new Date(), lastSkipReason:'previous-sync-running' });
-    return { ok:true, skipped:true, reason:'previous sync still running' };
+    if(options.scheduled===true) return { ok:true, skipped:true, reason:'previous sync still running' };
+    return {ok:false,error:'Sync موجودی در حال اجراست؛ چند دقیقه بعد دوباره تلاش کنید',code:'JOB_LOCKED',running:true};
   }
-  inventorySyncRunning = true;
   try {
-    const result = await syncInventoryReconciliation(Number(config.autoInventorySyncPageLimit || config.inventoryCatalogSyncPages || 5000), { source:'auto-reconciliation-sync', batchPrefix:'auto-recon-inv' });
+    const result = await executeInventorySyncJob({pages:Number(config.autoInventorySyncPageLimit || config.inventoryCatalogSyncPages || 5000),options:{source:'auto-reconciliation-sync',batchPrefix:'auto-recon-inv'}});
     if (db) await db.collection('appLogs').insertOne({ type:'auto_inventory_reconciliation_sync', ...result, at:new Date() }).catch(()=>{});
     return result;
   } catch (e) {
@@ -1548,8 +1643,6 @@ async function runAutoInventorySyncTick() {
     if (db) await db.collection('appLogs').insertOne({ type:'auto_inventory_sync_global_error', error:err, at:new Date() }).catch(()=>{});
     await saveAutoInventoryStatus({ enabled:true, running:false, lastRunAt:new Date(), lastError:err, lastResult:{ ok:false, error:err, mode:'auto-reconciliation-error' } });
     return { ok:false, error:err };
-  } finally {
-    inventorySyncRunning = false;
   }
 }
 
@@ -1558,9 +1651,9 @@ function startAutoInventorySyncWorker() {
   if (!config.autoInventorySyncEnabled || autoInventoryTimer) return;
   const interval = Math.max(60000, Number(config.autoInventorySyncIntervalMs || 300000));
   // اجرای اولیه با تأخیر کوتاه؛ منتظر اولین ۵ دقیقه نمی‌مانیم.
-  setTimeout(() => runAutoInventorySyncTick().catch(e => console.error('auto inventory sync initial warning:', e.message)), 15000);
+  setTimeout(() => runAutoInventorySyncTick({scheduled:true}).catch(e => console.error('auto inventory sync initial warning:', e.message)), 15000);
   autoInventoryTimer = setInterval(() => {
-    runAutoInventorySyncTick().catch(e => console.error('auto inventory sync warning:', e.message));
+    runAutoInventorySyncTick({scheduled:true}).catch(e => console.error('auto inventory sync warning:', e.message));
   }, interval);
   console.log(`auto inventory sync enabled: reconciliation cycle every ${interval}ms, pageLimit=${config.autoInventorySyncPageLimit}`);
 }
@@ -1666,6 +1759,13 @@ async function getUserMapping(username) {
   const db = await connectMongo();
   if (!username) return null;
   return await db.collection('userShayganMappings').findOne({ username, isActive: { $ne:false } });
+}
+async function sellerCanAccessInvoice(user,inv){
+  if(!['seller','seller_buyer'].includes(String(user?.role||'')))return true;
+  const db=await connectMongo(),mapping=await getUserMapping(user.username),extra=await db.collection('userAccountAccesses').find({username:user.username}).toArray();
+  const allowed=[mapping?.cashboxAccountNumber,mapping?.employeeAccountNumber,...extra.map(x=>x.accountNumber)].filter(Boolean).map(String);
+  const invoiceAccounts=[inv?.AccountNumber,inv?.SAccountNumber,inv?.SellerAccountNumber,inv?.CashboxAccountNumber,inv?.CashBoxAccountNumber].filter(Boolean).map(String);
+  return String(inv?.FirstIssuerUsername||'')===String(user.username||'')||invoiceAccounts.some(x=>allowed.includes(x));
 }
 
 async function resolveInvoiceMapping(body, user = null) {
@@ -3397,7 +3497,7 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
       const body = await collectBody(req);
       const db = await connectMongo();
-      return sendJson(res, 200, await saleSnapshot.buildSaleSnapshot(db, {
+      const request={
         dateFrom: body.dateFrom || query.dateFrom || '14050101',
         dateTo: body.dateTo || query.dateTo || '',
         maxPages: Number(body.maxPages || query.maxPages || 300),
@@ -3405,7 +3505,14 @@ async function handleApi(req, res, pathname, query) {
         maxDetailInvoices: Number(body.maxDetailInvoices || query.maxDetailInvoices || 0),
         reset: body.reset === true || body.reset === 'true' || query.reset === 'true',
         mode: body.mode || query.mode || 'incremental'
-      }));
+      };
+      if(saleSnapshotJobManager.isRunning('sale-snapshot')){const running=saleSnapshotJobManager.getRunning('sale-snapshot');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Sale Snapshot job is already running',jobId:running?.id||''});}
+      const jobId=`JOB-SALE-SNAPSHOT-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const now=new Date();
+      await db.collection('appJobs').updateOne({jobId},{$set:{jobId,type:'sale-snapshot',status:'queued',phase:'pending',createdAt:now,updatedAt:now,request}},{upsert:true});
+      try{startSaleSnapshotBackgroundJob({db,jobId,request});}
+      catch(e){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',finishedAt:new Date(),updatedAt:new Date(),error:String(e.message||e)}}).catch(()=>{});if(e?.code==='JOB_LOCKED')return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:e.message,jobId});throw e;}
+      return sendJson(res,200,{ok:true,jobId,status:'queued',type:'sale-snapshot',note:'Sale Snapshot job started in background'});
     }
     if (pathname === '/api/sale-snapshot/snapshots' && req.method === 'GET') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
@@ -3523,36 +3630,18 @@ async function handleApi(req, res, pathname, query) {
       const body = await collectBody(req);
       const db = await connectMongo();
       const activeJob = await supplierSleepActiveJob(db);
-      if (supplierSleepJobRunning || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا/خواندن فاکتور خرید در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
+      if (supplierSleepJobManager.isRunning('supplier-sleep') || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا/خواندن فاکتور خرید در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
       const jobId = `JOB-SUPPLIER-SLEEP-READ-${Date.now()}-${Math.random().toString(16).slice(2,8)}`;
       const now = new Date();
       const safeRequest = { ...body, supplierGuid:body?.supplierGuid?'[set]':'', accountGuid:body?.accountGuid?'[set]':'' };
       await db.collection('appJobs').updateOne({ jobId }, { $set:{ jobId, type:'supplier-sleep-read-selected-invoices', status:'queued', createdAt:now, updatedAt:now, request:safeRequest } }, { upsert:true }).catch(()=>{});
-      supplierSleepJobRunning = true;
-      setImmediate(async () => {
-        let jobDb = null;
-        try {
-          jobDb = await connectMongo();
-          const startedAt = new Date();
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'running', startedAt, updatedAt:startedAt, heartbeatAt:startedAt, phase:'read-selected-purchase-invoices' } }).catch(()=>{});
-          const hbTimer = setInterval(() => { jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ heartbeatAt:new Date(), updatedAt:new Date() } }).catch(()=>{}); }, 15000);
-          let result;
-          try { result = await purchaseSleep.readPurchaseInvoicesForSupplier(jobDb, body || {}); } finally { clearInterval(hbTimer); }
+      startSupplierSleepBackgroundJob({ db, jobId, operation:'read-selected-invoices', request:body||{}, mapResult:result=>{
           const slimList = (result.list||[]).slice(0, 1000).map(x => ({
             invNo:x.invNo, invDate:x.invDate, supplierAccountNo:x.supplierAccountNo, supplierName:x.supplierName,
             totalAmount:x.totalAmount, rowCount:x.rowCount
           }));
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{
-            status:result.ok?'completed':'failed', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), phase:'done',
-            result:{ ok:!!result.ok, source:result.source||'', statementRows:result.statementRows||0, invoiceNoCandidates:result.invoiceNoCandidates||0, count:result.count||0, fallbackUsed:!!result.fallbackUsed, list:slimList, diagnostics:result.diagnostics||null, error:result.error||'' }
-          } }).catch(()=>{});
-        } catch (e) {
-          jobDb = jobDb || await connectMongo().catch(()=>null);
-          if (jobDb) await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'failed', phase:'failed', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), error:String(e.message||e) } }).catch(()=>{});
-        } finally {
-          supplierSleepJobRunning = false;
-        }
-      });
+          return { ok:!!result.ok, source:result.source||'', statementRows:result.statementRows||0, invoiceNoCandidates:result.invoiceNoCandidates||0, count:result.count||0, fallbackUsed:!!result.fallbackUsed, list:slimList, diagnostics:result.diagnostics||null, error:result.error||'' };
+      }});
       return sendJson(res, 200, { ok:true, jobId, status:'queued', type:'supplier-sleep-read-selected-invoices', note:'خواندن فاکتورهای خرید به Job پس‌زمینه‌ای منتقل شد. ترک صفحه نباید Job را متوقف کند.' });
     }
     if (pathname === '/api/supplier-sleep/build-selected-job' && req.method === 'POST') {
@@ -3560,27 +3649,13 @@ async function handleApi(req, res, pathname, query) {
       const body = await collectBody(req);
       const db = await connectMongo();
       const activeJob = await supplierSleepActiveJob(db);
-      if (supplierSleepJobRunning || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
+      if (supplierSleepJobManager.isRunning('supplier-sleep') || activeJob) return sendJson(res, 409, { ok:false, error:'یک Job خواب کالا در حال اجراست؛ برای جلوگیری از فشار روی شایگان همزمان اجرا نمی‌شود.', running:true, jobId:activeJob?.jobId||'' });
       const jobId = `JOB-SUPPLIER-SLEEP-${Date.now()}-${Math.random().toString(16).slice(2,8)}`;
       const now = new Date();
       await db.collection('appJobs').updateOne({ jobId }, { $set:{ jobId, type:'supplier-sleep-build-selected', status:'queued', phase:'build-selected-snapshot', createdAt:now, updatedAt:now, request:{ ...body, supplierGuid:body?.supplierGuid?'[set]':'', accountGuid:body?.accountGuid?'[set]':'' } } }, { upsert:true }).catch(()=>{});
-      supplierSleepJobRunning = true;
-      setImmediate(async () => {
-        const startedAt = new Date();
-        try {
-          const jobDb = await connectMongo();
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'running', phase:'build-selected-snapshot', startedAt, updatedAt:startedAt, heartbeatAt:startedAt } }).catch(()=>{});
-          const hbTimer = setInterval(() => { jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ heartbeatAt:new Date(), updatedAt:new Date() } }).catch(()=>{}); }, 15000);
-          let result;
-          try { result = await purchaseSleep.buildSelectedSupplierSnapshot(jobDb, body || {}); } finally { clearInterval(hbTimer); }
-          await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:result.ok?'completed':'failed', phase:'done', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), result:{ ok:!!result.ok, snapshotId:result.snapshot?.snapshotId||'', source:result.source||'', summaryCount:result.summary?.length||0, invoiceSummaryCount:result.invoiceSummary?.length||0, groupSummaryCount:result.groupSummary?.length||0, purchaseInvoicesSynced:result.snapshot?.purchaseInvoicesSynced||0, purchaseLayerCount:result.snapshot?.purchaseLayerCount||0, totalAllocatedValue:result.snapshot?.totalAllocatedValue||0, totalUnknownValue:result.snapshot?.totalUnknownValue||0, reconciliation:result.reconciliation||null, error:result.error||'' } } }).catch(()=>{});
-        } catch (e) {
-          const jobDb = await connectMongo().catch(()=>null);
-          if (jobDb) await jobDb.collection('appJobs').updateOne({ jobId }, { $set:{ status:'failed', finishedAt:new Date(), updatedAt:new Date(), heartbeatAt:new Date(), error:String(e.message||e) } }).catch(()=>{});
-        } finally {
-          supplierSleepJobRunning = false;
-        }
-      });
+      startSupplierSleepBackgroundJob({ db, jobId, operation:'build-selected-snapshot', request:body||{}, mapResult:result=>{
+        return { ok:!!result.ok, snapshotId:result.snapshot?.snapshotId||'', source:result.source||'', summaryCount:result.summary?.length||0, invoiceSummaryCount:result.invoiceSummary?.length||0, groupSummaryCount:result.groupSummary?.length||0, purchaseInvoicesSynced:result.snapshot?.purchaseInvoicesSynced||0, purchaseLayerCount:result.snapshot?.purchaseLayerCount||0, totalAllocatedValue:result.snapshot?.totalAllocatedValue||0, totalUnknownValue:result.snapshot?.totalUnknownValue||0, reconciliation:result.reconciliation||null, error:result.error||'' };
+      }});
       return sendJson(res, 200, { ok:true, jobId, status:'queued', type:'supplier-sleep-build-selected', note:'Job خواب کالا در پس‌زمینه شروع شد. وضعیت را از /api/jobs/status?jobId=... بگیرید.' });
     }
     if (pathname === '/api/supplier-sleep/build-selected' && req.method === 'POST') {
@@ -3908,6 +3983,9 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req, res, ['admin','accounting','warehouse','purchase'])) return;
       return sendJson(res, 200, await readAutoInventoryStatus());
     }
+    if(pathname==='/api/admin/backups/status'&&req.method==='GET'){if(!requireRole(req,res,['admin']))return;const running=mongoBackupJobManager.getRunning('mongo-backup');return sendJson(res,200,{ok:true,...mongoBackup.status(),running:running?{id:running.id,status:running.status,progress:running.progress,heartbeatAt:running.heartbeatAt}:null,lastResult:mongoBackupLastResult});}
+    if(pathname==='/api/admin/backups/destinations'&&req.method==='GET'){if(!requireRole(req,res,['admin']))return;return sendJson(res,200,{ok:true,database:mongoBackup.databaseName(),list:mongoBackup.status().destinations});}
+    if(pathname==='/api/admin/backups/start'&&req.method==='POST'){if(!requireRole(req,res,['admin']))return;const body=await collectBody(req);if(!mongoBackup.status().configured)return sendJson(res,409,{ok:false,error:'MONGO_BACKUP_ALLOWED_ROOTS تنظیم نشده است'});try{mongoBackup.resolveDestination(body.destinationId,body.subfolder);const handle=startMongoBackupJob({destinationId:String(body.destinationId),subfolder:String(body.subfolder||''),jobId:`BACKUP-${Date.now()}`});return sendJson(res,202,{ok:true,jobId:handle.id,status:'queued'});}catch(e){return sendJson(res,e?.code==='JOB_LOCKED'?409:400,{ok:false,code:e?.code||'BACKUP_INVALID',error:String(e.message||e)});}}
     if (pathname === '/api/inventory/auto-sync/run' && req.method === 'POST') {
       if (!requireRole(req, res, ['admin'])) return;
       return sendJson(res, 200, await runAutoInventorySyncTick());
@@ -4015,8 +4093,40 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok:true, leadId:newLeadId, log });
     }
 
+    const invoiceResolveMatch=pathname.match(/^\/api\/invoices\/(\d+)\/resolve$/);
+    if(invoiceResolveMatch&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer']))return;
+      const invNo=Number(invoiceResolveMatch[1]);if(!Number.isSafeInteger(invNo)||invNo<=0)return sendJson(res,400,{ok:false,error:'شماره سند معتبر نیست'});
+      try{
+        const user=currentUser(req)||{},all=await invoiceResolver.resolve(invNo),candidates=[];
+        for(const candidate of all)if(await sellerCanAccessInvoice(user,candidate.invoice))candidates.push({invNo:candidate.invNo,invType:candidate.invType,invDate:candidate.invDate,accountName:candidate.accountName,label:invoiceTypes.getInvoiceTypeLabel(candidate.invType)});
+        if(all.length&&!candidates.length)return deny(res,'برای مشاهده این سند دسترسی ندارید');
+        return sendJson(res,200,{ok:true,invNo,candidates});
+      }catch(e){if(String(e.message||e)==='INVOICE_RESOLUTION_SERVICE_FAILED')return sendJson(res,502,{ok:false,code:'INVOICE_RESOLUTION_FAILED',error:'شناسایی نوع سند با خطا مواجه شد. دوباره تلاش کنید.'});throw e;}
+    }
     const invoiceMatch = pathname.match(/^\/api\/invoices\/(\d+)$/) || pathname.match(/^\/api\/shaygan\/invoice\/(\d+)$/);
-    if (invoiceMatch) { const r = await shaygan.getInvoice(invoiceMatch[1], query.invType || 2); return sendJson(res, 200, { ok: r.ok, list: r.list || [], error: r.error || '' }); }
+    if (invoiceMatch) {
+      if(req.method!=='GET')return sendJson(res,405,{ok:false,error:'Method not allowed'});
+      if (!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer'])) return;
+      const invType=invoiceTypes.normalizeInvTyp(query.invType);if(!invoiceTypes.isSupportedInvoiceType(invType))return sendJson(res,400,{ok:false,error:'نوع سند معتبر الزامی است',code:'INVOICE_TYPE_REQUIRED'});
+      if(query.source==='turnover'&&!invoiceTypes.turnoverTypes.includes(invType))return sendJson(res,400,{ok:false,error:'این نوع سند از گردش حساب قابل مشاهده نیست',code:'TURNOVER_INVOICE_TYPE_UNSUPPORTED'});
+      const r = await shaygan.getInvoice(invoiceMatch[1],invType);const list=(r.list||[]).filter(x=>Number(x.InvTyp||x.InvoiceType||0)===invType&&Number(x.InvNo||x.InvoiceNumber||0)===Number(invoiceMatch[1]));
+      const user=currentUser(req)||{};const permitted=[];for(const inv of list)if(await sellerCanAccessInvoice(user,inv))permitted.push(inv);if(list.length&&!permitted.length)return deny(res,'برای مشاهده این سند دسترسی ندارید');
+      return sendJson(res, 200, { ok:r.ok,invType,list:permitted,error:r.error||'' });
+    }
+    const invoiceKardexMatch=pathname.match(/^\/api\/invoices\/(\d+)\/items\/([^/]+)\/kardex$/);
+    if(invoiceKardexMatch){
+      if(!requireRole(req,res,['admin','accounting','warehouse','purchase','seller','seller_buyer']))return;
+      const invNo=Number(invoiceKardexMatch[1]),code=decodeURIComponent(invoiceKardexMatch[2]),invType=Number(query.invType||0);
+      if(![2,6].includes(invType))return sendJson(res,400,{ok:false,error:'کاردکس از این نما فقط برای فاکتور فروش یا برگشت از فروش مجاز است'});
+      const invoiceResult=await shaygan.getInvoice(invNo,invType);const inv=(invoiceResult.list||[]).find(x=>Number(x.InvTyp||0)===invType&&Number(x.InvNo||0)===invNo);
+      if(!inv)return sendJson(res,404,{ok:false,error:'سند فروش پیدا نشد'});
+      const user=currentUser(req)||{};
+      if(!await sellerCanAccessInvoice(user,inv))return deny(res,'برای کاردکس اقلام این فاکتور دسترسی ندارید');
+      const body=Array.isArray(inv.Body)?inv.Body:(Array.isArray(inv.InvoiceBody)?inv.InvoiceBody:[]);const line=body.find(x=>String(x.ItemNumber||x.ItemCode||'')===code);if(!line)return sendJson(res,403,{ok:false,error:'کالا در فاکتور مجاز وجود ندارد'});
+      const role=String(user.role||'seller'),requested=Number(query.maxRows||0),hard=role==='admin'?config.kardexAdminFullMaxRows:config.kardexSellerMaxRows,maxRows=requested?Math.min(requested,hard):(role==='admin'?config.kardexAdminQuickMaxRows:config.kardexSellerMaxRows);
+      const r=await shaygan.getKardexByItemCode(code,'',{maxRows,hardMaxRows:hard});return sendJson(res,200,{ok:r.ok,item:r.item,rows:r.rows||[],meta:r.meta||{},invoice:{invNo,invType},error:r.error||''});
+    }
     if (pathname === '/api/invoices/last-sale') return sendJson(res, 200, await shaygan.getLastSaleInvoiceNumber());
     if (pathname === '/api/invoice-numbers/reserve' && req.method === 'POST') return sendJson(res, 200, await reserveInvoiceNumber(await collectBody(req)));
     if (pathname === '/api/invoice-numbers/reservations') { const db = await connectMongo(); return sendJson(res, 200, { ok: true, list: await db.collection('invoiceReservations').find({}).sort({ reservedAt: -1 }).limit(50).toArray() }); }

@@ -1,16 +1,30 @@
 {
   "name": "mkcrm",
-  "version": "0.9.19.59",
+  "version": "0.9.19.61",
   "private": true,
-  "description": "MKCRM 0.9.19.56 Board v49 live reconcile fix",
+  "description": "MKCRM 0.9.19.61 classified turnover invoice reading",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
+    "build": "tsc -p tsconfig.jobs.json",
+    "typecheck": "tsc -p tsconfig.jobs.json --noEmit",
+    "lint": "eslint src/core/jobs/**/*.ts src/jobs/**/*.ts",
+    "test:jobs": "tsc -p tsconfig.jobs.json && node scripts/job-engine-test.js && node scripts/supplier-sleep-job-test.js && node scripts/sale-snapshot-job-test.js && node scripts/inventory-sync-job-test.js && node scripts/job-operational-validation-test.js",
+    "test:jobs:inventory-sync": "tsc -p tsconfig.jobs.json && node scripts/inventory-sync-job-test.js",
+    "test:admin-workflows": "tsc -p tsconfig.jobs.json && node scripts/admin-turnover-workflow-test.js",
+    "test:jobs:sale-snapshot": "tsc -p tsconfig.jobs.json && node scripts/sale-snapshot-job-test.js",
+    "test:jobs:operational": "tsc -p tsconfig.jobs.json && node scripts/job-operational-validation-test.js",
     "smoke": "node scripts/smoke-test.js",
     "test:all": "node scripts/test-all.js"
   },
   "dependencies": {
     "mongodb": "^6.12.0"
+  },
+  "devDependencies": {
+    "@typescript-eslint/eslint-plugin": "^8.0.0",
+    "@typescript-eslint/parser": "^8.0.0",
+    "eslint": "^9.0.0",
+    "typescript": "^5.0.0"
   },
   "engines": {
     "node": ">=24"
