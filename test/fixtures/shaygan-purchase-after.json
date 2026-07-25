@@ -1,0 +1,58 @@
+{
+  "ok": true,
+  "operation": "exact",
+  "invoice": {
+    "identity": {
+      "invoiceGuid": "fixture-guid",
+      "invoiceType": 3,
+      "invoiceNo": 100
+    },
+    "header": {
+      "InvDate": "14050101",
+      "AccountNumber": "SUP-FIXTURE",
+      "AccountName": "Fixture Supplier",
+      "CurrencyAbb1": "IRR",
+      "Rate": 1,
+      "SAccountNumber": null,
+      "DiscountPercent": 0,
+      "DiscAmount": 0,
+      "RelatedInvHeaderId": null,
+      "InvHeaderIdRoot": null,
+      "ControlCheck": null,
+      "Printed": false,
+      "FirstIssuerUsername": "fixture",
+      "LastIssuerUsername": "fixture-2",
+      "RowVersionAsNumber": 2,
+      "UpdateKind": 1,
+      "GuId": "fixture-guid"
+    },
+    "lines": [
+      {
+        "LineItemId": 1,
+        "ItemNumber": "ITEM-FIXTURE",
+        "STNumber": "1",
+        "Quan": 2,
+        "Quan2": 0,
+        "Price": 100,
+        "Price2": 0,
+        "Amount": 200,
+        "LineDiscAmount": 0,
+        "LineDiscPer": 0,
+        "ReturnRial": 0,
+        "UpdateKind": 1
+      }
+    ],
+    "expense": []
+  },
+  "versionSignals": {
+    "CurrentVersion": "2",
+    "RowVersionAsNumber": 2,
+    "UpdateKind": 1,
+    "CreatedDate": "14050101",
+    "LastIssuerUsername": "fixture-2"
+  },
+  "hashes": {
+    "identityHash": "fixture-identity",
+    "accountingHash": "fixture-accounting-after"
+  }
+}

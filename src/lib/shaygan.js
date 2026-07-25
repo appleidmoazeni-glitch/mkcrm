@@ -355,20 +355,20 @@ async function getProductListPage(rowStart = 0, rowCount = 100, itemCodeFrom = '
   return { ...res, list: res.result.map(mapItem) };
 }
 
-async function getInvoice(invNo, invType = 2) {
+async function getInvoice(invNo, invType = 2, opts = {}) {
   const domain = { Sort: range(), InvoiceNumber: range(invNo, invNo), InvoiceType: range(invType, invType), InvoiceDate: range(), ControlCheck: range(), Printed: range() };
-  const res = await post('/api/Invoice/Get', domain, 0, 20, { maxRowCount: 20 });
+  const res = await post('/api/Invoice/Get', domain, 0, 20, { maxRowCount: 20, timeoutMs: opts.timeoutMs });
   return { ...res, list: res.result };
 }
 
-async function getInvoiceByGuid(guid = '', invType = 2) {
+async function getInvoiceByGuid(guid = '', invType = 2, opts = {}) {
   const g = String(guid || '').trim();
   if (!g) return { ok:false, list:[], result:[], error:'invoice guid empty' };
   const domain = {
     Sort: range(), InvoiceNumber: range(), InvoiceType: range(invType, invType), InvoiceDate: range(), ControlCheck: range(), Printed: range(),
     GuId: range(g, g), Guid: range(g, g), InvGuId: range(g, g), InvHeaderGuId: range(g, g), InvHeaderGuid: range(g, g)
   };
-  const res = await post('/api/Invoice/Get', domain, 0, 20, { maxRowCount: 20, timeoutMs: Math.min(config.shayganTimeoutMs || 15000, 7000) });
+  const res = await post('/api/Invoice/Get', domain, 0, 20, { maxRowCount: 20, timeoutMs: opts.timeoutMs || Math.min(config.shayganTimeoutMs || 15000, 7000) });
   const list = (res.result || []).filter(x => String(x.GuId || x.Guid || x.InvGuId || x.InvHeaderGuId || '').trim().toLowerCase() === g.toLowerCase());
   return { ...res, list };
 }
@@ -405,10 +405,10 @@ function normalizeInvoiceDate(v=''){
   return s;
 }
 
-async function getInvoicePageByDate(rowStart = 0, invType = 2, dateFrom = '', dateTo = '', rowCount = 20) {
+async function getInvoicePageByDate(rowStart = 0, invType = 2, dateFrom = '', dateTo = '', rowCount = 20, opts = {}) {
   const df = normalizeInvoiceDate(dateFrom); const dt = normalizeInvoiceDate(dateTo);
   const domain = { Sort: range(), InvoiceNumber: range(), InvoiceType: range(invType, invType), InvoiceDate: (df || dt) ? range(df || '', dt || '') : range(), ControlCheck: range(), Printed: range() };
-  return post('/api/Invoice/Get', domain, rowStart, rowCount, { maxRowCount: Math.min(Number(rowCount || 20), 20), timeoutMs: Math.min(config.shayganTimeoutMs || 15000, 10000) });
+  return post('/api/Invoice/Get', domain, rowStart, rowCount, { maxRowCount: Math.min(Number(rowCount || 20), 20), timeoutMs: opts.timeoutMs || Math.min(config.shayganTimeoutMs || 15000, 10000) });
 }
 
 async function getInvoicePageByTypeRange(rowStart = 0, invTypeFrom = 6, invTypeTo = 7, dateFrom = '', dateTo = '', rowCount = 20) {
