@@ -13,6 +13,7 @@ const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
+const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -1786,123 +1787,12 @@ async function resolveInvoiceMapping(body, user = null) {
 }
 
 
-// 0.9.19.24: Fast sale issue helpers. Shaygan Invoice/Put with InvNo=0 returns GuId and often Number=0;
-// never trust Result[0].Number when it is 0. Resolve the real InvNo before enabling print.
-function extractIssuedInvoiceMeta(issueResponse = {}) {
-  const candidates = [];
-  if (Array.isArray(issueResponse.result)) candidates.push(...issueResponse.result);
-  if (Array.isArray(issueResponse.Result)) candidates.push(...issueResponse.Result);
-  if (Array.isArray(issueResponse.raw?.Result)) candidates.push(...issueResponse.raw.Result);
-  if (Array.isArray(issueResponse.raw?.result)) candidates.push(...issueResponse.raw.result);
-  if (issueResponse.raw && typeof issueResponse.raw === 'object') candidates.push(issueResponse.raw);
-  if (issueResponse && typeof issueResponse === 'object') candidates.push(issueResponse);
-  let picked = null;
-  for (const x of candidates) {
-    if (!x || typeof x !== 'object') continue;
-    const invoiceNumber = Number(x.Number || x.InvNo || x.InvoiceNumber || x.invoiceNumber || x.No || 0);
-    const invoiceGuid = String(x.GuId || x.Guid || x.GUID || x.InvoiceGuId || x.invoiceGuid || '').trim();
-    if (invoiceNumber > 0) { picked = { result:x, invoiceNumber, invoiceGuid }; break; }
-  }
-  if (!picked) picked = { result:candidates.find(x => x && typeof x === 'object') || {}, invoiceNumber:0, invoiceGuid:'' };
-  const result = { ...(picked.result || {}) };
-  if (picked.invoiceNumber > 0) result.Number = picked.invoiceNumber;
-  if (picked.invoiceGuid && !result.GuId) result.GuId = picked.invoiceGuid;
-  return { invoiceNumber:picked.invoiceNumber, invoiceGuid:picked.invoiceGuid || String(result.GuId || ''), result };
-}
 function invoicePrintUrl(invoiceNumber) {
   const n = Number(invoiceNumber || 0);
   return n > 0 ? `/print/invoice/${encodeURIComponent(String(n))}` : '';
 }
-function normInvDate8(v='') {
-  const x = String(v || '').trim();
-  if (/^\d{4}-\d{2}-\d{2}/.test(x)) return x.slice(0,10).replace(/-/g,'');
-  const d = x.replace(/[^0-9]/g,'').slice(0,8);
-  return d.length === 8 ? d : '';
-}
-function invoiceBodyAmount(inv = {}) {
-  return (Array.isArray(inv.Body) ? inv.Body : []).reduce((s,x)=>s + Number(x.Amount || (Number(x.Quan||0) * Number(x.Price||0)) || 0), 0);
-}
-function saleRequestAmount(body = {}) {
-  const rows = Array.isArray(body.items) ? body.items : [];
-  const gross = rows.reduce((s,x)=>s + Number(x.quantity || x.Quan || 0) * Number(x.price || x.Price || 0) - Number(x.discountAmount || x.LineDiscAmount || 0), 0);
-  return gross - Number(body.discountAmount || body.DiscAmount || 0) + saleInvoiceExtrasTotal(body.invoiceExtras || []);
-}
-function saleRequestLines(body = {}) {
-  return (Array.isArray(body.items) ? body.items : []).map(x => ({
-    itemCode:String(x.itemCode || x.ItemNumber || x.itemNumber || '').trim(),
-    stockNumber:String(x.stockNumber || x.STNumber || x.stNumber || '').trim(),
-    quantity:Number(x.quantity || x.Quan || 0),
-    price:Number(x.price || x.Price || 0),
-    amount:Number(x.amount || x.Amount || 0) || (Number(x.quantity || x.Quan || 0) * Number(x.price || x.Price || 0) - Number(x.discountAmount || x.LineDiscAmount || 0))
-  })).filter(x => x.itemCode && x.stockNumber && x.quantity > 0);
-}
-function scoreIssuedInvoiceCandidate(inv = {}, body = {}, mapping = {}, putGuid = '', crmId = '') {
-  let score = 0;
-  const reasons = [];
-  const invNo = Number(inv.InvNo || inv.Number || inv.InvoiceNumber || 0);
-  if (invNo > 0) { score += 5; reasons.push('has-number'); }
-  const invGuid = String(inv.GuId || inv.Guid || inv.InvGuId || inv.InvHeaderGuId || '').trim().toLowerCase();
-  const pg = String(putGuid || '').trim().toLowerCase();
-  if (pg && invGuid && pg === invGuid) { score += 10000; reasons.push('guid'); }
-  const acc = String(inv.AccountNumber || '').trim();
-  const sacc = String(inv.SAccountNumber || '').trim();
-  if (mapping.cashboxAccountNumber && acc === String(mapping.cashboxAccountNumber)) { score += 900; reasons.push('account'); }
-  if (mapping.employeeAccountNumber && sacc === String(mapping.employeeAccountNumber)) { score += 600; reasons.push('saccount'); }
-  const reqDate = normInvDate8(body.invDate || shaygan.formatDate8(new Date()));
-  const gotDate = normInvDate8(inv.InvDate || inv.InvoiceDate || '');
-  if (reqDate && gotDate && reqDate === gotDate) { score += 400; reasons.push('date'); }
-  const reqAmount = saleRequestAmount(body);
-  const invAmount = Number(inv.SourceTotalAmount || inv.TotalAmount || 0) || invoiceBodyAmount(inv);
-  if (reqAmount > 0 && invAmount > 0 && Math.abs(reqAmount - invAmount) <= 1) { score += 1200; reasons.push('amount'); }
-  const desc = String(inv.InvDescription || inv.Description || '');
-  if (crmId && desc.includes(String(crmId))) { score += 2500; reasons.push('crmId'); }
-  const reqLines = saleRequestLines(body);
-  const gotLines = Array.isArray(inv.Body) ? inv.Body : [];
-  let lineHits = 0;
-  for (const r of reqLines) {
-    if (gotLines.some(g => String(g.ItemNumber||'').trim() === r.itemCode && String(g.STNumber||'').trim() === r.stockNumber && Math.abs(Number(g.Quan||0)-r.quantity) < 0.0001 && (!r.price || Math.abs(Number(g.Price||0)-r.price) <= 1))) lineHits++;
-  }
-  if (reqLines.length && lineHits === reqLines.length) { score += 1500; reasons.push('lines-all'); }
-  else if (lineHits > 0) { score += lineHits * 250; reasons.push(`lines-${lineHits}`); }
-  if (String(inv.FirstIssuerUsername||'') && String(mapping.fullName||'') && String(inv.FirstIssuerUsername).includes(String(mapping.fullName))) { score += 150; reasons.push('issuer'); }
-  return { score, reasons, invNo, invGuid, reqAmount, invAmount };
-}
 async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, mapping = {}, invoiceType = 2, crmId = '' } = {}) {
-  const issuedMeta = extractIssuedInvoiceMeta(issueResponse);
-  const putGuid = issuedMeta.invoiceGuid || String(issueResponse?.raw?.Result?.[0]?.GuId || issueResponse?.result?.[0]?.GuId || '').trim();
-  const out = { ok:false, invoiceNumber:issuedMeta.invoiceNumber || 0, invoiceGuid:putGuid || issuedMeta.invoiceGuid || '', result:issuedMeta.result || {}, method:'put-response', attempts:[] };
-  if (out.invoiceNumber > 0) { out.ok = true; return out; }
-  if (putGuid && typeof shaygan.getInvoiceByGuid === 'function') {
-    const gr = await shaygan.getInvoiceByGuid(putGuid, invoiceType).catch(e => ({ ok:false, list:[], error:String(e.message||e) }));
-    out.attempts.push({ method:'guid', ok:gr.ok, count:(gr.list||[]).length, error:gr.error||'' });
-    const doc = (gr.list || []).find(x => Number(x.InvNo || x.Number || 0) > 0);
-    if (doc) return { ok:true, invoiceNumber:Number(doc.InvNo || doc.Number), invoiceGuid:String(doc.GuId || putGuid || ''), result:{ ...doc, Number:Number(doc.InvNo || doc.Number), GuId:String(doc.GuId || putGuid || '') }, method:'guid', attempts:out.attempts };
-  }
-  const date = normInvDate8(body.invDate || shaygan.formatDate8(new Date())) || shaygan.formatDate8(new Date());
-  const maxPages = Math.max(1, Math.min(Number(process.env.INVOICE_RESOLVE_MAX_PAGES || 40), 100));
-  const candidates = [];
-  for (let page = 0, rowStart = 0; page < maxPages; page++, rowStart += 20) {
-    const r = await shaygan.getInvoicePageByDate(rowStart, invoiceType, date, date, 20);
-    out.attempts.push({ method:'date-page', page, rowStart, ok:r.ok, count:(r.result||[]).length, error:r.error||'' });
-    if (!r.ok) break;
-    const list = r.result || [];
-    if (!list.length) break;
-    for (const inv of list) {
-      const sc = scoreIssuedInvoiceCandidate(inv, body, mapping, putGuid, crmId);
-      if (sc.invNo > 0 && sc.score >= 1700) candidates.push({ inv, sc });
-    }
-    if (list.length < 20) break;
-  }
-  candidates.sort((a,b) => b.sc.score - a.sc.score || Number(b.inv.InvNo||0) - Number(a.inv.InvNo||0));
-  const best = candidates[0];
-  if (best) {
-    const n = Number(best.inv.InvNo || best.inv.Number || 0);
-    const g = String(best.inv.GuId || putGuid || '');
-    return { ok:true, invoiceNumber:n, invoiceGuid:g, result:{ ...best.inv, Number:n, GuId:g }, method:'date-search', matchScore:best.sc.score, matchReasons:best.sc.reasons, attempts:out.attempts };
-  }
-  out.method = 'unresolved';
-  out.error = 'فاکتور صادر شد اما شماره واقعی با GUID/جستجوی امروز پیدا نشد';
-  return out;
+  return resolvePostPutInvoice({issueResponse,body,mapping,invoiceType,crmId,shaygan,formatDate8:shaygan.formatDate8,maxPages:Number(process.env.INVOICE_RESOLVE_MAX_PAGES||40),issuedAt:Date.now()});
 }
 
 async function applyLocalSaleInventoryDeductAfterSuccess({ db, body, invoiceNumber, invoiceGuid, saleIssueKey }) {
@@ -4675,7 +4565,7 @@ async function handleApi(req, res, pathname, query) {
           return sendJson(res, 200, { ok:true, result, invoiceNumber:finalInvoiceNumber, invoiceGuid:finalInvoiceGuid, printUrl:invoicePrintUrl(finalInvoiceNumber), mapping:mappingView, raw:r.raw, error:'', warning: r.warning||'', saleIssueKey, postProcessing:'queued', timing });
         }
         await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:r.error||'خطای ثبت فاکتور فروش', shayganRaw:r.raw, leadManual } });
-        return sendJson(res, 400, { ok:false, result, invoiceNumber:finalInvoiceNumber || 0, invoiceGuid:finalInvoiceGuid || issuedMeta.invoiceGuid || '', mapping: { username:mapping.username, fullName:mapping.fullName, storeName:mapping.storeName||'', cashboxAccountNumber:mapping.cashboxAccountNumber, employeeAccountNumber:mapping.employeeAccountNumber }, raw: r.raw, resolve:resolvedIssued || null, timing, error: (r.ok && !finalInvoiceNumber) ? 'فاکتور در شایگان ثبت شد اما شماره واقعی با GUID/جستجوی امروز resolve نشد؛ برای جلوگیری از چاپ اشتباه متوقف شد. invoiceAuditLogs را بررسی کنید.' : (r.error || 'خطای ثبت فاکتور فروش'), saleIssueKey });
+        return sendJson(res, 400, { ok:false, code:resolvedIssued?.code||'', result, invoiceNumber:finalInvoiceNumber || 0, invoiceGuid:finalInvoiceGuid || issuedMeta.invoiceGuid || '', mapping: { username:mapping.username, fullName:mapping.fullName, storeName:mapping.storeName||'', cashboxAccountNumber:mapping.cashboxAccountNumber, employeeAccountNumber:mapping.employeeAccountNumber }, raw: r.raw, resolve:resolvedIssued || null, timing, error: (r.ok && !finalInvoiceNumber) ? 'POST_PUT_RESOLVE_FAILED' : (r.error || 'خطای ثبت فاکتور فروش'), saleIssueKey });
       } catch (e) {
         await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:String(e.message||e), leadManual } }).catch(()=>{});
         throw e;
