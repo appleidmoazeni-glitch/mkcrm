@@ -6,7 +6,6 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const d = require('../scripts/diagnose-shaygan-purchase-invoices');
-const shaygan = require('../src/lib/shaygan');
 
 let tests=0;
 async function test(name,fn){await fn();tests++;process.stderr.write(`ok ${tests} - ${name}\n`);}
@@ -38,9 +37,12 @@ function apiExact(sequence){
     rejects(()=>d.parseArgs(['page','--type','3','--start-date','14050103','--end-date','14050102','--row-start','0','--row-count','20']), 'INVALID_DATE_RANGE');
   });
   await test('rejects unknown option',()=>rejects(()=>d.parseArgs(['exact','--type','3','--invoice-no','1','--wat','x']), 'UNKNOWN_OPTION'));
-  await test('normal exact response',async()=>{
+  await test('exact retrieves by type and number and extracts stable identities',async()=>{
     const r=await d.exactOperation({type:3,invoiceNo:1234,hydrate:false,timeoutMs:1000,provisionalThreshold:1},apiExact([inv()]));
     assert.equal(r.ok,true);assert.equal(r.invoice.lines.length,1);assert.equal(r.transport.requestCount,1);
+    assert.equal(r.invoice.identity.invoiceGuid,'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee');
+    assert.deepEqual(r.invoice.lines.map(x=>x.LineItemId),[11]);
+    assert.deepEqual(r.contract.identity,{retrievalKey:['InvoiceType','InvoiceNumber'],stableIdentity:['GuId','LineItemId']});
   });
   await test('header-only without hydrate',async()=>{
     const r=await d.exactOperation({type:3,invoiceNo:1234,hydrate:false,timeoutMs:1000,provisionalThreshold:1},apiExact([inv({Body:[]})]));
@@ -54,23 +56,7 @@ function apiExact(sequence){
     const r=await d.exactOperation({type:3,invoiceNo:1234,hydrate:true,timeoutMs:1000,provisionalThreshold:1},apiExact([inv({Body:[]})]));
     assert(r.warnings.some(x=>x.code==='HYDRATION_FAILED'));assert.equal(r.transport.requestCount,2);
   });
-  await test('GUID mismatch is contract error',async()=>{
-    await assert.rejects(()=>d.exactGuidOperation({type:3,guid:'ffffffff-ffff-ffff-ffff-ffffffffffff',timeoutMs:1000,provisionalThreshold:1},{getInvoiceByGuid:async()=>({ok:true,status:200,list:[inv()]})}),e=>e.code==='GUID_MISMATCH'&&e.exitCode===3);
-  });
-  await test('exact-guid Domain sends only GuId GUID field',async()=>{
-    const originalFetch=global.fetch;let requestBody;
-    global.fetch=async(_url,opts)=>{requestBody=JSON.parse(opts.body);return {ok:true,status:200,json:async()=>({Result:[]})};};
-    try{await shaygan.getInvoiceByGuid('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',3,{timeoutMs:1000});}
-    finally{global.fetch=originalFetch;}
-    assert.deepEqual(requestBody.Domain.GuId,{From:'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',To:'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',In:[]});
-    for(const key of ['Guid','InvGuId','InvHeaderGuId','InvHeaderGuid'])assert.equal(Object.hasOwn(requestBody.Domain,key),false);
-  });
-  await test('exact-guid transport error exposes sanitised status and actual error',async()=>{
-    await assert.rejects(
-      ()=>d.exactGuidOperation({type:3,guid:'ffffffff-ffff-ffff-ffff-ffffffffffff',timeoutMs:1000,provisionalThreshold:1},{getInvoiceByGuid:async()=>({ok:false,status:502,error:'upstream unavailable ConnectionName=RealName TokenString=real-token'})}),
-      e=>e.code==='TRANSPORT_ERROR'&&e.details.status===502&&e.details.error.includes('upstream unavailable')&&e.details.error.includes('ConnectionName=[REDACTED]')&&!e.details.error.includes('RealName')&&!e.details.error.includes('real-token')
-    );
-  });
+  await test('exact-guid operation is unsupported',()=>rejects(()=>d.parseArgs(['exact-guid','--type','3','--guid','aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee']),'INVALID_OPERATION'));
   await test('invoice number mismatch is contract error',async()=>{
     await assert.rejects(()=>d.exactOperation({type:3,invoiceNo:999,hydrate:false,timeoutMs:1000,provisionalThreshold:1},apiExact([inv()])),e=>e.code==='INVOICE_NUMBER_MISMATCH');
   });

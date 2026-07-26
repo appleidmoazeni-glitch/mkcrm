@@ -14,9 +14,12 @@ const COMPARE_HEADER_FIELDS = ['InvDate','AccountNumber','AccountName','Currency
 const COMPARE_LINE_FIELDS = ['ItemNumber','STNumber','Quan','Quan2','Price','Price2','Amount','LineDiscAmount','LineDiscPer','ReturnRial','UpdateKind'];
 const SENSITIVE = /^(tokenstring|token|authorization|password|pass|secret|connectionstring|connectionname|credential|apikey|cookie|set-cookie)$/i;
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const INVOICE_IDENTITY_CONTRACT = {
+  retrievalKey: ['InvoiceType','InvoiceNumber'],
+  stableIdentity: ['GuId','LineItemId']
+};
 const OPTIONS = {
   exact: new Set(['type','invoice-no','hydrate','timeout-ms','provisional-threshold']),
-  'exact-guid': new Set(['type','guid','timeout-ms','provisional-threshold']),
   page: new Set(['type','start-date','end-date','row-start','row-count','timeout-ms','provisional-threshold']),
   paging: new Set(['type','start-date','end-date','row-count','max-pages','max-invoices','hydrate','timeout-ms','provisional-threshold']),
   repeat: new Set(['type','invoice-no','reads','interval-ms','timeout-ms','provisional-threshold']),
@@ -191,11 +194,6 @@ function validateArgs(op,a) {
   if(![3,7].includes(out.type))throw new DiagnosticError('INVALID_INVOICE_TYPE','--type must be 3 or 7');
   if(op==='exact'||op==='repeat')out.invoiceNo=intArg(a,'invoice-no',1,Number.MAX_SAFE_INTEGER);
   if(op==='exact')out.hydrate=boolArg(a,'hydrate',false);
-  if(op==='exact-guid'){
-    const g=String(a.guid||'').trim();
-    if(!g||g.length>128||!/^[A-Za-z0-9{}_-]+$/.test(g))throw new DiagnosticError('INVALID_GUID','--guid is invalid');
-    out.guid=g;
-  }
   if(op==='page'||op==='paging'){
     for(const k of ['start-date','end-date'])if(!/^\d{8}$/.test(a[k]||''))throw new DiagnosticError('INVALID_DATE',`--${k} must contain exactly 8 digits`);
     if(a['start-date']>a['end-date'])throw new DiagnosticError('INVALID_DATE_RANGE','startDate must be <= endDate');
@@ -207,12 +205,12 @@ function validateArgs(op,a) {
   return out;
 }
 function apiDefault() {
-  const { getInvoice,getInvoiceByGuid,getInvoicePageByDate } = require('../src/lib/shaygan');
-  return { getInvoice,getInvoiceByGuid,getInvoicePageByDate };
+  const { getInvoice,getInvoicePageByDate } = require('../src/lib/shaygan');
+  return { getInvoice,getInvoicePageByDate };
 }
-function findExact(result,type,no,guid) {
+function findExact(result,type,no) {
   const rows=Array.isArray(result?.list)?result.list:(Array.isArray(result?.result)?result.result:[]);
-  return rows.find(x=>invoiceTypeOf(x)===type && (no ? invoiceNoOf(x)===no : guidOf(x).toLowerCase()===guid.toLowerCase())) || null;
+  return rows.find(x=>invoiceTypeOf(x)===type && invoiceNoOf(x)===no) || null;
 }
 async function exactOperation(args,api=apiDefault()) {
   const started=Date.now(), first=await api.getInvoice(args.invoiceNo,args.type,{timeoutMs:args.timeoutMs});
@@ -231,17 +229,11 @@ async function exactOperation(args,api=apiDefault()) {
     if(candidate&&bodyOf(candidate).length){inv=candidate;hydrated=true;}
   }
   const out=sanitizedInvoice(inv,args.provisionalThreshold);
+  out.contract.identity=INVOICE_IDENTITY_CONTRACT;
   out.contract.headerOnlyInitialResponse=initialHeaderOnly;out.contract.hydrated=hydrated;
   if(initialHeaderOnly)out.warnings.push(warning('HEADER_ONLY_RESPONSE','invoice',inv));
   if(initialHeaderOnly&&args.hydrate&&!hydrated)out.warnings.push(warning('HYDRATION_FAILED','invoice',inv));
   return {ok:true,operation:'exact',request:{invoiceType:args.type,invoiceNo:args.invoiceNo,hydrate:args.hydrate,timeoutMs:args.timeoutMs},transport:{status:first.status||0,durationMs:Date.now()-started,requestCount:requests},...out};
-}
-async function exactGuidOperation(args,api=apiDefault()) {
-  const started=Date.now(),r=await api.getInvoiceByGuid(args.guid,args.type,{timeoutMs:args.timeoutMs});
-  if(!r?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get by GUID failed',2,transportErrorDetails(r));
-  const inv=findExact(r,args.type,0,args.guid);
-  if(!inv)throw new DiagnosticError('GUID_MISMATCH','Response did not contain the requested GUID and invoice type',3);
-  return {ok:true,operation:'exact-guid',request:{invoiceType:args.type,guid:args.guid,timeoutMs:args.timeoutMs},transport:{status:r.status||0,durationMs:Date.now()-started,requestCount:1},...sanitizedInvoice(inv,args.provisionalThreshold)};
 }
 async function pageOperation(args,api=apiDefault()) {
   const started=Date.now(),r=await api.getInvoicePageByDate(args.rowStart,args.type,args.startDate,args.endDate,args.rowCount,{timeoutMs:args.timeoutMs});
@@ -333,7 +325,6 @@ function readJsonFile(file) {
 }
 async function run(operation,args,api) {
   if(operation==='exact')return exactOperation(args,api);
-  if(operation==='exact-guid')return exactGuidOperation(args,api);
   if(operation==='page')return pageOperation(args,api);
   if(operation==='paging')return pagingOperation(args,api);
   if(operation==='repeat')return repeatOperation(args,api);
@@ -353,4 +344,4 @@ async function main(argv=process.argv.slice(2)) {
 }
 if(require.main===module)main().then(code=>{process.exitCode=code;}).catch(()=>{process.stdout.write(`${JSON.stringify(errorOutput(null,new Error()))}\n`);process.exitCode=3;});
 
-module.exports={ DiagnosticError,parseArgs,redact,sanitizeError,canonicalize,sha,sanitizedInvoice,hashInvoice,exactOperation,exactGuidOperation,pageOperation,pagingOperation,repeatOperation,compareSnapshots,readJsonFile,run,exitCodeForResult,main,MAX_FILE_BYTES };
+module.exports={ DiagnosticError,parseArgs,redact,sanitizeError,canonicalize,sha,sanitizedInvoice,hashInvoice,exactOperation,pageOperation,pagingOperation,repeatOperation,compareSnapshots,readJsonFile,run,exitCodeForResult,main,MAX_FILE_BYTES,INVOICE_IDENTITY_CONTRACT };
