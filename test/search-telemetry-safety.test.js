@@ -22,9 +22,11 @@ test('telemetry logging is failure-isolated and excludes sensitive transport dat
   assert.doesNotMatch(emit, /authorization|api[-_]?key|connectionString|rawResponse/i);
 });
 
-test('telemetry does not add a Shaygan or authoritative reconcile invocation', () => {
-  assert.equal((server.match(/authoritativeLiveReconcileItem\(/g) || []).length, 7);
-  assert.equal((server.match(/getInventoryByItemCode\(/g) || []).length, 3);
+test('search telemetry remains observational in the cumulative local-first pipeline', () => {
+  const saleSearch = server.slice(server.indexOf('async function searchSaleInventorySnapshot'), server.indexOf('async function liveScanInventorySearch'));
+  const inventorySearch = server.slice(server.indexOf('async function searchInventoryRows'), server.indexOf('function deriveMainGroup'));
+  assert.doesNotMatch(saleSearch, /authoritativeLiveReconcileItem|targetedLiveInventoryRepair|getInventoryByItemCode/);
+  assert.doesNotMatch(inventorySearch, /authoritativeLiveReconcileItem|targetedLiveInventoryRepair|getInventoryByItemCode/);
   assert.match(server, /shayganCallCount:0/);
   assert.match(server, /shayganCalls:\[\]/);
 });
@@ -33,14 +35,15 @@ test('existing ItemCode detection is unchanged', () => {
   assert.match(server, /return \/\^\[0-9A-Za-z_-\]\{5,\}\$\/\.test\(x\) && !\/\\s\/\.test\(x\);/);
 });
 
-test('existing frontend debounce values and cancellation behavior are unchanged', () => {
+test('frontend keeps debounce values and cumulative AbortController behavior', () => {
   assert.match(frontend, /const deb=debounce\(\(\)=>fastSearch\(true\),250\);/);
   assert.match(frontend, /\},220\);\s*q\.addEventListener\('input'/);
   assert.match(frontend, /requestController\.abort\(\);requestController=new AbortController\(\);/);
-  assert.doesNotMatch(
-    frontend.slice(frontend.indexOf('function bindSaleSnapshotSearch'), frontend.indexOf('window.bindSaleSnapshotSearch')),
-    /new AbortController/
-  );
+  const saleSearch = frontend.slice(frontend.indexOf('function bindSaleSnapshotSearch'), frontend.indexOf('window.bindSaleSnapshotSearch'));
+  assert.match(saleSearch, /requestController=new AbortController\(\)/);
+  assert.match(saleSearch, /verifyController=new AbortController\(\)/);
+  assert.match(saleSearch, /requestController\?\.abort\(\)/);
+  assert.match(saleSearch, /verifyController\?\.abort\(\)/);
 });
 
 test('frontend telemetry remains console-only and adds no transport endpoint', () => {

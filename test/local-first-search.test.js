@@ -55,10 +55,21 @@ test('search session discards stale, replaced, and disposed verification respons
   const body = section(frontend, 'function bindSaleSnapshotSearch', 'window.bindSaleSnapshotSearch');
   assert.match(body, /searchSessionId=`search-session-/);
   assert.match(body, /generation!==seq/);
+  assert.match(body, /q\.value\.trim\(\)!==queryText/);
   assert.match(body, /r\.searchSessionId!==searchSessionId/);
   assert.match(body, /Number\(r\.generation\)!==generation/);
+  assert.match(body, /r\.query!==queryText/);
   assert.match(body, /disposed=true;invalidateSearch\(\)/);
   assert.match(body, /verifyController\?\.abort\(\)/);
+});
+
+test('background verification updates only a live result status badge', () => {
+  const body = section(frontend, 'async function verifyVisibleResult', 'async function run');
+  assert.match(body, /btn\.isConnected/);
+  assert.match(body, /list\.contains\(btn\)/);
+  assert.match(body, /String\(local\.itemCode\|\|''\)!==String\(itemCode\)/);
+  assert.match(body, /sale-search-verify-status/);
+  assert.doesNotMatch(body, /(?:^|\n)\s*btn\.textContent\s*=/);
 });
 
 test('existing ranking algorithm remains present and unchanged in responsibility', () => {
