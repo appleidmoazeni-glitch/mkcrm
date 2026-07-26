@@ -366,7 +366,7 @@ async function getInvoiceByGuid(guid = '', invType = 2, opts = {}) {
   if (!g) return { ok:false, list:[], result:[], error:'invoice guid empty' };
   const domain = {
     Sort: range(), InvoiceNumber: range(), InvoiceType: range(invType, invType), InvoiceDate: range(), ControlCheck: range(), Printed: range(),
-    GuId: range(g, g), Guid: range(g, g), InvGuId: range(g, g), InvHeaderGuId: range(g, g), InvHeaderGuid: range(g, g)
+    GuId: range(g, g)
   };
   const res = await post('/api/Invoice/Get', domain, 0, 20, { maxRowCount: 20, timeoutMs: opts.timeoutMs || Math.min(config.shayganTimeoutMs || 15000, 7000) });
   const list = (res.result || []).filter(x => String(x.GuId || x.Guid || x.InvGuId || x.InvHeaderGuId || '').trim().toLowerCase() === g.toLowerCase());

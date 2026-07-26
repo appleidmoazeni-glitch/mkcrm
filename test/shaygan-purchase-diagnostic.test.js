@@ -6,6 +6,7 @@ const os = require('os');
 const path = require('path');
 const { spawnSync } = require('child_process');
 const d = require('../scripts/diagnose-shaygan-purchase-invoices');
+const shaygan = require('../src/lib/shaygan');
 
 let tests=0;
 async function test(name,fn){await fn();tests++;process.stderr.write(`ok ${tests} - ${name}\n`);}
@@ -56,6 +57,20 @@ function apiExact(sequence){
   await test('GUID mismatch is contract error',async()=>{
     await assert.rejects(()=>d.exactGuidOperation({type:3,guid:'ffffffff-ffff-ffff-ffff-ffffffffffff',timeoutMs:1000,provisionalThreshold:1},{getInvoiceByGuid:async()=>({ok:true,status:200,list:[inv()]})}),e=>e.code==='GUID_MISMATCH'&&e.exitCode===3);
   });
+  await test('exact-guid Domain sends only GuId GUID field',async()=>{
+    const originalFetch=global.fetch;let requestBody;
+    global.fetch=async(_url,opts)=>{requestBody=JSON.parse(opts.body);return {ok:true,status:200,json:async()=>({Result:[]})};};
+    try{await shaygan.getInvoiceByGuid('aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',3,{timeoutMs:1000});}
+    finally{global.fetch=originalFetch;}
+    assert.deepEqual(requestBody.Domain.GuId,{From:'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',To:'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',In:[]});
+    for(const key of ['Guid','InvGuId','InvHeaderGuId','InvHeaderGuid'])assert.equal(Object.hasOwn(requestBody.Domain,key),false);
+  });
+  await test('exact-guid transport error exposes sanitised status and actual error',async()=>{
+    await assert.rejects(
+      ()=>d.exactGuidOperation({type:3,guid:'ffffffff-ffff-ffff-ffff-ffffffffffff',timeoutMs:1000,provisionalThreshold:1},{getInvoiceByGuid:async()=>({ok:false,status:502,error:'upstream unavailable ConnectionName=RealName TokenString=real-token'})}),
+      e=>e.code==='TRANSPORT_ERROR'&&e.details.status===502&&e.details.error.includes('upstream unavailable')&&e.details.error.includes('ConnectionName=[REDACTED]')&&!e.details.error.includes('RealName')&&!e.details.error.includes('real-token')
+    );
+  });
   await test('invoice number mismatch is contract error',async()=>{
     await assert.rejects(()=>d.exactOperation({type:3,invoiceNo:999,hydrate:false,timeoutMs:1000,provisionalThreshold:1},apiExact([inv()])),e=>e.code==='INVOICE_NUMBER_MISMATCH');
   });
@@ -86,6 +101,28 @@ function apiExact(sequence){
   await test('unsafe numeric warning',()=>{
     const x=d.sanitizedInvoice(inv({Body:[{...inv().Body[0],Amount:Number.MAX_SAFE_INTEGER+10}]}),1);
     assert(x.warnings.some(w=>w.code==='UNSAFE_NUMERIC_VALUE'));
+  });
+  await test('normal decimal does not trigger unsafe numeric warning',()=>{
+    const x=d.sanitizedInvoice(inv({Body:[{...inv().Body[0],Price:951860416.64,Amount:1903720833.28}]}),1);
+    assert(!x.warnings.some(w=>w.code==='UNSAFE_NUMERIC_VALUE'));
+  });
+  await test('NaN and Infinity trigger unsafe numeric warnings without breaking hashes',()=>{
+    const x=d.sanitizedInvoice(inv({Body:[{...inv().Body[0],Price:NaN,Amount:Infinity}]}),1);
+    assert.equal(x.warnings.filter(w=>w.code==='UNSAFE_NUMERIC_VALUE').length,2);
+    assert.match(x.hashes.fullHash,/^[a-f0-9]{64}$/);
+  });
+  await test('tiny amount difference is within tolerance',()=>{
+    const x=d.sanitizedInvoice(inv({Body:[{...inv().Body[0],Quan:3,Price:0.1,Amount:0.3000000001}]}),1);
+    assert(!x.warnings.some(w=>w.code==='AMOUNT_INCONSISTENT'));
+  });
+  await test('real amount difference still warns',()=>{
+    const x=d.sanitizedInvoice(inv({Body:[{...inv().Body[0],Quan:3,Price:10,Amount:31}]}),1);
+    assert(x.warnings.some(w=>w.code==='AMOUNT_INCONSISTENT'));
+  });
+  await test('AmortizePercent is exposed as allocatedExpenseAmount observation',()=>{
+    const x=d.sanitizedInvoice(inv({Body:[{...inv().Body[0],AmortizePercent:1250.5}]}),1);
+    assert.equal(x.invoice.lines[0].AmortizePercent,1250.5);
+    assert.equal(x.observations[0].allocatedExpenseAmount,1250.5);
   });
   await test('redacts nested secrets',()=>{
     const warnings=[],x=d.redact({a:{TokenString:'secret',ok:1}},warnings);
