@@ -14,6 +14,7 @@ const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
+const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -938,6 +939,17 @@ async function validateSaleInventoryLines(db, items = [], reason = 'sale-issue-v
 function looksLikeItemCode(q = '') {
   const x = String(q || '').trim();
   return /^[0-9A-Za-z_-]{5,}$/.test(x) && !/\s/.test(x);
+}
+function observeItemCodeClassifierV2(endpoint, queryText) {
+  try {
+    const scheduled = setImmediate(() => {
+      try {
+        const comparison = compareItemCodeClassifiers(queryText, looksLikeItemCode(queryText));
+        console.info('ITEM_CODE_CLASSIFIER_V2_SHADOW', JSON.stringify({ event:'ITEM_CODE_CLASSIFIER_V2_SHADOW', endpoint, ...comparison }));
+      } catch {}
+    });
+    scheduled.unref?.();
+  } catch {}
 }
 
 // 0.9.19.23: Targeted repair for Shaygan GetRemain stock-list gaps.
@@ -3961,15 +3973,20 @@ async function handleApi(req, res, pathname, query) {
     if (pathname === '/api/accounts/sync' && req.method === 'POST') { if (!requireRole(req, res, ['admin'])) return; return sendJson(res, 200, await syncAccountsCatalog(Number(query.pages || config.accountSearchPages || 220))); }
     if (pathname === '/api/items/search') {
       // 0.9.19.17→WS: SQL searchItems حذف شد
-      return sendJson(res, 200, await searchItems(query.q || query.term || '', Number(query.limit || 200), Number(query.pages || config.inventorySearchLivePages)));
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      return sendJson(res, 200, await searchItems(searchQuery, Number(query.limit || 200), Number(query.pages || config.inventorySearchLivePages)));
     }
     if (pathname === '/api/items/search-all') {
       // 0.9.19.17→WS: SQL searchItems حذف شد
-      return sendJson(res, 200, await searchAllItems(query.q || query.term || '', Number(query.limit || 200), Number(query.pages || config.inventoryCatalogSyncPages), { forceLive: query.forceLive === '1' || query.forceLive === 'true' }));
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      return sendJson(res, 200, await searchAllItems(searchQuery, Number(query.limit || 200), Number(query.pages || config.inventoryCatalogSyncPages), { forceLive: query.forceLive === '1' || query.forceLive === 'true' }));
     }
     if (pathname === '/api/sale/inventory-snapshot-search') {
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
       const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
       const searchTrace = createSearchPerfTrace(pathname, searchQuery);
       req.once('aborted', () => { searchTrace.requestAborted = true; });
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
@@ -3978,6 +3995,7 @@ async function handleApi(req, res, pathname, query) {
     }
     if (pathname === '/api/inventory/search') {
       const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
       const searchTrace = createSearchPerfTrace(pathname, searchQuery);
       req.once('aborted', () => { searchTrace.requestAborted = true; });
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
@@ -3992,6 +4010,7 @@ async function handleApi(req, res, pathname, query) {
     if (pathname === '/api/inventory/by-stock') {
       // 0.9.15.9: sellers also need full selected-warehouse inventory for stocktaking/control.
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      observeItemCodeClassifierV2(pathname, query.q || '');
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
       if (!filters.stockNumber) return sendJson(res, 400, { ok:false, error:'stockNumber required' });
       // 0.9.19.51: operational by-stock view must use global Mongo snapshot, not WebService stock-filter scan.
@@ -5114,8 +5133,8 @@ async function handleApi(req, res, pathname, query) {
       if (!draft) return sendJson(res, 404, { ok:false, error:'پیش‌نویس خرید پیدا نشد یا دسترسی ندارید' });
       return sendJson(res, 200, { ok:true, draft });
     }
-    if (pathname === '/api/legacy/productName/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; const r = await searchItems(q, 30, Number(query.pages || config.inventorySearchLivePages)); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toProductNameRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
-    if (pathname === '/api/legacy/stock/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; const r = await searchInventoryRows(q, Number(query.limit || 1000), Number(query.pages || config.inventorySearchLivePages), { stockNumber: query.stockNumber || '' }); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toOldStockRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
+    if (pathname === '/api/legacy/productName/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; observeItemCodeClassifierV2(pathname, q); const r = await searchItems(q, 30, Number(query.pages || config.inventorySearchLivePages)); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toProductNameRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
+    if (pathname === '/api/legacy/stock/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; observeItemCodeClassifierV2(pathname, q); const r = await searchInventoryRows(q, Number(query.limit || 1000), Number(query.pages || config.inventorySearchLivePages), { stockNumber: query.stockNumber || '' }); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toOldStockRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
     if (pathname === '/api/legacy/cardex/search') { const body = await collectBody(req); const code = body.itemCode || body.ItemCode || query.itemCode; const stockNumber = body.stockNumber || body.STNumber || query.stockNumber || query.STNumber || ''; const r = await shaygan.getKardexByItemCode(code, stockNumber, { maxRows: Number(query.maxRows || config.kardexAdminQuickMaxRows), hardMaxRows: config.kardexAdminFullMaxRows }); return sendJson(res, 200, { ok: r.ok, item: r.item, rows: r.rows || [], meta: r.meta || {}, error: r.error || '' }); }
     if (pathname === '/admin/getUserInfo') return sendJson(res, 200, { userData: { id: 'dev', name: 'تست', role: 'admin' } });
     if (pathname === '/api/template-map') return sendJson(res, 200, getTemplateMap());
