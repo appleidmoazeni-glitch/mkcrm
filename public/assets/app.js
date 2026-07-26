@@ -2017,8 +2017,14 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
   function bindSaleSnapshotSearch(){
     const q=$('#saleQ'), list=$('#saleList'), msg=$('#saleMsg');
     if(!q||!list) return;
-    let seq=0, lastGroups=[],lastInputAt=0;
+    let seq=0, lastGroups=[],lastInputAt=0,requestController=null,disposed=false;
+    function invalidateRequest(){
+      seq++;
+      if(requestController)requestController.abort();
+      requestController=null;
+    }
     const search=debounceLocal(async()=>{
+      if(disposed)return;
       const val=q.value.trim();
       state.selectedItem=null; state.selectedStock=null;
       if($('#STNumber')) $('#STNumber').value='';
@@ -2027,10 +2033,11 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
       const my=++seq;
       const requestStarted=performance.now(),inputStarted=lastInputAt||requestStarted;searchPerfRuntime.activeRequestCount++;
       let responseAt=requestStarted,staleResponseIgnored=false,resultCount=0;
+      requestController=new AbortController();
       list.style.display='block'; list.innerHTML='<div class="floating-empty">در حال جستجوی موجودی فعال CRM...</div>';
       if(msg) msg.textContent='سرچ فروش و موجودی از موتور یکپارچه موجودی فعال CRM.';
       try{
-        const r=await api(`/api/sale/inventory-snapshot-search?q=${encodeURIComponent(val)}&limit=30`);responseAt=performance.now();
+        const r=await api(`/api/sale/inventory-snapshot-search?q=${encodeURIComponent(val)}&limit=30`,{signal:requestController.signal});responseAt=performance.now();
         if(my!==seq){staleResponseIgnored=true;logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored:true,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1)});return;}
         lastGroups=r.groups||[];
         resultCount=lastGroups.length;
@@ -2047,12 +2054,13 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
         });
         logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1)});
       }catch(e){
+        if(e.name==='AbortError')return;
         if(my!==seq) return;
         list.innerHTML=`<div class="floating-empty">${safe(e.message||e)}</div>`;
         if(msg) msg.textContent='خطا در جستجوی snapshot موجودی';
       }finally{searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1)}
     },220);
-    q.addEventListener('input',()=>{lastInputAt=performance.now();search()});
+    q.addEventListener('input',()=>{lastInputAt=performance.now();invalidateRequest();search()});
     q.addEventListener('keydown',async e=>{
       if(e.key==='Enter'){
         e.preventDefault();
@@ -2061,6 +2069,7 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
       }
     });
     document.addEventListener('click',e=>{if(list&&!list.contains(e.target)&&e.target!==q)list.style.display='none'});
+    uiPageLifecycle.add(()=>{disposed=true;invalidateRequest()});
   }
   window.bindSaleSnapshotSearch = bindSaleSnapshotSearch;
   const oldAddSaleLine = window.addSaleLine || addSaleLine;
