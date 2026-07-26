@@ -50,6 +50,15 @@ function redact(value, warnings = []) {
   }
   return out;
 }
+function sanitizeError(value) {
+  return String(value || '').slice(0,1000)
+    .replace(/\bBearer\s+\S+/gi,'Bearer [REDACTED]')
+    .replace(/\b(tokenstring|token|authorization|password|pass|secret|connectionstring|connectionname|credential|apikey|cookie|set-cookie)\b\s*[:=]\s*(?:"[^"]*"|'[^']*'|[^\s,;]+)/gi,'$1=[REDACTED]')
+    .replace(/(https?:\/\/)[^/\s:@]+:[^/\s@]+@/gi,'$1[REDACTED]@');
+}
+function transportErrorDetails(result) {
+  return { status:result?.status || 0, error:sanitizeError(result?.error) };
+}
 function pick(obj, fields) {
   const out = {};
   for (const key of fields) out[key] = clean(obj?.[key]);
@@ -67,7 +76,7 @@ function lineSortKey(line, index = 0) {
 }
 function canonicalize(value) {
   if (value === undefined) return undefined;
-  if (typeof value === 'number' && !Number.isFinite(value)) throw new DiagnosticError('INVALID_NUMERIC_VALUE','NaN or Infinity cannot be hashed',3);
+  if (typeof value === 'number' && !Number.isFinite(value)) return null;
   if (Array.isArray(value)) return value.map(canonicalize);
   if (!value || typeof value !== 'object') return value;
   const out = {};
@@ -115,7 +124,7 @@ function analyzeInvoice(inv, lines, threshold, warnings) {
     if (!String(line.STNumber ?? '').trim()) warnings.push(warning('WAREHOUSE_MISSING','line',inv,line,{ index:i }));
     const q=Number(line.Quan), p=Number(line.Price), a=Number(line.Amount);
     for (const [field,value] of [['Quan',line.Quan],['Price',line.Price],['Amount',line.Amount],['Quan2',line.Quan2],['Price2',line.Price2]]) {
-      if (typeof value === 'number' && (!Number.isSafeInteger(value) || !Number.isFinite(value))) warnings.push(warning('UNSAFE_NUMERIC_VALUE','line',inv,line,{ field, value:String(value) }));
+      if (typeof value === 'number' && (!Number.isFinite(value) || Math.abs(value)>Number.MAX_SAFE_INTEGER)) warnings.push(warning('UNSAFE_NUMERIC_VALUE','line',inv,line,{ field, value:String(value) }));
     }
     if (q === 0) warnings.push(warning('ZERO_QUANTITY','line',inv,line));
     if (q < 0) warnings.push(warning('NEGATIVE_QUANTITY','line',inv,line));
@@ -128,8 +137,8 @@ function analyzeInvoice(inv, lines, threshold, warnings) {
     if (isProv) { provisional++; warnings.push(warning('PRICE_BELOW_PROVISIONAL_THRESHOLD','line',inv,line,{ threshold })); }
     const expected = Number.isFinite(q)&&Number.isFinite(p) ? q*p : null;
     const diff = expected !== null&&Number.isFinite(a) ? a-expected : null;
-    if (diff !== null && diff !== 0) warnings.push(warning('AMOUNT_INCONSISTENT','line',inv,line,{ expectedAmount:expected, amountDifference:diff }));
-    observations.push({ lineItemId:id??null, itemNumber:line.ItemNumber, priceEqualsOne:p===1, amountEqualsOne:a===1, derivedUnitCostEqualsOne:derived===1, priceBelowConfiguredThreshold:isProv, expectedAmount:expected, amountDifference:diff, quan2:line.Quan2, price2:line.Price2 });
+    if (diff !== null && Math.abs(diff)>0.01) warnings.push(warning('AMOUNT_INCONSISTENT','line',inv,line,{ expectedAmount:expected, amountDifference:diff }));
+    observations.push({ lineItemId:id??null, itemNumber:line.ItemNumber, priceEqualsOne:p===1, amountEqualsOne:a===1, derivedUnitCostEqualsOne:derived===1, priceBelowConfiguredThreshold:isProv, expectedAmount:expected, amountDifference:diff, quan2:line.Quan2, price2:line.Price2, allocatedExpenseAmount:line.AmortizePercent });
   }
   for (const [id,count] of ids) if (count>1) warnings.push(warning('DUPLICATE_LINE_ITEM_ID','invoice',inv,null,{ lineItemId:id,count }));
   if (provisional>0 && provisional<lines.length) warnings.push(warning('MIXED_PROVISIONAL_COST','invoice',inv,null,{ provisionalLines:provisional,totalLines:lines.length }));
@@ -207,7 +216,7 @@ function findExact(result,type,no,guid) {
 }
 async function exactOperation(args,api=apiDefault()) {
   const started=Date.now(), first=await api.getInvoice(args.invoiceNo,args.type,{timeoutMs:args.timeoutMs});
-  if(!first?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get failed',2,{status:first?.status||0});
+  if(!first?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get failed',2,transportErrorDetails(first));
   let inv=findExact(first,args.type,args.invoiceNo), requests=1, hydrated=false;
   if(!inv){
     const any=(first.list||first.result||[])[0];
@@ -217,7 +226,7 @@ async function exactOperation(args,api=apiDefault()) {
   const initialHeaderOnly=bodyOf(inv).length===0;
   if(initialHeaderOnly&&args.hydrate){
     const second=await api.getInvoice(args.invoiceNo,args.type,{timeoutMs:args.timeoutMs}); requests++;
-    if(!second?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Hydration Invoice/Get failed',2,{status:second?.status||0});
+    if(!second?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Hydration Invoice/Get failed',2,transportErrorDetails(second));
     const candidate=findExact(second,args.type,args.invoiceNo);
     if(candidate&&bodyOf(candidate).length){inv=candidate;hydrated=true;}
   }
@@ -229,25 +238,25 @@ async function exactOperation(args,api=apiDefault()) {
 }
 async function exactGuidOperation(args,api=apiDefault()) {
   const started=Date.now(),r=await api.getInvoiceByGuid(args.guid,args.type,{timeoutMs:args.timeoutMs});
-  if(!r?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get by GUID failed',2,{status:r?.status||0});
+  if(!r?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get by GUID failed',2,transportErrorDetails(r));
   const inv=findExact(r,args.type,0,args.guid);
   if(!inv)throw new DiagnosticError('GUID_MISMATCH','Response did not contain the requested GUID and invoice type',3);
   return {ok:true,operation:'exact-guid',request:{invoiceType:args.type,guid:args.guid,timeoutMs:args.timeoutMs},transport:{status:r.status||0,durationMs:Date.now()-started,requestCount:1},...sanitizedInvoice(inv,args.provisionalThreshold)};
 }
 async function pageOperation(args,api=apiDefault()) {
   const started=Date.now(),r=await api.getInvoicePageByDate(args.rowStart,args.type,args.startDate,args.endDate,args.rowCount,{timeoutMs:args.timeoutMs});
-  if(!r?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get page failed',2,{status:r?.status||0});
+  if(!r?.ok)throw new DiagnosticError('TRANSPORT_ERROR','Invoice/Get page failed',2,transportErrorDetails(r));
   const rows=Array.isArray(r.result)?r.result:[];
   const invoices=rows.map(x=>sanitizedInvoice(x,args.provisionalThreshold));
   return {ok:true,operation:'page',request:{invoiceType:args.type,startDate:args.startDate,endDate:args.endDate,rowStart:args.rowStart,rowCount:args.rowCount,timeoutMs:args.timeoutMs},transport:{status:r.status||0,durationMs:Date.now()-started,requestCount:1},page:{count:rows.length,shortPage:rows.length<args.rowCount,emptyPage:rows.length===0},invoices,sequence:invoices.map(x=>x.invoice.identity),sequenceHash:sha(invoices.map(x=>x.invoice.identity)),warnings:invoices.flatMap(x=>x.warnings)};
 }
 function invoiceIdentity(inv){return inv.identity.invoiceGuid?`${inv.identity.invoiceType}:g:${inv.identity.invoiceGuid.toLowerCase()}`:`${inv.identity.invoiceType}:n:${inv.identity.invoiceNo}`;}
 async function pagingOperation(args,api=apiDefault()) {
-  const pages=[],invoices=[],warnings=[],seenInv=new Map(),seenLine=new Map();let hydrateRequests=0,stoppedBy='MAX_PAGES',transportStatus=0;
+  const pages=[],invoices=[],warnings=[],seenInv=new Map(),seenLine=new Map();let hydrateRequests=0,stoppedBy='MAX_PAGES',transportStatus=0,transportError='';
   outer:for(let page=0;page<args.maxPages;page++){
     const rowStart=page*args.rowCount,r=await api.getInvoicePageByDate(rowStart,args.type,args.startDate,args.endDate,args.rowCount,{timeoutMs:args.timeoutMs});
     transportStatus=r?.status||0;
-    if(!r?.ok){stoppedBy='TRANSPORT_ERROR';break;}
+    if(!r?.ok){stoppedBy='TRANSPORT_ERROR';transportError=sanitizeError(r?.error);break;}
     const rows=Array.isArray(r.result)?r.result:[];
     pages.push({page,rowStart,count:rows.length,shortPage:rows.length<args.rowCount,emptyPage:rows.length===0});
     if(!rows.length){stoppedBy='EMPTY_PAGE';break;}
@@ -274,7 +283,7 @@ async function pagingOperation(args,api=apiDefault()) {
   const complete=stoppedBy==='EMPTY_PAGE';
   if(!complete&&['MAX_PAGES','MAX_INVOICES'].includes(stoppedBy))warnings.push({code:'SAFETY_LIMIT_REACHED',scope:'paging',invoiceNo:null,lineItemId:null,details:{stoppedBy}});
   const sequence=invoices.map(x=>x.invoice.identity);
-  return {ok:!['TRANSPORT_ERROR','CONTRACT_ERROR'].includes(stoppedBy),operation:'paging',request:{invoiceType:args.type,startDate:args.startDate,endDate:args.endDate,rowCount:args.rowCount,maxPages:args.maxPages,maxInvoices:args.maxInvoices,hydrate:args.hydrate,timeoutMs:args.timeoutMs},transport:{status:transportStatus,requestCount:pages.length+hydrateRequests},pages,invoices,summary:{invoiceCount:invoices.length,hydrateRequests,complete,stoppedBy,shortPageFollowedByData:pages.some((p,i)=>p.shortPage&&!p.emptyPage&&pages[i+1]?.count>0),duplicateInvoiceCount:warnings.filter(x=>x.code==='DUPLICATE_INVOICE_ACROSS_PAGES').length,duplicateLineCount:warnings.filter(x=>x.code==='DUPLICATE_LINE_ACROSS_PAGES').length,sequence,sequenceHash:sha(sequence)},warnings};
+  return {ok:!['TRANSPORT_ERROR','CONTRACT_ERROR'].includes(stoppedBy),operation:'paging',request:{invoiceType:args.type,startDate:args.startDate,endDate:args.endDate,rowCount:args.rowCount,maxPages:args.maxPages,maxInvoices:args.maxInvoices,hydrate:args.hydrate,timeoutMs:args.timeoutMs},transport:{status:transportStatus,error:transportError,requestCount:pages.length+hydrateRequests},pages,invoices,summary:{invoiceCount:invoices.length,hydrateRequests,complete,stoppedBy,shortPageFollowedByData:pages.some((p,i)=>p.shortPage&&!p.emptyPage&&pages[i+1]?.count>0),duplicateInvoiceCount:warnings.filter(x=>x.code==='DUPLICATE_INVOICE_ACROSS_PAGES').length,duplicateLineCount:warnings.filter(x=>x.code==='DUPLICATE_LINE_ACROSS_PAGES').length,sequence,sequenceHash:sha(sequence)},warnings};
 }
 const delay=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 async function repeatOperation(args,api=apiDefault()) {
@@ -344,4 +353,4 @@ async function main(argv=process.argv.slice(2)) {
 }
 if(require.main===module)main().then(code=>{process.exitCode=code;}).catch(()=>{process.stdout.write(`${JSON.stringify(errorOutput(null,new Error()))}\n`);process.exitCode=3;});
 
-module.exports={ DiagnosticError,parseArgs,redact,canonicalize,sha,sanitizedInvoice,hashInvoice,exactOperation,exactGuidOperation,pageOperation,pagingOperation,repeatOperation,compareSnapshots,readJsonFile,run,exitCodeForResult,main,MAX_FILE_BYTES };
+module.exports={ DiagnosticError,parseArgs,redact,sanitizeError,canonicalize,sha,sanitizedInvoice,hashInvoice,exactOperation,exactGuidOperation,pageOperation,pagingOperation,repeatOperation,compareSnapshots,readJsonFile,run,exitCodeForResult,main,MAX_FILE_BYTES };
