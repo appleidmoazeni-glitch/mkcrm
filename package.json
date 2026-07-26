@@ -14,6 +14,7 @@
     "test:admin-workflows": "tsc -p tsconfig.jobs.json && node scripts/admin-turnover-workflow-test.js",
     "test:jobs:sale-snapshot": "tsc -p tsconfig.jobs.json && node scripts/sale-snapshot-job-test.js",
     "test:jobs:operational": "tsc -p tsconfig.jobs.json && node scripts/job-operational-validation-test.js",
+    "test:search-telemetry": "node --test test/search-telemetry-safety.test.js",
     "smoke": "node scripts/smoke-test.js",
     "test:all": "node scripts/test-all.js"
   },

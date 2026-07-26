@@ -25,6 +25,10 @@ function cleanDate8(v){return String(v||'').replace(/[^0-9]/g,'').slice(0,8)}
 
 async function api(url, opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const j=await r.json().catch(()=>({ok:false,error:'bad json'}));if(!r.ok) throw new Error(j.error||r.statusText);return j}
 function post(url, body){return api(url,{method:'POST',body:JSON.stringify(body||{})})}
+const searchPerfRuntime={activeRequestCount:0};
+function logSearchPerfFrontend(fields){
+  try{console.info('SEARCH_PERF_FRONTEND',JSON.stringify({event:'SEARCH_PERF_FRONTEND',at:new Date().toISOString(),...fields}))}catch{}
+}
 const uiPageLifecycle=(()=>{
   let cleanups=[];
   function add(cleanup){if(typeof cleanup==='function')cleanups.push(cleanup);return cleanup}
@@ -1825,17 +1829,24 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
   // Fast autocomplete: product catalog only. No live inventory scan while typing.
   window.bindItemSearch = bindItemSearch = function(prefix,onPick,opts={}){
     const q=$(`#${prefix}Q`), box=$(`#${prefix}List`), msg=$(`#${prefix}Msg`); if(!q||!box) return;
-    const limit=Number(opts.limit||80); let seq=0,requestController=null;
+    const limit=Number(opts.limit||80); let seq=0,requestController=null,lastInputAt=0;
     const managedPopup=true;
     uiPageLifecycle.add(()=>{seq++;if(requestController)requestController.abort();requestController=null;});
     async function fastSearch(showBox=true){
       const val=q.value.trim();
       if(val.length<2){box.innerHTML='';if(managedPopup)popupSuggestionController.close({restoreFocus:false});else box.style.display='none';if(msg)msg.textContent='';return []}
       const my=++seq;if(requestController)requestController.abort();requestController=new AbortController();
+      const requestStarted=performance.now(),inputStarted=lastInputAt||requestStarted;searchPerfRuntime.activeRequestCount++;
+      let requestAborted=false,staleResponseIgnored=false,resultCount=0,responseAt=requestStarted;
       if(showBox){box.style.display='block';box.innerHTML='<div class="floating-empty">در حال جستجوی سریع کالا...</div>';if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});}
       if(msg) msg.textContent='جستجوی سریع کالا؛ موجودی بعد از انتخاب کنترل می‌شود.';
-      let r;try{r=await searchAllItemsRows(val,limit,false,{signal:requestController.signal});}catch(e){if(e.name==='AbortError')return [];throw e;} if(my!==seq) return [];
+      let r;try{r=await searchAllItemsRows(val,limit,false,{signal:requestController.signal});responseAt=performance.now();}catch(e){if(e.name==='AbortError'){requestAborted=true;return [];}throw e;} finally {
+        searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1);
+        if(requestAborted)logSearchPerfFrontend({endpoint:'/api/items/search-all',query:val,generation:my,debounceConfiguredMs:250,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((performance.now()-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:true,staleResponseIgnored,activeRequestCount:searchPerfRuntime.activeRequestCount});
+      } if(my!==seq){staleResponseIgnored=true;logSearchPerfFrontend({endpoint:'/api/items/search-all',query:val,generation:my,debounceConfiguredMs:250,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted,staleResponseIgnored:true,activeRequestCount:searchPerfRuntime.activeRequestCount});return [];
+      }
       const list=(r.list||[]).map(productFromRow).filter(x=>x.itemCode);
+      resultCount=list.length;
       if(msg) msg.textContent=`${list.length} کالا | ${r.source||''}${r.cacheCount?' | کش: '+r.cacheCount:''}${r.scannedPages?' | '+r.scannedPages+' صفحه سریع':''}${r.note?' | '+r.note:''}`;
       if(showBox){
         box.style.display='block';
@@ -1843,10 +1854,11 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
         box.querySelectorAll('.product-row').forEach(el=>el.onclick=()=>{const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;if(managedPopup)popupSuggestionController.close();else box.style.display='none';onPick(item,list)});
         if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});
       }
+      logSearchPerfFrontend({endpoint:'/api/items/search-all',query:val,generation:my,debounceConfiguredMs:250,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted,staleResponseIgnored,activeRequestCount:searchPerfRuntime.activeRequestCount});
       return list;
     }
     const deb=debounce(()=>fastSearch(true),250);
-    q.addEventListener('input',deb);
+    q.addEventListener('input',()=>{lastInputAt=performance.now();deb()});
     q.addEventListener('keydown',async e=>{if(e.key==='Enter'){e.preventDefault();const list=await fastSearch(false);box.style.display='none';if(opts.onEnter) opts.onEnter(q.value.trim(),list);else if(list.length===1) onPick(list[0],list)}});
     if(opts.filterElement){opts.filterElement.addEventListener('change',()=>{const val=q.value.trim(); if(val.length>=2 && opts.onEnter) opts.onEnter(val,[]);});}
   };
@@ -2005,7 +2017,7 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
   function bindSaleSnapshotSearch(){
     const q=$('#saleQ'), list=$('#saleList'), msg=$('#saleMsg');
     if(!q||!list) return;
-    let seq=0, lastGroups=[];
+    let seq=0, lastGroups=[],lastInputAt=0;
     const search=debounceLocal(async()=>{
       const val=q.value.trim();
       state.selectedItem=null; state.selectedStock=null;
@@ -2013,12 +2025,15 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
       if($('#saleInventory')) $('#saleInventory').innerHTML='';
       if(val.length<2){list.style.display='none';list.innerHTML='';if(msg)msg.textContent='';return;}
       const my=++seq;
+      const requestStarted=performance.now(),inputStarted=lastInputAt||requestStarted;searchPerfRuntime.activeRequestCount++;
+      let responseAt=requestStarted,staleResponseIgnored=false,resultCount=0;
       list.style.display='block'; list.innerHTML='<div class="floating-empty">در حال جستجوی موجودی فعال CRM...</div>';
       if(msg) msg.textContent='سرچ فروش و موجودی از موتور یکپارچه موجودی فعال CRM.';
       try{
-        const r=await api(`/api/sale/inventory-snapshot-search?q=${encodeURIComponent(val)}&limit=30`);
-        if(my!==seq) return;
+        const r=await api(`/api/sale/inventory-snapshot-search?q=${encodeURIComponent(val)}&limit=30`);responseAt=performance.now();
+        if(my!==seq){staleResponseIgnored=true;logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored:true,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1)});return;}
         lastGroups=r.groups||[];
+        resultCount=lastGroups.length;
         if(msg) msg.innerHTML=`${nfmt(lastGroups.length)} کالا دارای موجودی فعال | ${safe(r.source||'snapshot')}${r.stale?' | <span class="warn-inline">snapshot موجودی فعال است؛ در صورت خطا Sync موجودی را بررسی کنید</span>':''}`;
         renderSaleSnapshotGroups(list,lastGroups);
         list.querySelectorAll('.choose-sale-snapshot-stock').forEach(btn=>btn.onclick=async(ev)=>{
@@ -2030,13 +2045,14 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
           list.style.display='none';
           await verifyAndSelectSaleStock(item,stock);
         });
+        logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1)});
       }catch(e){
         if(my!==seq) return;
         list.innerHTML=`<div class="floating-empty">${safe(e.message||e)}</div>`;
         if(msg) msg.textContent='خطا در جستجوی snapshot موجودی';
-      }
+      }finally{searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1)}
     },220);
-    q.addEventListener('input',search);
+    q.addEventListener('input',()=>{lastInputAt=performance.now();search()});
     q.addEventListener('keydown',async e=>{
       if(e.key==='Enter'){
         e.preventDefault();
@@ -4369,16 +4385,19 @@ async function pageSellerProfit(){
   };
   window.renderInventorySearch = renderInventorySearch = async function(query,target,selectable=false,stockNumber=''){
     const box=$(target); if(!box) return;
+    const requestStarted=performance.now();searchPerfRuntime.activeRequestCount++;let responseAt=requestStarted,resultCount=0;
     box.innerHTML='در حال جستجوی موجودی از snapshot یکپارچه...';
     try{
-      const r=await searchInventoryRowsFull(query,stockNumber);
+      const r=await searchInventoryRowsFull(query,stockNumber);responseAt=performance.now();
       if(!r.ok){ box.innerHTML=`<div class="error">${esc(r.error||'خطا در جستجوی موجودی')}</div>`; return; }
       const rows=r.list||[];
+      resultCount=rows.length;
       if(!rows.length){ box.innerHTML='<div class="warn">نتیجه‌ای برای این جستجو/انبار پیدا نشد.</div>'; return; }
       box.innerHTML=`<div class="small muted">${fmt(rows.length)} ردیف انبار منطبق با «${esc(query)}» | منبع: ${esc(r.source||'snapshot')} ${r.exactRefresh?`| refresh دقیق کالا: ${r.exactRefresh.ok?'موفق':'ناموفق'}`:''}</div><div id="stockGroupBox" class="form-group"></div><div id="stockRowsBox"></div>`;
       renderGroupSelect(r.groups||[],'stock','#stockRowsBox',rows,selectable);
       renderInventoryRows(rows,'#stockRowsBox',selectable);
     }catch(e){ box.innerHTML=`<div class="error">خطا در جستجوی موجودی: ${esc(invErr(e))}</div>`; }
+    finally{searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1);logSearchPerfFrontend({endpoint:'/api/inventory/search',query,generation:0,debounceConfiguredMs:0,actualDebounceMs:0,requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-requestStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored:false,activeRequestCount:searchPerfRuntime.activeRequestCount})}
   };
   window.renderKardex = renderKardex = async function(item,target,stockNumber=''){
     const box=$(target); if(!box) return;
