@@ -15,6 +15,7 @@ const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
 const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
+const { emitSearchEvent } = require('./lib/search-observability');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -46,7 +47,8 @@ const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan
 function searchPerfNow() {
   return Number(process.hrtime.bigint()) / 1e6;
 }
-function createSearchPerfTrace(endpoint, queryText) {
+const SEARCH_BACKEND_SLOW_THRESHOLD_MS = 500;
+function createSearchPerfTrace(endpoint, queryText, context = {}) {
   const startedMs = searchPerfNow();
   const requestStartedAt = new Date().toISOString();
   const searchRequestId = `search-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -55,9 +57,10 @@ function createSearchPerfTrace(endpoint, queryText) {
   const tokens = tokensOf(queryText);
   const itemCodeLike = looksLikeItemCode(queryText);
   return {
-    event:'SEARCH_PERF_BACKEND',
     searchRequestId,
     endpoint,
+    page:String(context.page || ''),
+    searchSessionId:String(context.searchSessionId || ''),
     normalizedQuery,
     queryLength:String(queryText || '').length,
     compactQueryLength:normalizedQuery.replace(/\s+/g, '').length,
@@ -89,11 +92,67 @@ function createSearchPerfTrace(endpoint, queryText) {
 function emitSearchPerf(trace) {
   if (!trace || trace._emitted) return;
   trace._emitted = true;
-  const output = { ...trace };
-  delete output._startedMs;
-  delete output._localSearchStartedMs;
-  delete output._emitted;
-  try { console.info(JSON.stringify(output)); } catch {}
+  const summary = {
+    requestId:trace.searchRequestId,
+    timestamp:trace.requestStartedAt,
+    route:trace.endpoint,
+    page:trace.page,
+    normalizedQuery:trace.normalizedQuery,
+    tokenCount:trace.tokenCount,
+    resultCount:trace.localResultCount,
+    backendTotalMs:trace.totalMs,
+    localDbMs:trace.localSnapshotQueryMs,
+    rankingMs:trace.localRankingMs,
+    serializationMs:trace.serializationMs,
+    liveRepairUsed:trace.liveRepairUsed,
+    shayganCallCount:trace.shayganCallCount,
+    aborted:trace.requestAborted,
+    searchSessionId:trace.searchSessionId
+  };
+  emitSearchEvent('SEARCH_QUERY_SUMMARY', summary);
+  if (Number(trace.totalMs || 0) > SEARCH_BACKEND_SLOW_THRESHOLD_MS) {
+    emitSearchEvent('SEARCH_SLOW_QUERY', {
+      requestId:trace.searchRequestId,
+      timestamp:new Date().toISOString(),
+      route:trace.endpoint,
+      page:trace.page,
+      normalizedQuery:trace.normalizedQuery,
+      tokenCount:trace.tokenCount,
+      resultCount:trace.localResultCount,
+      durationMs:trace.totalMs,
+      thresholdMs:SEARCH_BACKEND_SLOW_THRESHOLD_MS,
+      thresholdType:'backend-total',
+      searchSessionId:trace.searchSessionId
+    });
+  }
+  if (trace.responseCompleted && Number(trace.localResultCount || 0) === 0) {
+    emitSearchEvent('SEARCH_ZERO_RESULT', {
+      requestId:trace.searchRequestId,
+      timestamp:new Date().toISOString(),
+      route:trace.endpoint,
+      page:trace.page,
+      normalizedQuery:trace.normalizedQuery,
+      tokenCount:trace.tokenCount,
+      resultCount:0,
+      searchSessionId:trace.searchSessionId
+    }, { force:true });
+  }
+  if (trace.requestAborted && !trace._abortEventEmitted) emitSearchAborted(trace, 'client-disconnected');
+}
+function emitSearchAborted(trace, reason = 'client-disconnected') {
+  if (!trace || trace._abortEventEmitted) return;
+  trace.requestAborted = true;
+  trace._abortEventEmitted = true;
+  emitSearchEvent('SEARCH_ABORTED', {
+    requestId:trace.searchRequestId,
+    timestamp:new Date().toISOString(),
+    route:trace.endpoint,
+    page:trace.page,
+    normalizedQuery:trace.normalizedQuery,
+    tokenCount:trace.tokenCount,
+    reason,
+    searchSessionId:trace.searchSessionId
+  });
 }
 function sendSearchPerfJson(req, res, status, payload, trace) {
   const serializationStarted = searchPerfNow();
@@ -108,9 +167,9 @@ function sendSearchPerfJson(req, res, status, payload, trace) {
   }
   trace.serializationMs = Number((searchPerfNow() - serializationStarted).toFixed(3));
   trace.totalMs = Number((searchPerfNow() - trace._startedMs).toFixed(3));
-  trace.responseCompleted = true;
   res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' });
   res.end(body);
+  trace.responseCompleted = true;
   emitSearchPerf(trace);
 }
 
@@ -945,7 +1004,7 @@ function observeItemCodeClassifierV2(endpoint, queryText) {
     const scheduled = setImmediate(() => {
       try {
         const comparison = compareItemCodeClassifiers(queryText, looksLikeItemCode(queryText));
-        console.info('ITEM_CODE_CLASSIFIER_V2_SHADOW', JSON.stringify({ event:'ITEM_CODE_CLASSIFIER_V2_SHADOW', endpoint, ...comparison }));
+        emitSearchEvent('ITEM_CODE_CLASSIFIER_V2_SHADOW', { timestamp:new Date().toISOString(), endpoint, ...comparison });
       } catch {}
     });
     scheduled.unref?.();
@@ -3912,17 +3971,18 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
       const searchQuery = query.q || query.term || '';
       observeItemCodeClassifierV2(pathname, searchQuery);
-      const searchTrace = createSearchPerfTrace(pathname, searchQuery);
-      req.once('aborted', () => { searchTrace.requestAborted = true; });
+      const searchTrace = createSearchPerfTrace(pathname, searchQuery, { page:'sale', searchSessionId:query.searchSessionId });
+      req.once('aborted', () => emitSearchAborted(searchTrace));
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
       const r = await searchSaleInventorySnapshot(searchQuery, Number(query.limit || 30), filters, searchTrace);
+      searchTrace.localResultCount = (r.groups || []).length;
       return sendSearchPerfJson(req, res, 200, r, searchTrace);
     }
     if (pathname === '/api/inventory/search') {
       const searchQuery = query.q || query.term || '';
       observeItemCodeClassifierV2(pathname, searchQuery);
-      const searchTrace = createSearchPerfTrace(pathname, searchQuery);
-      req.once('aborted', () => { searchTrace.requestAborted = true; });
+      const searchTrace = createSearchPerfTrace(pathname, searchQuery, { page:'inventory', searchSessionId:query.searchSessionId });
+      req.once('aborted', () => emitSearchAborted(searchTrace));
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
       const r = await searchInventoryRows(searchQuery, Number(query.limit || 0), Number(query.pages || config.inventoryCatalogSyncPages), filters, searchTrace);
       const dd = dedupeRemainRows(r.list || []);

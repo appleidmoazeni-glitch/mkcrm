@@ -18,6 +18,8 @@
     "test:itemcode-shadow": "node --test test/item-code-classifier-v2.test.js",
     "test:search-local-first": "node --test test/local-first-search.test.js",
     "test:final-verify-dedup": "node --test test/final-verify-dedup.test.js",
+    "test:search-observability": "node --test test/search-observability.test.js",
+    "report:search-observability": "node scripts/report-search-observability.js",
     "smoke": "node scripts/smoke-test.js",
     "test:all": "node scripts/test-all.js"
   },

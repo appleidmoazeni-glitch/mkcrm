@@ -7,9 +7,11 @@ const root = path.resolve(__dirname, '..');
 const server = fs.readFileSync(path.join(root, 'src/server.js'), 'utf8');
 const frontend = fs.readFileSync(path.join(root, 'public/assets/app.js'), 'utf8');
 const config = fs.readFileSync(path.join(root, 'src/lib/config.js'), 'utf8');
+const observability = fs.readFileSync(path.join(root, 'src/lib/search-observability.js'), 'utf8');
 
 test('backend telemetry covers both search routes without changing their payload fields', () => {
-  assert.match(server, /createSearchPerfTrace\(pathname, searchQuery\)/);
+  assert.match(server, /createSearchPerfTrace\(pathname, searchQuery, \{ page:'sale'/);
+  assert.match(server, /createSearchPerfTrace\(pathname, searchQuery, \{ page:'inventory'/);
   assert.match(server, /sendSearchPerfJson\(req, res, 200, r, searchTrace\)/);
   assert.match(server, /const payload = \{ ok:r\.ok, list:dd\.list, groups: inventoryGroups\(dd\.list\), source:/);
   assert.doesNotMatch(server, /searchTelemetry\s*:/);
@@ -18,8 +20,11 @@ test('backend telemetry covers both search routes without changing their payload
 
 test('telemetry logging is failure-isolated and excludes sensitive transport data', () => {
   const emit = server.slice(server.indexOf('function emitSearchPerf'), server.indexOf('async function executeInventorySyncJob'));
-  assert.match(emit, /try \{ console\.info\(JSON\.stringify\(output\)\); \} catch \{\}/);
+  assert.match(emit, /emitSearchEvent\('SEARCH_QUERY_SUMMARY'/);
+  assert.match(observability, /try \{ sink\(eventName, JSON\.stringify\(event\)\); \} catch \{\}/);
+  assert.match(observability, /catch \{\s*return \{ emitted:false, event:null \};/);
   assert.doesNotMatch(emit, /authorization|api[-_]?key|connectionString|rawResponse/i);
+  assert.doesNotMatch(observability, /authorization|api[-_]?key|connectionString|rawResponse/i);
 });
 
 test('search telemetry remains observational in the cumulative local-first pipeline', () => {
@@ -59,7 +64,8 @@ test('inventory sync configuration remains at its established defaults', () => {
 });
 
 test('no telemetry field is persisted into inventory documents', () => {
-  assert.doesNotMatch(server, /\$set\s*:\s*\{[^}]*SEARCH_PERF/is);
-  assert.doesNotMatch(server, /collection\(['"]itemInventoryCatalog['"]\)[\s\S]{0,120}(SEARCH_PERF|searchRequestId)/);
-  assert.doesNotMatch(server, /collection\(['"]itemCatalog(?:All)?['"]\)[\s\S]{0,120}(SEARCH_PERF|searchRequestId)/);
+  const telemetryNames = 'SEARCH_(?:PERF|QUERY_SUMMARY|ZERO_RESULT|ABORTED|SLOW_QUERY|VERIFY_DIFF)';
+  assert.doesNotMatch(server, new RegExp(`\\$set\\s*:\\s*\\{[^}]*(?:${telemetryNames})`, 'is'));
+  assert.doesNotMatch(server, new RegExp(`collection\\(['"]itemInventoryCatalog['"]\\)[\\s\\S]{0,120}(?:${telemetryNames}|searchRequestId)`));
+  assert.doesNotMatch(server, new RegExp(`collection\\(['"]itemCatalog(?:All)?['"]\\)[\\s\\S]{0,120}(?:${telemetryNames}|searchRequestId)`));
 });
