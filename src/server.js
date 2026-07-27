@@ -14,6 +14,8 @@ const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
+const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
+const { emitSearchEvent } = require('./lib/search-observability');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -41,6 +43,135 @@ mongoBackupJobRegistry.register({name:'mongo-backup',version:1,factory:input=>ne
 const mongoBackupJobManager=new JobManager(mongoBackupJobRegistry);
 let mongoBackupLastResult=null;
 const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan.getInvoice(invNo,invType),supportedTypes:invoiceTypes.supportedTypes});
+
+function searchPerfNow() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+const SEARCH_BACKEND_SLOW_THRESHOLD_MS = 500;
+function createSearchPerfTrace(endpoint, queryText, context = {}) {
+  const startedMs = searchPerfNow();
+  const requestStartedAt = new Date().toISOString();
+  const searchRequestId = `search-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const normalizationStarted = searchPerfNow();
+  const normalizedQuery = normalizeFa(queryText);
+  const tokens = tokensOf(queryText);
+  const itemCodeLike = looksLikeItemCode(queryText);
+  return {
+    searchRequestId,
+    endpoint,
+    page:String(context.page || ''),
+    searchSessionId:String(context.searchSessionId || ''),
+    normalizedQuery,
+    queryLength:String(queryText || '').length,
+    compactQueryLength:normalizedQuery.replace(/\s+/g, '').length,
+    tokenCount:tokens.length,
+    queryKind:itemCodeLike ? 'item-code-like' : (tokens.length > 1 ? 'multi-token' : 'single-token'),
+    looksLikeItemCode:itemCodeLike,
+    requestStartedAt,
+    _startedMs:startedMs,
+    normalizationMs:Number((searchPerfNow() - normalizationStarted).toFixed(3)),
+    candidateSearchMs:0,
+    candidateCount:0,
+    liveRepairUsed:false,
+    liveRepairMs:0,
+    liveRepairCandidateCount:0,
+    shayganCallCount:0,
+    shayganCalls:[],
+    localSnapshotQueryMs:0,
+    localRowsLoaded:0,
+    localRankingMs:0,
+    localResultCount:0,
+    groupingMs:0,
+    serializationMs:0,
+    negativeCacheHit:false,
+    fallbackUsed:false,
+    requestAborted:false,
+    responseCompleted:false
+  };
+}
+function emitSearchPerf(trace) {
+  if (!trace || trace._emitted) return;
+  trace._emitted = true;
+  const summary = {
+    requestId:trace.searchRequestId,
+    timestamp:trace.requestStartedAt,
+    route:trace.endpoint,
+    page:trace.page,
+    normalizedQuery:trace.normalizedQuery,
+    tokenCount:trace.tokenCount,
+    resultCount:trace.localResultCount,
+    backendTotalMs:trace.totalMs,
+    localDbMs:trace.localSnapshotQueryMs,
+    rankingMs:trace.localRankingMs,
+    serializationMs:trace.serializationMs,
+    liveRepairUsed:trace.liveRepairUsed,
+    shayganCallCount:trace.shayganCallCount,
+    aborted:trace.requestAborted,
+    searchSessionId:trace.searchSessionId
+  };
+  emitSearchEvent('SEARCH_QUERY_SUMMARY', summary);
+  if (Number(trace.totalMs || 0) > SEARCH_BACKEND_SLOW_THRESHOLD_MS) {
+    emitSearchEvent('SEARCH_SLOW_QUERY', {
+      requestId:trace.searchRequestId,
+      timestamp:new Date().toISOString(),
+      route:trace.endpoint,
+      page:trace.page,
+      normalizedQuery:trace.normalizedQuery,
+      tokenCount:trace.tokenCount,
+      resultCount:trace.localResultCount,
+      durationMs:trace.totalMs,
+      thresholdMs:SEARCH_BACKEND_SLOW_THRESHOLD_MS,
+      thresholdType:'backend-total',
+      searchSessionId:trace.searchSessionId
+    });
+  }
+  if (trace.responseCompleted && Number(trace.localResultCount || 0) === 0) {
+    emitSearchEvent('SEARCH_ZERO_RESULT', {
+      requestId:trace.searchRequestId,
+      timestamp:new Date().toISOString(),
+      route:trace.endpoint,
+      page:trace.page,
+      normalizedQuery:trace.normalizedQuery,
+      tokenCount:trace.tokenCount,
+      resultCount:0,
+      searchSessionId:trace.searchSessionId
+    }, { force:true });
+  }
+  if (trace.requestAborted && !trace._abortEventEmitted) emitSearchAborted(trace, 'client-disconnected');
+}
+function emitSearchAborted(trace, reason = 'client-disconnected') {
+  if (!trace || trace._abortEventEmitted) return;
+  trace.requestAborted = true;
+  trace._abortEventEmitted = true;
+  emitSearchEvent('SEARCH_ABORTED', {
+    requestId:trace.searchRequestId,
+    timestamp:new Date().toISOString(),
+    route:trace.endpoint,
+    page:trace.page,
+    normalizedQuery:trace.normalizedQuery,
+    tokenCount:trace.tokenCount,
+    reason,
+    searchSessionId:trace.searchSessionId
+  });
+}
+function sendSearchPerfJson(req, res, status, payload, trace) {
+  const serializationStarted = searchPerfNow();
+  let body;
+  try {
+    body = JSON.stringify(payload, null, 2);
+  } catch (error) {
+    trace.serializationMs = Number((searchPerfNow() - serializationStarted).toFixed(3));
+    trace.totalMs = Number((searchPerfNow() - trace._startedMs).toFixed(3));
+    emitSearchPerf(trace);
+    throw error;
+  }
+  trace.serializationMs = Number((searchPerfNow() - serializationStarted).toFixed(3));
+  trace.totalMs = Number((searchPerfNow() - trace._startedMs).toFixed(3));
+  res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' });
+  res.end(body);
+  trace.responseCompleted = true;
+  emitSearchPerf(trace);
+}
 
 async function executeInventorySyncJob(request){
   let serviceResult=null;
@@ -868,6 +999,17 @@ function looksLikeItemCode(q = '') {
   const x = String(q || '').trim();
   return /^[0-9A-Za-z_-]{5,}$/.test(x) && !/\s/.test(x);
 }
+function observeItemCodeClassifierV2(endpoint, queryText) {
+  try {
+    const scheduled = setImmediate(() => {
+      try {
+        const comparison = compareItemCodeClassifiers(queryText, looksLikeItemCode(queryText));
+        emitSearchEvent('ITEM_CODE_CLASSIFIER_V2_SHADOW', { timestamp:new Date().toISOString(), endpoint, ...comparison });
+      } catch {}
+    });
+    scheduled.unref?.();
+  } catch {}
+}
 
 // 0.9.19.23: Targeted repair for Shaygan GetRemain stock-list gaps.
 // Normal searches remain Mongo-first. Live fallback is only used when snapshot has no result.
@@ -894,11 +1036,18 @@ function markLiveRepairNegative(q, filters = {}) {
   if (ttl > 0) liveInventoryRepairNegativeCache.set(liveRepairCacheKey(q, filters), Date.now() + ttl);
 }
 function escapeRe(s='') { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-async function findCatalogItemCodesByQuery(db, q, max = 5) {
+async function findCatalogItemCodesByQuery(db, q, max = 5, searchTrace = null) {
+  const candidateStarted = searchPerfNow();
   const tokens = tokensOf(q);
-  if (!tokens.length) return [];
+  if (!tokens.length) {
+    if (searchTrace) searchTrace.candidateSearchMs += Number((searchPerfNow() - candidateStarted).toFixed(3));
+    return [];
+  }
   const first = tokens.sort((a,b)=>b.length-a.length)[0];
-  if (!first || first.length < 3) return [];
+  if (!first || first.length < 3) {
+    if (searchTrace) searchTrace.candidateSearchMs += Number((searchPerfNow() - candidateStarted).toFixed(3));
+    return [];
+  }
   const rx = new RegExp(escapeRe(first), 'i');
   const cols = ['itemCatalog', 'itemCatalogAll', 'itemInventoryCatalog'];
   const seen = new Set();
@@ -912,19 +1061,51 @@ async function findCatalogItemCodesByQuery(db, q, max = 5) {
       candidates.push({ code, score: scoreMatch(d.searchText || `${d.itemCode||d.ItemCode||''} ${d.itemDescription||d.ItemDescription||''}`, tokens, code) });
     }
   }
-  return candidates.filter(x => x.score > -Infinity).sort((a,b)=>b.score-a.score).slice(0, Number(max||5)).map(x=>x.code);
+  const selected = candidates.filter(x => x.score > -Infinity).sort((a,b)=>b.score-a.score).slice(0, Number(max||5)).map(x=>x.code);
+  if (searchTrace) {
+    searchTrace.candidateSearchMs += Number((searchPerfNow() - candidateStarted).toFixed(3));
+    searchTrace.candidateCount += selected.length;
+  }
+  return selected;
 }
-async function targetedLiveInventoryRepair(db, q, filters = {}, reason = 'targeted-live-search-repair') {
+async function targetedLiveInventoryRepair(db, q, filters = {}, reason = 'targeted-live-search-repair', searchTrace = null) {
+  const repairStarted = searchPerfNow();
   const query = String(q || '').trim();
-  if (!shouldRunLiveInventoryRepair(query, 0)) return { ok:true, skipped:true, reason:'not-eligible', rows:[], rowCount:0 };
-  if (liveRepairNegativeBlocked(query, filters)) return { ok:true, skipped:true, negativeCached:true, rows:[], rowCount:0 };
-  const codes = looksLikeItemCode(query) ? [query.toUpperCase()] : await findCatalogItemCodesByQuery(db, query, Number(config.liveSearchFallbackMaxCatalogCandidates || 5));
+  if (!shouldRunLiveInventoryRepair(query, 0)) {
+    if (searchTrace) searchTrace.liveRepairMs += Number((searchPerfNow() - repairStarted).toFixed(3));
+    return { ok:true, skipped:true, reason:'not-eligible', rows:[], rowCount:0 };
+  }
+  if (liveRepairNegativeBlocked(query, filters)) {
+    if (searchTrace) {
+      searchTrace.negativeCacheHit = true;
+      searchTrace.liveRepairMs += Number((searchPerfNow() - repairStarted).toFixed(3));
+    }
+    return { ok:true, skipped:true, negativeCached:true, rows:[], rowCount:0 };
+  }
+  const codes = looksLikeItemCode(query) ? [query.toUpperCase()] : await findCatalogItemCodesByQuery(db, query, Number(config.liveSearchFallbackMaxCatalogCandidates || 5), searchTrace);
+  if (searchTrace) {
+    searchTrace.liveRepairUsed = true;
+    searchTrace.liveRepairCandidateCount += codes.length;
+  }
   const allRows = [];
   const results = [];
   const active = await getActiveWarehouseNumbers(db).catch(()=>[]);
   const activeSet = new Set((active || []).map(String));
   for (const code of [...new Set(codes)]) {
+    const shayganStarted = searchPerfNow();
     const rr = await authoritativeLiveReconcileItem(db, code, reason).catch(e => ({ ok:false, itemCode:code, rows:[], error:String(e.message||e) }));
+    if (searchTrace) {
+      const errorText = String(rr.error || '');
+      searchTrace.shayganCalls.push({
+        itemCode:code,
+        durationMs:Number((searchPerfNow() - shayganStarted).toFixed(3)),
+        success:!!rr.ok,
+        timeout:/timeout/i.test(errorText),
+        resultCount:(rr.rows || []).length,
+        errorCategory:rr.ok ? '' : (/timeout/i.test(errorText) ? 'timeout' : 'read-failed')
+      });
+      searchTrace.shayganCallCount = searchTrace.shayganCalls.length;
+    }
     results.push({ itemCode:code, ok:!!rr.ok, rowCount:(rr.rows||[]).length, error:rr.error||'' });
     for (const row of (rr.rows || [])) {
       if (filters.stockNumber && String(row.stockNumber) !== String(filters.stockNumber)) continue;
@@ -934,6 +1115,7 @@ async function targetedLiveInventoryRepair(db, q, filters = {}, reason = 'target
   }
   if (!allRows.length) markLiveRepairNegative(query, filters);
   await db.collection('appLogs').insertOne({ type:'inventory_live_search_repair', query, filters, codes, resultCount:allRows.length, results, at:new Date() }).catch(()=>{});
+  if (searchTrace) searchTrace.liveRepairMs += Number((searchPerfNow() - repairStarted).toFixed(3));
   return { ok:true, skipped:false, rows:allRows, rowCount:allRows.length, codes, results, source:'targeted-live-getremain-repair' };
 }
 async function repairInventorySnapshotFromKardex(db, code, stockNumber, kardexResult) {
@@ -960,60 +1142,53 @@ async function buildActiveInventoryFind(db, filters = {}) {
   return { find, active, blockedStock:false };
 }
 
-async function searchActiveInventorySnapshot(q, limit = 50, filters = {}) {
+async function searchActiveInventorySnapshot(q, limit = 50, filters = {}, searchTrace = null) {
+  if (searchTrace && !searchTrace._localSearchStartedMs) searchTrace._localSearchStartedMs = searchPerfNow();
   const db = await connectMongo();
   const tokens = tokensOf(q);
   const { find, active, blockedStock } = await buildActiveInventoryFind(db, filters);
   if (blockedStock || !find) return { ok:true, list:[], groups:[], source:'active-inventory-snapshot-blocked-stock', activeWarehouseNumbers:active, cacheCount:0 };
   if (!tokens.length && !filters.stockNumber) return { ok:true, list:[], groups:[], source:'active-inventory-snapshot-empty', activeWarehouseNumbers:active, cacheCount:0 };
+  const snapshotStarted = searchPerfNow();
   const docs = await db.collection('itemInventoryCatalog').find(find).limit(120000).toArray();
+  if (searchTrace) {
+    searchTrace.localSnapshotQueryMs += Number((searchPerfNow() - snapshotStarted).toFixed(3));
+    searchTrace.localRowsLoaded += docs.length;
+  }
+  const rankingStarted = searchPerfNow();
   const ranked = docs
     .map(x => ({ ...x, _score: tokens.length ? scoreMatch(x.searchText || rowSearchText(x), tokens, x.itemCode || '') : 0 }))
     .filter(x => !tokens.length || x._score > -Infinity)
     .sort((a,b) => b._score - a._score || String(a.itemDescription||'').localeCompare(String(b.itemDescription||''),'fa') || String(a.stockNumber||'').localeCompare(String(b.stockNumber||''),'fa'));
+  if (searchTrace) searchTrace.localRankingMs += Number((searchPerfNow() - rankingStarted).toFixed(3));
   const cap = Number(limit || 50);
   const list = cap > 0 ? ranked.slice(0, Math.max(cap, 5000)) : ranked;
+  const groupingStarted = searchPerfNow();
   const groups = saleInventoryGroups(ranked, cap || 40);
+  if (searchTrace) {
+    searchTrace.groupingMs += Number((searchPerfNow() - groupingStarted).toFixed(3));
+    searchTrace.localResultCount = cap > 0 ? Math.min(ranked.length, cap) : ranked.length;
+  }
   return { ok:true, list: cap > 0 ? ranked.slice(0, cap) : ranked, groups, source:'active-inventory-snapshot-unified', activeWarehouseNumbers:active, cacheCount:docs.length };
 }
 
-async function searchInventoryCatalog(q, limit = 30, filters = {}) {
-  const r = await searchActiveInventorySnapshot(q, limit, filters);
+async function searchInventoryCatalog(q, limit = 30, filters = {}, searchTrace = null) {
+  const r = await searchActiveInventorySnapshot(q, limit, filters, searchTrace);
   return r.list || [];
 }
 
-async function searchSaleInventorySnapshot(q, limit = 40, filters = {}) {
+async function searchSaleInventorySnapshot(q, limit = 40, filters = {}, searchTrace = null) {
   // 0.9.19.21: سرچ فروش دقیقاً از همان موتور سرچ موجودی انبارها استفاده می‌کند.
   // وابستگی به maxAge باعث حذف کاذب کالاهای تازه sync شده می‌شد؛ cache فعال همیشه مرجع UI است و قبل از صدور live check انجام می‌شود.
   const db = await connectMongo();
   const tokens = tokensOf(q);
   if (!tokens.length) return { ok:true, list:[], groups:[], source:'sale-inventory-unified-empty', cacheCount:0, stale:false };
 
-  let exactRefresh = null;
-  if (looksLikeItemCode(q)) {
-    exactRefresh = await authoritativeLiveReconcileItem(db, String(q || '').trim().toUpperCase(), 'sale-search-exact-code-refresh').catch(e => ({ ok:false, error:String(e.message||e) }));
-  }
-
-  let preTextRefresh = null;
-  if (!looksLikeItemCode(q) && normalizeFa(String(q||'')).replace(/\s+/g,'').length >= 4) {
-    preTextRefresh = await targetedLiveInventoryRepair(db, q, filters, 'sale-text-search-targeted-refresh-before-filter').catch(e => ({ ok:false, rows:[], error:String(e.message||e) }));
-  }
-  let r = await searchActiveInventorySnapshot(q, Number(limit || 40), filters);
-  let groups = r.groups || [];
-  let list = groups.flatMap(g => (g.stocks || []).map(st => ({ ...st, totalQty:g.totalQty })));
-
-  // 0.9.19.23/52: اگر snapshot نتیجه نداد، repair هدفمند بزن؛ سرچ‌های مدل‌محور هم قبل از فیلتر refresh شدند.
-  if (!groups.length && shouldRunLiveInventoryRepair(q, 0)) {
-    const liveInfo = await targetedLiveInventoryRepair(db, q, filters, 'sale-search-targeted-live-repair');
-    if ((liveInfo.rows || []).length) {
-      // بعد از upsert fallback، دوباره از موتور واحد snapshot بخوان تا active warehouse و group key یکی باشد.
-      r = await searchActiveInventorySnapshot(q, Number(limit || 40), filters);
-      groups = r.groups || [];
-      list = groups.flatMap(g => (g.stocks || []).map(st => ({ ...st, totalQty:g.totalQty })));
-      if (groups.length) return { ok:true, list, groups, source:'sale-inventory-unified-targeted-live-repair', cacheCount:r.cacheCount||0, stale:false, exactRefresh, preTextRefresh, fallback:liveInfo, activeWarehouseNumbers:r.activeWarehouseNumbers||[] };
-    }
-  }
-  return { ok:true, list, groups, source: exactRefresh ? 'sale-inventory-unified-snapshot-exact-refreshed' : (preTextRefresh ? 'sale-inventory-unified-snapshot-text-refreshed' : 'sale-inventory-unified-snapshot'), cacheCount:r.cacheCount||0, stale:false, exactRefresh, preTextRefresh, activeWarehouseNumbers:r.activeWarehouseNumbers||[] };
+  if (searchTrace) searchTrace.preLocalSearchMs = Number((searchPerfNow() - searchTrace._startedMs).toFixed(3));
+  let r = await searchActiveInventorySnapshot(q, Number(limit || 40), filters, searchTrace);
+  const groups = r.groups || [];
+  const list = groups.flatMap(g => (g.stocks || []).map(st => ({ ...st, totalQty:g.totalQty })));
+  return { ok:true, list, groups, source:'sale-inventory-unified-snapshot', cacheCount:r.cacheCount||0, stale:false, exactRefresh:null, preTextRefresh:null, activeWarehouseNumbers:r.activeWarehouseNumbers||[] };
 }
 
 
@@ -1080,7 +1255,7 @@ async function liveScanInventorySearch(q, limit = 30, maxPages = config.inventor
   return { ok:true, list:dd.list, rows:dd.list, source:'inventory-live-deduped-store-item', scannedPages:scanned, rawCount:dd.rawCount, uniqueCount:dd.uniqueCount, duplicateCount:dd.duplicates.length, duplicateConflicts:dd.conflicts };
 }
 
-async function searchInventoryRows(q, limit = 50, maxPages = config.inventorySearchLivePages, filters = {}) {
+async function searchInventoryRows(q, limit = 50, maxPages = config.inventorySearchLivePages, filters = {}, searchTrace = null) {
   // 0.9.19.17→WS: SQL حذف شد؛ MongoDB snapshot استفاده می‌شود
   const tokens = tokensOf(q);
   if (tokens.length < 1 && !filters.stockNumber) return { ok:true, list:[], source:'empty' };
@@ -1089,33 +1264,10 @@ async function searchInventoryRows(q, limit = 50, maxPages = config.inventorySea
   // only positive-stock rows from the local inventory snapshot. Do NOT call Shaygan while typing.
   // Live Shaygan remains only for final sale verification and single-item inventory detail.
   const cacheLimit = limit > 0 ? Math.max(limit, 5000) : 80000;
-  let exactRefresh = null;
-  if (looksLikeItemCode(q)) {
-    const db = await connectMongo();
-    exactRefresh = await authoritativeLiveReconcileItem(db, String(q || '').trim().toUpperCase(), 'inventory-search-exact-code-refresh').catch(e => ({ ok:false, error:String(e.message||e) }));
-  }
-  let fallback = null;
   let source = 'inventory-snapshot-positive';
-  // 0.9.19.52: for strong text/model searches, identify candidate itemCodes first, refresh them, then apply stock filter.
-  // This fixes cases like q=m100a + stock=11 where snapshot is missing one stock row.
-  if (!looksLikeItemCode(q) && normalizeFa(String(q||'')).replace(/\s+/g,'').length >= 4) {
-    const db = await connectMongo();
-    fallback = await targetedLiveInventoryRepair(db, q, filters, 'inventory-text-search-targeted-refresh-before-filter').catch(e => ({ ok:false, rows:[], error:String(e.message||e) }));
-    if ((fallback.rows || []).length) source = 'inventory-snapshot-positive-text-targeted-refreshed';
-  }
-  let rows = await searchInventoryCatalog(q, cacheLimit, filters);
-  // 0.9.19.23/52: if still empty, try repair for eligible exact/long search.
-  if (!rows.length && shouldRunLiveInventoryRepair(q, 0)) {
-    const db = await connectMongo();
-    fallback = await targetedLiveInventoryRepair(db, q, filters, 'inventory-search-targeted-live-repair');
-    if ((fallback.rows || []).length) {
-      rows = await searchInventoryCatalog(q, cacheLimit, filters);
-      source = 'inventory-snapshot-positive-targeted-live-repair';
-    } else if (fallback.negativeCached) {
-      source = 'inventory-snapshot-positive-negative-cache';
-    }
-  }
-  return { ok:true, list: limit > 0 ? rows.slice(0, limit) : rows, source: exactRefresh ? source + '-exact-refreshed' : source, scannedPages:0, exactRefresh, fallback, error:'' };
+  if (searchTrace) searchTrace.preLocalSearchMs = Number((searchPerfNow() - searchTrace._startedMs).toFixed(3));
+  let rows = await searchInventoryCatalog(q, cacheLimit, filters, searchTrace);
+  return { ok:true, list: limit > 0 ? rows.slice(0, limit) : rows, source, scannedPages:0, exactRefresh:null, fallback:null, error:'' };
 }
 
 function deriveMainGroup(row) {
@@ -1210,28 +1362,8 @@ async function searchAllItems(q, limit = 50, maxPages = config.inventoryCatalogS
     found = [...byCode.values()].sort((a,b) => b._score - a._score || String(a.itemDescription || '').length - String(b.itemDescription || '').length || String(a.itemCode || '').localeCompare(String(b.itemCode || ''), 'fa'));
   }
 
-  // 3) Do NOT scan 300 pages during typing. A heavy scan made Kardex search slow.
-  // If cache is empty/incomplete, run only a small bounded live scan unless forceLive=1 is explicitly requested.
-  const forceLive = opts.forceLive === true;
-  const quickPages = forceLive ? Number(maxPages || 300) : Math.min(Number(maxPages || 20), Number(config.itemSearchQuickPages || 25));
-  let scanned = 0;
-  if (found.length < cap && quickPages > 0) {
-    const map = new Map(found.map(x => [x.itemCode, x]));
-    for (let rowStart = 0; scanned < quickPages; scanned++, rowStart += 100) {
-      const res = await shaygan.getItemsPage(rowStart, 100);
-      if (!res.ok) return { ok:false, list:[...map.values()].slice(0, cap).map(toProductNameRow), source:'all-items-live', scannedPages:scanned, error:res.error };
-      if (!res.list.length) break;
-      await upsertAllItemRows(db, res.list);
-      for (const item of res.list) {
-        const score = scoreMatch(`${item.itemCode || ''} ${item.itemDescription || ''}`, tokens, item.itemCode || '');
-        if (item.itemCode && score > -Infinity && !map.has(item.itemCode)) map.set(item.itemCode, { ...item, _score: score });
-      }
-      if (res.list.length < 100) break;
-    }
-    found = [...map.values()].sort((a,b) => b._score - a._score || String(a.itemDescription || '').length - String(b.itemDescription || '').length || String(a.itemCode || '').localeCompare(String(b.itemCode || ''), 'fa'));
-  }
-
-  const source = cached.length ? 'all-items-cache-ranked' : (scanned ? 'all-items-quick-live' : 'all-items-empty-cache');
+  const scanned = 0;
+  const source = cached.length ? 'all-items-cache-ranked' : 'all-items-empty-cache';
   const note = found.length ? '' : 'کاتالوگ کامل کالا هنوز sync نشده یا نتیجه‌ای در صفحات سریع پیدا نشد. از ابزار Sync All Items Catalog استفاده کنید.';
   return { ok:true, list:found.slice(0, cap).map(toProductNameRow), source, scannedPages:scanned, cacheCount:cached.length, note };
 }
@@ -3811,29 +3943,59 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok:r.ok, list, source:r.source||'', scannedPages:r.scannedPages||0, error:r.error||'' });
     }
     if (pathname === '/api/accounts/sync' && req.method === 'POST') { if (!requireRole(req, res, ['admin'])) return; return sendJson(res, 200, await syncAccountsCatalog(Number(query.pages || config.accountSearchPages || 220))); }
+    if (pathname === '/api/search/inventory-verify' && req.method === 'GET') {
+      if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      const itemCode = String(query.itemCode || '').trim();
+      const stockNumber = String(query.stockNumber || '').trim();
+      const searchSessionId = String(query.searchSessionId || '').trim();
+      const generation = Number(query.generation || 0);
+      const searchQuery = String(query.query || '').trim();
+      if (!itemCode || !searchSessionId || !Number.isFinite(generation)) return sendJson(res, 400, { ok:false, error:'itemCode, searchSessionId and generation required' });
+      const live = await shaygan.getInventoryByItemCode(itemCode).catch(e => ({ ok:false, list:[], error:String(e.message||e) }));
+      const list = (live.list || []).filter(row => !stockNumber || String(row.stockNumber || row.STNumber || '') === stockNumber);
+      return sendJson(res, 200, { ok:!!live.ok, searchSessionId, generation, query:searchQuery, itemCode, stockNumber, list, error:live.error || '', source:'shaygan-read-only-search-verify' });
+    }
     if (pathname === '/api/items/search') {
       // 0.9.19.17→WS: SQL searchItems حذف شد
-      return sendJson(res, 200, await searchItems(query.q || query.term || '', Number(query.limit || 200), Number(query.pages || config.inventorySearchLivePages)));
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      return sendJson(res, 200, await searchItems(searchQuery, Number(query.limit || 200), Number(query.pages || config.inventorySearchLivePages)));
     }
     if (pathname === '/api/items/search-all') {
       // 0.9.19.17→WS: SQL searchItems حذف شد
-      return sendJson(res, 200, await searchAllItems(query.q || query.term || '', Number(query.limit || 200), Number(query.pages || config.inventoryCatalogSyncPages), { forceLive: query.forceLive === '1' || query.forceLive === 'true' }));
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      return sendJson(res, 200, await searchAllItems(searchQuery, Number(query.limit || 200), Number(query.pages || config.inventoryCatalogSyncPages), { forceLive: query.forceLive === '1' || query.forceLive === 'true' }));
     }
     if (pathname === '/api/sale/inventory-snapshot-search') {
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      const searchTrace = createSearchPerfTrace(pathname, searchQuery, { page:'sale', searchSessionId:query.searchSessionId });
+      req.once('aborted', () => emitSearchAborted(searchTrace));
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
-      const r = await searchSaleInventorySnapshot(query.q || query.term || '', Number(query.limit || 30), filters);
-      return sendJson(res, 200, r);
+      const r = await searchSaleInventorySnapshot(searchQuery, Number(query.limit || 30), filters, searchTrace);
+      searchTrace.localResultCount = (r.groups || []).length;
+      return sendSearchPerfJson(req, res, 200, r, searchTrace);
     }
     if (pathname === '/api/inventory/search') {
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      const searchTrace = createSearchPerfTrace(pathname, searchQuery, { page:'inventory', searchSessionId:query.searchSessionId });
+      req.once('aborted', () => emitSearchAborted(searchTrace));
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
-      const r = await searchInventoryRows(query.q || query.term || '', Number(query.limit || 0), Number(query.pages || config.inventoryCatalogSyncPages), filters);
+      const r = await searchInventoryRows(searchQuery, Number(query.limit || 0), Number(query.pages || config.inventoryCatalogSyncPages), filters, searchTrace);
       const dd = dedupeRemainRows(r.list || []);
-      return sendJson(res, 200, { ok:r.ok, list:dd.list, groups: inventoryGroups(dd.list), source:(r.source||'')+'-deduped-store-item', scannedPages:r.scannedPages||0, fallback:r.fallback||null, error:r.error||'', rawCount:dd.rawCount, uniqueCount:dd.uniqueCount, duplicateCount:dd.duplicates.length, duplicateConflicts:dd.conflicts });
+      const groupingStarted = searchPerfNow();
+      const payload = { ok:r.ok, list:dd.list, groups: inventoryGroups(dd.list), source:(r.source||'')+'-deduped-store-item', scannedPages:r.scannedPages||0, fallback:r.fallback||null, error:r.error||'', rawCount:dd.rawCount, uniqueCount:dd.uniqueCount, duplicateCount:dd.duplicates.length, duplicateConflicts:dd.conflicts };
+      searchTrace.groupingMs += Number((searchPerfNow() - groupingStarted).toFixed(3));
+      searchTrace.localResultCount = dd.list.length;
+      return sendSearchPerfJson(req, res, 200, payload, searchTrace);
     }
     if (pathname === '/api/inventory/by-stock') {
       // 0.9.15.9: sellers also need full selected-warehouse inventory for stocktaking/control.
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      observeItemCodeClassifierV2(pathname, query.q || '');
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
       if (!filters.stockNumber) return sendJson(res, 400, { ok:false, error:'stockNumber required' });
       // 0.9.19.51: operational by-stock view must use global Mongo snapshot, not WebService stock-filter scan.
@@ -4956,8 +5118,8 @@ async function handleApi(req, res, pathname, query) {
       if (!draft) return sendJson(res, 404, { ok:false, error:'پیش‌نویس خرید پیدا نشد یا دسترسی ندارید' });
       return sendJson(res, 200, { ok:true, draft });
     }
-    if (pathname === '/api/legacy/productName/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; const r = await searchItems(q, 30, Number(query.pages || config.inventorySearchLivePages)); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toProductNameRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
-    if (pathname === '/api/legacy/stock/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; const r = await searchInventoryRows(q, Number(query.limit || 1000), Number(query.pages || config.inventorySearchLivePages), { stockNumber: query.stockNumber || '' }); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toOldStockRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
+    if (pathname === '/api/legacy/productName/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; observeItemCodeClassifierV2(pathname, q); const r = await searchItems(q, 30, Number(query.pages || config.inventorySearchLivePages)); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toProductNameRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
+    if (pathname === '/api/legacy/stock/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; observeItemCodeClassifierV2(pathname, q); const r = await searchInventoryRows(q, Number(query.limit || 1000), Number(query.pages || config.inventorySearchLivePages), { stockNumber: query.stockNumber || '' }); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toOldStockRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
     if (pathname === '/api/legacy/cardex/search') { const body = await collectBody(req); const code = body.itemCode || body.ItemCode || query.itemCode; const stockNumber = body.stockNumber || body.STNumber || query.stockNumber || query.STNumber || ''; const r = await shaygan.getKardexByItemCode(code, stockNumber, { maxRows: Number(query.maxRows || config.kardexAdminQuickMaxRows), hardMaxRows: config.kardexAdminFullMaxRows }); return sendJson(res, 200, { ok: r.ok, item: r.item, rows: r.rows || [], meta: r.meta || {}, error: r.error || '' }); }
     if (pathname === '/admin/getUserInfo') return sendJson(res, 200, { userData: { id: 'dev', name: 'تست', role: 'admin' } });
     if (pathname === '/api/template-map') return sendJson(res, 200, getTemplateMap());
