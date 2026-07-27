@@ -204,7 +204,8 @@ function checkBelowCost(){if(!state.selectedStock)return;const p=Number($('#Pric
 async function loadSerialsForSelected(){const box=$('#serialBox');if(!box||!state.selectedItem||!state.selectedStock)return;state.selectedSerials=[];state.serialInfo=null;box.innerHTML='<div class="small muted">در حال بررسی سریال‌های کالا در انبار انتخاب‌شده...</div>';try{const url=`/api/items/${encodeURIComponent(state.selectedItem.itemCode)}/serials?stockNumber=${encodeURIComponent(state.selectedStock.stockNumber)}&stockGuid=${encodeURIComponent(state.selectedStock.stockGuid||'')}&itemGuid=${encodeURIComponent(state.selectedItem.itemGuid||'')}`;const r=await api(url);state.serialInfo=r;const list=r.list||[];if(list.length){box.innerHTML=`<div class="form-group"><label>سریال کالا در ${esc(state.selectedStock.stockNumber)} - ${esc(state.selectedStock.stockName)}</label><div class="serial-list">${list.map((x,i)=>`<label class="serial-option"><input type="checkbox" class="serial-check" data-i="${i}"> <span>${esc(x.serialNumber)}</span></label>`).join('')}</div><div class="small muted">اگر تعداد بیش از یک است، به تعداد فروش سریال انتخاب کن.</div></div>`;$$('.serial-check').forEach(ch=>ch.onchange=()=>{state.selectedSerials=$$('.serial-check').filter(x=>x.checked).map(x=>list[Number(x.dataset.i)])});}else{box.innerHTML=`<div class="form-group"><label>سریال کالا</label><input id="manualSerials" placeholder="اگر کالا سریال‌دار است، سریال‌ها را با کاما جدا وارد کن"><div class="small muted">${esc(r.note||'برای این کالا/انبار سریالی از شایگان برنگشت. در صورت نیاز سریال را دستی وارد کن تا در فاکتور شایگان داخل فیلد Serials ارسال شود.')}</div></div>`;}}catch(e){box.innerHTML=`<div class="form-group"><label>سریال کالا</label><input id="manualSerials" placeholder="خطا در خواندن سریال؛ در صورت نیاز دستی وارد کن"><div class="small error">${esc(e.message)}</div></div>`}}
 function getLineSerials(){const manual=$('#manualSerials')?.value||'';const manualList=manual.split(/[،,\n]/).map(x=>x.trim()).filter(Boolean);return [...(state.selectedSerials||[]),...manualList.map(serialNumber=>({serialNumber}))]}
 
-function selectSaleStock(item,stock){state.selectedItem=item;state.selectedStock=stock;state.selectedSerials=[];state.serialInfo=null;$('#STNumber').value=`${stock.stockNumber} - ${stock.stockName} (${stock.quantity})`;$('#saleInventory').innerHTML=`<div class="success">کالا و انبار انتخاب شد: ${esc(item.itemDescription)} | ${esc(stock.stockName)}</div>`;checkBelowCost();loadSerialsForSelected()}
+function applyVerifiedSaleStockSelection(item,stock){state.selectedItem=item;state.selectedStock=stock;state.selectedSerials=[];state.serialInfo=null;$('#STNumber').value=`${stock.stockNumber} - ${stock.stockName} (${stock.quantity})`;$('#saleInventory').innerHTML=`<div class="success">کالا و انبار انتخاب شد: ${esc(item.itemDescription)} | ${esc(stock.stockName)}</div>`;checkBelowCost();loadSerialsForSelected()}
+function selectSaleStock(item,stock){return applyVerifiedSaleStockSelection(item,stock)}
 function renderSaleLines(){const box=$('#saleLines');if(!box)return;if(!state.saleLines.length){box.innerHTML='<div class="small muted">هنوز ردیفی به فاکتور اضافه نشده است.</div>';return}let h='<table class="table"><thead><tr><th>ردیف</th><th>کالا</th><th>انبار</th><th>تعداد</th><th>سریال</th><th>قیمت</th><th>مبلغ</th><th>حذف</th></tr></thead><tbody>';h+=state.saleLines.map((x,i)=>`<tr><td>${i+1}</td><td>${esc(x.itemCode)}<br>${esc(x.itemDescription)}</td><td>${esc(x.stockNumber)} - ${esc(x.stockName)}</td><td>${fmt(x.quantity)}</td><td>${(x.serials||[]).map(s=>esc(s.serialNumber||s)).join('<br>')||'<span class="muted">-</span>'}</td><td>${fmt(x.price)}</td><td>${fmt(x.quantity*x.price)}</td><td><button class="mini remove-line" data-i="${i}">حذف</button></td></tr>`).join('');box.innerHTML=h+'</tbody></table>';$$('.remove-line').forEach(b=>b.onclick=()=>{state.saleLines.splice(Number(b.dataset.i),1);renderSaleLines()})}
 function clearSaleLineInputs(){state.selectedItem=null;state.selectedStock=null;state.selectedSerials=[];state.serialInfo=null;['saleQ','saleSelected','STNumber','Quan','Price','manualSerials'].forEach(id=>{const el=$('#'+id);if(el)el.value=id==='Quan'?'1':''});$('#saleInventory').innerHTML='';$('#priceWarn').innerHTML='';const sb=$('#serialBox');if(sb)sb.innerHTML='';setTimeout(()=>$('#saleQ')?.focus(),50)}
 function addSaleLine(){if(!state.selectedItem||!state.selectedStock)return alert('اول کالا و انبار را از لیست انتخاب کنید');const quantity=Number($('#Quan').value||0);const price=Number($('#Price').value||0);if(quantity<=0)return alert('تعداد معتبر وارد کنید');if(price<=0)return alert('مبلغ فروش را وارد کنید');if(quantity>Number(state.selectedStock.quantity||0))return alert('تعداد از موجودی انبار بیشتر است');const serials=getLineSerials();if(serials.length && serials.length!==quantity){if(!confirm(`تعداد سریال انتخاب/وارد شده (${serials.length}) با تعداد فروش (${quantity}) برابر نیست. ادامه می‌دهی؟`))return;}state.saleLines.push({itemCode:state.selectedItem.itemCode,itemDescription:state.selectedItem.itemDescription,itemGuid:state.selectedItem.itemGuid,stockNumber:state.selectedStock.stockNumber,stockName:state.selectedStock.stockName,stockGuid:state.selectedStock.stockGuid,quantity,price,averageCost:state.selectedStock.averageCost,serials});renderSaleLines();clearSaleLineInputs()}
@@ -1641,23 +1642,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
     return {ok:!!r.ok, rows:(r.list||[]).filter(x=>qtyOf(x)>0), error:r.error||''};
   }
 
-  const oldSelectSaleStock = window.selectSaleStock || selectSaleStock;
-  window.selectSaleStock = selectSaleStock = async function(item,stock){
-    const code=item?.itemCode||stock?.itemCode; const sn=stock?.stockNumber||'';
-    const box=$('#saleInventory'); if(box) box.innerHTML='<div class="info">در حال کنترل موجودی لحظه‌ای شایگان...</div>';
-    const live=await verifyLiveInventory(code,sn);
-    if(!live.ok){ if(box) box.innerHTML=`<div class="error">کنترل موجودی زنده ناموفق بود: ${safe(live.error)}</div>`; return; }
-    const row=live.rows.find(x=>stockNoOfLocal(x)===String(sn)) || live.rows[0];
-    if(!row){
-      state.selectedItem=null; state.selectedStock=null;
-      if($('#STNumber')) $('#STNumber').value='';
-      if(box) box.innerHTML='<div class="warn">این کالا در این لحظه در شایگان موجودی قابل فروش ندارد. انتخاب برای فاکتور فروش مجاز نیست.</div>';
-      return;
-    }
-    const is=rawToItemStock(row);
-    return oldSelectSaleStock(is.item,is.stock);
-  };
-
   window.renderInventory = renderInventory = async function(itemCode,target,selectable=false,stockNumber=''){
     const el=$(target); if(el) el.innerHTML='در حال خواندن موجودی لحظه‌ای شایگان...';
     const r=await verifyLiveInventory(itemCode,stockNumber);
@@ -2006,7 +1990,7 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
         return;
       }
       const liveStock={...stock, stockNumber:live.stockNumber||stock.stockNumber, stockName:live.stockName||stock.stockName, stockGuid:live.stockGuid||stock.stockGuid, quantity:qtyOf(live), averageCost:Number(live.averageCost||stock.averageCost||0), remainCost:Number(live.remainCost||stock.remainCost||0)};
-      selectSaleStock(item, liveStock);
+      applyVerifiedSaleStockSelection(item, liveStock);
       if(box) box.innerHTML=`<div class="success">موجودی زنده تأیید شد: ${safe(item.itemDescription)} | ${safe(liveStock.stockNumber)} - ${safe(liveStock.stockName)} | موجودی ${nfmt(liveStock.quantity)}</div>`;
     }catch(e){
       state.selectedItem=null; state.selectedStock=null;
