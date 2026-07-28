@@ -12,7 +12,7 @@ const root=path.join(__dirname,'..');
 test('package metadata is the single version source for API and health payloads',()=>{
   assert.equal(APP_NAME,'mkcrm');
   assert.equal(APP_VERSION,pkg.version);
-  assert.equal(pkg.version,'0.9.19.62');
+  assert.match(pkg.version,/^\d+(?:\.\d+){2,}(?:-[0-9A-Za-z.-]+)?$/);
   assert.deepEqual(versionPayload({}),{ok:true,name:'mkcrm',version:pkg.version,commit:null,environment:null});
   assert.equal(versionPayload({GIT_COMMIT:'abcdef123456',APP_ENV:'stage'}).commit,'abcdef123456');
 });

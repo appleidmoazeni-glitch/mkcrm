@@ -39,17 +39,18 @@ test('full scan excludes returns, records diagnostics, and reruns idempotently',
   assert.equal(first.endInvNo,10);
   assert.equal(first.nextInvNo,11);
   for(const field of ['invoiceHeadersFound','invoiceBodiesLoaded','saleLinesParsed','pagesScanned','insertedHeaders','updatedHeaders','insertedLines','updatedLines','removedOrReconciledLines','duplicatePrevented','emptyBodyInvoices','unmappedSellerInvoices','groupFallbackLines','amountMismatchInvoices','errors','startInvNo','endInvNo','nextInvNo','mode','scopeKey','durationMs']) assert.ok(Object.hasOwn(first,field),field);
-  assert.equal(db.collection('saleInvoiceHeaders').rows.length,1);
-  assert.equal(db.collection('saleInvoiceLines').rows.length,2);
+  assert.equal(db.collection('saleSnapshotDatasetHeaders').rows.filter(x=>x.snapshotId===first.snapshotId).length,1);
+  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===first.snapshotId).length,2);
   assert.equal(db.collection('saleSnapshotState').rows[0].latestType2,10);
+  assert.equal(db.collection('saleSnapshotState').rows[0].activeSnapshotId,first.snapshotId);
 
   const rerun=await saleSnapshot.buildSaleSnapshot(db,{mode:'full',pageSize:2,maxPages:3,dateFrom:'14050101'});
-  assert.equal(rerun.insertedHeaders,0);
-  assert.equal(rerun.updatedHeaders,1);
-  assert.equal(rerun.insertedLines,0);
-  assert.equal(rerun.updatedLines,2);
-  assert.equal(rerun.duplicatePrevented,3);
-  assert.equal(db.collection('saleInvoiceLines').rows.length,2);
+  assert.equal(rerun.insertedHeaders,1);
+  assert.equal(rerun.updatedHeaders,0);
+  assert.equal(rerun.insertedLines,2);
+  assert.equal(rerun.updatedLines,0);
+  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===rerun.snapshotId).length,2);
+  assert.equal(db.collection('saleSnapshotState').rows[0].activeSnapshotId,rerun.snapshotId);
 });
 
 test('seller mapping fallback is explicit and never inferred from account name alone',()=>{
@@ -76,8 +77,9 @@ test('incremental resumes committed state, appends, and reconciles changed bodie
 
   shaygan.getInvoicePageByTypeNumberRange=async rowStart=>({ok:true,result:rowStart===0?[invoice(11,[line('A',1,120)])]:[]});
   const refresh=await saleSnapshot.buildSaleSnapshot(db,{mode:'full',pageSize:2,maxPages:3,dateFrom:'14050101'});
-  assert.equal(refresh.removedOrReconciledLines,1);
-  assert.equal(db.collection('saleInvoiceLines').rows.filter(x=>x.saleInvoiceNo===11).length,1);
+  assert.equal(refresh.removedOrReconciledLines,0);
+  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===refresh.snapshotId&&x.saleInvoiceNo===11).length,1);
+  assert.equal(db.collection('saleSnapshotState').rows[0].activeSnapshotId,refresh.snapshotId);
 });
 
 test('failure and cancellation never advance committed state',async t=>{
@@ -160,7 +162,7 @@ test('seller report authorization and UI accounting warnings remain explicit',()
   const server=fs.readFileSync(path.join(__dirname,'../src/server.js'),'utf8');
   const app=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
   assert.ok(server.includes("['admin','accounting','purchase'].includes(role)"));
-  assert.ok(server.includes('buildSellerSalesProfitReportFromSnapshot(db, query)'));
+  assert.match(server,/buildSellerSalesProfitReportFromSnapshot\(db,\s*reportQuery\)/);
   assert.match(app,/متوقف تا تکمیل پوشش/);
   assert.match(app,/نامشخص/);
   assert.match(app,/supplierPurchaseLayers|Supplier Sleep/);

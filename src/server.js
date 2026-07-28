@@ -17,6 +17,7 @@ const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:r
 const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
 const { emitSearchEvent } = require('./lib/search-observability');
 const { APP_NAME, APP_VERSION, versionPayload, injectAssetVersion } = require('./lib/app-version');
+const { normalizeJalaliRange, normalizeJalaliMonth } = require('./lib/jalali-date');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -197,7 +198,7 @@ function startSaleSnapshotBackgroundJob({db,jobId,request}){
   const handle=saleSnapshotJobManager.start('sale-snapshot',{db,request,service:saleSnapshot,onResult:result=>{serviceResult=result;}});
   const startedAt=new Date();
   const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
-  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase}}).catch(()=>{});},15000);
+  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress}}).catch(()=>{});},15000);
   timer.unref?.();
   handle.completion.then(async snapshot=>{clearInterval(timer);await runningUpdate;const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;const cancelled=snapshot.status===JobStatus.Cancelled;const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};if(serviceResult)update.result=serviceResult;return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});}).catch(()=>clearInterval(timer));
   return handle;
@@ -2712,14 +2713,32 @@ async function fetchSaleInvoicesFromShayganWebService({ from8='', to8='', maxPag
 }
 
 const SELLER_PERFORMANCE_SOURCE = 'mongo-sale-snapshot-aggregate+supplierPurchaseLayers-coverage-only';
-function reportDate8(value='', fallback='') {
-  const digits=String(value||'').replace(/[^0-9]/g,'');
-  return digits.length>=8 ? digits.slice(0,8) : fallback;
+function normalizeSellerPerformanceQuery(query={}) {
+  const normalized={ ...query };
+  const month=normalizeJalaliMonth(query.month||'', { field:'month' });
+  const rawDateFrom=query.dateFrom??query.from??(month?`${month}01`:'');
+  const rawDateTo=query.dateTo??query.to??'';
+  const { dateFrom, dateTo }=normalizeJalaliRange({ dateFrom:rawDateFrom, dateTo:rawDateTo });
+  normalized.dateFrom=dateFrom;
+  normalized.dateTo=dateTo;
+  normalized.month=month;
+  delete normalized.from;
+  delete normalized.to;
+  return normalized;
+}
+function sendJalaliDateValidationError(res, error) {
+  return sendJson(res, Number(error?.statusCode||400), {
+    ok:false,
+    code:error?.code||'INVALID_JALALI_DATE',
+    field:error?.field||'date',
+    error:String(error?.message||'تاریخ شمسی نامعتبر است')
+  });
 }
 async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
-  const month=String(query.month||'').replace(/[^0-9]/g,'').slice(0,6);
-  const dateFrom=reportDate8(query.dateFrom||query.from, month?`${month}01`:'');
-  const dateTo=reportDate8(query.dateTo||query.to, '');
+  const normalizedQuery=normalizeSellerPerformanceQuery(query);
+  const month=normalizedQuery.month;
+  const dateFrom=normalizedQuery.dateFrom;
+  const dateTo=normalizedQuery.dateTo;
   const seller=String(query.seller||query.employeeAccountNumber||'').trim();
   const store=String(query.store||'').trim();
   const commissionRate=query.commissionRate==null||query.commissionRate===''?0.18:Number(query.commissionRate);
@@ -2802,11 +2821,12 @@ async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
     profitStatus:report.profitStatus,
     coverage
   };
-  return { ok:true, period:{from:dateFrom,to:dateTo,month}, seller:seller||'all', store, source:SELLER_PERFORMANCE_SOURCE, summary, sellers, invoices, groups:report.groups||[], allocations:[], unmatched:(report.lines||[]).filter(x=>x.profitStatus!=='calculated').slice(0,1000), coverage, profitStatus:report.profitStatus, limitations:report.limitations, diagnostics:report.profitDiagnostics, meta:{ invoiceRows:report.invoiceCount, saleRows:report.lineCount, itemGroup:'all', itemGroupRule:'mainGroup from catalog; explicit item-code fallback retained', commissionRate, leadPenaltyRial, reportScanLimit:report.reportScanLimit, reportScanLimitReached:report.reportScanLimitReached, note:'گزارش فقط از aggregateهای Sale Snapshot در Mongo خوانده می‌شود. سود و پورسانت تا تکمیل تاریخچه خرید، پوشش‌محور و غیرقطعی است.' } };
+  return { ok:true, period:{from:dateFrom,to:dateTo,month}, seller:seller||'all', store, source:SELLER_PERFORMANCE_SOURCE, activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', summary, sellers, invoices, groups:report.groups||[], allocations:[], unmatched:(report.lines||[]).filter(x=>x.profitStatus!=='calculated').slice(0,1000), coverage, profitStatus:report.profitStatus, limitations:report.limitations, diagnostics:report.profitDiagnostics, meta:{ activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', invoiceRows:report.invoiceCount, saleRows:report.lineCount, itemGroup:'all', itemGroupRule:'mainGroup from catalog; explicit item-code fallback retained', commissionRate, leadPenaltyRial, reportScanLimit:report.reportScanLimit, reportScanLimitReached:report.reportScanLimitReached, note:'گزارش فقط از Snapshot فعال و کامل فروش در Mongo خوانده می‌شود. تا اولین فعال‌سازی نسخه‌ای، fallback قدیمی با برچسب legacy_unversioned حفظ می‌شود. سود و پورسانت تا تکمیل تاریخچه خرید، پوشش‌محور و غیرقطعی است.' } };
 }
 
 
 function sellerPerformanceFilterKey(query={}) {
+  query=normalizeSellerPerformanceQuery(query);
   const keep = {};
   // کلید آرشیو فقط بر اساس فیلتر پایه است؛ فیلترهای سود و نوت‌بوک در UI روی گزارش کش‌شده اعمال می‌شوند.
   ['dateFrom','from','dateTo','to','month','seller','employeeAccountNumber','store','commissionRate','leadPenaltyRial','leadPenalty'].forEach(k => {
@@ -2835,7 +2855,10 @@ async function saveSellerPerformanceHistory(db, query, report, by='system') {
 }
 async function getLatestSellerPerformanceHistory(db, query={}) {
   const filterKey = sellerPerformanceFilterKey(query);
-  return await db.collection('sellerPerformanceHistory').findOne({ type:'seller-performance', filterKey, 'report.source':SELLER_PERFORMANCE_SOURCE }, { sort:{ generatedAt:-1 } });
+  const active=await saleSnapshot._activeDataset(db);
+  const q={ type:'seller-performance', filterKey, 'report.source':SELLER_PERFORMANCE_SOURCE };
+  q['report.meta.activeSnapshotId']=active.snapshotId||'';
+  return await db.collection('sellerPerformanceHistory').findOne(q, { sort:{ generatedAt:-1 } });
 }
 
 
@@ -3112,6 +3135,7 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/user-account-access': 'user-account-access.save',
     'POST /api/sale-snapshot/init': 'sale-snapshot.init',
     'POST /api/sale-snapshot/start': 'sale-snapshot.start',
+    'POST /api/sale-snapshot/resume': 'sale-snapshot.resume',
     'POST /api/supplier-sleep/init': 'supplier-sleep.init',
     'POST /api/supplier-sleep/sync-purchases': 'supplier-sleep.sync-purchases',
     'POST /api/supplier-sleep/supplier-index': 'supplier-sleep.supplier-index',
@@ -3378,18 +3402,30 @@ async function handleApi(req, res, pathname, query) {
       const db = await connectMongo();
       return sendJson(res, 200, await saleSnapshot.init(db));
     }
-    if (pathname === '/api/sale-snapshot/start' && req.method === 'POST') {
+    if ((pathname === '/api/sale-snapshot/start' || pathname === '/api/sale-snapshot/resume') && req.method === 'POST') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
       const body = await collectBody(req);
+      const resumeSnapshotId=String(body.resumeSnapshotId||query.resumeSnapshotId||(pathname.endsWith('/resume')?body.snapshotId||query.snapshotId:'')||'').trim();
+      let snapshotDates;
+      try {
+        snapshotDates=normalizeJalaliRange({
+          dateFrom: body.dateFrom || query.dateFrom || '14050101',
+          dateTo: body.dateTo || query.dateTo || ''
+        }, { requireFrom:true });
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
       const request={
-        dateFrom: body.dateFrom || query.dateFrom || '14050101',
-        dateTo: body.dateTo || query.dateTo || '',
+        dateFrom: snapshotDates.dateFrom,
+        dateTo: snapshotDates.dateTo,
         maxPages: Number(body.maxPages || query.maxPages || 300),
         pageSize: Number(body.pageSize || query.pageSize || 20),
         maxDetailInvoices: Number(body.maxDetailInvoices || query.maxDetailInvoices || 0),
         reset: body.reset === true || body.reset === 'true' || query.reset === 'true',
-        mode: body.mode || query.mode || 'incremental'
+        mode: body.mode || query.mode || 'incremental',
+        resumeSnapshotId,
+        maxPageAttempts:Number(body.maxPageAttempts||query.maxPageAttempts||3)
       };
       if(saleSnapshotJobManager.isRunning('sale-snapshot')){const running=saleSnapshotJobManager.getRunning('sale-snapshot');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Sale Snapshot job is already running',jobId:running?.id||''});}
       const jobId=`JOB-SALE-SNAPSHOT-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -3411,25 +3447,37 @@ async function handleApi(req, res, pathname, query) {
     }
     if (pathname === '/api/sale-snapshot/lines' && req.method === 'GET') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
+      let snapshotDates;
+      try {
+        snapshotDates=normalizeJalaliRange({ dateFrom:query.dateFrom||'', dateTo:query.dateTo||'' });
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
       return sendJson(res, 200, await saleSnapshot.lines(db, {
         snapshotId: query.snapshotId || '',
         itemCode: query.itemCode || '',
         sellerAccountNumber: query.sellerAccountNumber || '',
-        dateFrom: query.dateFrom || '',
-        dateTo: query.dateTo || '',
+        dateFrom: snapshotDates.dateFrom,
+        dateTo: snapshotDates.dateTo,
         limit: Number(query.limit || 500)
       }));
     }
 
     if (pathname === '/api/sale-snapshot/seller-performance' && req.method === 'GET') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
+      let reportDates;
+      try {
+        reportDates=normalizeJalaliRange({ dateFrom:query.dateFrom||'', dateTo:query.dateTo||'' });
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
       return sendJson(res, 200, await saleSnapshot.sellerPerformance(db, {
         sellerAccountNumber: query.sellerAccountNumber || query.seller || '',
         store: query.store || '',
-        dateFrom: query.dateFrom || '',
-        dateTo: query.dateTo || '',
+        dateFrom: reportDates.dateFrom,
+        dateTo: reportDates.dateTo,
         limit: Number(query.limit || 250000),
         invoiceLimit: Number(query.invoiceLimit || 1000),
         lineLimit: Number(query.lineLimit || 1000)
@@ -4415,26 +4463,34 @@ async function handleApi(req, res, pathname, query) {
     }
     if (pathname === '/api/reports/seller-sales-profit/latest') {
       if (!canUseSellerPerformance(req, res)) return;
+      let reportQuery;
+      try {
+        reportQuery=normalizeSellerPerformanceQuery(query);
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
-      const doc = await getLatestSellerPerformanceHistory(db, query);
+      const doc = await getLatestSellerPerformanceHistory(db, reportQuery);
       return sendJson(res, 200, { ok:true, found:!!doc, generatedAt:doc?.generatedAt || null, filters:doc?.filters || null, report:doc?.report || null });
     }
     if (pathname === '/api/reports/seller-sales-profit') {
       if (!canUseSellerPerformance(req, res)) return;
       try {
+        const reportQuery=normalizeSellerPerformanceQuery(query);
         const db = await connectMongo();
-        const force = String(query.force || query.update || '').trim() === '1' || String(query.force || query.update || '').toLowerCase() === 'true';
+        const force = String(reportQuery.force || reportQuery.update || '').trim() === '1' || String(reportQuery.force || reportQuery.update || '').toLowerCase() === 'true';
         if (!force) {
-          const cached = await getLatestSellerPerformanceHistory(db, query);
+          const cached = await getLatestSellerPerformanceHistory(db, reportQuery);
           if (cached?.report) return sendJson(res, 200, { ...cached.report, ok:true, cached:true, generatedAt:cached.generatedAt, cacheSource:'sellerPerformanceHistory' });
         }
-        const r = await buildSellerSalesProfitReportFromSnapshot(db, query);
+        const r = await buildSellerSalesProfitReportFromSnapshot(db, reportQuery);
         if (r.ok) {
-          const doc = await saveSellerPerformanceHistory(db, query, r, currentUser(req)?.username || 'system');
+          const doc = await saveSellerPerformanceHistory(db, reportQuery, r, currentUser(req)?.username || 'system');
           return sendJson(res, 200, { ...r, cached:false, generatedAt:doc.generatedAt, historyId:String(doc._id) });
         }
         return sendJson(res, 200, r);
       } catch (e) {
+        if (Number(e?.statusCode)===400) return sendJalaliDateValidationError(res, e);
         return sendJson(res, 500, { ok:false, error:String(e.message||e), code:e.code||'' });
       }
     }
