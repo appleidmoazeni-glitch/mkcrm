@@ -1,7 +1,8 @@
 'use strict';
 
 const shaygan = require('./shaygan');
-const VERSION = '0.9.19.44-stability-sync-sale-reset-background-jobs';
+const { APP_VERSION: VERSION } = require('./app-version');
+const AMOUNT_TOLERANCE_RIAL = 0.01;
 
 function clean(v){ return String(v == null ? '' : v).trim(); }
 function num(v,d=0){ const n=Number(String(v??'').replace(/[,،\s]/g,'')); return Number.isFinite(n)?n:d; }
@@ -61,25 +62,28 @@ async function loadLatestPurchaseLayersForProfit(db){
     byItem.get(code).push(l);
   }
   for(const arr of byItem.values()) arr.sort((a,b)=>(a.purchaseDateScore-b.purchaseDateScore)||(a.purchaseInvoiceNoNum-b.purchaseInvoiceNoNum)||(a.purchaseRowNum-b.purchaseRowNum));
-  return { byItem, layerCount:byKey.size };
+  return { byItem, layerCount:byKey.size, sourceRows:docs.length, scanLimitReached:docs.length>=200000 };
 }
 async function computeSellerProfitFifo(db, filters={}){
   const seller=clean(filters.sellerAccountNumber || filters.seller || '');
+  const store=clean(filters.store||'');
   const dateFrom=normDate8(filters.dateFrom||''); const dateTo=normDate8(filters.dateTo||'');
   const saleQ={ saleInvoiceType:2 };
-  if(dateTo) saleQ.saleDate={ $lte:dateTo };
   // We must consume all sales up to dateTo, not just the chosen seller/date range; otherwise older layers are assigned incorrectly.
-  const allSales=await db.collection('saleInvoiceLines').find(saleQ).sort({ saleDate:1, saleInvoiceNo:1, row:1 }).limit(Math.max(1, Math.min(Number(filters.profitScanLimit||250000), 500000))).toArray().catch(()=>[]);
+  const profitScanLimit=Math.max(1, Math.min(Number(filters.profitScanLimit||250000), 500000));
+  const allSalesRaw=await db.collection('saleInvoiceLines').find(saleQ).sort({ saleInvoiceNo:1, row:1 }).limit(profitScanLimit).toArray().catch(()=>[]);
+  const allSales=allSalesRaw.filter(row=>!dateTo||parseDateScore(row.saleDate||'')<=parseDateScore(dateTo)).sort((a,b)=>lineDateScoreFromDoc(a)-lineDateScoreFromDoc(b)||num(a.saleInvoiceNo)-num(b.saleInvoiceNo)||num(a.row)-num(b.row));
   const purchasePool=await loadLatestPurchaseLayersForProfit(db);
   const targetKey=(l)=>{
     if(seller && clean(l.sellerAccountNumber)!==seller) return false;
+    if(store && !clean(l.sellerStoreName).includes(store)) return false;
     const ds=parseDateScore(l.saleDate||'');
     if(dateFrom && ds<parseDateScore(dateFrom)) return false;
     if(dateTo && ds>parseDateScore(dateTo)) return false;
     return true;
   };
   const resultByLine=new Map(); const invoiceProfit=new Map(); const groupProfit=new Map();
-  const diagnostics={ saleRowsScanned:allSales.length, purchaseLayerPool:purchasePool.layerCount, allocatedRows:0, targetAllocatedRows:0, partialRows:0, unknownRows:0, skippedFutureLayers:0, noPurchaseLayerRows:0, insufficientLayerRows:0, unmatchedReasons:{}, note:'FIFO consumes all sale lines up to dateTo; only selected seller/date rows are reported.' };
+  const diagnostics={ saleRowsScanned:allSales.length, saleSourceRowsRead:allSalesRaw.length, saleScanLimit:profitScanLimit, saleScanLimitReached:allSalesRaw.length>=profitScanLimit, purchaseLayerPool:purchasePool.layerCount, purchaseLayerSourceRows:purchasePool.sourceRows, purchaseLayerScanLimitReached:purchasePool.scanLimitReached, purchaseHistoryComplete:false, purchaseHistoryScope:'supplierPurchaseLayers may contain only suppliers selected by Supplier Sleep runs', allocatedRows:0, targetAllocatedRows:0, partialRows:0, unknownRows:0, skippedFutureLayers:0, noPurchaseLayerRows:0, insufficientLayerRows:0, unmatchedReasons:{}, note:'FIFO consumes all sale lines up to dateTo; only selected seller/date rows are reported. Profit is coverage-only until a complete purchase-history source is established.' };
   for(const sale of allSales){
     const code=clean(sale.itemCode); const arr=purchasePool.byItem.get(code)||[];
     let need=num(sale.qty,0); const originalQty=need; const saleValueTotal=num(sale.saleValue,0); const unitSale= originalQty ? saleValueTotal/originalQty : num(sale.unitSale,0);
@@ -99,7 +103,7 @@ async function computeSellerProfitFifo(db, filters={}){
     if(allocatedQty<=0){ status='unknown'; reason=arr.length?'NO_ELIGIBLE_PURCHASE_BEFORE_SALE':'NO_PURCHASE_LAYER'; diagnostics.unknownRows++; diagnostics.unmatchedReasons[reason]=(diagnostics.unmatchedReasons[reason]||0)+1; }
     else if(need>0.0001){ status='partial'; reason='INSUFFICIENT_PURCHASE_LAYER_QTY'; diagnostics.partialRows++; diagnostics.insufficientLayerRows++; diagnostics.unmatchedReasons[reason]=(diagnostics.unmatchedReasons[reason]||0)+1; }
     diagnostics.allocatedRows += allocations.length;
-    const lineProfit={ saleLineId:sale.saleLineId||'', saleInvoiceNo:sale.saleInvoiceNo, saleDate:sale.saleDate, row:sale.row, itemCode:code, itemName:sale.itemName||'', sellerAccountNumber:sale.sellerAccountNumber||'', sellerName:sale.sellerName||'', qty:originalQty, allocatedQty, saleValue:Math.round(saleValue || (status==='unknown'?0:saleValueTotal)), fifoCost:Math.round(cost), fifoProfit: status==='unknown'?null:Math.round((saleValue||0)-cost), profitStatus:status, profitReason:reason, allocations };
+    const lineProfit={ saleLineId:sale.saleLineId||'', saleInvoiceNo:sale.saleInvoiceNo, saleDate:sale.saleDate, row:sale.row, itemCode:code, itemName:sale.itemName||'', sellerAccountNumber:sale.sellerAccountNumber||'', sellerName:sale.sellerName||'', sellerStoreName:sale.sellerStoreName||'', qty:originalQty, allocatedQty, saleValue:Math.round(saleValue || (status==='unknown'?0:saleValueTotal)), fifoCost:Math.round(cost), fifoProfit: status==='unknown'?null:Math.round((saleValue||0)-cost), profitStatus:status, profitReason:reason, allocations };
     resultByLine.set(`${sale.saleInvoiceType}-${sale.saleInvoiceNo}-${sale.row}`, lineProfit);
     if(targetKey(sale)){
       if(status!=='unknown') diagnostics.targetAllocatedRows += allocations.length;
@@ -116,9 +120,28 @@ async function computeSellerProfitFifo(db, filters={}){
     }
   }
   function roi(profit,cost){ return cost ? Math.round(profit*10000/cost)/100 : null; }
-  const totals=[...invoiceProfit.values()].reduce((a,x)=>{a.amount+=x.amount; a.cost+=x.fifoCost; a.profit+=x.fifoProfit; a.lines+=x.lines; a.calculated+=x.calculatedLines; a.partial+=x.partialLines; a.unknown+=x.unknownLines; return a;},{amount:0,cost:0,profit:0,lines:0,calculated:0,partial:0,unknown:0});
-  const profitStatus = totals.unknown===0 && totals.partial===0 ? 'calculated' : (totals.calculated>0 || totals.partial>0 ? 'partial' : 'unknown');
-  return { resultByLine, invoiceProfit, groupProfit, totals:{ totalSales:Math.round(totals.amount), fifoCost:Math.round(totals.cost), fifoProfit:Math.round(totals.profit), roiPercent:roi(totals.profit,totals.cost), lineCount:totals.lines, calculatedLines:totals.calculated, partialLines:totals.partial, unknownLines:totals.unknown, profitStatus }, diagnostics };
+  const targetResults=[...resultByLine.values()].filter(x=>{
+    if(seller && clean(x.sellerAccountNumber)!==seller) return false;
+    if(store && !clean(x.sellerStoreName).includes(store)) return false;
+    const ds=parseDateScore(x.saleDate||'');
+    if(dateFrom && ds<parseDateScore(dateFrom)) return false;
+    if(dateTo && ds>parseDateScore(dateTo)) return false;
+    return true;
+  });
+  const totals=targetResults.reduce((a,x)=>{
+    const q=num(x.qty,0), aq=num(x.allocatedQty,0), fullSale=num(x.saleValue,0);
+    a.amount+=num(x.saleValue,0); a.coveredSales+=fullSale; a.cost+=num(x.fifoCost,0); if(x.fifoProfit!=null)a.profit+=num(x.fifoProfit,0);
+    a.qty+=q; a.coveredQty+=aq; a.lines++;
+    if(x.profitStatus==='calculated')a.calculated++; else if(x.profitStatus==='partial')a.partial++; else a.unknown++;
+    return a;
+  },{amount:0,coveredSales:0,cost:0,profit:0,qty:0,coveredQty:0,lines:0,calculated:0,partial:0,unknown:0});
+  const targetSales=[...invoiceProfit.values()].reduce((sum,x)=>sum+num(x.amount,0),0);
+  const coveredQtyPercent=totals.qty?Math.round(totals.coveredQty*10000/totals.qty)/100:0;
+  const coveredSalesPercent=targetSales?Math.round(totals.coveredSales*10000/targetSales)/100:0;
+  const hasCoverage=totals.coveredQty>0;
+  const profitStatus=hasCoverage?'partial':'unknown';
+  const coverage={ totalLines:totals.lines, calculatedLines:totals.calculated, partialLines:totals.partial, unknownLines:totals.unknown, totalQty:totals.qty, coveredQty:totals.coveredQty, coveredQtyPercent, totalSales:Math.round(targetSales), coveredSales:Math.round(totals.coveredSales), coveredSalesPercent, purchaseHistoryComplete:false };
+  return { resultByLine, invoiceProfit, groupProfit, totals:{ totalSales:Math.round(targetSales), fifoCost:hasCoverage?Math.round(totals.cost):null, fifoProfit:hasCoverage?Math.round(totals.profit):null, roiPercent:hasCoverage?roi(totals.profit,totals.cost):null, lineCount:totals.lines, calculatedLines:totals.calculated, partialLines:totals.partial, unknownLines:totals.unknown, profitStatus, coverage }, diagnostics };
 }
 function scopeKeyFor(dateFrom, dateTo){ return `sale-type2|${clean(dateFrom)}|${clean(dateTo)}`; }
 
@@ -178,8 +201,8 @@ function resolveSellerForInvoice(inv, maps){
   const sellerNo=invSellerAccountNo(inv);
   const cashNo=invAccountNo(inv);
   const m = (sellerNo && maps?.byEmployee?.get(sellerNo)) || (cashNo && maps?.byCashbox?.get(cashNo)) || null;
-  if(m) return { ...m, sellerAccountNumber: sellerNo || m.sellerAccountNumber, rawSellerAccountName: invSellerAccountName(inv) };
-  return { username:'', sellerName: invSellerAccountName(inv) || (sellerNo ? `نماینده ${sellerNo}` : 'نامشخص'), sellerAccountNumber:sellerNo, sellerAccountName:invSellerAccountName(inv), cashboxAccountNumber:cashNo, cashboxAccountName:invAccountName(inv), storeName:'', rawSellerAccountName:invSellerAccountName(inv) };
+  if(m) return { ...m, sellerAccountNumber: sellerNo || m.sellerAccountNumber, rawSellerAccountName: invSellerAccountName(inv), mappingStatus:'mapped', mappingSource:sellerNo && maps?.byEmployee?.get(sellerNo) ? 'employeeAccountNumber' : 'cashboxAccountNumber' };
+  return { username:'', sellerName: invSellerAccountName(inv) || (sellerNo ? `نماینده ${sellerNo}` : 'نامشخص'), sellerAccountNumber:sellerNo, sellerAccountName:invSellerAccountName(inv), cashboxAccountNumber:cashNo, cashboxAccountName:invAccountName(inv), storeName:'', rawSellerAccountName:invSellerAccountName(inv), mappingStatus:'unmapped', mappingSource:'shaygan-raw-fallback' };
 }
 
 function saleHeaderDoc(inv, snapshotIdValue, sellerMaps){
@@ -190,7 +213,8 @@ function saleHeaderDoc(inv, snapshotIdValue, sellerMaps){
     invNo: invNo(inv),
     invTyp: typ,
     invTypeLabel: invTypeLabel(typ),
-    invDate: invDate(inv),
+    invDate: normDate8(invDate(inv)) || invDate(inv),
+    invDateRaw: invDate(inv),
     createdDate: clean(inv.CreatedDate || ''),
     guId: invGuid(inv),
     accountNumber: invAccountNo(inv),
@@ -203,6 +227,8 @@ function saleHeaderDoc(inv, snapshotIdValue, sellerMaps){
     sellerName: seller.sellerName || seller.sellerAccountName || 'نامشخص',
     sellerUsername: seller.username || '',
     sellerStoreName: seller.storeName || '',
+    sellerMappingStatus: seller.mappingStatus || 'unmapped',
+    sellerMappingSource: seller.mappingSource || 'shaygan-raw-fallback',
     mappedCashboxAccountNumber: seller.cashboxAccountNumber || '',
     mappedCashboxAccountName: seller.cashboxAccountName || '',
     firstIssuerUsername: invIssuerFirst(inv),
@@ -219,6 +245,7 @@ function saleLineDocs(inv, snapshotIdValue, sellerMaps, groupMap){
   const header=saleHeaderDoc(inv, snapshotIdValue, sellerMaps);
   return invBody(inv).map((x,i)=>{
     const qty=lineQty(x); const amount=lineAmount(x); const unit=lineUnitPrice(x) || (qty ? amount/qty : 0);
+    const group=(groupMap && groupMap.get(lineItemCode(x))) || deriveMainGroupFromCode(lineItemCode(x));
     return {
       snapshotId: snapshotIdValue,
       saleLineId: `SL-${header.invTyp}-${header.invNo}-${String(i+1).padStart(3,'0')}-${lineItemCode(x)}`,
@@ -237,6 +264,8 @@ function saleLineDocs(inv, snapshotIdValue, sellerMaps, groupMap){
       sellerName: header.sellerName,
       sellerUsername: header.sellerUsername,
       sellerStoreName: header.sellerStoreName,
+      sellerMappingStatus: header.sellerMappingStatus,
+      sellerMappingSource: header.sellerMappingSource,
       firstIssuerUsername: header.firstIssuerUsername,
       lastIssuerUsername: header.lastIssuerUsername,
       generalRef: header.generalRef,
@@ -244,9 +273,10 @@ function saleLineDocs(inv, snapshotIdValue, sellerMaps, groupMap){
       lineItemId: num(x.LineItemId || x.LineId || 0,0),
       itemCode: lineItemCode(x),
       itemName: lineItemName(x),
-      mainGroupCode: (groupMap && groupMap.get(lineItemCode(x)) && groupMap.get(lineItemCode(x)).mainGroupCode) || deriveMainGroupFromCode(lineItemCode(x)).mainGroupCode,
-      mainGroupName: (groupMap && groupMap.get(lineItemCode(x)) && groupMap.get(lineItemCode(x)).mainGroupName) || deriveMainGroupFromCode(lineItemCode(x)).mainGroupName,
-      mainGroup: (groupMap && groupMap.get(lineItemCode(x)) && groupMap.get(lineItemCode(x)).mainGroup) || deriveMainGroupFromCode(lineItemCode(x)).mainGroup,
+      mainGroupCode: group.mainGroupCode,
+      mainGroupName: group.mainGroupName,
+      mainGroup: group.mainGroup,
+      mainGroupSource: group.source,
       itemGuid: clean(x.ItemGuId || x.ItemGuid || x.itemGuid || ''),
       stockNumber: clean(x.STNumber || x.StoreNumber || x.StockNumber || ''),
       stockName: clean(x.STDesc || x.StoreName || x.StockName || ''),
@@ -297,23 +327,13 @@ async function ensureIndexes(db){
 
 async function init(db){ await ensureIndexes(db); return { ok:true, version:VERSION }; }
 
-async function latestInvNoByType(db, invTyp, dateFrom='', dateTo=''){
-  const q={ invTyp:Number(invTyp) };
-  // The stored saleDate is the invoice date from Shaygan. For the current 1405 workflow we primarily rely on InvNo.
-  if(dateFrom || dateTo){
-    q.invDate={};
-    if(dateFrom) q.invDate.$gte=clean(dateFrom).replace(/-/g,'');
-    if(dateTo) q.invDate.$lte=clean(dateTo).replace(/-/g,'');
-  }
-  const doc=await db.collection('saleInvoiceHeaders').findOne(q,{ sort:{ invNo:-1 } }).catch(()=>null);
-  return Number(doc?.invNo || 0);
-}
 function saleInvoicesOnly(rows, typ=2){
   return (Array.isArray(rows)?rows:[]).filter(inv=>Number(inv.InvTyp || inv.InvoiceType || 0)===Number(typ));
 }
 
 async function buildSaleSnapshot(db, opts={}){
   await ensureIndexes(db);
+  const startedAtMs=Date.now();
   const jobControl=opts.jobControl;
   const progress=(phase,current,total,message)=>jobControl?.progress?.({phase,current,total,message});
   const checkpoint=()=>{ jobControl?.heartbeat?.(); jobControl?.checkCancellation?.(); };
@@ -326,13 +346,15 @@ async function buildSaleSnapshot(db, opts={}){
   const maxPages=Math.max(1, Math.min(Number(opts.maxPages || 1000), 10000));
   const reset = opts.reset === true || opts.reset === 'true' || opts.mode === 'full';
   const scopeKey = scopeKeyFor(dateFrom, dateTo);
+  const mode=reset?'full-sale-type2-scan':'new-sale-type2-by-invno';
   const sellerMaps = await getSellerMaps(db);
   checkpoint();
-  const snap={ snapshotId:sid, version:VERSION, status:'running', dateFrom, dateTo, pageSize, maxPages, incremental:!reset, mode: reset?'full-sale-type2-scan':'new-sale-type2-by-invno', scopeKey, createdAt:now, updatedAt:now, invoiceHeadersFound:0, invoiceBodiesLoaded:0, saleLinesParsed:0, emptyBodyInvoices:0, errors:[] };
+  const snap={ snapshotId:sid, version:VERSION, status:'running', dateFrom, dateTo, pageSize, maxPages, incremental:!reset, mode, scopeKey, createdAt:now, updatedAt:now, invoiceHeadersFound:0, invoiceBodiesLoaded:0, saleLinesParsed:0, emptyBodyInvoices:0, errors:[] };
   await db.collection('saleSnapshots').insertOne(snap);
 
   const errors=[]; const samples=[];
-  let headersFound=0, bodiesLoaded=0, linesParsed=0, emptyBody=0, detailFetched=0, pagesScanned=0;
+  const counters={ insertedHeaders:0, updatedHeaders:0, insertedLines:0, updatedLines:0, removedOrReconciledLines:0, duplicatePrevented:0, unmappedSellerInvoices:0, groupFallbackLines:0, amountMismatchInvoices:0 };
+  let headersFound=0, bodiesLoaded=0, linesParsed=0, emptyBody=0, detailFetched=0, pagesScanned=0, startInvNo=0, endInvNo=0;
   const typeStats = { '2': { label:'Sale', invoices:0, lines:0, amount:0, startInvNo:0, nextInvNoFrom:0, pagesScanned:0, reachedEnd:false } };
   const sellerStatsMap = new Map();
 
@@ -343,25 +365,36 @@ async function buildSaleSnapshot(db, opts={}){
     headersFound += 1;
     if(body.length) bodiesLoaded++; else emptyBody++;
     const h=saleHeaderDoc(inv, sid, sellerMaps);
-    await db.collection('saleInvoiceHeaders').updateOne(
+    if(h.sellerMappingStatus!=='mapped') counters.unmappedSellerInvoices++;
+    const headerWrite=await db.collection('saleInvoiceHeaders').updateOne(
       { invTyp:h.invTyp, invNo:h.invNo },
       { $set:{ ...h, lastSnapshotId:sid, updatedAt:new Date() }, $setOnInsert:{ firstSyncedAt:new Date() } },
       { upsert:true }
     );
+    if(Number(headerWrite.upsertedCount||0)>0) counters.insertedHeaders++; else { counters.updatedHeaders++; counters.duplicatePrevented++; }
     const lines=saleLineDocs(inv, sid, sellerMaps, pageGroupMap);
     linesParsed += lines.length;
+    counters.groupFallbackLines += lines.filter(x=>x.mainGroupSource==='item-code-prefix-fallback').length;
+    const lineAmountTotal=lines.reduce((sum,line)=>sum+num(line.saleValue,0),0);
+    if(Math.abs(num(h.totalAmount,0)-lineAmountTotal)>AMOUNT_TOLERANCE_RIAL) counters.amountMismatchInvoices++;
     if(typeStats[String(h.invTyp)]){ typeStats[String(h.invTyp)].invoices += 1; typeStats[String(h.invTyp)].lines += lines.length; typeStats[String(h.invTyp)].amount += Number(h.totalAmount||0); }
     const skey = h.sellerAccountNumber || h.sellerName || h.accountName || 'UNKNOWN';
     const ss = sellerStatsMap.get(skey) || { key:skey, sellerAccountNumber:h.sellerAccountNumber, sellerAccountName:h.sellerAccountName, sellerName:h.sellerName, sellerUsername:h.sellerUsername, sellerStoreName:h.sellerStoreName, cashboxAccountName:h.cashboxAccountName, invoices:0, lines:0, amount:0 };
     ss.invoices += 1; ss.lines += lines.length; ss.amount += Number(h.totalAmount||0);
     sellerStatsMap.set(skey, ss);
     for(const line of lines){
-      await db.collection('saleInvoiceLines').updateOne(
+      const lineWrite=await db.collection('saleInvoiceLines').updateOne(
         { saleInvoiceType:line.saleInvoiceType, saleInvoiceNo:line.saleInvoiceNo, row:line.row },
         { $set:{ ...line, lastSnapshotId:sid, updatedAt:new Date() }, $setOnInsert:{ firstSyncedAt:new Date() } },
         { upsert:true }
       );
+      if(Number(lineWrite.upsertedCount||0)>0) counters.insertedLines++; else { counters.updatedLines++; counters.duplicatePrevented++; }
     }
+    if(lines.length){
+      const reconciled=await db.collection('saleInvoiceLines').deleteMany({ saleInvoiceType:h.invTyp, saleInvoiceNo:h.invNo, row:{ $nin:lines.map(x=>x.row) } });
+      counters.removedOrReconciledLines += Number(reconciled.deletedCount||0);
+    }
+    endInvNo=Math.max(endInvNo,Number(h.invNo||0));
     if(samples.length<20) samples.push({ invTyp:h.invTyp, invTypeLabel:h.invTypeLabel, invNo:h.invNo, invDate:h.invDate, accountName:h.accountName, sellerAccountNumber:h.sellerAccountNumber, sellerAccountName:h.sellerAccountName, sellerName:h.sellerName, sellerUsername:h.sellerUsername, generalRef:h.generalRef, rowCount:body.length, saleLines:lines.length, totalAmount:h.totalAmount });
   }
 
@@ -369,8 +402,13 @@ async function buildSaleSnapshot(db, opts={}){
     const startNoByType={};
     for(const typ of [2]){
       const key=String(typ);
-      const lastNo = reset ? 0 : await latestInvNoByType(db, typ, dateFrom, dateTo);
+      const committedState=reset ? null : await db.collection('saleSnapshotState').findOne({ scopeKey }).catch(()=>null);
+      const committedNo=Number(committedState?.latestType2||0);
+      // Resume only from a successfully committed state. Existing aggregate rows may
+      // come from an interrupted run, so they are not a safe progress checkpoint.
+      const lastNo = reset ? 0 : committedNo;
       const invNoFrom = lastNo > 0 ? String(lastNo + 1) : '';
+      startInvNo=lastNo; endInvNo=lastNo;
       startNoByType[key]=lastNo;
       typeStats[key].startInvNo=lastNo;
       typeStats[key].nextInvNoFrom=lastNo+1;
@@ -381,8 +419,10 @@ async function buildSaleSnapshot(db, opts={}){
         const r=await shaygan.getInvoicePageByTypeNumberRange(rowStart, typ, invNoFrom, '', dateFrom, dateTo, pageSize).catch(e=>({ok:false,error:String(e.message||e),result:[]}));
         pagesScanned++; typeStats[key].pagesScanned++;
         if(!r.ok){ errors.push({ stage:'sale-invoice-page', typ, page, rowStart, invNoFrom, error:r.error||`Invoice/Get type ${typ} page failed` }); break; }
-        const rows=saleInvoicesOnly(r.result,typ);
-        if(!rows.length){ typeReachedEnd=true; typeStats[key].reachedEnd=true; break; }
+        const rawRows=Array.isArray(r.result)?r.result:[];
+        if(!rawRows.length){ typeReachedEnd=true; typeStats[key].reachedEnd=true; break; }
+        const rows=saleInvoicesOnly(rawRows,typ);
+        if(!rows.length) continue;
         const pageItemCodes=[]; for(const inv of rows){ for(const b of invBody(inv)) pageItemCodes.push(lineItemCode(b)); }
         const pageGroupMap=await loadMainGroupMap(db, pageItemCodes);
         for(let index=0; index<rows.length; index++){
@@ -390,7 +430,7 @@ async function buildSaleSnapshot(db, opts={}){
           if((index+1)%10===0 || index===rows.length-1) checkpoint();
         }
         // Do not stop on short pages. Shaygan sometimes returns short pages before the real end.
-        await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ updatedAt:new Date(), pagesScanned, startNoByType, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
+        await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ updatedAt:new Date(), pagesScanned, startNoByType, startInvNo, endInvNo, nextInvNo:endInvNo+1, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
       }
       if(!typeReachedEnd && typeStats[key].pagesScanned>=maxPages) errors.push({ stage:'max-pages-reached', typ, maxPages, note:'برای خواندن ادامه، maxPages را بالاتر بگذار یا دوباره اجرا کن.' });
     }
@@ -400,15 +440,22 @@ async function buildSaleSnapshot(db, opts={}){
     const reachedEnd = !!(typeStats['2'] && typeStats['2'].reachedEnd);
     progress('Saving Snapshot',0,1,'Saving final Sale Snapshot');
     checkpoint();
-    await db.collection('saleSnapshotState').updateOne({ scopeKey }, { $set:{ scopeKey, dateFrom, dateTo, reachedEnd, updatedAt:new Date(), lastSnapshotId:sid, lastHeadersFound:headersFound, lastLinesParsed:linesParsed, latestType2: await latestInvNoByType(db,2,dateFrom,dateTo), invoiceTypes:{ sale:2, buy:3, saleReturn:6, purchaseReturn:7 } } }, { upsert:true });
-    const status=errors.length && !linesParsed ? 'completed_with_errors' : 'completed';
-    await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ status, finishedAt:new Date(), updatedAt:new Date(), pagesScanned, reachedEnd, startNoByType, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100), samples } });
-    await db.collection('saleSnapshotDiagnostics').insertOne({ snapshotId:sid, at:new Date(), version:VERSION, dateFrom, dateTo, incremental:!reset, mode:reset?'full-sale-type2-scan':'new-sale-type2-by-invno', reachedEnd, startNoByType, pagesScanned, headersFound, bodiesLoaded, linesParsed, emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100), samples });
-    return { ok:true, snapshotId:sid, status, incremental:!reset, mode:reset?'full-sale-type2-scan':'new-sale-type2-by-invno', reachedEnd, startNoByType, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,20), samples };
+    const successful=errors.length===0 && reachedEnd;
+    if(successful){
+      await db.collection('saleSnapshotState').updateOne({ scopeKey }, { $set:{ scopeKey, dateFrom, dateTo, reachedEnd, updatedAt:new Date(), lastSnapshotId:sid, lastHeadersFound:headersFound, lastLinesParsed:linesParsed, latestType2:endInvNo, nextInvNo:endInvNo+1, invoiceTypes:{ sale:2, buy:3, saleReturn:6, purchaseReturn:7 } } }, { upsert:true });
+    }
+    const status=successful?'completed':'completed_with_errors';
+    const durationMs=Date.now()-startedAtMs;
+    const result={ ok:successful, snapshotId:sid, status, incremental:!reset, mode, scopeKey, reachedEnd, startNoByType, startInvNo, endInvNo, nextInvNo:endInvNo+1, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, durationMs, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100), samples };
+    await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ ...result, finishedAt:new Date(), updatedAt:new Date() } });
+    await db.collection('saleSnapshotDiagnostics').insertOne({ ...result, at:new Date(), version:VERSION, dateFrom, dateTo });
+    return { ...result, errors:errors.slice(0,20) };
   }catch(e){
-    await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ status:'failed', error:String(e.message||e), updatedAt:new Date(), finishedAt:new Date(), pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
+    const status=e?.code==='JOB_CANCELLED'?'cancelled':'failed';
+    const durationMs=Date.now()-startedAtMs;
+    await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ status, error:String(e.message||e), updatedAt:new Date(), finishedAt:new Date(), scopeKey, mode, startInvNo, endInvNo, nextInvNo:endInvNo+1, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, durationMs, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
     if(e?.code==='JOB_CANCELLED') throw e;
-    return { ok:false, snapshotId:sid, error:String(e.message||e), incremental:!reset, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,20) };
+    return { ok:false, snapshotId:sid, status, error:String(e.message||e), incremental:!reset, mode, scopeKey, startInvNo, endInvNo, nextInvNo:endInvNo+1, pagesScanned, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, durationMs, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,20) };
   }
 }
 
@@ -441,29 +488,53 @@ async function sellerPerformance(db, filters={}){
   const seller=clean(filters.sellerAccountNumber || filters.seller || '');
   const q={ saleInvoiceType: 2 };
   if(seller) q.sellerAccountNumber=seller;
+  if(filters.store) q.sellerStoreName={ $regex:clean(filters.store).replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), $options:'i' };
   const dateFrom=normDate8(filters.dateFrom||''); const dateTo=normDate8(filters.dateTo||'');
-  if(dateFrom || dateTo){ q.saleDate={}; if(dateFrom) q.saleDate.$gte=dateFrom; if(dateTo) q.saleDate.$lte=dateTo; }
-  const lines=await db.collection('saleInvoiceLines').find(q).sort({ saleDate:-1, saleInvoiceNo:-1, row:1 }).limit(Math.max(1,Math.min(Number(filters.limit||2000),10000))).toArray();
+  const reportScanLimit=Math.max(1,Math.min(Number(filters.limit||250000),500000));
+  const sourceLines=await db.collection('saleInvoiceLines').find(q).sort({ saleInvoiceNo:1, row:1 }).limit(reportScanLimit).toArray();
+  const lines=sourceLines.filter(line=>{const score=parseDateScore(line.saleDate||'');return (!dateFrom||score>=parseDateScore(dateFrom))&&(!dateTo||score<=parseDateScore(dateTo));}).sort((a,b)=>lineDateScoreFromDoc(a)-lineDateScoreFromDoc(b)||num(a.saleInvoiceNo)-num(b.saleInvoiceNo)||num(a.row)-num(b.row));
   const profit=await computeSellerProfitFifo(db, { ...filters, sellerAccountNumber:seller, dateFrom, dateTo });
-  const invoiceMap=new Map(); const groupMap=new Map();
+  const invoiceMap=new Map(); const groupMap=new Map(); const sellerMap=new Map(); const itemCodes=new Set();
   let total=0, qty=0;
   for(const l of lines){
     const pk=`${l.saleInvoiceType}-${l.saleInvoiceNo}-${l.row}`; const pr=profit.resultByLine.get(pk)||{};
     total+=num(l.saleValue,0); qty+=num(l.qty,0);
     const ik=`${l.saleInvoiceType}-${l.saleInvoiceNo}`;
-    const inv=invoiceMap.get(ik)||{ saleInvoiceType:l.saleInvoiceType, saleInvoiceNo:l.saleInvoiceNo, saleDate:l.saleDate, sellerAccountNumber:l.sellerAccountNumber, sellerName:l.sellerName, cashboxAccountName:l.cashboxAccountName, amount:0, fifoCost:0, fifoProfit:0, lines:0, calculatedLines:0, partialLines:0, unknownLines:0, itemCodes:new Set() };
-    inv.amount+=num(l.saleValue,0); inv.lines+=1; inv.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null) inv.fifoProfit+=num(pr.fifoProfit,0);
+    const inv=invoiceMap.get(ik)||{ saleInvoiceType:l.saleInvoiceType, saleInvoiceNo:l.saleInvoiceNo, saleDate:l.saleDate, sellerAccountNumber:l.sellerAccountNumber, sellerName:l.sellerName, sellerUsername:l.sellerUsername, sellerStoreName:l.sellerStoreName, cashboxAccountName:l.cashboxAccountName, accountName:l.accountName, generalRef:l.generalRef, amount:0, fifoCost:0, fifoProfit:0, coveredQty:0, coveredSales:0, qty:0, lines:0, calculatedLines:0, partialLines:0, unknownLines:0, itemCodes:new Set() };
+    inv.amount+=num(l.saleValue,0); inv.qty+=num(l.qty,0); inv.lines+=1; inv.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null) inv.fifoProfit+=num(pr.fifoProfit,0);
+    inv.coveredQty+=num(pr.allocatedQty,0); inv.coveredSales+=num(pr.saleValue,0);
     if(pr.profitStatus==='calculated') inv.calculatedLines++; else if(pr.profitStatus==='partial') inv.partialLines++; else inv.unknownLines++;
     if(l.itemCode) inv.itemCodes.add(l.itemCode); invoiceMap.set(ik,inv);
-    const gk=clean(l.mainGroupCode||'__UNKNOWN__'); const g=groupMap.get(gk)||{ mainGroupCode:gk, mainGroup:l.mainGroup||'نامشخص', amount:0, fifoCost:0, fifoProfit:0, lines:0, qty:0, calculatedLines:0, partialLines:0, unknownLines:0, invoices:new Set(), itemCodes:new Set() };
+    const gk=clean(l.mainGroupCode||'__UNKNOWN__'); const g=groupMap.get(gk)||{ mainGroupCode:gk, mainGroup:l.mainGroup||'نامشخص', mainGroupSource:l.mainGroupSource||'', amount:0, fifoCost:0, fifoProfit:0, coveredQty:0, coveredSales:0, lines:0, qty:0, calculatedLines:0, partialLines:0, unknownLines:0, invoices:new Set(), itemCodes:new Set() };
     g.amount+=num(l.saleValue,0); g.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null) g.fifoProfit+=num(pr.fifoProfit,0); g.lines+=1; g.qty+=num(l.qty,0);
+    g.coveredQty+=num(pr.allocatedQty,0); g.coveredSales+=num(pr.saleValue,0);
     if(pr.profitStatus==='calculated') g.calculatedLines++; else if(pr.profitStatus==='partial') g.partialLines++; else g.unknownLines++;
     g.invoices.add(ik); if(l.itemCode) g.itemCodes.add(l.itemCode); groupMap.set(gk,g);
-    l.fifoCost=pr.fifoCost||0; l.fifoProfit=pr.fifoProfit; l.profitStatus=pr.profitStatus||'unknown'; l.profitReason=pr.profitReason||''; l.purchaseAllocations=pr.allocations||[];
+    const sellerKey=clean(l.sellerAccountNumber||'__UNMAPPED__');
+    const sr=sellerMap.get(sellerKey)||{ sellerAccountNumber:sellerKey==='__UNMAPPED__'?'':sellerKey, sellerName:l.sellerName||'نامشخص', sellerUsername:l.sellerUsername||'', sellerStoreName:l.sellerStoreName||'', amount:0, fifoCost:0, fifoProfit:0, coveredQty:0, coveredSales:0, qty:0, lines:0, calculatedLines:0, partialLines:0, unknownLines:0, invoices:new Set(), itemCodes:new Set() };
+    sr.amount+=num(l.saleValue,0); sr.qty+=num(l.qty,0); sr.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null)sr.fifoProfit+=num(pr.fifoProfit,0); sr.coveredQty+=num(pr.allocatedQty,0); sr.coveredSales+=num(pr.saleValue,0); sr.lines++; sr.invoices.add(ik); if(l.itemCode)sr.itemCodes.add(l.itemCode);
+    if(pr.profitStatus==='calculated')sr.calculatedLines++; else if(pr.profitStatus==='partial')sr.partialLines++; else sr.unknownLines++;
+    sellerMap.set(sellerKey,sr); if(l.itemCode)itemCodes.add(l.itemCode);
+    l.allocatedQty=num(pr.allocatedQty,0); l.coveredSales=num(pr.saleValue,0); l.fifoCost=pr.profitStatus==='unknown'?null:pr.fifoCost; l.fifoProfit=pr.fifoProfit; l.profitStatus=pr.profitStatus||'unknown'; l.profitReason=pr.profitReason||''; l.purchaseAllocations=pr.allocations||[];
   }
-  const invoices=[...invoiceMap.values()].map(x=>({ ...x, fifoCost:Math.round(x.fifoCost), fifoProfit:Math.round(x.fifoProfit), roiPercent:x.fifoCost?Math.round(x.fifoProfit*10000/x.fifoCost)/100:null, profitStatus:x.unknownLines===0&&x.partialLines===0?'calculated':(x.calculatedLines||x.partialLines?'partial':'unknown'), itemCount:x.itemCodes.size, itemCodes:undefined })).sort((a,b)=>String(b.saleDate).localeCompare(String(a.saleDate)) || Number(b.saleInvoiceNo)-Number(a.saleInvoiceNo));
-  const groups=[...groupMap.values()].map(g=>({ mainGroupCode:g.mainGroupCode==='__UNKNOWN__'?'':g.mainGroupCode, mainGroup:g.mainGroup, amount:Math.round(g.amount), fifoCost:Math.round(g.fifoCost), fifoProfit:Math.round(g.fifoProfit), roiPercent:g.fifoCost?Math.round(g.fifoProfit*10000/g.fifoCost)/100:null, profitStatus:g.unknownLines===0&&g.partialLines===0?'calculated':(g.calculatedLines||g.partialLines?'partial':'unknown'), lines:g.lines, qty:g.qty, calculatedLines:g.calculatedLines, partialLines:g.partialLines, unknownLines:g.unknownLines, invoiceCount:g.invoices.size, itemCount:g.itemCodes.size })).sort((a,b)=>b.amount-a.amount);
-  return { ok:true, sellerAccountNumber:seller, dateFrom:clean(filters.dateFrom||''), dateTo:clean(filters.dateTo||''), invoiceCount:invoices.length, lineCount:lines.length, qty, totalSales:Math.round(total), fifoCost:profit.totals.fifoCost, estimatedProfit:profit.totals.fifoProfit, fifoProfit:profit.totals.fifoProfit, roiPercent:profit.totals.roiPercent, profitStatus:profit.totals.profitStatus, profitLineStats:{ calculated:profit.totals.calculatedLines, partial:profit.totals.partialLines, unknown:profit.totals.unknownLines }, profitDiagnostics:profit.diagnostics, groups, invoices:invoices.slice(0,Math.min(Number(filters.invoiceLimit||500),2000)), lines:lines.slice(0,Math.min(Number(filters.lineLimit||500),2000)) };
+  const coverageFor=x=>({ totalLines:x.lines, calculatedLines:x.calculatedLines, partialLines:x.partialLines, unknownLines:x.unknownLines, totalQty:x.qty, coveredQty:x.coveredQty, coveredQtyPercent:x.qty?Math.round(x.coveredQty*10000/x.qty)/100:0, totalSales:Math.round(x.amount), coveredSales:Math.round(x.coveredSales), coveredSalesPercent:x.amount?Math.round(x.coveredSales*10000/x.amount)/100:0, purchaseHistoryComplete:false });
+  const statusFor=x=>x.coveredQty>0?'partial':'unknown';
+  const invoices=[...invoiceMap.values()].map(x=>{const status=statusFor(x);return { ...x, fifoCost:status==='unknown'?null:Math.round(x.fifoCost), fifoProfit:status==='unknown'?null:Math.round(x.fifoProfit), roiPercent:status!=='unknown'&&x.fifoCost?Math.round(x.fifoProfit*10000/x.fifoCost)/100:null, profitStatus:status, coverage:coverageFor(x), itemCount:x.itemCodes.size, itemCodes:undefined }}).sort((a,b)=>String(b.saleDate).localeCompare(String(a.saleDate)) || Number(b.saleInvoiceNo)-Number(a.saleInvoiceNo));
+  const invoiceOutputLimit=Math.min(Number(filters.invoiceLimit||1000),5000);
+  let outputInvoices=invoices.slice(0,invoiceOutputLimit);
+  const outputInvoiceNumbers=[...new Set(outputInvoices.map(x=>Number(x.saleInvoiceNo)).filter(Boolean))];
+  if(outputInvoiceNumbers.length){
+    const headers=await db.collection('saleInvoiceHeaders').find({ invTyp:2, invNo:{ $in:outputInvoiceNumbers } }).limit(outputInvoiceNumbers.length).toArray().catch(()=>[]);
+    const headerMap=new Map(headers.map(header=>[`2-${header.invNo}`,header]));
+    outputInvoices=outputInvoices.map(inv=>{
+      const header=headerMap.get(`2-${inv.saleInvoiceNo}`);
+      if(!header)return inv;
+      return { ...inv, saleDate:header.invDate||inv.saleDate, sellerAccountNumber:header.sellerAccountNumber||inv.sellerAccountNumber, sellerName:header.sellerName||inv.sellerName, sellerUsername:header.sellerUsername||inv.sellerUsername, sellerStoreName:header.sellerStoreName||inv.sellerStoreName, cashboxAccountName:header.cashboxAccountName||inv.cashboxAccountName, accountName:header.accountName||inv.accountName, generalRef:header.generalRef||inv.generalRef, headerFound:true };
+    });
+  }
+  const groups=[...groupMap.values()].map(g=>{const status=statusFor(g);return { mainGroupCode:g.mainGroupCode==='__UNKNOWN__'?'':g.mainGroupCode, mainGroup:g.mainGroup, mainGroupSource:g.mainGroupSource, amount:Math.round(g.amount), fifoCost:status==='unknown'?null:Math.round(g.fifoCost), fifoProfit:status==='unknown'?null:Math.round(g.fifoProfit), roiPercent:status!=='unknown'&&g.fifoCost?Math.round(g.fifoProfit*10000/g.fifoCost)/100:null, profitStatus:status, coverage:coverageFor(g), lines:g.lines, qty:g.qty, calculatedLines:g.calculatedLines, partialLines:g.partialLines, unknownLines:g.unknownLines, invoiceCount:g.invoices.size, itemCount:g.itemCodes.size }}).sort((a,b)=>b.amount-a.amount);
+  const sellers=[...sellerMap.values()].map(s=>{const status=statusFor(s);return { sellerAccountNumber:s.sellerAccountNumber, sellerName:s.sellerName, sellerUsername:s.sellerUsername, sellerStoreName:s.sellerStoreName, amount:Math.round(s.amount), fifoCost:status==='unknown'?null:Math.round(s.fifoCost), fifoProfit:status==='unknown'?null:Math.round(s.fifoProfit), roiPercent:status!=='unknown'&&s.fifoCost?Math.round(s.fifoProfit*10000/s.fifoCost)/100:null, profitStatus:status, coverage:coverageFor(s), invoiceCount:s.invoices.size, lineCount:s.lines, qty:s.qty, itemCount:s.itemCodes.size }}).sort((a,b)=>b.amount-a.amount);
+  return { ok:true, source:'mongo:saleInvoiceHeaders+saleInvoiceLines|fifo:supplierPurchaseLayers-coverage-only', sellerAccountNumber:seller, dateFrom:clean(filters.dateFrom||''), dateTo:clean(filters.dateTo||''), invoiceCount:invoices.length, lineCount:lines.length, qty, itemCount:itemCodes.size, totalSales:Math.round(total), fifoCost:profit.totals.fifoCost, estimatedProfit:profit.totals.fifoProfit, fifoProfit:profit.totals.fifoProfit, roiPercent:profit.totals.roiPercent, profitStatus:profit.totals.profitStatus, coverage:profit.totals.coverage, profitLineStats:{ calculated:profit.totals.calculatedLines, partial:profit.totals.partialLines, unknown:profit.totals.unknownLines }, reportScanLimit, reportScanLimitReached:sourceLines.length>=reportScanLimit, profitDiagnostics:profit.diagnostics, sellers, groups, invoices:outputInvoices, lines:lines.slice(0,Math.min(Number(filters.lineLimit||5000),10000)), limitations:{ purchaseHistoryComplete:false, saleReturnsNettingImplemented:false, saleReturnsExcluded:true } };
 }
 
-module.exports={ VERSION, init, buildSaleSnapshot, listSnapshots, status, lines, sellerPerformance, _saleInvoicesOnly:saleInvoicesOnly };
+module.exports={ VERSION, init, buildSaleSnapshot, listSnapshots, status, lines, sellerPerformance, _saleInvoicesOnly:saleInvoicesOnly, _computeSellerProfitFifo:computeSellerProfitFifo, _saleHeaderDoc:saleHeaderDoc, _saleLineDocs:saleLineDocs, _resolveSellerForInvoice:resolveSellerForInvoice };

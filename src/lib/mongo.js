@@ -20,7 +20,7 @@ async function initMongo() {
   const database = await connectMongo();
   const collections = await database.listCollections().toArray();
   const existing = new Set(collections.map(c => c.name));
-  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','appJobs'];
+  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','saleSnapshotState','appJobs'];
   for (const name of needed) if (!existing.has(name)) await database.createCollection(name);
   await database.collection('settings').createIndex({ key: 1 }, { unique: true });
   await database.collection('customers').createIndex({ mobile: 1 });
@@ -68,12 +68,13 @@ async function initMongo() {
 
   await database.collection('saleSnapshots').createIndex({ snapshotId: 1 }, { unique: true });
   await database.collection('saleSnapshots').createIndex({ createdAt: -1 });
-  await database.collection('saleInvoiceHeaders').createIndex({ invNo: 1 }, { unique: true });
+  await database.collection('saleInvoiceHeaders').createIndex({ invTyp: 1, invNo: 1 }, { unique: true });
   await database.collection('saleInvoiceHeaders').createIndex({ snapshotId: 1, invDate: 1 });
-  await database.collection('saleInvoiceLines').createIndex({ saleInvoiceNo: 1, row: 1 }, { unique: true });
+  await database.collection('saleInvoiceLines').createIndex({ saleInvoiceType: 1, saleInvoiceNo: 1, row: 1 }, { unique: true });
   await database.collection('saleInvoiceLines').createIndex({ snapshotId: 1, itemCode: 1 });
   await database.collection('saleInvoiceLines').createIndex({ itemCode: 1, saleDate: 1 });
-  await database.collection('saleSnapshotDiagnostics','appJobs').createIndex({ snapshotId: 1, at: -1 });
+  await database.collection('saleSnapshotDiagnostics').createIndex({ snapshotId: 1, at: -1 });
+  await database.collection('saleSnapshotState').createIndex({ scopeKey: 1 }, { unique: true });
 
 
   await database.collection('purchaseDrafts').createIndex({ purchaseDraftNo: 1 }, { unique: true });

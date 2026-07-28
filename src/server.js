@@ -16,6 +16,7 @@ const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
 const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
 const { emitSearchEvent } = require('./lib/search-observability');
+const { APP_NAME, APP_VERSION, versionPayload, injectAssetVersion } = require('./lib/app-version');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
@@ -28,7 +29,6 @@ const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
 const publicDir = path.join(process.cwd(), 'public');
-const APP_VERSION = '0.9.19.59-supplier-sleep-operational-control';
 const supplierSleepJobRegistry = new JobRegistry();
 supplierSleepJobRegistry.register({ name:'supplier-sleep', version:1, factory:input=>new SupplierSleepJob(input) });
 const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
@@ -288,13 +288,6 @@ function parseMoneyInput(v, unit='rial') {
   if (/تومان|toman/i.test(raw) || unit === 'toman') return n * 10;
   return n;
 }
-function calcCommission({ fifoProfit=0, commissionRate=0.18, withoutLeadCount=0, leadPenaltyRial=0 } = {}) {
-  const raw = Math.round(Math.max(0, Number(fifoProfit||0)) * Number(commissionRate||0));
-  const leadPenalty = Math.max(0, Number(withoutLeadCount||0)) * Math.max(0, Number(leadPenaltyRial||0));
-  const final = Math.max(0, raw - leadPenalty);
-  return { rawCommission:raw, leadPenalty, finalCommission:final };
-}
-
 // 0.9.19.22: Sale invoice allowed extras/additions (Expense[]) governance.
 const SALE_ALLOWED_EXTRAS_KEY = 'sale.allowedInvoiceExtras';
 function normalizeAllowedInvoiceExtra(x = {}) {
@@ -2703,58 +2696,6 @@ async function buildSupplierAgingReport(opts = {}) {
 }
 
 
-async function estimateLineCostFromCardex(itemCode, saleDate, qty, salePrice) {
-  // 0.9.19.17→WS: shayganSql.getKardexByItemCode → shaygan.getKardexByItemCode
-  try {
-    if (!itemCode) return { cost:0, profit:null, unknown:Number(qty||0)*Number(salePrice||0), note:'no_item' };
-    const kr = await shaygan.getKardexByItemCode(String(itemCode), '', { maxRows: 300, hardMaxRows: 600 });
-    const rows = (kr.rows || []).filter(r => Number(r.inQty || r.InQty || 0) > 0 || Number(r.costPrice || r.CostPrice || r.buyPrice || r.inPrice || 0) > 0);
-    const saleTs = saleDate ? new Date(saleDate).getTime() : Date.now();
-    const candidates = rows.map(r => {
-      const dt = new Date(r.date || r.Date || r.invoiceDate || '').getTime();
-      const price = Number(r.costPrice || r.CostPrice || r.buyPrice || r.inPrice || r.price || 0);
-      return { dt: Number.isFinite(dt) ? dt : 0, price };
-    }).filter(x => x.price > 0 && (!x.dt || x.dt <= saleTs)).sort((a,b)=>b.dt-a.dt);
-    const unitCost = candidates[0]?.price || 0;
-    if (!unitCost) return { cost:0, profit:null, unknown:Number(qty||0)*Number(salePrice||0), note:'no_cost_from_ws_kardex' };
-    const cost = unitCost * Number(qty||0);
-    const sale = Number(qty||0)*Number(salePrice||0);
-    return { cost, profit:sale-cost, unknown:0, unitCost, note:'latest_ws_kardex_cost' };
-  } catch(e) { return { cost:0, profit:null, unknown:Number(qty||0)*Number(salePrice||0), note:'cost_error:'+String(e.message||e) }; }
-}
-function startOfMonthIso(month='') {
-  const m = String(month || '').trim();
-  if (/^\d{4}-\d{2}$/.test(m)) return `${m}-01`;
-  return '';
-}
-function endOfMonthIso(month='') {
-  const m = String(month || '').trim();
-  if (!/^\d{4}-\d{2}$/.test(m)) return '';
-  const d = new Date(`${m}-01T00:00:00`);
-  d.setMonth(d.getMonth() + 1);
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0,10);
-}
-function normalizeDate8ForShaygan(v='', end=false) {
-  const iso = normalizeReportDate(v, end);
-  if (!iso) return '';
-  return iso.slice(0,10).replace(/-/g,'');
-}
-function extractLeadIdFromInvoiceDoc(inv={}) {
-  const txt = [inv.InvDescription, inv.GeneralRef, ...(Array.isArray(inv.Body) ? inv.Body.map(x=>x.LineItemDesc) : [])].filter(Boolean).join(' ');
-  const m = String(txt).match(/(?:Lead\s*ID|LeadID|CRM\s*Lead|لید)\s*[:=\- ]\s*([A-Za-z0-9_\-\/\.]+)/i) || String(txt).match(/\bLID[-_A-Za-z0-9]{3,}\b/i);
-  return m ? String(m[1] || m[0] || '').trim() : '';
-}
-function normalizeRepText(v='') {
-  return normalizeText(String(v||'')).replace(/نماینده/g,'').replace(/فروش/g,'').trim();
-}
-function sellerLabelFromInvoice(inv={}, mappingsByEmployee=new Map()) {
-  const emp = String(inv.SAccountNumber || inv.SAccount2Number || '').trim();
-  const repNameRaw = String(inv.SAccountName || inv.SJobName || inv.LastIssuerUsername || inv.FirstIssuerUsername || '').trim();
-  const m = emp ? mappingsByEmployee.get(emp) : null;
-  const name = m?.fullName || repNameRaw || (emp ? `نماینده ${emp}` : 'نماینده نامشخص');
-  return { employeeAccountNumber:emp, sellerKey: emp || normalizeRepText(name) || 'unknown-rep', sellerName:name, sellerStore:m?.storeName || '' };
-}
 async function fetchSaleInvoicesFromShayganWebService({ from8='', to8='', maxPages=600 }={}) {
   const list = [];
   let rowStart = 0;
@@ -2770,176 +2711,98 @@ async function fetchSaleInvoicesFromShayganWebService({ from8='', to8='', maxPag
   return { ok:true, list, source:'shaygan-webservice-invoice-get-date', pages:Math.ceil(list.length/pageSize) };
 }
 
-// 0.9.19.17→WS: موتور FIFO بدون SQL — از Kardex وب‌سرویس شایگان می‌خواند
-async function getSellerSalesProfitFifoFromSalesWS(saleRows=[], opts={}) {
-  const rows = (saleRows || []).map((x, idx) => ({
-    sellerKey: String(x.sellerKey || 'unknown').trim() || 'unknown',
-    sellerName: String(x.sellerName || x.sellerKey || 'نامشخص').trim() || 'نامشخص',
-    sellerStore: String(x.sellerStore || '').trim(),
-    invoiceNo: String(x.invoiceNo || '').trim(),
-    invoiceDate: x.invoiceDate ? new Date(x.invoiceDate) : new Date(),
-    leadId: String(x.leadId || '').trim(),
-    customerName: String(x.customerName || '').trim(),
-    itemCode: String(x.itemCode || '').trim(),
-    itemDescription: String(x.itemDescription || '').trim(),
-    qty: Number(x.qty || x.quantity || 0),
-    unitSale: Number(x.unitSale || x.price || 0),
-    saleRial: Number(x.saleRial || 0),
-    _idx: idx
-  })).filter(x => x.itemCode && x.qty > 0 && (x.unitSale > 0 || x.saleRial > 0));
-
-  if (!rows.length) return { ok:true, list:[], invoices:[], allocations:[], unmatched:[], source:'seller-profit-ws-empty' };
-  for (const r of rows) {
-    if (!r.saleRial) r.saleRial = r.qty * r.unitSale;
-    if (!r.unitSale) r.unitSale = r.saleRial / r.qty;
-  }
-
-  // خواندن kardex به ازای هر کد کالا از WebService
-  const codes = [...new Set(rows.map(x => x.itemCode))];
-  const batchesByCode = new Map();
-  await Promise.allSettled(codes.map(async (code) => {
-    try {
-      const kr = await shaygan.getKardexByItemCode(code, '', { maxRows: Number(opts.kardexMaxRows || 600), hardMaxRows: Number(opts.kardexHardMaxRows || 1200) });
-      const purchaseRows = (kr.rows || []).filter(r => Number(r.inQty || r.InQty || 0) > 0 && Number(r.costPrice || r.CostPrice || r.buyPrice || r.inPrice || r.unitCost || 0) > 0)
-        .map(r => {
-          const rawDate = r.date || r.Date || r.invoiceDate || r.InvDate || '';
-          return { invNo:String(r.invoiceNo||r.InvNo||''), invDate: rawDate ? new Date(rawDate) : null, qty:Number(r.inQty||r.InQty||0), remainingQty:Number(r.inQty||r.InQty||0), unitCost:Number(r.costPrice||r.CostPrice||r.buyPrice||r.inPrice||r.unitCost||0) };
-        })
-        .sort((a,b) => { if (!a.invDate&&!b.invDate) return 0; if (!a.invDate) return 1; if (!b.invDate) return -1; return a.invDate-b.invDate; });
-      batchesByCode.set(code, purchaseRows);
-    } catch(e) { batchesByCode.set(code, []); }
-  }));
-
-  const sellerMap = new Map(), invoicesMap = new Map(), allocations = [], unmatched = [];
-  function ensureSeller(r) {
-    const k = r.sellerKey||'unknown';
-    if (!sellerMap.has(k)) sellerMap.set(k, { sellerKey:k, sellerName:r.sellerName||k, sellerStore:r.sellerStore||'', invoiceCountSet:new Set(), saleRial:0, fifoCost:0, fifoProfit:0, totalQty:0, allocatedRows:0, unmatchedSaleRial:0, withoutLeadCount:0, withLeadCount:0 });
-    const s = sellerMap.get(k);
-    if (!s.sellerName||s.sellerName===k) s.sellerName=r.sellerName||k;
-    if (!s.sellerStore&&r.sellerStore) s.sellerStore=r.sellerStore;
-    return s;
-  }
-  function ensureInvoice(r) {
-    const k=`${r.sellerKey}|${r.invoiceNo||r._idx}`;
-    if (!invoicesMap.has(k)) invoicesMap.set(k,{sellerKey:r.sellerKey,sellerName:r.sellerName,sellerStore:r.sellerStore,invoiceNo:r.invoiceNo,invoiceDate:r.invoiceDate?r.invoiceDate.toISOString().slice(0,10):'',customerName:r.customerName||'',leadId:r.leadId||'',saleRial:0,fifoCost:0,fifoProfit:0,unmatchedSaleRial:0,itemCount:0,lines:[],itemCodes:[],hasNotebook:false});
-    return invoicesMap.get(k);
-  }
-  const saleList = [...rows].sort((a,b)=>(a.invoiceDate-b.invoiceDate)||String(a.invoiceNo).localeCompare(String(b.invoiceNo))||a._idx-b._idx);
-  for (const sale of saleList) {
-    let need=sale.qty;
-    const batches=batchesByCode.get(sale.itemCode)||[];
-    const ss=ensureSeller(sale), inv=ensureInvoice(sale);
-    ss.saleRial+=sale.saleRial; ss.totalQty+=sale.qty; if(sale.invoiceNo) ss.invoiceCountSet.add(sale.invoiceNo); if(sale.leadId) ss.withLeadCount+=1; else ss.withoutLeadCount+=1;
-    inv.saleRial+=sale.saleRial; inv.itemCount+=1;
-    if (!inv.itemCodes.includes(sale.itemCode)) inv.itemCodes.push(sale.itemCode);
-    if (String(sale.itemCode||'').startsWith('1')) inv.hasNotebook=true;
-    const invLine={itemCode:sale.itemCode,itemDescription:sale.itemDescription,qty:sale.qty,saleRial:Math.round(sale.saleRial),fifoCost:0,fifoProfit:0,unmatchedSaleRial:0,leadId:sale.leadId||'',invoiceNo:sale.invoiceNo};
-    inv.lines.push(invLine);
-    for (const b of batches) {
-      if (need<=0) break; if (b.remainingQty<=0) continue;
-      if (sale.invoiceDate&&b.invDate&&sale.invoiceDate<b.invDate) continue;
-      const qty=Math.min(need,b.remainingQty); need-=qty; b.remainingQty-=qty;
-      const saleValue=qty*sale.unitSale, cost=qty*b.unitCost, profit=saleValue-cost;
-      ss.fifoCost+=cost; ss.fifoProfit+=profit; ss.allocatedRows+=1;
-      inv.fifoCost+=cost; inv.fifoProfit+=profit; invLine.fifoCost+=cost; invLine.fifoProfit+=profit;
-      allocations.push({sellerKey:sale.sellerKey,sellerName:sale.sellerName,invoiceNo:sale.invoiceNo,itemCode:sale.itemCode,itemDescription:sale.itemDescription,saleQty:qty,saleValue:Math.round(saleValue),purchaseInvNo:b.invNo,unitCost:Math.round(b.unitCost),fifoCost:Math.round(cost),fifoProfit:Math.round(profit)});
-    }
-    if (need>0.0001) {
-      const val=need*sale.unitSale;
-      ss.unmatchedSaleRial+=val; inv.unmatchedSaleRial+=val; invLine.unmatchedSaleRial+=val;
-      unmatched.push({sellerKey:sale.sellerKey,sellerName:sale.sellerName,invoiceNo:sale.invoiceNo,itemCode:sale.itemCode,itemDescription:sale.itemDescription,unmatchedQty:need,unmatchedSaleRial:Math.round(val),reason:'opening-stock-or-missing-purchase-kardex-ws'});
-    }
-  }
-  const list=[...sellerMap.values()].map(s=>({...s,invoiceCount:s.invoiceCountSet.size,invoiceCountSet:undefined,saleRial:Math.round(s.saleRial),fifoCost:Math.round(s.fifoCost),fifoProfit:Math.round(s.fifoProfit),avgProfitPct:s.saleRial?Math.round((s.fifoProfit/s.saleRial)*10000)/100:null,unmatchedSaleRial:Math.round(s.unmatchedSaleRial),confidence:s.unmatchedSaleRial?'partial-fifo-ws-kardex':'fifo-ws-kardex'})).sort((a,b)=>b.saleRial-a.saleRial);
-  const invoiceList=[...invoicesMap.values()].map(x=>({...x,saleRial:Math.round(x.saleRial),fifoCost:Math.round(x.fifoCost),fifoProfit:Math.round(x.fifoProfit),profitPct:x.saleRial?Math.round((x.fifoProfit/x.saleRial)*10000)/100:null,unmatchedSaleRial:Math.round(x.unmatchedSaleRial),lines:(x.lines||[]).map(l=>({...l,saleRial:Math.round(l.saleRial||0),fifoCost:Math.round(l.fifoCost||0),fifoProfit:Math.round(l.fifoProfit||0),unmatchedSaleRial:Math.round(l.unmatchedSaleRial||0),profitPct:l.saleRial?Math.round(((l.fifoProfit||0)/l.saleRial)*10000)/100:null}))})).sort((a,b)=>String(b.invoiceDate).localeCompare(String(a.invoiceDate))||Number(b.invoiceNo)-Number(a.invoiceNo));
-  return { ok:true, list, invoices:invoiceList, allocations, unmatched:unmatched.slice(0,1000), source:'shaygan-webservice-kardex-seller-profit-fifo' };
+const SELLER_PERFORMANCE_SOURCE = 'mongo-sale-snapshot-aggregate+supplierPurchaseLayers-coverage-only';
+function reportDate8(value='', fallback='') {
+  const digits=String(value||'').replace(/[^0-9]/g,'');
+  return digits.length>=8 ? digits.slice(0,8) : fallback;
 }
-
-async function buildSellerSalesProfitReport(query={}) {
-  const db = await connectMongo();
-  const seller = String(query.seller || query.employeeAccountNumber || '').trim();
-  const store = String(query.store || '').trim();
-  const month = String(query.month || '').trim();
-  const dateFromNorm = normalizeReportDate(query.dateFrom || query.from || '', false) || normalizeReportDate(startOfMonthIso(month), false);
-  const dateToNorm = normalizeReportDate(query.dateTo || query.to || '', true) || normalizeReportDate(endOfMonthIso(month), true);
-  const days = Math.min(Math.max(Number(query.days || 31), 1), 366);
-  const fromDate = dateFromNorm ? new Date(dateFromNorm) : new Date(Date.now() - days * 86400000);
-  const toDate = dateToNorm ? new Date(dateToNorm) : new Date();
-  const from8 = dateFromNorm ? dateFromNorm.slice(0,10).replace(/-/g,'') : '';
-  const to8 = dateToNorm ? dateToNorm.slice(0,10).replace(/-/g,'') : '';
-  const profitUnit = String(query.profitUnit || 'toman');
-  const minProfit = parseMoneyInput(query.minProfit, profitUnit);
-  const maxProfit = parseMoneyInput(query.maxProfit, profitUnit);
-  const commissionRate = query.commissionRate === undefined || query.commissionRate === '' ? 0.18 : Number(query.commissionRate);
-  const leadPenaltyRial = parseMoneyInput(query.leadPenaltyRial ?? query.leadPenalty, 'rial') || 0;
-  const itemGroup = String(query.itemGroup || query.group || '').trim().toLowerCase();
-  const isNotebookOnly = itemGroup === 'notebook' || itemGroup === 'nb' || itemGroup === '1';
-
-  const maps = await db.collection('userShayganMappings').find({ isActive:{ $ne:false } }).toArray().catch(()=>[]);
-  const mappingsByEmployee = new Map();
-  for (const m of maps) {
-    const emp = String(m.employeeAccountNumber || '').trim();
-    if (emp && !mappingsByEmployee.has(emp)) mappingsByEmployee.set(emp, m);
+async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
+  const month=String(query.month||'').replace(/[^0-9]/g,'').slice(0,6);
+  const dateFrom=reportDate8(query.dateFrom||query.from, month?`${month}01`:'');
+  const dateTo=reportDate8(query.dateTo||query.to, '');
+  const seller=String(query.seller||query.employeeAccountNumber||'').trim();
+  const store=String(query.store||'').trim();
+  const commissionRate=query.commissionRate==null||query.commissionRate===''?0.18:Number(query.commissionRate);
+  const leadPenaltyRial=parseMoneyInput(query.leadPenaltyRial??query.leadPenalty,'rial')||0;
+  const report=await saleSnapshot.sellerPerformance(db,{ sellerAccountNumber:seller, store, dateFrom, dateTo, limit:Number(query.limit||250000), invoiceLimit:Number(query.invoiceLimit||5000), lineLimit:Number(query.lineLimit||10000) });
+  const linesByInvoice=new Map();
+  for(const line of report.lines||[]){
+    const key=`${line.saleInvoiceType}-${line.saleInvoiceNo}`;
+    if(!linesByInvoice.has(key))linesByInvoice.set(key,[]);
+    linesByInvoice.get(key).push({ itemCode:line.itemCode, itemDescription:line.itemName, qty:line.qty, allocatedQty:line.allocatedQty, saleRial:line.saleValue, coveredSales:line.coveredSales, fifoCost:line.fifoCost, fifoProfit:line.fifoProfit, profitStatus:line.profitStatus, profitReason:line.profitReason, mainGroup:line.mainGroup, mainGroupSource:line.mainGroupSource });
   }
-
-  const invFetch = await fetchSaleInvoicesFromShayganWebService({ from8, to8, maxPages:Number(query.maxPages || config.sellerSalesInvoiceMaxPages || 800) });
-  if (!invFetch.ok) return { ok:false, error:invFetch.error, source:invFetch.source || 'shaygan-webservice-invoice-get-date' };
-  let invDocs = invFetch.list || [];
-  const saleRows = [];
-  for (const inv of invDocs) {
-    const rep = sellerLabelFromInvoice(inv, mappingsByEmployee);
-    if (seller && String(rep.employeeAccountNumber || rep.sellerKey) !== seller) continue;
-    if (store && !String(rep.sellerStore || '').includes(store)) continue;
-    const body = Array.isArray(inv.Body) ? inv.Body : [];
-    const invoiceNo = String(inv.InvNo || inv.Number || '').trim();
-    const leadId = extractLeadIdFromInvoiceDoc(inv);
-    const customerName = String(inv.InvDescription || inv.AccountName || '').trim();
-    const invDate = inv.InvDate || inv.CreatedDate || fromDate;
-    const discount = Number(inv.DiscAmount || inv.DiscountAmount || 0);
-    const rawAmounts = body.map(it => Number(it.Amount || (Number(it.Quan||0)*Number(it.Price||0)) || 0));
-    const gross = rawAmounts.reduce((a,b)=>a+b,0) || 1;
-    body.forEach((it, idx) => {
-      const qty = Number(it.Quan || it.quantity || 0);
-      const price = Number(it.Price || it.price || 0);
-      const amount = Number(it.Amount || (qty*price) || 0);
-      const itemCode = String(it.ItemNumber || it.ItemCode || '').trim();
-      if (!qty || !itemCode || (!price && !amount)) return;
-      // گروه اصلی نوت‌بوک در حسابداری مشهدکالا: هر کالایی که کد آن با 1 شروع شود.
-      // این فیلتر روی ردیف‌های فاکتور اعمال می‌شود؛ در فاکتورهای ترکیبی فقط ردیف‌های نوت‌بوک وارد فروش/سود می‌شوند.
-      if (isNotebookOnly && !itemCode.startsWith('1')) return;
-      const allocatedDiscount = discount ? (discount * (amount / gross)) : 0;
-      saleRows.push({
-        sellerKey:rep.sellerKey, sellerName:rep.sellerName, sellerStore:rep.sellerStore, employeeAccountNumber:rep.employeeAccountNumber,
-        invoiceNo, invoiceDate:invDate, leadId, customerName,
-        itemCode, itemDescription:String(it.ItemDescription || it.ItemDesc || '').trim(),
-        qty, unitSale: price || (amount/qty), saleRial: Math.max(0, amount - allocatedDiscount)
-      });
-    });
-  }
-  const fifo = await getSellerSalesProfitFifoFromSalesWS(saleRows, { kardexMaxRows: 600, kardexHardMaxRows: 1200 });
-  let invoices = fifo.invoices || [];
-  if (minProfit != null) invoices = invoices.filter(x => Number(x.fifoProfit || 0) >= minProfit);
-  if (maxProfit != null) invoices = invoices.filter(x => Number(x.fifoProfit || 0) <= maxProfit);
-  const sellerAgg = new Map();
-  for (const inv of invoices) {
-    const k = inv.sellerKey || 'unknown';
-    const emp = String(k).startsWith('NO_EMPLOYEE:') ? '' : String(k);
-    if (!sellerAgg.has(k)) sellerAgg.set(k, { sellerKey:k, sellerName:inv.sellerName||k, sellerStore:inv.sellerStore||'', employeeAccountNumber:emp, invoiceCount:0, saleRial:0, fifoCost:0, fifoProfit:0, unmatchedSaleRial:0, withLeadCount:0, withoutLeadCount:0 });
-    const s = sellerAgg.get(k);
-    s.invoiceCount += 1;
-    s.saleRial += Number(inv.saleRial||0);
-    s.fifoCost += Number(inv.fifoCost||0);
-    s.fifoProfit += Number(inv.fifoProfit||0);
-    s.unmatchedSaleRial += Number(inv.unmatchedSaleRial||0);
-    if (inv.leadId) s.withLeadCount += 1; else s.withoutLeadCount += 1;
-  }
-  const sellers = [...sellerAgg.values()].map(s => {
-    const c = calcCommission({ fifoProfit:s.fifoProfit, commissionRate, withoutLeadCount:s.withoutLeadCount, leadPenaltyRial });
-    return { ...s, saleRial:Math.round(s.saleRial), fifoCost:Math.round(s.fifoCost), fifoProfit:Math.round(s.fifoProfit), unmatchedSaleRial:Math.round(s.unmatchedSaleRial), avgProfitPct:s.saleRial ? Math.round((s.fifoProfit/s.saleRial)*10000)/100 : null, commissionRate, ...c, suggestedCommission:c.finalCommission, leadStatus:s.withoutLeadCount ? 'needs-review' : 'ok', employeeStatus:s.employeeAccountNumber ? 'ok' : 'missing' };
-  }).sort((a,b)=>b.fifoProfit-a.fifoProfit);
-  const summary = sellers.reduce((a,s)=>{ a.invoiceCount+=s.invoiceCount; a.saleRial+=s.saleRial; a.fifoCost+=s.fifoCost; a.fifoProfit+=s.fifoProfit; a.unmatchedSaleRial+=s.unmatchedSaleRial; a.rawCommission+=s.rawCommission||0; a.leadPenalty+=s.leadPenalty||0; a.suggestedCommission+=s.suggestedCommission; a.withoutLeadCount+=s.withoutLeadCount; a.missingEmployeeCount += s.employeeStatus === 'missing' ? 1 : 0; return a; }, { invoiceCount:0, saleRial:0, fifoCost:0, fifoProfit:0, unmatchedSaleRial:0, rawCommission:0, leadPenalty:0, suggestedCommission:0, withoutLeadCount:0, missingEmployeeCount:0 });
-  summary.avgProfitPct = summary.saleRial ? Math.round((summary.fifoProfit/summary.saleRial)*10000)/100 : null;
-  return { ok:true, period:{ from:fromDate.toISOString().slice(0,10), to:toDate.toISOString().slice(0,10), month:month||'' }, seller:seller||'all', store, source:'shaygan-webservice-sales-invoices+shaygan-webservice-kardex-seller-profit-fifo', summary, sellers, invoices:invoices.slice(0,1000), allocations:(fifo.allocations||[]).slice(0,1000), unmatched:(fifo.unmatched||[]).slice(0,1000), meta:{ invoiceRows:invDocs.length, saleRows:saleRows.length, itemGroup:isNotebookOnly?'notebook':'all', itemGroupRule:isNotebookOnly?'ItemCode starts with 1':'all items', minProfit, maxProfit, profitUnit, commissionRate, leadPenaltyRial, note:'عملکرد فروشنده از فاکتورهای فروش شایگان خوانده می‌شود؛ فروشنده از نماینده فاکتور/SAccountNumber استخراج می‌شود، نه صندوق و نه فقط لاگ CRM. فیلتر نوت‌بوک بر اساس شروع کد کالا با رقم 1 اعمال می‌شود.' } };
+  const invoices=(report.invoices||[]).map(inv=>{
+    const key=`${inv.saleInvoiceType}-${inv.saleInvoiceNo}`;
+    const unmatchedSaleRial=Math.max(0,Number(inv.amount||0)-Number(inv.coverage?.coveredSales||0));
+    return {
+      sellerKey:inv.sellerAccountNumber||'unmapped',
+      sellerName:inv.sellerName||'نامشخص',
+      sellerStore:inv.sellerStoreName||'',
+      employeeAccountNumber:inv.sellerAccountNumber||'',
+      invoiceNo:inv.saleInvoiceNo,
+      invoiceDate:inv.saleDate,
+      customerName:inv.accountName||'',
+      leadId:inv.generalRef||'',
+      saleRial:inv.amount,
+      fifoCost:inv.fifoCost,
+      fifoProfit:inv.fifoProfit,
+      profitPct:inv.roiPercent,
+      unmatchedSaleRial,
+      profitStatus:inv.profitStatus,
+      coverage:inv.coverage,
+      lines:linesByInvoice.get(key)||[],
+      itemCodes:[...new Set((linesByInvoice.get(key)||[]).map(x=>x.itemCode).filter(Boolean))]
+    };
+  });
+  const sellers=(report.sellers||[]).map(s=>{
+    const incomplete=s.profitStatus!=='calculated'||s.coverage?.purchaseHistoryComplete!==true;
+    const rawCommission=incomplete||s.fifoProfit==null?null:Math.round(Number(s.fifoProfit)*commissionRate);
+    const leadPenalty=rawCommission==null?null:0;
+    const suggestedCommission=rawCommission==null?null:Math.max(0,rawCommission-leadPenalty);
+    return {
+      sellerKey:s.sellerAccountNumber||'unmapped',
+      sellerName:s.sellerName||'نامشخص',
+      sellerStore:s.sellerStoreName||'',
+      employeeAccountNumber:s.sellerAccountNumber||'',
+      invoiceCount:s.invoiceCount,
+      lineCount:s.lineCount,
+      saleRial:s.amount,
+      fifoCost:s.fifoCost,
+      fifoProfit:s.fifoProfit,
+      avgProfitPct:s.roiPercent,
+      unmatchedSaleRial:Math.max(0,Number(s.amount||0)-Number(s.coverage?.coveredSales||0)),
+      commissionRate,
+      rawCommission,
+      leadPenalty,
+      finalCommission:suggestedCommission,
+      suggestedCommission,
+      commissionStatus:incomplete?'withheld-incomplete-coverage':'calculated',
+      profitStatus:s.profitStatus,
+      coverage:s.coverage,
+      leadStatus:'not-evaluated-from-snapshot',
+      employeeStatus:s.sellerAccountNumber?'ok':'missing'
+    };
+  });
+  const coverage=report.coverage||{};
+  const incomplete=report.profitStatus!=='calculated'||coverage.purchaseHistoryComplete!==true;
+  const summary={
+    invoiceCount:report.invoiceCount,
+    lineCount:report.lineCount,
+    itemCount:report.itemCount,
+    qty:report.qty,
+    saleRial:report.totalSales,
+    fifoCost:report.fifoCost,
+    fifoProfit:report.fifoProfit,
+    avgProfitPct:report.roiPercent,
+    unmatchedSaleRial:Math.max(0,Number(report.totalSales||0)-Number(coverage.coveredSales||0)),
+    rawCommission:null,
+    leadPenalty:null,
+    suggestedCommission:null,
+    commissionStatus:incomplete?'withheld-incomplete-coverage':'calculated',
+    profitStatus:report.profitStatus,
+    coverage
+  };
+  return { ok:true, period:{from:dateFrom,to:dateTo,month}, seller:seller||'all', store, source:SELLER_PERFORMANCE_SOURCE, summary, sellers, invoices, groups:report.groups||[], allocations:[], unmatched:(report.lines||[]).filter(x=>x.profitStatus!=='calculated').slice(0,1000), coverage, profitStatus:report.profitStatus, limitations:report.limitations, diagnostics:report.profitDiagnostics, meta:{ invoiceRows:report.invoiceCount, saleRows:report.lineCount, itemGroup:'all', itemGroupRule:'mainGroup from catalog; explicit item-code fallback retained', commissionRate, leadPenaltyRial, reportScanLimit:report.reportScanLimit, reportScanLimitReached:report.reportScanLimitReached, note:'گزارش فقط از aggregateهای Sale Snapshot در Mongo خوانده می‌شود. سود و پورسانت تا تکمیل تاریخچه خرید، پوشش‌محور و غیرقطعی است.' } };
 }
 
 
@@ -2972,7 +2835,7 @@ async function saveSellerPerformanceHistory(db, query, report, by='system') {
 }
 async function getLatestSellerPerformanceHistory(db, query={}) {
   const filterKey = sellerPerformanceFilterKey(query);
-  return await db.collection('sellerPerformanceHistory').findOne({ type:'seller-performance', filterKey }, { sort:{ generatedAt:-1 } });
+  return await db.collection('sellerPerformanceHistory').findOne({ type:'seller-performance', filterKey, 'report.source':SELLER_PERFORMANCE_SOURCE }, { sort:{ generatedAt:-1 } });
 }
 
 
@@ -3302,8 +3165,8 @@ async function handleApi(req, res, pathname, query) {
   try {
     const readOnlyOperation = stagingReadOnlyOperation(req, pathname);
     if (readOnlyOperation && rejectIfStagingReadOnly(req, res, readOnlyOperation)) return;
-    if (pathname === '/health') return sendJson(res, 200, { ok: true, app: 'mkcrm', version: APP_VERSION, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
-    if (pathname === '/api/version') return sendJson(res, 200, { ok: true, app: 'mkcrm', version: APP_VERSION, node: process.version, serverTime: time.serverTimePayload() });
+    if (pathname === '/health') return sendJson(res, 200, { ...versionPayload(), app: APP_NAME, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
+    if (pathname === '/api/version') return sendJson(res, 200, { ...versionPayload(), app: APP_NAME, node: process.version, serverTime: time.serverTimePayload() });
     if (pathname === '/api/server-time') return sendJson(res, 200, time.serverTimePayload());
     if (pathname === '/api/search/status') { const db = await connectMongo(); return sendJson(res, 200, { ok:true, version:APP_VERSION, counts:{ inventory: await db.collection('itemInventoryCatalog').estimatedDocumentCount().catch(()=>0), allItems: await db.collection('itemCatalogAll').estimatedDocumentCount().catch(()=>0), accounts: await db.collection('accountCatalog').estimatedDocumentCount().catch(()=>0) } }); }
     if (pathname === '/api/jobs/status' && req.method === 'GET') { const db = await connectMongo(); const jobId=String(query.jobId||''); const q=jobId?{jobId}:{ }; const jobsRaw=await db.collection('appJobs').find(q).sort({ updatedAt:-1 }).limit(jobId?1:20).toArray().catch(()=>[]); const nowMs=Date.now(); const jobs=jobsRaw.map(j=>{ const hb=new Date(j.heartbeatAt||j.updatedAt||j.startedAt||0).getTime(); const stale=String(j.status||'')==='running' && hb && (nowMs-hb)>10*60*1000; return { ...j, heartbeatAgeMs: hb ? nowMs-hb : null, staleRunning: !!stale, statusFa: stale ? 'در حال اجرا - heartbeat قدیمی، بررسی PM2/WebService لازم است' : '' }; }); return sendJson(res, 200, { ok:true, list:jobs, job:jobs[0]||null, serverTime: time.serverTimePayload() }); }
@@ -3564,9 +3427,10 @@ async function handleApi(req, res, pathname, query) {
       const db = await connectMongo();
       return sendJson(res, 200, await saleSnapshot.sellerPerformance(db, {
         sellerAccountNumber: query.sellerAccountNumber || query.seller || '',
+        store: query.store || '',
         dateFrom: query.dateFrom || '',
         dateTo: query.dateTo || '',
-        limit: Number(query.limit || 5000),
+        limit: Number(query.limit || 250000),
         invoiceLimit: Number(query.invoiceLimit || 1000),
         lineLimit: Number(query.lineLimit || 1000)
       }));
@@ -3886,7 +3750,7 @@ async function handleApi(req, res, pathname, query) {
     }
     if (pathname === '/api/shaygan/sql-health') { // FIX-C2
       if (!requireRole(req, res, ['admin'])) return;
-      return sendJson(res, 200, { ok:false, disabled:true, message:'اتصال مستقیم SQL از نسخه 0.9.19.17-WS حذف شده؛ WebService رسمی شایگان استفاده می‌شود.' });
+      return sendJson(res, 200, { ok:false, disabled:true, message:'اتصال مستقیم SQL غیرفعال است؛ WebService رسمی شایگان استفاده می‌شود.' });
     }
     if (pathname === '/api/shaygan/health') { // FIX-C2
       if (!needLogin(req, res)) return;
@@ -4543,10 +4407,10 @@ async function handleApi(req, res, pathname, query) {
       if (query.id) {
         let oid = null;
         try { oid = new ObjectId(String(query.id)); } catch {}
-        const doc = oid ? await db.collection('sellerPerformanceHistory').findOne({ _id:oid, type:'seller-performance' }) : null;
+        const doc = oid ? await db.collection('sellerPerformanceHistory').findOne({ _id:oid, type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE }) : null;
         return sendJson(res, 200, { ok:true, found:!!doc, generatedAt:doc?.generatedAt || null, filters:doc?.filters || null, report:doc?.report || null });
       }
-      const list = await db.collection('sellerPerformanceHistory').find({ type:'seller-performance' }).sort({ generatedAt:-1 }).limit(30).project({ report:0 }).toArray().catch(()=>[]);
+      const list = await db.collection('sellerPerformanceHistory').find({ type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE }).sort({ generatedAt:-1 }).limit(30).project({ report:0 }).toArray().catch(()=>[]);
       return sendJson(res, 200, { ok:true, list });
     }
     if (pathname === '/api/reports/seller-sales-profit/latest') {
@@ -4564,7 +4428,7 @@ async function handleApi(req, res, pathname, query) {
           const cached = await getLatestSellerPerformanceHistory(db, query);
           if (cached?.report) return sendJson(res, 200, { ...cached.report, ok:true, cached:true, generatedAt:cached.generatedAt, cacheSource:'sellerPerformanceHistory' });
         }
-        const r = await buildSellerSalesProfitReport(query);
+        const r = await buildSellerSalesProfitReportFromSnapshot(db, query);
         if (r.ok) {
           const doc = await saveSellerPerformanceHistory(db, query, r, currentUser(req)?.username || 'system');
           return sendJson(res, 200, { ...r, cached:false, generatedAt:doc.generatedAt, historyId:String(doc._id) });
@@ -5200,7 +5064,8 @@ async function serveStatic(req, res, pathname) {
   if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) filePath = path.join(publicDir, 'index.html');
   fs.readFile(filePath, (err, data) => {
     if (err) return sendJson(res, 404, { ok: false, error: 'Not found' });
-    res.writeHead(200, { 'Content-Type': mime(filePath), 'Cache-Control': 'no-store, no-cache, must-revalidate' }); res.end(data);
+    const body = path.basename(filePath) === 'index.html' ? injectAssetVersion(data.toString('utf8')) : data;
+    res.writeHead(200, { 'Content-Type': mime(filePath), 'Cache-Control': 'no-store, no-cache, must-revalidate' }); res.end(body);
   });
 }
 
