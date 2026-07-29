@@ -55,6 +55,24 @@ function lineIdentity(invoice, line, row) {
 function retryable(error) {
   return /timeout|timed out|econnreset|econnrefused|socket|network|fetch|transport|429|5\d\d|temporar/i.test(clean(error));
 }
+function responseTotalRecords(response) {
+  const candidates = [
+    response?.totalRecords,
+    response?.TotalRecords,
+    response?.raw?.TotalRecords,
+    response?.raw?.totalRecords,
+    response?.result?.[0]?.TotalRecords,
+    response?.result?.[0]?.totalRecords,
+    response?.raw?.Result?.[0]?.TotalRecords,
+    response?.raw?.Result?.[0]?.totalRecords
+  ];
+  for (const candidate of candidates) {
+    if (candidate == null || clean(candidate) === '') continue;
+    const value = Number(candidate);
+    if (Number.isSafeInteger(value) && value >= 0) return value;
+  }
+  return null;
+}
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
 async function count(collection, query) {
@@ -317,6 +335,11 @@ async function buildPurchaseLayerDataset(db, options = {}) {
   const nextRowStartByType = { '3':0, '7':0, ...(startCheckpoint.nextRowStartByType || {}) };
   const reachedEndByType = { '3':false, '7':false, ...(startCheckpoint.reachedEndByType || {}) };
   const lastInvoiceNoByType = { '3':0, '7':0, ...(resumed?.lastInvoiceNoByType || previousActive?.dataset?.lastInvoiceNoByType || {}) };
+  const pagingByType = {
+    '3':{ totalRecords:null, expectedPages:null, pagesRead:0, mode:'fallback' },
+    '7':{ totalRecords:null, expectedPages:null, pagesRead:0, mode:'fallback' },
+    ...(replayFromStart ? {} : (resumed?.pagingByType || {}))
+  };
   let retryCount = Number(resumed?.retryCount || 0);
   let pageCount = Number(resumed?.pageCount || 0);
   const errors = [];
@@ -337,7 +360,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
           const attemptStartedAt = Date.now();
           response = await api.getInvoicePageByTypeNumberRange(rowStart, type, invNoFrom, '', dateFrom, dateTo, pageSize)
             .catch(error => ({ ok:false, error:String(error.message || error), result:[] }));
-          attempts.push({ attempt, ok:!!response.ok, durationMs:Date.now() - attemptStartedAt, error:response.ok ? '' : safeError(response.error), at:new Date() });
+          attempts.push({ attempt, ok:!!response.ok, status:Number(response.status || 0), durationMs:Date.now() - attemptStartedAt, error:response.ok ? '' : safeError(response.error), at:new Date() });
           if (response.ok) break;
           if (!retryable(response.error) || attempt === maxPageAttempts) break;
           retryCount++;
@@ -351,6 +374,16 @@ async function buildPurchaseLayerDataset(db, options = {}) {
           break;
         }
         const sourceRows = Array.isArray(response.result) ? response.result.filter(row => invoiceType(row) === type) : [];
+        const totalRecords=responseTotalRecords(response);
+        if(totalRecords!=null){
+          pagingByType[key]={
+            ...pagingByType[key],
+            totalRecords,
+            expectedPages:Math.ceil(totalRecords/pageSize),
+            mode:'total-records'
+          };
+        }
+        pagingByType[key].pagesRead=Number(pagingByType[key].pagesRead||0)+1;
         pageDiagnostics.push({ type, page, rowStart, rows:sourceRows.length, attempts, at:new Date() });
         if (!sourceRows.length) {
           reachedEndByType[key] = true;
@@ -370,11 +403,16 @@ async function buildPurchaseLayerDataset(db, options = {}) {
         }
         // Advance only after every row in the page is durable. A failed page is replayed on resume.
         nextRowStartByType[key] = rowStart + pageSize;
+        if(pagingByType[key].mode==='total-records' &&
+          Number(pagingByType[key].pagesRead)>=Number(pagingByType[key].expectedPages)){
+          reachedEndByType[key]=true;
+        }
         const checkpointValue = { typeIndex, nextRowStartByType, reachedEndByType };
         await db.collection(DATASETS).updateOne({ datasetId }, { $set:{
           checkpoint:checkpointValue, pageCount, retryCount, lastInvoiceNoByType,
-          pageDiagnostics:pageDiagnostics.slice(-200), updatedAt:new Date()
+          pagingByType, pageDiagnostics:pageDiagnostics.slice(-200), updatedAt:new Date()
         } });
+        if(reachedEndByType[key])break;
         // A short page is not an end marker; only an empty official response ends a type.
       }
       if (!reachedEndByType[key] && !errors.length) {
@@ -405,7 +443,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
       pageCount, retryCount, resumeCount:Number(resumed?.resumeCount||0)+(resumed?1:0),
       replayFromStartCount:Number(resumed?.replayFromStartCount||0)+(replayFromStart?1:0),
       checkpoint:{ typeIndex:finalTypeIndex<0?SOURCE_TYPES.length:finalTypeIndex, nextRowStartByType, reachedEndByType },
-      lastInvoiceNoByType, clonedLayerCount, purchaseInvoiceCount:purchaseInvoiceKeys.size,
+      pagingByType, lastInvoiceNoByType, clonedLayerCount, purchaseInvoiceCount:purchaseInvoiceKeys.size,
       purchaseReturnInvoiceCount:purchaseReturnInvoiceKeys.size,
       purchaseLineCount:purchaseRows.length, purchaseReturnLineCount:rows.length - purchaseRows.length,
       layerCount:rows.length, itemCount:itemKeys.size, supplierCount:suppliers.size,
@@ -532,5 +570,6 @@ module.exports = {
   DATASETS, STATE, LAYERS, DIAGNOSTICS, SCHEMA_VERSION, SOURCE_TYPES,
   ensureIndexes, activeDataset, buildPurchaseLayerDataset, coverage, listDatasets, status, listLayers,
   _mapSourceLine:mapSourceLine, _lineIdentity:lineIdentity, _reconcilePurchaseReturns:reconcilePurchaseReturns,
-  _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate
+  _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate,
+  _responseTotalRecords:responseTotalRecords
 };

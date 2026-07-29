@@ -25,7 +25,11 @@ function apiFor(rowsByType,options={}){
       calls.push({rowStart,type,from,dateFrom,dateTo,rowCount});
       if(options.failOnce&&!failed){failed=true;return {ok:false,error:'request timeout'};}
       const pages=rowsByType[String(type)]||{};
-      return {ok:true,result:pages[rowStart]||[]};
+      return {
+        ok:true,
+        result:pages[rowStart]||[],
+        totalRecords:options.totalRecordsByType?.[String(type)]
+      };
     }
   };
 }
@@ -87,6 +91,42 @@ test('a failed page does not advance its durable resume checkpoint',async()=>{
   assert.equal(failed.ok,false);
   assert.equal(failed.status,'failed');
   assert.equal(failed.checkpoint.nextRowStartByType['3'],0);
+});
+
+test('TotalRecords stops exactly before Shaygan rejects an extra page',async()=>{
+  const db=new MemoryDb();
+  const api=apiFor({
+    '3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[invoice(3,11,[line(12,'B',1,200)])]},
+    '7':{0:[]}
+  },{totalRecordsByType:{'3':40,'7':0}});
+  const result=await purchaseLayers.buildPurchaseLayerDataset(db,{
+    shaygan:api,mode:'full',reset:true,dateFrom:'14050101',pageSize:20,maxPages:10,maxPageAttempts:1
+  });
+  assert.equal(result.ok,true);
+  assert.deepEqual(api.calls.filter(call=>call.type===3).map(call=>call.rowStart),[0,20]);
+  assert.equal(result.pagingByType['3'].expectedPages,2);
+  assert.equal(result.pagingByType['3'].pagesRead,2);
+  assert.equal(result.pagingByType['3'].mode,'total-records');
+});
+
+test('TotalRecords tolerates a short middle page and zero-record invoice type',async()=>{
+  const db=new MemoryDb();
+  const api=apiFor({
+    '3':{
+      0:[invoice(3,10,[line(11,'A',5,100)])],
+      20:[invoice(3,11,[line(12,'B',1,200)])],
+      40:[invoice(3,12,[line(13,'C',1,300)])]
+    },
+    '7':{0:[]}
+  },{totalRecordsByType:{'3':45,'7':0}});
+  const result=await purchaseLayers.buildPurchaseLayerDataset(db,{
+    shaygan:api,mode:'full',reset:true,dateFrom:'14050101',pageSize:20,maxPages:10,maxPageAttempts:1
+  });
+  assert.equal(result.ok,true);
+  assert.deepEqual(api.calls.filter(call=>call.type===3).map(call=>call.rowStart),[0,20,40]);
+  assert.deepEqual(api.calls.filter(call=>call.type===7).map(call=>call.rowStart),[0]);
+  assert.equal(result.pagingByType['7'].expectedPages,0);
+  assert.equal(result.validation.allTypesReachedEnd,true);
 });
 
 test('full backfill retries, represents returns, validates quantities, and activates atomically',async()=>{
