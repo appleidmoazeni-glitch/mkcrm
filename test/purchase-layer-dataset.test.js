@@ -130,6 +130,33 @@ test('bounded candidate remains inactive then resumes the same dataset without d
   assert.equal((await purchaseLayers.activeDataset(db)).datasetId,bounded.datasetId);
 });
 
+test('an interrupted running candidate can safely replay from page zero with the same id',async()=>{
+  const db=new MemoryDb({
+    purchaseLayerDatasets:[{
+      datasetId:'PLAYER-INTERRUPTED',status:'running',activationStatus:'candidate',mode:'full',
+      sourceDateFrom:'14050101',sourceDateTo:'',pageSize:20,maxPages:1000,maxPageAttempts:3,
+      pageCount:16,resumeCount:1,
+      checkpoint:{typeIndex:0,nextRowStartByType:{'3':320,'7':0},reachedEndByType:{'3':false,'7':false}}
+    }]
+  });
+  const existing=purchaseLayers._mapSourceLine(invoice(3,11,[line(12,'B',1,200)]),line(12,'B',1,200),1,'PLAYER-INTERRUPTED');
+  await db.collection('supplierPurchaseLayers').insertOne(existing);
+  const api=apiFor({
+    '3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[invoice(3,11,[line(12,'B',1,200)])],40:[]},
+    '7':{0:[]}
+  });
+  const result=await purchaseLayers.buildPurchaseLayerDataset(db,{
+    shaygan:api,resumeDatasetId:'PLAYER-INTERRUPTED',replayFromStart:true,maxPages:10,maxPageAttempts:1
+  });
+  assert.equal(result.ok,true);
+  assert.equal(result.datasetId,'PLAYER-INTERRUPTED');
+  assert.equal(result.resumeCount,2);
+  assert.equal(result.replayFromStartCount,1);
+  assert.equal(result.duplicateCount,0);
+  assert.equal(api.calls[0].rowStart,0);
+  assert.equal(db.collection('supplierPurchaseLayers').rows.filter(row=>row.datasetId==='PLAYER-INTERRUPTED').length,2);
+});
+
 test('failed candidate never replaces a prior active dataset',async()=>{
   const db=new MemoryDb();
   const goodApi=apiFor({'3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[]},'7':{0:[]}});

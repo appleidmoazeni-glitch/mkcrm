@@ -270,8 +270,11 @@ async function buildPurchaseLayerDataset(db, options = {}) {
   const checkpoint = () => { jobControl?.heartbeat?.(); jobControl?.checkCancellation?.(); };
   const requestedResumeId = clean(options.resumeDatasetId);
   const resumed = requestedResumeId ? await db.collection(DATASETS).findOne({ datasetId:requestedResumeId }) : null;
+  const replayFromStart = options.replayFromStart === true;
   if (requestedResumeId && !resumed) return { ok:false, code:'DATASET_NOT_FOUND', error:'Purchase Layer Candidate not found', datasetId:requestedResumeId };
-  if (resumed && !['completed_with_errors', 'failed', 'cancelled'].includes(clean(resumed.status))) {
+  const resumableStatus = ['completed_with_errors', 'failed', 'cancelled'].includes(clean(resumed?.status)) ||
+    (replayFromStart && clean(resumed?.status) === 'running');
+  if (resumed && !resumableStatus) {
     return { ok:false, code:'DATASET_NOT_RESUMABLE', error:`Dataset status ${clean(resumed.status)} is not resumable`, datasetId:requestedResumeId };
   }
   const { dateFrom, dateTo } = normalizeJalaliRange({
@@ -304,12 +307,13 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     }
   } else {
     await db.collection(DATASETS).updateOne({ datasetId }, { $set:{
-      status:'running', activationStatus:'candidate', resumedAt:now,
+      status:'running', activationStatus:'candidate', resumedAt:now, recoveryMode:replayFromStart ? 'replay-from-start' : 'checkpoint-resume',
       resumeCount:Number(resumed.resumeCount || 0) + 1, maxPages, maxPageAttempts, updatedAt:now
-    } });
+    }, $unset:{ error:'' } });
   }
 
-  const startCheckpoint = resumed?.checkpoint || { typeIndex:0, nextRowStartByType:{ '3':0, '7':0 }, reachedEndByType:{ '3':false, '7':false } };
+  const emptyCheckpoint = { typeIndex:0, nextRowStartByType:{ '3':0, '7':0 }, reachedEndByType:{ '3':false, '7':false } };
+  const startCheckpoint = replayFromStart ? emptyCheckpoint : (resumed?.checkpoint || emptyCheckpoint);
   const nextRowStartByType = { '3':0, '7':0, ...(startCheckpoint.nextRowStartByType || {}) };
   const reachedEndByType = { '3':false, '7':false, ...(startCheckpoint.reachedEndByType || {}) };
   const lastInvoiceNoByType = { '3':0, '7':0, ...(resumed?.lastInvoiceNoByType || previousActive?.dataset?.lastInvoiceNoByType || {}) };
@@ -399,6 +403,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
       activationStatus:successful ? 'validated' : 'rejected',
       completedAt, updatedAt:completedAt, durationMs:Date.now() - startedAtMs,
       pageCount, retryCount, resumeCount:Number(resumed?.resumeCount||0)+(resumed?1:0),
+      replayFromStartCount:Number(resumed?.replayFromStartCount||0)+(replayFromStart?1:0),
       checkpoint:{ typeIndex:finalTypeIndex<0?SOURCE_TYPES.length:finalTypeIndex, nextRowStartByType, reachedEndByType },
       lastInvoiceNoByType, clonedLayerCount, purchaseInvoiceCount:purchaseInvoiceKeys.size,
       purchaseReturnInvoiceCount:purchaseReturnInvoiceKeys.size,

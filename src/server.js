@@ -3566,6 +3566,7 @@ async function handleApi(req, res, pathname, query) {
         mode:body.mode||query.mode||'incremental',
         reset:body.reset===true||body.reset==='true'||query.reset==='true',
         resumeDatasetId,
+        replayFromStart:body.replayFromStart===true||body.replayFromStart==='true'||query.replayFromStart==='true',
         pageSize:Number(body.pageSize||query.pageSize||20),
         maxPages:Number(body.maxPages||query.maxPages||1000),
         maxPageAttempts:Number(body.maxPageAttempts||query.maxPageAttempts||3)
