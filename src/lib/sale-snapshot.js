@@ -12,6 +12,15 @@ const DEFAULT_PAGE_ATTEMPTS = 3;
 
 function clean(v){ return String(v == null ? '' : v).trim(); }
 function num(v,d=0){ const n=Number(String(v??'').replace(/[,،\s]/g,'')); return Number.isFinite(n)?n:d; }
+function normalizeSellerAccountNumber(v){
+  return clean(v)
+    .replace(/[۰-۹]/g,d=>String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)))
+    .replace(/[٠-٩]/g,d=>String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)))
+    .replace(/\s+/g,'');
+}
+function normalizeSellerName(v){
+  return clean(v).replace(/[يى]/g,'ی').replace(/ك/g,'ک').replace(/\s+/g,' ').toLocaleLowerCase('fa');
+}
 function safeError(value, maxLength=1000){
   return clean(value)
     .replace(/mongodb(?:\+srv)?:\/\/[^\s"'<>]+/gi, 'mongodb://[REDACTED]')
@@ -331,11 +340,15 @@ function saleHeaderDoc(inv, snapshotIdValue, sellerMaps){
     firstIssuerUsername: invIssuerFirst(inv),
     lastIssuerUsername: invIssuerLast(inv),
     generalRef: invGeneralRef(inv),
+    relatedInvHeaderId: clean(inv.RelatedInvHeaderId || ''),
+    invHeaderIdRoot: clean(inv.InvHeaderIdRoot || ''),
     totalAmount: invTotal(inv),
+    discountAmount: nonNegativeNumber(inv.DiscAmount ?? inv.DiscountAmount),
+    discountPercent: nonNegativeNumber(inv.DiscountPercent),
     expenseTotal: Array.isArray(inv.Expense) ? inv.Expense.reduce((s,x)=>s+num(x.InvExpRowAmount||0),0) : 0,
     rowCount: invBody(inv).length,
     syncedAt: new Date(),
-    source: 'shaygan-invoice-get-type2-rowcount20-sale-snapshot'
+    source: 'shaygan-invoice-get-types2-and6-rowcount20-sale-snapshot'
   };
 }
 function saleLineDocs(inv, snapshotIdValue, sellerMaps, groupMap){
@@ -366,6 +379,8 @@ function saleLineDocs(inv, snapshotIdValue, sellerMaps, groupMap){
       firstIssuerUsername: header.firstIssuerUsername,
       lastIssuerUsername: header.lastIssuerUsername,
       generalRef: header.generalRef,
+      relatedInvHeaderId: header.relatedInvHeaderId,
+      invHeaderIdRoot: header.invHeaderIdRoot,
       row: i+1,
       lineItemId: num(x.LineItemId || x.LineId || 0,0),
       itemCode: lineItemCode(x),
@@ -380,10 +395,18 @@ function saleLineDocs(inv, snapshotIdValue, sellerMaps, groupMap){
       qty,
       unitSale: unit,
       saleValue: amount || qty*unit,
+      lineDiscountAmount: nonNegativeNumber(x.LineDiscAmount ?? x.DiscountAmount),
+      lineDiscountPercent: nonNegativeNumber(x.LineDiscPer ?? x.DiscountPercent),
       raw: x,
       syncedAt: new Date()
     };
   }).filter(x=>x.itemCode && x.qty>0);
+}
+
+function nonNegativeNumber(value){
+  if(value==null || clean(value)==='')return null;
+  const number=Number(String(value).replace(/[,،\s]/g,''));
+  return Number.isFinite(number)&&number>=0?number:null;
 }
 
 async function dropLegacyUniqueIndexes(db){
@@ -507,13 +530,21 @@ async function buildSaleSnapshot(db, opts={}){
   let startInvNo=Number(resumedSnapshot?.startInvNo||0);
   let endInvNo=Number(resumedSnapshot?.endInvNo||0);
   let nextRowStart=Number(resumedSnapshot?.nextRowStart||0);
+  const nextRowStartByType={
+    '2':Number(resumedSnapshot?.nextRowStartByType?.['2'] ?? resumedSnapshot?.nextRowStart ?? 0),
+    '6':Number(resumedSnapshot?.nextRowStartByType?.['6'] ?? 0)
+  };
   let lastSuccessfulPage=Number.isInteger(resumedSnapshot?.lastSuccessfulPage)?Number(resumedSnapshot.lastSuccessfulPage):-1;
   let failedPages=Array.isArray(resumedSnapshot?.failedPages)?resumedSnapshot.failedPages.slice(0,100):[];
   let pageDiagnostics=Array.isArray(resumedSnapshot?.pageDiagnostics)?resumedSnapshot.pageDiagnostics.slice(-200):[];
   const typeStats=resumedSnapshot?.typeStats
     ? structuredClone(resumedSnapshot.typeStats)
-    : { '2': { label:'Sale', invoices:0, lines:0, amount:0, startInvNo:0, nextInvNoFrom:0, pagesScanned:0, reachedEnd:false } };
+    : {
+      '2': { label:'Sale', invoices:0, lines:0, amount:0, startInvNo:0, nextInvNoFrom:0, pagesScanned:0, reachedEnd:false },
+      '6': { label:'SaleReturn', invoices:0, lines:0, amount:0, startInvNo:0, nextInvNoFrom:0, pagesScanned:0, reachedEnd:false }
+    };
   typeStats['2']={ label:'Sale', invoices:0, lines:0, amount:0, startInvNo:0, nextInvNoFrom:0, pagesScanned:0, reachedEnd:false, ...(typeStats['2']||{}) };
+  typeStats['6']={ label:'SaleReturn', invoices:0, lines:0, amount:0, startInvNo:0, nextInvNoFrom:0, pagesScanned:0, reachedEnd:false, ...(typeStats['6']||{}) };
   const sellerStatsMap = new Map((resumedSnapshot?.sellerStats||[]).map(value=>[value.key,value]));
 
   async function processInvoice(inv, pageGroupMap){
@@ -535,7 +566,12 @@ async function buildSaleSnapshot(db, opts={}){
     counters.groupFallbackLines += lines.filter(x=>x.mainGroupSource==='item-code-prefix-fallback').length;
     const lineAmountTotal=lines.reduce((sum,line)=>sum+num(line.saleValue,0),0);
     if(Math.abs(num(h.totalAmount,0)-lineAmountTotal)>AMOUNT_TOLERANCE_RIAL) counters.amountMismatchInvoices++;
-    if(typeStats[String(h.invTyp)]){ typeStats[String(h.invTyp)].invoices += 1; typeStats[String(h.invTyp)].lines += lines.length; typeStats[String(h.invTyp)].amount += Number(h.totalAmount||0); }
+    if(typeStats[String(h.invTyp)]){
+      typeStats[String(h.invTyp)].invoices += 1;
+      typeStats[String(h.invTyp)].lines += lines.length;
+      typeStats[String(h.invTyp)].amount += Number(h.totalAmount||0);
+      typeStats[String(h.invTyp)].nextInvNoFrom=Math.max(Number(typeStats[String(h.invTyp)].nextInvNoFrom||0),Number(h.invNo||0)+1);
+    }
     const skey = h.sellerAccountNumber || h.sellerName || h.accountName || 'UNKNOWN';
     const ss = sellerStatsMap.get(skey) || { key:skey, sellerAccountNumber:h.sellerAccountNumber, sellerAccountName:h.sellerAccountName, sellerName:h.sellerName, sellerUsername:h.sellerUsername, sellerStoreName:h.sellerStoreName, cashboxAccountName:h.cashboxAccountName, invoices:0, lines:0, amount:0 };
     ss.invoices += 1; ss.lines += lines.length; ss.amount += Number(h.totalAmount||0);
@@ -552,30 +588,34 @@ async function buildSaleSnapshot(db, opts={}){
       const reconciled=await db.collection(DATASET_LINES).deleteMany({ snapshotId:sid, saleInvoiceType:h.invTyp, saleInvoiceNo:h.invNo, row:{ $nin:lines.map(x=>x.row) } });
       counters.removedOrReconciledLines += Number(reconciled.deletedCount||0);
     }
-    endInvNo=Math.max(endInvNo,Number(h.invNo||0));
+    if(Number(h.invTyp)===2) endInvNo=Math.max(endInvNo,Number(h.invNo||0));
     if(samples.length<20) samples.push({ invTyp:h.invTyp, invTypeLabel:h.invTypeLabel, invNo:h.invNo, invDate:h.invDate, accountName:h.accountName, sellerAccountNumber:h.sellerAccountNumber, sellerAccountName:h.sellerAccountName, sellerName:h.sellerName, sellerUsername:h.sellerUsername, generalRef:h.generalRef, rowCount:body.length, saleLines:lines.length, totalAmount:h.totalAmount });
   }
 
   try{
     const startNoByType={ ...(resumedSnapshot?.startNoByType||{}) };
-    for(const typ of [2]){
+    for(const typ of [2,6]){
       const key=String(typ);
       const committedState=await db.collection('saleSnapshotState').findOne({ scopeKey }).catch(()=>null);
-      let committedNo=Number(committedState?.latestType2||previousActive.state?.latestType2||0);
+      const stateField=typ===2?'latestType2':'latestType6';
+      let committedNo=Number(committedState?.[stateField]||previousActive.state?.[stateField]||0);
       if(!reset && !committedNo){
         const newest=await db.collection(previousActive.headerCollection).findOne(
-          { ...previousActive.headerQuery, invTyp:2 },
+          { ...previousActive.headerQuery, invTyp:typ },
           { sort:{ invNo:-1 } }
         ).catch(()=>null);
         committedNo=Number(newest?.invNo||0);
       }
-      const lastNo = resumedSnapshot ? Number(resumedSnapshot.startInvNo||0) : (reset ? 0 : committedNo);
-      const invNoFrom = clean(resumedSnapshot?.invNoFrom || (lastNo > 0 ? String(lastNo + 1) : ''));
-      startInvNo=lastNo; if(!resumedSnapshot)endInvNo=lastNo;
+      const lastNo = resumedSnapshot
+        ? Number(resumedSnapshot.startNoByType?.[key] ?? (typ===2 ? resumedSnapshot.startInvNo : 0) ?? 0)
+        : (reset ? 0 : committedNo);
+      const invNoFrom = clean(resumedSnapshot?.invNoFromByType?.[key] || (lastNo > 0 ? String(lastNo + 1) : ''));
+      if(typ===2){ startInvNo=lastNo; if(!resumedSnapshot)endInvNo=lastNo; }
       startNoByType[key]=lastNo;
       typeStats[key].startInvNo=lastNo;
       typeStats[key].nextInvNoFrom=lastNo+1;
       let typeReachedEnd=false;
+      nextRowStart=Number(nextRowStartByType[key]||0);
       const firstPage=Math.floor(nextRowStart/pageSize);
       for(let page=firstPage,rowStart=nextRowStart; page<maxPages; page++, rowStart+=pageSize){
         progress('Reading Sale Invoices',page,maxPages,`Candidate ${sid} | page ${page+1} | rowStart ${rowStart}`);
@@ -602,12 +642,14 @@ async function buildSaleSnapshot(db, opts={}){
           failedPages=[...failedPages.filter(x=>Number(x.rowStart)!==rowStart),failure].slice(-100);
           pageDiagnostics=[...pageDiagnostics,{ page, rowStart, ok:false, attemptDiagnostics, at:new Date() }].slice(-200);
           nextRowStart=rowStart;
+          nextRowStartByType[key]=rowStart;
           break;
         }
         pageDiagnostics=[...pageDiagnostics,{ page, rowStart, ok:true, rowCount:Array.isArray(r.result)?r.result.length:0, attemptDiagnostics, at:new Date() }].slice(-200);
         failedPages=failedPages.filter(x=>Number(x.rowStart)!==rowStart);
         lastSuccessfulPage=page;
         nextRowStart=rowStart+pageSize;
+        nextRowStartByType[key]=nextRowStart;
         const rawRows=Array.isArray(r.result)?r.result:[];
         if(!rawRows.length){ typeReachedEnd=true; typeStats[key].reachedEnd=true; break; }
         const rows=saleInvoicesOnly(rawRows,typ);
@@ -619,14 +661,15 @@ async function buildSaleSnapshot(db, opts={}){
           if((index+1)%10===0 || index===rows.length-1) checkpoint();
         }
         // Do not stop on short pages. Shaygan sometimes returns short pages before the real end.
-        await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ updatedAt:new Date(), pagesScanned, retryCount, failedPages, pageDiagnostics, lastSuccessfulPage, nextRowStart, startNoByType, startInvNo, endInvNo, invNoFrom, nextInvNo:endInvNo+1, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
+        await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ updatedAt:new Date(), pagesScanned, retryCount, failedPages, pageDiagnostics, lastSuccessfulPage, nextRowStart, nextRowStartByType, startNoByType, invNoFromByType:{ ...(resumedSnapshot?.invNoFromByType||{}), [key]:invNoFrom }, startInvNo, endInvNo, invNoFrom, nextInvNo:endInvNo+1, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100) } });
       }
       if(!typeReachedEnd && nextRowStart>=maxPages*pageSize && !errors.length) errors.push({ stage:'max-pages-reached', typ, maxPages, nextRowStart, note:'برای خواندن ادامه، maxPages را بالاتر بگذار و همین Snapshot را Resume کن.' });
+      if(errors.length) break;
     }
 
     progress('Calculating Snapshot',1,1,'Finalizing Sale Snapshot counters');
     checkpoint();
-    const reachedEnd = !!(typeStats['2'] && typeStats['2'].reachedEnd);
+    const reachedEnd = [2,6].every(typ=>typeStats[String(typ)]?.reachedEnd===true);
     const validationHeaders=await db.collection(DATASET_HEADERS).find({ snapshotId:sid, invTyp:2 }).toArray();
     const validationLines=await db.collection(DATASET_LINES).find({ snapshotId:sid, saleInvoiceType:2 }).toArray();
     const datasetHeaderCount=validationHeaders.length;
@@ -656,7 +699,8 @@ async function buildSaleSnapshot(db, opts={}){
     if(successful){
       await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ status:'completed', activationStatus:'validated', validation, finishedAt:new Date(), updatedAt:new Date() } });
       const activatedAt=new Date();
-      await db.collection('saleSnapshotState').updateOne({ scopeKey }, { $set:{ scopeKey, dateFrom, dateTo, reachedEnd, updatedAt:activatedAt, activatedAt, activeSnapshotId:sid, activeSnapshotStatus:'completed', previousActiveSnapshotId, lastSnapshotId:sid, lastHeadersFound:datasetHeaderCount, lastLinesParsed:datasetLineCount, latestType2:endInvNo, nextInvNo:endInvNo+1, invoiceTypes:{ sale:2, buy:3, saleReturn:6, purchaseReturn:7 } } }, { upsert:true });
+      const latestType6=Number(typeStats['6']?.nextInvNoFrom||1)-1;
+      await db.collection('saleSnapshotState').updateOne({ scopeKey }, { $set:{ scopeKey, dateFrom, dateTo, reachedEnd, updatedAt:activatedAt, activatedAt, activeSnapshotId:sid, activeSnapshotStatus:'completed', previousActiveSnapshotId, lastSnapshotId:sid, lastHeadersFound:datasetHeaderCount, lastLinesParsed:datasetLineCount, latestType2:endInvNo, latestType6, nextInvNo:endInvNo+1, invoiceTypes:{ sale:2, buy:3, saleReturn:6, purchaseReturn:7 } } }, { upsert:true });
       await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ activationStatus:'active', activatedAt, previousActiveSnapshotId, updatedAt:activatedAt } });
       if(previousActiveSnapshotId && previousActiveSnapshotId!==sid){
         await db.collection('saleSnapshots').updateOne({ snapshotId:previousActiveSnapshotId, activationStatus:'active' }, { $set:{ activationStatus:'superseded', supersededAt:activatedAt, supersededBySnapshotId:sid, updatedAt:activatedAt } });
@@ -664,7 +708,7 @@ async function buildSaleSnapshot(db, opts={}){
     }
     const status=successful?'completed':'completed_with_errors';
     const durationMs=Date.now()-startedAtMs;
-    const result={ ok:successful, code:successful?'SNAPSHOT_ACTIVATED':'SNAPSHOT_INCOMPLETE', error:successful?'':clean(errors[0]?.error||errors[0]?.code||'Sale Snapshot ناقص است و فعال نشد.'), snapshotId:sid, activeSnapshotId:successful?sid:previousActiveSnapshotId, previousActiveSnapshotId, activationStatus:successful?'active':'rejected', status, incremental:!reset, resumed:!!resumedSnapshot, mode, scopeKey, reachedEnd, startNoByType, startInvNo, endInvNo, invNoFrom:clean(resumedSnapshot?.invNoFrom||(startInvNo>0?String(startInvNo+1):'')), nextInvNo:endInvNo+1, pagesScanned, retryCount, failedPages, pageDiagnostics, lastSuccessfulPage, nextRowStart, datasetBaseCounts, datasetHeaderCount, datasetLineCount, validation, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, durationMs, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100), samples };
+    const result={ ok:successful, code:successful?'SNAPSHOT_ACTIVATED':'SNAPSHOT_INCOMPLETE', error:successful?'':clean(errors[0]?.error||errors[0]?.code||'Sale Snapshot ناقص است و فعال نشد.'), snapshotId:sid, activeSnapshotId:successful?sid:previousActiveSnapshotId, previousActiveSnapshotId, activationStatus:successful?'active':'rejected', status, incremental:!reset, resumed:!!resumedSnapshot, mode, scopeKey, reachedEnd, startNoByType, startInvNo, endInvNo, invNoFrom:clean(resumedSnapshot?.invNoFrom||(startInvNo>0?String(startInvNo+1):'')), nextInvNo:endInvNo+1, pagesScanned, retryCount, failedPages, pageDiagnostics, lastSuccessfulPage, nextRowStart, nextRowStartByType, datasetBaseCounts, datasetHeaderCount, datasetLineCount, validation, invoiceHeadersFound:headersFound, invoiceBodiesLoaded:bodiesLoaded, saleLinesParsed:linesParsed, emptyBodyInvoices:emptyBody, detailFetched, ...counters, durationMs, typeStats, sellerStats:Array.from(sellerStatsMap.values()).slice(0,200), errors:errors.slice(0,100), samples };
     await db.collection('saleSnapshots').updateOne({ snapshotId:sid }, { $set:{ ...result, activationStatus:successful?'active':'rejected', finishedAt:new Date(), updatedAt:new Date() } });
     await db.collection('saleSnapshotDiagnostics').insertOne({ ...result, at:new Date(), version:VERSION, dateFrom, dateTo });
     return { ...result, errors:errors.slice(0,20) };
@@ -712,62 +756,198 @@ async function lines(db, filters={}){
 }
 
 
+function jalaliMonthDays(year,month){
+  if(month<=6)return 31;
+  if(month<=11)return 30;
+  return [1,5,9,13,17,22,26,30].includes(Number(year)%33)?30:29;
+}
+function previousJalaliDate(date){
+  const value=saleDate8(date);
+  let year=Number(value.slice(0,4)),month=Number(value.slice(4,6)),day=Number(value.slice(6,8))-1;
+  if(day<1){month--;if(month<1){year--;month=12;}day=jalaliMonthDays(year,month);}
+  return `${String(year).padStart(4,'0')}${String(month).padStart(2,'0')}${String(day).padStart(2,'0')}`;
+}
+function previousEquivalentRange(dateFrom,dateTo){
+  if(!dateFrom||!dateTo)return {dateFrom:'',dateTo:''};
+  let length=1,cursor=dateTo;
+  while(cursor>dateFrom && length<=3700){cursor=previousJalaliDate(cursor);length++;}
+  const previousTo=previousJalaliDate(dateFrom);
+  let previousFrom=previousTo;
+  for(let i=1;i<length;i++)previousFrom=previousJalaliDate(previousFrom);
+  return {dateFrom:previousFrom,dateTo:previousTo};
+}
+function inRange(row,dateFrom,dateTo){
+  const date=saleDate8(row.saleDate||row.invDate||'');
+  return (!dateFrom||date>=dateFrom)&&(!dateTo||date<=dateTo);
+}
+function financialUnavailable(target){
+  return { ...target, fifoCost:null, estimatedProfit:null, fifoProfit:null, roiPercent:null, profitStatus:'unavailable' };
+}
+
 async function sellerPerformance(db, filters={}){
   await ensureIndexes(db);
   const saleSource=await activeDataset(db);
-  const seller=clean(filters.sellerAccountNumber || filters.seller || '');
-  const q={ ...saleSource.lineQuery, saleInvoiceType: 2 };
-  if(seller) q.sellerAccountNumber=seller;
-  if(filters.store) q.sellerStoreName={ $regex:clean(filters.store).replace(/[.*+?^${}()|[\]\\]/g,'\\$&'), $options:'i' };
-  const { dateFrom, dateTo }=normalizeJalaliRange(filters);
+  const seller=normalizeSellerAccountNumber(filters.sellerAccountNumber||filters.seller||'');
+  const store=clean(filters.store||'');
+  const {dateFrom,dateTo}=normalizeJalaliRange(filters);
   const reportScanLimit=Math.max(1,Math.min(Number(filters.limit||250000),500000));
-  const sourceLines=await db.collection(saleSource.lineCollection).find(q).sort({ saleInvoiceNo:1, row:1 }).limit(reportScanLimit).toArray();
-  const lines=sourceLines
-    .map(line=>({ ...line, saleDate:saleDate8(line.saleDate) }))
-    .filter(line=>(!dateFrom||line.saleDate>=dateFrom)&&(!dateTo||line.saleDate<=dateTo))
-    .sort((a,b)=>lineDateScoreFromDoc(a)-lineDateScoreFromDoc(b)||num(a.saleInvoiceNo)-num(b.saleInvoiceNo)||num(a.row)-num(b.row));
-  const profit=await computeSellerProfitFifo(db, { ...filters, sellerAccountNumber:seller, dateFrom, dateTo, _saleSource:saleSource });
-  const invoiceMap=new Map(); const groupMap=new Map(); const sellerMap=new Map(); const itemCodes=new Set();
-  let total=0, qty=0;
-  for(const l of lines){
-    const pk=`${l.saleInvoiceType}-${l.saleInvoiceNo}-${l.row}`; const pr=profit.resultByLine.get(pk)||{};
-    total+=num(l.saleValue,0); qty+=num(l.qty,0);
-    const ik=`${l.saleInvoiceType}-${l.saleInvoiceNo}`;
-    const inv=invoiceMap.get(ik)||{ saleInvoiceType:l.saleInvoiceType, saleInvoiceNo:l.saleInvoiceNo, saleDate:l.saleDate, sellerAccountNumber:l.sellerAccountNumber, sellerName:l.sellerName, sellerUsername:l.sellerUsername, sellerStoreName:l.sellerStoreName, cashboxAccountName:l.cashboxAccountName, accountName:l.accountName, generalRef:l.generalRef, amount:0, fifoCost:0, fifoProfit:0, coveredQty:0, coveredSales:0, qty:0, lines:0, calculatedLines:0, partialLines:0, unknownLines:0, itemCodes:new Set() };
-    inv.amount+=num(l.saleValue,0); inv.qty+=num(l.qty,0); inv.lines+=1; inv.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null) inv.fifoProfit+=num(pr.fifoProfit,0);
-    inv.coveredQty+=num(pr.allocatedQty,0); inv.coveredSales+=num(pr.saleValue,0);
-    if(pr.profitStatus==='calculated') inv.calculatedLines++; else if(pr.profitStatus==='partial') inv.partialLines++; else inv.unknownLines++;
-    if(l.itemCode) inv.itemCodes.add(l.itemCode); invoiceMap.set(ik,inv);
-    const gk=clean(l.mainGroupCode||'__UNKNOWN__'); const g=groupMap.get(gk)||{ mainGroupCode:gk, mainGroup:l.mainGroup||'نامشخص', mainGroupSource:l.mainGroupSource||'', amount:0, fifoCost:0, fifoProfit:0, coveredQty:0, coveredSales:0, lines:0, qty:0, calculatedLines:0, partialLines:0, unknownLines:0, invoices:new Set(), itemCodes:new Set() };
-    g.amount+=num(l.saleValue,0); g.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null) g.fifoProfit+=num(pr.fifoProfit,0); g.lines+=1; g.qty+=num(l.qty,0);
-    g.coveredQty+=num(pr.allocatedQty,0); g.coveredSales+=num(pr.saleValue,0);
-    if(pr.profitStatus==='calculated') g.calculatedLines++; else if(pr.profitStatus==='partial') g.partialLines++; else g.unknownLines++;
-    g.invoices.add(ik); if(l.itemCode) g.itemCodes.add(l.itemCode); groupMap.set(gk,g);
-    const sellerKey=clean(l.sellerAccountNumber||'__UNMAPPED__');
-    const sr=sellerMap.get(sellerKey)||{ sellerAccountNumber:sellerKey==='__UNMAPPED__'?'':sellerKey, sellerName:l.sellerName||'نامشخص', sellerUsername:l.sellerUsername||'', sellerStoreName:l.sellerStoreName||'', amount:0, fifoCost:0, fifoProfit:0, coveredQty:0, coveredSales:0, qty:0, lines:0, calculatedLines:0, partialLines:0, unknownLines:0, invoices:new Set(), itemCodes:new Set() };
-    sr.amount+=num(l.saleValue,0); sr.qty+=num(l.qty,0); sr.fifoCost+=num(pr.fifoCost,0); if(pr.fifoProfit!=null)sr.fifoProfit+=num(pr.fifoProfit,0); sr.coveredQty+=num(pr.allocatedQty,0); sr.coveredSales+=num(pr.saleValue,0); sr.lines++; sr.invoices.add(ik); if(l.itemCode)sr.itemCodes.add(l.itemCode);
-    if(pr.profitStatus==='calculated')sr.calculatedLines++; else if(pr.profitStatus==='partial')sr.partialLines++; else sr.unknownLines++;
-    sellerMap.set(sellerKey,sr); if(l.itemCode)itemCodes.add(l.itemCode);
-    l.allocatedQty=num(pr.allocatedQty,0); l.coveredSales=num(pr.saleValue,0); l.fifoCost=pr.profitStatus==='unknown'?null:pr.fifoCost; l.fifoProfit=pr.fifoProfit; l.profitStatus=pr.profitStatus||'unknown'; l.profitReason=pr.profitReason||''; l.purchaseAllocations=pr.allocations||[];
+  const query={...saleSource.lineQuery,saleInvoiceType:{$in:[2,6]}};
+  const sourceLines=await db.collection(saleSource.lineCollection).find(query).sort({saleInvoiceNo:1,row:1}).limit(reportScanLimit).toArray();
+  const normalized=sourceLines.map(row=>({
+    ...row,
+    saleDate:saleDate8(row.saleDate),
+    sellerAccountNumber:normalizeSellerAccountNumber(row.sellerAccountNumber)
+  }));
+  const selected=normalized.filter(row=>
+    (!seller||row.sellerAccountNumber===seller)&&
+    (!store||clean(row.sellerStoreName).includes(store))&&
+    inRange(row,dateFrom,dateTo)
+  );
+  const sales=selected.filter(row=>Number(row.saleInvoiceType)===2);
+  const returns=selected.filter(row=>Number(row.saleInvoiceType)===6);
+  const invoiceKeys=new Set(sales.map(row=>`2-${row.saleInvoiceNo}`));
+  const returnInvoiceKeys=new Set(returns.map(row=>`6-${row.saleInvoiceNo}`));
+  const headerNumbersByType={
+    2:[...new Set(sales.map(row=>Number(row.saleInvoiceNo)).filter(Boolean))],
+    6:[...new Set(returns.map(row=>Number(row.saleInvoiceNo)).filter(Boolean))]
+  };
+  const headers=[];
+  for(const type of [2,6]){
+    if(!headerNumbersByType[type].length)continue;
+    headers.push(...await db.collection(saleSource.headerCollection).find({
+      ...saleSource.headerQuery,invTyp:type,invNo:{$in:headerNumbersByType[type]}
+    }).limit(headerNumbersByType[type].length).toArray().catch(()=>[]));
   }
-  const coverageFor=x=>({ totalLines:x.lines, calculatedLines:x.calculatedLines, partialLines:x.partialLines, unknownLines:x.unknownLines, totalQty:x.qty, coveredQty:x.coveredQty, coveredQtyPercent:x.qty?Math.round(x.coveredQty*10000/x.qty)/100:0, totalSales:Math.round(x.amount), coveredSales:Math.round(x.coveredSales), coveredSalesPercent:x.amount?Math.round(x.coveredSales*10000/x.amount)/100:0, purchaseHistoryComplete:false });
-  const statusFor=x=>x.coveredQty>0?'partial':'unknown';
-  const invoices=[...invoiceMap.values()].map(x=>{const status=statusFor(x);return { ...x, fifoCost:status==='unknown'?null:Math.round(x.fifoCost), fifoProfit:status==='unknown'?null:Math.round(x.fifoProfit), roiPercent:status!=='unknown'&&x.fifoCost?Math.round(x.fifoProfit*10000/x.fifoCost)/100:null, profitStatus:status, coverage:coverageFor(x), itemCount:x.itemCodes.size, itemCodes:undefined }}).sort((a,b)=>String(b.saleDate).localeCompare(String(a.saleDate)) || Number(b.saleInvoiceNo)-Number(a.saleInvoiceNo));
-  const invoiceOutputLimit=Math.min(Number(filters.invoiceLimit||1000),5000);
-  let outputInvoices=invoices.slice(0,invoiceOutputLimit);
-  const outputInvoiceNumbers=[...new Set(outputInvoices.map(x=>Number(x.saleInvoiceNo)).filter(Boolean))];
-  if(outputInvoiceNumbers.length){
-    const headers=await db.collection(saleSource.headerCollection).find({ ...saleSource.headerQuery, invTyp:2, invNo:{ $in:outputInvoiceNumbers } }).limit(outputInvoiceNumbers.length).toArray().catch(()=>[]);
-    const headerMap=new Map(headers.map(header=>[`2-${header.invNo}`,header]));
-    outputInvoices=outputInvoices.map(inv=>{
-      const header=headerMap.get(`2-${inv.saleInvoiceNo}`);
-      if(!header)return inv;
-      return { ...inv, saleDate:saleDate8(header.invDate||inv.saleDate), sellerAccountNumber:header.sellerAccountNumber||inv.sellerAccountNumber, sellerName:header.sellerName||inv.sellerName, sellerUsername:header.sellerUsername||inv.sellerUsername, sellerStoreName:header.sellerStoreName||inv.sellerStoreName, cashboxAccountName:header.cashboxAccountName||inv.cashboxAccountName, accountName:header.accountName||inv.accountName, generalRef:header.generalRef||inv.generalRef, headerFound:true };
+  const headerMap=new Map(headers.map(row=>[`${row.invTyp}-${row.invNo}`,row]));
+  const saleHeaders=headers.filter(row=>Number(row.invTyp)===2);
+  const discountDataComplete=invoiceKeys.size===saleHeaders.length&&saleHeaders.every(row=>Object.prototype.hasOwnProperty.call(row,'discountAmount'));
+  const discountAmount=discountDataComplete?saleHeaders.reduce((sum,row)=>sum+num(row.discountAmount,0),0):null;
+  const netSaleAmount=sales.reduce((sum,row)=>sum+num(row.saleValue,0),0);
+  const grossSaleAmount=discountAmount==null?null:netSaleAmount+discountAmount;
+  const saleReturnAmount=returns.reduce((sum,row)=>sum+num(row.saleValue,0),0);
+  const saleReturnQuantity=returns.reduce((sum,row)=>sum+num(row.qty,0),0);
+  const totalSoldQuantity=sales.reduce((sum,row)=>sum+num(row.qty,0),0);
+  const netSalesAfterReturns=netSaleAmount-saleReturnAmount;
+  const uniqueCustomers=new Set(sales.map(row=>clean(row.accountNumber)).filter(Boolean));
+  const uniqueCustomerDataComplete=sales.every(row=>clean(row.accountNumber));
+  const itemCodes=new Set(sales.map(row=>clean(row.itemCode)).filter(Boolean));
+
+  const invoiceMap=new Map();
+  const groupMap=new Map();
+  const storeMap=new Map();
+  const sellerMap=new Map();
+  const trendMap=new Map();
+  function addTrend(row,kind){
+    const key=row.saleDate;
+    const value=trendMap.get(key)||{date:key,grossSaleAmount:0,saleReturnAmount:0,netSalesAfterReturns:0,saleQuantity:0,saleReturnQuantity:0};
+    if(kind==='sale'){value.grossSaleAmount+=num(row.saleValue,0);value.saleQuantity+=num(row.qty,0);}
+    else{value.saleReturnAmount+=num(row.saleValue,0);value.saleReturnQuantity+=num(row.qty,0);}
+    value.netSalesAfterReturns=value.grossSaleAmount-value.saleReturnAmount;
+    trendMap.set(key,value);
+  }
+  for(const row of [...sales,...returns])addTrend(row,Number(row.saleInvoiceType)===2?'sale':'return');
+  for(const row of sales){
+    const invoiceKey=`2-${row.saleInvoiceNo}`;
+    const header=headerMap.get(invoiceKey)||{};
+    const invoice=invoiceMap.get(invoiceKey)||financialUnavailable({
+      saleInvoiceType:2,saleInvoiceNo:row.saleInvoiceNo,saleDate:row.saleDate,
+      sellerAccountNumber:row.sellerAccountNumber,sellerName:row.sellerName||'نامشخص',
+      sellerUsername:row.sellerUsername||'',sellerStoreName:row.sellerStoreName||'',
+      cashboxAccountName:row.cashboxAccountName||'',accountNumber:row.accountNumber||'',
+      accountName:row.accountName||'',generalRef:row.generalRef||'',amount:0,qty:0,lines:0,
+      discountAmount:num(header.discountAmount,0),itemCodes:new Set()
     });
+    invoice.amount+=num(row.saleValue,0);invoice.qty+=num(row.qty,0);invoice.lines++;
+    if(row.itemCode)invoice.itemCodes.add(row.itemCode);
+    invoiceMap.set(invoiceKey,invoice);
+    const groupKey=clean(row.mainGroupCode||'__UNKNOWN__');
+    const group=groupMap.get(groupKey)||financialUnavailable({mainGroupCode:groupKey==='__UNKNOWN__'?'':groupKey,mainGroup:row.mainGroup||'نامشخص',mainGroupSource:row.mainGroupSource||'unavailable',amount:0,qty:0,lines:0,invoices:new Set(),itemCodes:new Set()});
+    group.amount+=num(row.saleValue,0);group.qty+=num(row.qty,0);group.lines++;group.invoices.add(invoiceKey);if(row.itemCode)group.itemCodes.add(row.itemCode);groupMap.set(groupKey,group);
+    const storeKey=clean(row.sellerStoreName||'__UNMAPPED__');
+    const storeValue=storeMap.get(storeKey)||{storeName:storeKey==='__UNMAPPED__'?'':storeKey,saleAmount:0,returnAmount:0,netSalesAfterReturns:0,invoiceKeys:new Set(),lineCount:0};
+    storeValue.saleAmount+=num(row.saleValue,0);storeValue.invoiceKeys.add(invoiceKey);storeValue.lineCount++;storeMap.set(storeKey,storeValue);
+    const sellerKey=normalizeSellerAccountNumber(row.sellerAccountNumber)||'__UNMAPPED__';
+    const sellerValue=sellerMap.get(sellerKey)||financialUnavailable({sellerAccountNumber:sellerKey==='__UNMAPPED__'?'':sellerKey,sellerName:row.sellerName||'نامشخص',sellerUsername:row.sellerUsername||'',sellerStoreName:row.sellerStoreName||'',amount:0,returnAmount:0,netSalesAfterReturns:0,qty:0,returnQty:0,lines:0,invoices:new Set(),itemCodes:new Set()});
+    sellerValue.amount+=num(row.saleValue,0);sellerValue.qty+=num(row.qty,0);sellerValue.lines++;sellerValue.invoices.add(invoiceKey);if(row.itemCode)sellerValue.itemCodes.add(row.itemCode);sellerMap.set(sellerKey,sellerValue);
   }
-  const groups=[...groupMap.values()].map(g=>{const status=statusFor(g);return { mainGroupCode:g.mainGroupCode==='__UNKNOWN__'?'':g.mainGroupCode, mainGroup:g.mainGroup, mainGroupSource:g.mainGroupSource, amount:Math.round(g.amount), fifoCost:status==='unknown'?null:Math.round(g.fifoCost), fifoProfit:status==='unknown'?null:Math.round(g.fifoProfit), roiPercent:status!=='unknown'&&g.fifoCost?Math.round(g.fifoProfit*10000/g.fifoCost)/100:null, profitStatus:status, coverage:coverageFor(g), lines:g.lines, qty:g.qty, calculatedLines:g.calculatedLines, partialLines:g.partialLines, unknownLines:g.unknownLines, invoiceCount:g.invoices.size, itemCount:g.itemCodes.size }}).sort((a,b)=>b.amount-a.amount);
-  const sellers=[...sellerMap.values()].map(s=>{const status=statusFor(s);return { sellerAccountNumber:s.sellerAccountNumber, sellerName:s.sellerName, sellerUsername:s.sellerUsername, sellerStoreName:s.sellerStoreName, amount:Math.round(s.amount), fifoCost:status==='unknown'?null:Math.round(s.fifoCost), fifoProfit:status==='unknown'?null:Math.round(s.fifoProfit), roiPercent:status!=='unknown'&&s.fifoCost?Math.round(s.fifoProfit*10000/s.fifoCost)/100:null, profitStatus:status, coverage:coverageFor(s), invoiceCount:s.invoices.size, lineCount:s.lines, qty:s.qty, itemCount:s.itemCodes.size }}).sort((a,b)=>b.amount-a.amount);
-  return { ok:true, source:`mongo:${saleSource.headerCollection}+${saleSource.lineCollection}|fifo:supplierPurchaseLayers-coverage-only`, activeSnapshotId:saleSource.snapshotId, snapshotStatus:saleSource.status, snapshotSource:saleSource.source, sellerAccountNumber:seller, dateFrom, dateTo, invoiceCount:invoices.length, lineCount:lines.length, qty, itemCount:itemCodes.size, totalSales:Math.round(total), fifoCost:profit.totals.fifoCost, estimatedProfit:profit.totals.fifoProfit, fifoProfit:profit.totals.fifoProfit, roiPercent:profit.totals.roiPercent, profitStatus:profit.totals.profitStatus, coverage:profit.totals.coverage, profitLineStats:{ calculated:profit.totals.calculatedLines, partial:profit.totals.partialLines, unknown:profit.totals.unknownLines }, reportScanLimit, reportScanLimitReached:sourceLines.length>=reportScanLimit, profitDiagnostics:profit.diagnostics, sellers, groups, invoices:outputInvoices, lines:lines.slice(0,Math.min(Number(filters.lineLimit||5000),10000)), limitations:{ purchaseHistoryComplete:false, saleReturnsNettingImplemented:false, saleReturnsExcluded:true } };
+  for(const row of returns){
+    const storeKey=clean(row.sellerStoreName||'__UNMAPPED__');
+    const storeValue=storeMap.get(storeKey)||{storeName:storeKey==='__UNMAPPED__'?'':storeKey,saleAmount:0,returnAmount:0,netSalesAfterReturns:0,invoiceKeys:new Set(),lineCount:0};
+    storeValue.returnAmount+=num(row.saleValue,0);storeMap.set(storeKey,storeValue);
+    const sellerKey=normalizeSellerAccountNumber(row.sellerAccountNumber)||'__UNMAPPED__';
+    const sellerValue=sellerMap.get(sellerKey)||financialUnavailable({sellerAccountNumber:sellerKey==='__UNMAPPED__'?'':sellerKey,sellerName:row.sellerName||'نامشخص',sellerUsername:row.sellerUsername||'',sellerStoreName:row.sellerStoreName||'',amount:0,returnAmount:0,netSalesAfterReturns:0,qty:0,returnQty:0,lines:0,invoices:new Set(),itemCodes:new Set()});
+    sellerValue.returnAmount+=num(row.saleValue,0);sellerValue.returnQty+=num(row.qty,0);sellerMap.set(sellerKey,sellerValue);
+  }
+  const outputInvoices=[...invoiceMap.values()].map(row=>({
+    ...row,amount:Math.round(row.amount),grossAmount:Math.round(row.amount+row.discountAmount),
+    netAmount:Math.round(row.amount),itemCount:row.itemCodes.size,itemCodes:undefined
+  })).sort((a,b)=>String(b.saleDate).localeCompare(String(a.saleDate))||Number(b.saleInvoiceNo)-Number(a.saleInvoiceNo))
+    .slice(0,Math.min(Number(filters.invoiceLimit||1000),5000));
+  const groups=[...groupMap.values()].map(row=>({
+    ...row,amount:Math.round(row.amount),invoiceCount:row.invoices.size,itemCount:row.itemCodes.size,
+    invoices:undefined,itemCodes:undefined,mappingAvailable:row.mainGroupSource!=='unavailable'
+  })).sort((a,b)=>b.amount-a.amount);
+  const sellers=[...sellerMap.values()].map(row=>({
+    ...row,amount:Math.round(row.amount),returnAmount:Math.round(row.returnAmount),
+    netSalesAfterReturns:Math.round(row.amount-row.returnAmount),invoiceCount:row.invoices.size,
+    lineCount:row.lines,itemCount:row.itemCodes.size,invoices:undefined,itemCodes:undefined
+  })).sort((a,b)=>b.amount-a.amount);
+  const stores=[...storeMap.values()].map(row=>({
+    storeName:row.storeName,saleAmount:Math.round(row.saleAmount),returnAmount:Math.round(row.returnAmount),
+    netSalesAfterReturns:Math.round(row.saleAmount-row.returnAmount),invoiceCount:row.invoiceKeys.size,lineCount:row.lineCount
+  })).sort((a,b)=>b.netSalesAfterReturns-a.netSalesAfterReturns);
+
+  const previousRange=previousEquivalentRange(dateFrom,dateTo);
+  const previousRows=previousRange.dateFrom?normalized.filter(row=>
+    Number(row.saleInvoiceType)===2&&(!seller||row.sellerAccountNumber===seller)&&
+    (!store||clean(row.sellerStoreName).includes(store))&&inRange(row,previousRange.dateFrom,previousRange.dateTo)
+  ):[];
+  const previousReturnRows=previousRange.dateFrom?normalized.filter(row=>
+    Number(row.saleInvoiceType)===6&&(!seller||row.sellerAccountNumber===seller)&&
+    (!store||clean(row.sellerStoreName).includes(store))&&inRange(row,previousRange.dateFrom,previousRange.dateTo)
+  ):[];
+  const previousNet=previousRows.reduce((sum,row)=>sum+num(row.saleValue,0),0)-previousReturnRows.reduce((sum,row)=>sum+num(row.saleValue,0),0);
+  const identityRows=await db.collection('userShayganMappings').find({isActive:{$ne:false}}).limit(1000).toArray().catch(()=>[]);
+  const accountsByName=new Map();
+  for(const mapping of identityRows){
+    const nameKey=normalizeSellerName(mapping.employeeAccountName||mapping.fullName);
+    const account=normalizeSellerAccountNumber(mapping.employeeAccountNumber);
+    if(!nameKey||!account)continue;
+    if(!accountsByName.has(nameKey))accountsByName.set(nameKey,new Set());
+    accountsByName.get(nameKey).add(account);
+  }
+  const ambiguousMappings=[...accountsByName.entries()].filter(([,accounts])=>accounts.size>1).map(([normalizedName,accounts])=>({normalizedName,accountNumbers:[...accounts].sort()}));
+  const dataState=sales.length||returns.length?'ready':(saleSource.source==='legacy-unversioned-fallback'&&!sourceLines.length?'snapshot-unavailable':'no-data');
+  const coverage={purchaseHistoryComplete:false,financialCalculationsEnabled:false,totalLines:sales.length,totalQty:totalSoldQuantity,totalSales:Math.round(netSaleAmount),coveredQty:null,coveredSales:null,coveredQtyPercent:null,coveredSalesPercent:null};
+  const lineLimit=Math.min(Number(filters.lineLimit||5000),10000);
+  const safeLines=sales.slice(0,lineLimit).map(row=>financialUnavailable({...row,allocatedQty:null,coveredSales:null,purchaseAllocations:undefined}));
+  const returnLines=returns.slice(0,lineLimit).map(row=>({...row,returnTreatment:'separate-invtyp6-same-filter-scope',originalInvoiceLinkStatus:clean(row.relatedInvHeaderId||row.invHeaderIdRoot)?'source-link-present':'not-linked'}));
+  return {
+    ok:true,source:`mongo:${saleSource.headerCollection}+${saleSource.lineCollection}|financials-disabled`,
+    activeSnapshotId:saleSource.snapshotId,snapshotStatus:saleSource.status,snapshotSource:saleSource.source,
+    dataState,sellerAccountNumber:seller,dateFrom,dateTo,
+    invoiceCount:invoiceKeys.size,lineCount:sales.length,qty:totalSoldQuantity,itemCount:itemCodes.size,
+    uniqueCustomerCount:uniqueCustomerDataComplete?uniqueCustomers.size:null,
+    uniqueCustomerStatus:uniqueCustomerDataComplete?'reliable':'unknown-missing-customer-account',
+    averageInvoiceAmount:invoiceKeys.size?Math.round(netSaleAmount/invoiceKeys.size):0,
+    grossSaleAmount:grossSaleAmount==null?null:Math.round(grossSaleAmount),netSaleAmount:Math.round(netSaleAmount),
+    discountAmount:discountAmount==null?null:Math.round(discountAmount),
+    discountPercent:grossSaleAmount?Math.round(discountAmount*10000/grossSaleAmount)/100:(discountDataComplete?0:null),
+    discountStatus:discountDataComplete?'reliable':'unknown-legacy-or-missing-header-field',
+    saleReturnInvoiceCount:returnInvoiceKeys.size,saleReturnLineCount:returns.length,
+    saleReturnAmount:Math.round(saleReturnAmount),saleReturnQuantity,
+    netSalesAfterReturns:Math.round(netSalesAfterReturns),totalSales:Math.round(netSaleAmount),
+    fifoCost:null,estimatedProfit:null,fifoProfit:null,roiPercent:null,profitStatus:'unavailable',
+    commissionStatus:'disabled',coverage,profitLineStats:{calculated:0,partial:0,unknown:sales.length},
+    reportScanLimit,reportScanLimitReached:sourceLines.length>=reportScanLimit,
+    profitDiagnostics:{enabled:false,reason:'Financial calculations are intentionally disabled for 0.9.19.64-dev.1'},
+    sellerIdentityDiagnostics:{stableIdentifier:'AccountNumber',ambiguousMappings,ambiguousMappingCount:ambiguousMappings.length},
+    returnsPolicy:{invoiceType:6,treatedAsNormalSale:false,linkageGuessed:false,netRule:'Subtract InvTyp 6 rows in the same authorized seller/store/date scope from InvTyp 2 sales.'},
+    previousPeriod:{...previousRange,netSalesAfterReturns:Math.round(previousNet),differenceAmount:Math.round(netSalesAfterReturns-previousNet),changePercent:previousNet?Math.round((netSalesAfterReturns-previousNet)*10000/Math.abs(previousNet))/100:null},
+    stores,groups,sellers,dailyTrend:[...trendMap.values()].sort((a,b)=>a.date.localeCompare(b.date)),
+    invoices:outputInvoices,lines:safeLines,returnLines,
+    limitations:{purchaseHistoryComplete:false,saleReturnsNettingImplemented:true,saleReturnsExcluded:false,profitDisabled:true,commissionDisabled:true}
+  };
 }
 
-module.exports={ VERSION, init, buildSaleSnapshot, listSnapshots, status, lines, sellerPerformance, _activeDataset:activeDataset, _saleInvoicesOnly:saleInvoicesOnly, _computeSellerProfitFifo:computeSellerProfitFifo, _saleHeaderDoc:saleHeaderDoc, _saleLineDocs:saleLineDocs, _resolveSellerForInvoice:resolveSellerForInvoice, _saleDate8:saleDate8, _safeError:safeError };
+module.exports={ VERSION, init, buildSaleSnapshot, listSnapshots, status, lines, sellerPerformance, _activeDataset:activeDataset, _saleInvoicesOnly:saleInvoicesOnly, _computeSellerProfitFifo:computeSellerProfitFifo, _saleHeaderDoc:saleHeaderDoc, _saleLineDocs:saleLineDocs, _resolveSellerForInvoice:resolveSellerForInvoice, _saleDate8:saleDate8, _safeError:safeError, _normalizeSellerAccountNumber:normalizeSellerAccountNumber, _normalizeSellerName:normalizeSellerName, _previousEquivalentRange:previousEquivalentRange };

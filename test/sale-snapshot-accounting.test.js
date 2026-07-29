@@ -20,18 +20,18 @@ function baseDb(extra={}) {
   });
 }
 
-test('full scan excludes returns, records diagnostics, and reruns idempotently',async t=>{
+test('full scan stores sales and sale returns separately, records diagnostics, and reruns idempotently',async t=>{
   const original=shaygan.getInvoicePageByTypeNumberRange;
   t.after(()=>{shaygan.getInvoicePageByTypeNumberRange=original;});
   const db=baseDb();
   const sale=invoice(10,[line('A',1,100),line('B',2,100)],{TotalAmount:301});
-  shaygan.getInvoicePageByTypeNumberRange=async rowStart=>({ok:true,result:rowStart===0?[sale,{...invoice(11,[line('A',1,1)]),InvTyp:6}]:[]});
+  shaygan.getInvoicePageByTypeNumberRange=async (rowStart,typ)=>({ok:true,result:rowStart===0?(typ===2?[sale]:[{...invoice(11,[line('A',1,1)]),InvTyp:6}]):[]});
   const first=await saleSnapshot.buildSaleSnapshot(db,{mode:'full',pageSize:2,maxPages:3,dateFrom:'14050101'});
   assert.equal(first.ok,true);
-  assert.equal(first.invoiceHeadersFound,1);
-  assert.equal(first.saleLinesParsed,2);
-  assert.equal(first.insertedHeaders,1);
-  assert.equal(first.insertedLines,2);
+  assert.equal(first.invoiceHeadersFound,2);
+  assert.equal(first.saleLinesParsed,3);
+  assert.equal(first.insertedHeaders,2);
+  assert.equal(first.insertedLines,3);
   assert.equal(first.groupFallbackLines,1);
   assert.equal(first.amountMismatchInvoices,1);
   assert.equal(first.unmappedSellerInvoices,0);
@@ -39,17 +39,18 @@ test('full scan excludes returns, records diagnostics, and reruns idempotently',
   assert.equal(first.endInvNo,10);
   assert.equal(first.nextInvNo,11);
   for(const field of ['invoiceHeadersFound','invoiceBodiesLoaded','saleLinesParsed','pagesScanned','insertedHeaders','updatedHeaders','insertedLines','updatedLines','removedOrReconciledLines','duplicatePrevented','emptyBodyInvoices','unmappedSellerInvoices','groupFallbackLines','amountMismatchInvoices','errors','startInvNo','endInvNo','nextInvNo','mode','scopeKey','durationMs']) assert.ok(Object.hasOwn(first,field),field);
-  assert.equal(db.collection('saleSnapshotDatasetHeaders').rows.filter(x=>x.snapshotId===first.snapshotId).length,1);
-  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===first.snapshotId).length,2);
+  assert.equal(db.collection('saleSnapshotDatasetHeaders').rows.filter(x=>x.snapshotId===first.snapshotId).length,2);
+  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===first.snapshotId).length,3);
+  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===first.snapshotId&&x.saleInvoiceType===6).length,1);
   assert.equal(db.collection('saleSnapshotState').rows[0].latestType2,10);
   assert.equal(db.collection('saleSnapshotState').rows[0].activeSnapshotId,first.snapshotId);
 
   const rerun=await saleSnapshot.buildSaleSnapshot(db,{mode:'full',pageSize:2,maxPages:3,dateFrom:'14050101'});
-  assert.equal(rerun.insertedHeaders,1);
+  assert.equal(rerun.insertedHeaders,2);
   assert.equal(rerun.updatedHeaders,0);
-  assert.equal(rerun.insertedLines,2);
+  assert.equal(rerun.insertedLines,3);
   assert.equal(rerun.updatedLines,0);
-  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===rerun.snapshotId).length,2);
+  assert.equal(db.collection('saleSnapshotDatasetLines').rows.filter(x=>x.snapshotId===rerun.snapshotId).length,3);
   assert.equal(db.collection('saleSnapshotState').rows[0].activeSnapshotId,rerun.snapshotId);
 });
 
@@ -65,13 +66,14 @@ test('incremental resumes committed state, appends, and reconciles changed bodie
   t.after(()=>{shaygan.getInvoicePageByTypeNumberRange=original;});
   const scopeKey='sale-type2|14050101|';
   const db=baseDb({saleSnapshotState:[{scopeKey,latestType2:10}]});
-  let expectedFrom='';
-  shaygan.getInvoicePageByTypeNumberRange=async (rowStart,_typ,from)=>{
-    expectedFrom=from;
-    return {ok:true,result:rowStart===0?[invoice(11,[line('A',1,110),line('B',1,90)])]:[]};
+  const expectedFrom={};
+  shaygan.getInvoicePageByTypeNumberRange=async (rowStart,typ,from)=>{
+    expectedFrom[String(typ)]=from;
+    return {ok:true,result:rowStart===0&&typ===2?[invoice(11,[line('A',1,110),line('B',1,90)])]:[]};
   };
   const append=await saleSnapshot.buildSaleSnapshot(db,{mode:'incremental',pageSize:2,maxPages:3,dateFrom:'14050101'});
-  assert.equal(expectedFrom,'11');
+  assert.equal(expectedFrom['2'],'11');
+  assert.equal(expectedFrom['6'],'');
   assert.equal(append.insertedHeaders,1);
   assert.equal(db.collection('saleSnapshotState').rows[0].latestType2,11);
 
@@ -150,7 +152,7 @@ test('unknown profit stays null and seller/group totals remain consistent',async
   const db=baseDb({saleInvoiceLines:[{saleInvoiceType:2,saleInvoiceNo:9,row:1,saleDate:'14050401',sellerAccountNumber:'117',sellerName:'Seller',sellerStoreName:'Main',itemCode:'Z',itemName:'Unknown',qty:2,saleValue:400,mainGroupCode:'9',mainGroup:'Unknown'}]});
   const report=await saleSnapshot.sellerPerformance(db,{sellerAccountNumber:'117',dateFrom:'14050401',dateTo:'14050430'});
   assert.equal(report.fifoProfit,null);
-  assert.equal(report.profitStatus,'unknown');
+  assert.equal(report.profitStatus,'unavailable');
   assert.equal(report.invoices[0].fifoProfit,null);
   assert.equal(report.groups[0].fifoProfit,null);
   assert.equal(report.sellers[0].fifoProfit,null);
@@ -158,12 +160,73 @@ test('unknown profit stays null and seller/group totals remain consistent',async
   assert.equal(report.totalSales,report.invoices.reduce((sum,inv)=>sum+inv.amount,0));
 });
 
+test('seller identity is account-based, returns are separate, and accounting metrics reconcile to rows',async()=>{
+  const db=baseDb({
+    userShayganMappings:[
+      {username:'seller-a',fullName:'علی رضايي',employeeAccountName:'علی رضایی',employeeAccountNumber:' ۱۱۷ ',cashboxAccountNumber:'110',storeName:'Main'},
+      {username:'seller-a-copy',fullName:' علی  رضایی ',employeeAccountName:'علي رضايي',employeeAccountNumber:'117',cashboxAccountNumber:'110',storeName:'Main'}
+    ],
+    saleInvoiceHeaders:[
+      {invTyp:2,invNo:10,invDate:'14050502',discountAmount:20,accountNumber:'C1'},
+      {invTyp:6,invNo:20,invDate:'14050503',discountAmount:0,accountNumber:'C1'}
+    ],
+    saleInvoiceLines:[
+      {saleInvoiceType:2,saleInvoiceNo:10,row:1,saleDate:'14050502',sellerAccountNumber:' ۱۱۷ ',sellerName:'علی رضایی',sellerStoreName:'Main',accountNumber:'C1',itemCode:'A',qty:2,saleValue:200,mainGroupCode:'10',mainGroup:'CPU'},
+      {saleInvoiceType:2,saleInvoiceNo:10,row:2,saleDate:'14050502',sellerAccountNumber:'117',sellerName:'علی رضایی',sellerStoreName:'Main',accountNumber:'C1',itemCode:'B',qty:1,saleValue:100,mainGroupCode:'20',mainGroup:'Other'},
+      {saleInvoiceType:6,saleInvoiceNo:20,row:1,saleDate:'14050503',sellerAccountNumber:'117',sellerName:'علی رضایی',sellerStoreName:'Main',accountNumber:'C1',itemCode:'A',qty:1,saleValue:80}
+    ],
+    supplierPurchaseLayers:[{persistentLayerId:'SHOULD-NOT-ACTIVATE-PROFIT',itemCode:'A',purchaseDate:'14040101',purchaseQty:99,unitCost:1}]
+  });
+  const report=await saleSnapshot.sellerPerformance(db,{sellerAccountNumber:'۱۱۷',dateFrom:'14050501',dateTo:'14050506'});
+  assert.equal(report.sellerAccountNumber,'117');
+  assert.equal(report.invoiceCount,1);
+  assert.equal(report.lineCount,2);
+  assert.equal(report.saleReturnInvoiceCount,1);
+  assert.equal(report.saleReturnLineCount,1);
+  assert.equal(report.netSaleAmount,300);
+  assert.equal(report.grossSaleAmount,320);
+  assert.equal(report.discountAmount,20);
+  assert.equal(report.discountPercent,6.25);
+  assert.equal(report.saleReturnAmount,80);
+  assert.equal(report.netSalesAfterReturns,220);
+  assert.equal(report.uniqueCustomerCount,1);
+  assert.equal(report.averageInvoiceAmount,300);
+  assert.equal(report.sellers.length,1);
+  assert.equal(report.fifoProfit,null);
+  assert.equal(report.roiPercent,null);
+  assert.equal(report.profitStatus,'unavailable');
+  assert.equal(report.commissionStatus,'disabled');
+  assert.equal(report.returnsPolicy.linkageGuessed,false);
+  assert.equal(report.lines.reduce((sum,row)=>sum+row.saleValue,0),report.netSaleAmount);
+  assert.equal(report.returnLines.reduce((sum,row)=>sum+row.saleValue,0),report.saleReturnAmount);
+});
+
+test('seller performance no-data and previous equivalent period states are explicit',async()=>{
+  const db=baseDb({
+    saleInvoiceLines:[
+      {saleInvoiceType:2,saleInvoiceNo:1,row:1,saleDate:'14050431',sellerAccountNumber:'117',itemCode:'A',qty:1,saleValue:100},
+      {saleInvoiceType:2,saleInvoiceNo:2,row:1,saleDate:'14050501',sellerAccountNumber:'117',itemCode:'A',qty:1,saleValue:150}
+    ]
+  });
+  const report=await saleSnapshot.sellerPerformance(db,{sellerAccountNumber:'117',dateFrom:'14050501',dateTo:'14050501'});
+  assert.equal(report.dataState,'ready');
+  assert.deepEqual(report.previousPeriod.dateFrom,'14050431');
+  assert.deepEqual(report.previousPeriod.dateTo,'14050431');
+  assert.equal(report.previousPeriod.netSalesAfterReturns,100);
+  assert.equal(report.previousPeriod.differenceAmount,50);
+  const empty=await saleSnapshot.sellerPerformance(db,{sellerAccountNumber:'999',dateFrom:'14050501',dateTo:'14050501'});
+  assert.equal(empty.dataState,'no-data');
+  assert.equal(empty.invoiceCount,0);
+  assert.equal(empty.fifoProfit,null);
+});
+
 test('seller report authorization and UI accounting warnings remain explicit',()=>{
   const server=fs.readFileSync(path.join(__dirname,'../src/server.js'),'utf8');
+  const access=fs.readFileSync(path.join(__dirname,'../src/lib/seller-performance-access.js'),'utf8');
   const app=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
-  assert.ok(server.includes("['admin','accounting','purchase'].includes(role)"));
+  assert.match(server,/authorizedSellerScope/);
+  assert.match(access,/SELLER_SCOPE_FORBIDDEN/);
   assert.match(server,/buildSellerSalesProfitReportFromSnapshot\(db,\s*reportQuery\)/);
-  assert.match(app,/متوقف تا تکمیل پوشش/);
-  assert.match(app,/نامشخص/);
-  assert.match(app,/supplierPurchaseLayers|Supplier Sleep/);
+  assert.match(app,/سود، ROI و پورسانت در نسخه جاری عمداً غیرفعال است/);
+  assert.match(app,/مرجوعی فروش/);
 });

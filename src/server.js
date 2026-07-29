@@ -9,6 +9,7 @@ const { sendJson, sendText, collectBody, normalizeMobile, normalizeText } = requ
 const shaygan = require('./lib/shaygan');
 const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
+const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -18,12 +19,14 @@ const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
 const { emitSearchEvent } = require('./lib/search-observability');
 const { APP_NAME, APP_VERSION, versionPayload, injectAssetVersion } = require('./lib/app-version');
 const { normalizeJalaliRange, normalizeJalaliMonth } = require('./lib/jalali-date');
+const { resolveSellerScope } = require('./lib/seller-performance-access');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
 const { JobStatus } = require('../dist/core/jobs/JobStatus');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
+const { PurchaseLayerDatasetJob } = require('../dist/jobs/PurchaseLayerDatasetJob');
 const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
 const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
@@ -36,6 +39,9 @@ const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
 const saleSnapshotJobRegistry = new JobRegistry();
 saleSnapshotJobRegistry.register({ name:'sale-snapshot', version:1, factory:input=>new SaleSnapshotJob(input) });
 const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
+const purchaseLayerJobRegistry = new JobRegistry();
+purchaseLayerJobRegistry.register({ name:'purchase-layer-dataset', version:1, factory:input=>new PurchaseLayerDatasetJob(input) });
+const purchaseLayerJobManager = new JobManager(purchaseLayerJobRegistry);
 const inventorySyncJobRegistry=new JobRegistry();
 inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
 const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
@@ -201,6 +207,28 @@ function startSaleSnapshotBackgroundJob({db,jobId,request}){
   const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress}}).catch(()=>{});},15000);
   timer.unref?.();
   handle.completion.then(async snapshot=>{clearInterval(timer);await runningUpdate;const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;const cancelled=snapshot.status===JobStatus.Cancelled;const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};if(serviceResult)update.result=serviceResult;return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});}).catch(()=>clearInterval(timer));
+  return handle;
+}
+
+function startPurchaseLayerBackgroundJob({db,jobId,request}){
+  let serviceResult=null;
+  const handle=purchaseLayerJobManager.start('purchase-layer-dataset',{db,request,service:purchaseLayerDataset,onResult:result=>{serviceResult=result;}});
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const timer=setInterval(()=>{
+    const snapshot=handle.snapshot();
+    db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress}}).catch(()=>{});
+  },15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{
+    clearInterval(timer);
+    await runningUpdate;
+    const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;
+    const cancelled=snapshot.status===JobStatus.Cancelled;
+    const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};
+    if(serviceResult)update.result=serviceResult;
+    return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
+  }).catch(()=>clearInterval(timer));
   return handle;
 }
 
@@ -623,11 +651,13 @@ async function getActiveWarehouseNumbersFromDb() {
 
 const ROLE_PERMISSIONS = {
   admin: 'all',
-  seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','tablo'],
+  seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
   accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
-  seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','tablo']
+  seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
+  manager: ['dashboard','seller-profit','reports'],
+  supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
   const s = getSession(req);
@@ -691,9 +721,19 @@ function canUseSupplierAging(req, res) {
 function canUseSellerPerformance(req, res) {
   if (!needLogin(req, res)) return false;
   const role = String(roleOf(req));
-  if (['admin','accounting','purchase'].includes(role)) return true;
-  deny(res, 'دسترسی عملکرد فروشنده فقط برای مدیر، حسابداری و بازرگانی مجاز است');
+  if (['admin','accounting','purchase','manager','supervisor','seller','seller_buyer'].includes(role)) return true;
+  deny(res, 'دسترسی عملکرد فروشنده برای این نقش مجاز نیست');
   return false;
+}
+
+async function authorizedSellerScope(db, req, requestedSeller='') {
+  const role=roleOf(req);
+  if(['admin','accounting','purchase','manager','supervisor'].includes(role)){
+    return resolveSellerScope({role,requestedSeller,normalize:saleSnapshot._normalizeSellerAccountNumber});
+  }
+  const username=String(currentUser(req)?.username||'').trim();
+  const mapping=await db.collection('userShayganMappings').findOne({username,isActive:{$ne:false}}).catch(()=>null);
+  return resolveSellerScope({role,requestedSeller,ownSeller:mapping?.employeeAccountNumber||'',normalize:saleSnapshot._normalizeSellerAccountNumber});
 }
 
 
@@ -2712,7 +2752,7 @@ async function fetchSaleInvoicesFromShayganWebService({ from8='', to8='', maxPag
   return { ok:true, list, source:'shaygan-webservice-invoice-get-date', pages:Math.ceil(list.length/pageSize) };
 }
 
-const SELLER_PERFORMANCE_SOURCE = 'mongo-sale-snapshot-aggregate+supplierPurchaseLayers-coverage-only';
+const SELLER_PERFORMANCE_SOURCE = 'mongo-active-sale-snapshot-accounting-metrics-financials-disabled';
 function normalizeSellerPerformanceQuery(query={}) {
   const normalized={ ...query };
   const month=normalizeJalaliMonth(query.month||'', { field:'month' });
@@ -2763,11 +2803,14 @@ async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
       customerName:inv.accountName||'',
       leadId:inv.generalRef||'',
       saleRial:inv.amount,
-      fifoCost:inv.fifoCost,
-      fifoProfit:inv.fifoProfit,
-      profitPct:inv.roiPercent,
-      unmatchedSaleRial,
-      profitStatus:inv.profitStatus,
+      qty:inv.qty,
+      lineCount:inv.lines,
+      discountAmount:inv.discountAmount||0,
+      fifoCost:null,
+      fifoProfit:null,
+      profitPct:null,
+      unmatchedSaleRial:null,
+      profitStatus:'unavailable',
       coverage:inv.coverage,
       lines:linesByInvoice.get(key)||[],
       itemCodes:[...new Set((linesByInvoice.get(key)||[]).map(x=>x.itemCode).filter(Boolean))]
@@ -2786,17 +2829,20 @@ async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
       invoiceCount:s.invoiceCount,
       lineCount:s.lineCount,
       saleRial:s.amount,
-      fifoCost:s.fifoCost,
-      fifoProfit:s.fifoProfit,
-      avgProfitPct:s.roiPercent,
-      unmatchedSaleRial:Math.max(0,Number(s.amount||0)-Number(s.coverage?.coveredSales||0)),
+      returnAmount:s.returnAmount||0,
+      returnQty:s.returnQty||0,
+      netSalesAfterReturns:s.netSalesAfterReturns,
+      fifoCost:null,
+      fifoProfit:null,
+      avgProfitPct:null,
+      unmatchedSaleRial:null,
       commissionRate,
       rawCommission,
       leadPenalty,
       finalCommission:suggestedCommission,
       suggestedCommission,
-      commissionStatus:incomplete?'withheld-incomplete-coverage':'calculated',
-      profitStatus:s.profitStatus,
+      commissionStatus:'disabled',
+      profitStatus:'unavailable',
       coverage:s.coverage,
       leadStatus:'not-evaluated-from-snapshot',
       employeeStatus:s.sellerAccountNumber?'ok':'missing'
@@ -2810,18 +2856,27 @@ async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
     itemCount:report.itemCount,
     qty:report.qty,
     saleRial:report.totalSales,
-    fifoCost:report.fifoCost,
-    fifoProfit:report.fifoProfit,
-    avgProfitPct:report.roiPercent,
-    unmatchedSaleRial:Math.max(0,Number(report.totalSales||0)-Number(coverage.coveredSales||0)),
+    grossSaleAmount:report.grossSaleAmount,
+    netSaleAmount:report.netSaleAmount,
+    saleReturnAmount:report.saleReturnAmount,
+    saleReturnQuantity:report.saleReturnQuantity,
+    netSalesAfterReturns:report.netSalesAfterReturns,
+    uniqueCustomerCount:report.uniqueCustomerCount,
+    averageInvoiceAmount:report.averageInvoiceAmount,
+    discountAmount:report.discountAmount,
+    discountPercent:report.discountPercent,
+    fifoCost:null,
+    fifoProfit:null,
+    avgProfitPct:null,
+    unmatchedSaleRial:null,
     rawCommission:null,
     leadPenalty:null,
     suggestedCommission:null,
-    commissionStatus:incomplete?'withheld-incomplete-coverage':'calculated',
-    profitStatus:report.profitStatus,
+    commissionStatus:'disabled',
+    profitStatus:'unavailable',
     coverage
   };
-  return { ok:true, period:{from:dateFrom,to:dateTo,month}, seller:seller||'all', store, source:SELLER_PERFORMANCE_SOURCE, activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', summary, sellers, invoices, groups:report.groups||[], allocations:[], unmatched:(report.lines||[]).filter(x=>x.profitStatus!=='calculated').slice(0,1000), coverage, profitStatus:report.profitStatus, limitations:report.limitations, diagnostics:report.profitDiagnostics, meta:{ activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', invoiceRows:report.invoiceCount, saleRows:report.lineCount, itemGroup:'all', itemGroupRule:'mainGroup from catalog; explicit item-code fallback retained', commissionRate, leadPenaltyRial, reportScanLimit:report.reportScanLimit, reportScanLimitReached:report.reportScanLimitReached, note:'گزارش فقط از Snapshot فعال و کامل فروش در Mongo خوانده می‌شود. تا اولین فعال‌سازی نسخه‌ای، fallback قدیمی با برچسب legacy_unversioned حفظ می‌شود. سود و پورسانت تا تکمیل تاریخچه خرید، پوشش‌محور و غیرقطعی است.' } };
+  return { ok:true, period:{from:dateFrom,to:dateTo,month}, seller:seller||'all', store, source:SELLER_PERFORMANCE_SOURCE, activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', dataState:report.dataState, summary, sellers, invoices, groups:report.groups||[], stores:report.stores||[], dailyTrend:report.dailyTrend||[], previousPeriod:report.previousPeriod||null, returnLines:report.returnLines||[], sellerIdentityDiagnostics:report.sellerIdentityDiagnostics||{}, returnsPolicy:report.returnsPolicy||{}, allocations:[], unmatched:[], coverage, profitStatus:'unavailable', limitations:report.limitations, diagnostics:report.profitDiagnostics, meta:{ activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', invoiceRows:report.invoiceCount, saleRows:report.lineCount, returnRows:report.saleReturnLineCount||0, itemGroup:'all', itemGroupRule:'mainGroup from catalog; explicit item-code fallback retained', commissionRate, leadPenaltyRial, reportScanLimit:report.reportScanLimit, reportScanLimitReached:report.reportScanLimitReached, note:'گزارش فقط از Snapshot فعال و کامل فروش در Mongo خوانده می‌شود. سود، ROI و پورسانت در این نسخه عمداً غیرفعال‌اند.' } };
 }
 
 
@@ -3465,7 +3520,7 @@ async function handleApi(req, res, pathname, query) {
     }
 
     if (pathname === '/api/sale-snapshot/seller-performance' && req.method === 'GET') {
-      if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
+      if (!canUseSellerPerformance(req, res)) return;
       let reportDates;
       try {
         reportDates=normalizeJalaliRange({ dateFrom:query.dateFrom||'', dateTo:query.dateTo||'' });
@@ -3473,8 +3528,10 @@ async function handleApi(req, res, pathname, query) {
         return sendJalaliDateValidationError(res, error);
       }
       const db = await connectMongo();
+      const sellerScope=await authorizedSellerScope(db,req,query.sellerAccountNumber||query.seller||'');
+      if(!sellerScope.ok)return sendJson(res,sellerScope.status||403,{ok:false,code:sellerScope.code,error:sellerScope.error});
       return sendJson(res, 200, await saleSnapshot.sellerPerformance(db, {
-        sellerAccountNumber: query.sellerAccountNumber || query.seller || '',
+        sellerAccountNumber: sellerScope.sellerAccountNumber,
         store: query.store || '',
         dateFrom: reportDates.dateFrom,
         dateTo: reportDates.dateTo,
@@ -3484,6 +3541,80 @@ async function handleApi(req, res, pathname, query) {
       }));
     }
 
+    // 0.9.19.64: isolated, versioned purchase-layer foundation. No FIFO/profit is activated here.
+    if (pathname === '/api/purchase-layer-datasets/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      await purchaseLayerDataset.ensureIndexes(db);
+      return sendJson(res,200,{ok:true,version:APP_VERSION,collections:['purchaseLayerDatasets','purchaseLayerDatasetState','supplierPurchaseLayers','purchaseLayerDiagnostics'],profitActivationAllowed:false});
+    }
+    if ((pathname === '/api/purchase-layer-datasets/start' || pathname === '/api/purchase-layer-datasets/resume') && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      let dates;
+      try{
+        dates=normalizeJalaliRange({
+          dateFrom:body.dateFrom||query.dateFrom||'12000101',
+          dateTo:body.dateTo||query.dateTo||''
+        },{requireFrom:true});
+      }catch(error){
+        return sendJalaliDateValidationError(res,error);
+      }
+      const resumeDatasetId=String(body.resumeDatasetId||query.resumeDatasetId||(pathname.endsWith('/resume')?body.datasetId||query.datasetId:'')||'').trim();
+      const request={
+        dateFrom:dates.dateFrom,dateTo:dates.dateTo,
+        mode:body.mode||query.mode||'incremental',
+        reset:body.reset===true||body.reset==='true'||query.reset==='true',
+        resumeDatasetId,
+        pageSize:Number(body.pageSize||query.pageSize||20),
+        maxPages:Number(body.maxPages||query.maxPages||1000),
+        maxPageAttempts:Number(body.maxPageAttempts||query.maxPageAttempts||3)
+      };
+      const db=await connectMongo();
+      if(purchaseLayerJobManager.isRunning('purchase-layer-dataset')){
+        const running=purchaseLayerJobManager.getRunning('purchase-layer-dataset');
+        return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Purchase Layer Dataset job is already running',jobId:running?.id||''});
+      }
+      const recentLock=await db.collection('appJobs').findOne({
+        type:'purchase-layer-dataset',status:{$in:['queued','running']},
+        updatedAt:{$gte:new Date(Date.now()-10*60*1000)}
+      },{sort:{updatedAt:-1}}).catch(()=>null);
+      if(recentLock)return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Purchase Layer Dataset job lock is active',jobId:recentLock.jobId||''});
+      const jobId=`JOB-PURCHASE-LAYER-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const now=new Date();
+      await db.collection('appJobs').updateOne({jobId},{$set:{jobId,type:'purchase-layer-dataset',status:'queued',phase:'pending',createdAt:now,updatedAt:now,request}},{upsert:true});
+      try{startPurchaseLayerBackgroundJob({db,jobId,request});}
+      catch(error){
+        await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',finishedAt:new Date(),updatedAt:new Date(),error:String(error.message||error)}}).catch(()=>{});
+        if(error?.code==='JOB_LOCKED')return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:error.message,jobId});
+        throw error;
+      }
+      return sendJson(res,200,{ok:true,jobId,status:'queued',type:'purchase-layer-dataset',profitActivationAllowed:false});
+    }
+    if (pathname === '/api/purchase-layer-datasets' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.listDatasets(db,Number(query.limit||20)));
+    }
+    if (pathname === '/api/purchase-layer-datasets/status' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.status(db,query.datasetId||''));
+    }
+    if (pathname === '/api/purchase-layer-datasets/coverage' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.coverage(db,query.datasetId||''));
+    }
+    if (pathname === '/api/purchase-layer-datasets/layers' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.listLayers(db,{
+        datasetId:query.datasetId||'',itemCode:query.itemCode||'',
+        supplierAccountNumber:query.supplierAccountNumber||'',layerKind:query.layerKind||'',
+        validationStatus:query.validationStatus||'',limit:Number(query.limit||500)
+      }));
+    }
 
     // 0.9.19.27: Supplier stock sleep based on purchase invoice layers, not Kardex.
     if (pathname === '/api/supplier-sleep/init' && req.method === 'POST') {
@@ -4440,25 +4571,38 @@ async function handleApi(req, res, pathname, query) {
     if (pathname === '/api/reports/seller-sales-profit/sellers') {
       if (!canUseSellerPerformance(req, res)) return;
       const db = await connectMongo();
+      const scope=await authorizedSellerScope(db,req,'');
+      if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
       const maps = await db.collection('userShayganMappings').find({ isActive:{ $ne:false } }).sort({ employeeAccountNumber:1, fullName:1 }).limit(800).toArray().catch(()=>[]);
       const by = new Map();
+      const identitiesByName=new Map();
       for (const m of maps) {
-        const emp = String(m.employeeAccountNumber || '').trim();
+        const emp = saleSnapshot._normalizeSellerAccountNumber(m.employeeAccountNumber);
         if (!emp) continue;
-        if (!by.has(emp)) by.set(emp, { username:m.username||'', fullName:m.fullName||`نماینده ${emp}`, storeName:m.storeName||'', cashboxAccountNumber:m.cashboxAccountNumber||'', employeeAccountNumber:emp, sellerKey:emp, source:'userShayganMappings.employeeAccountNumber' });
+        if(scope.scope==='own-seller-only'&&emp!==scope.sellerAccountNumber)continue;
+        const nameKey=saleSnapshot._normalizeSellerName(m.employeeAccountName||m.fullName);
+        if(nameKey){
+          if(!identitiesByName.has(nameKey))identitiesByName.set(nameKey,new Set());
+          identitiesByName.get(nameKey).add(emp);
+        }
+        if (!by.has(emp)) by.set(emp, { username:m.username||'', fullName:m.fullName||m.employeeAccountName||`نماینده ${emp}`, storeName:m.storeName||'', cashboxAccountNumber:m.cashboxAccountNumber||'', employeeAccountNumber:emp, sellerKey:emp, source:'userShayganMappings.employeeAccountNumber' });
       }
-      return sendJson(res, 200, { ok:true, source:'employeeAccountNumber-current-account-mapping', list:[...by.values()].sort((a,b)=>String(a.employeeAccountNumber).localeCompare(String(b.employeeAccountNumber),'fa')) });
+      const ambiguousMappings=[...identitiesByName.entries()].filter(([,values])=>values.size>1).map(([normalizedName,values])=>({normalizedName,accountNumbers:[...values].sort()}));
+      return sendJson(res, 200, { ok:true, source:'employeeAccountNumber-current-account-mapping', stableIdentifier:'AccountNumber', scope:scope.scope, ambiguousMappings, list:[...by.values()].sort((a,b)=>String(a.employeeAccountNumber).localeCompare(String(b.employeeAccountNumber),'fa')) });
     }
     if (pathname === '/api/reports/seller-sales-profit/history') {
       if (!canUseSellerPerformance(req, res)) return;
       const db = await connectMongo();
+      const scope=await authorizedSellerScope(db,req,query.seller||query.employeeAccountNumber||'');
+      if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
+      const ownershipQuery=scope.scope==='own-seller-only'?{$or:[{'filters.seller':scope.sellerAccountNumber},{'filters.employeeAccountNumber':scope.sellerAccountNumber}]}:{};
       if (query.id) {
         let oid = null;
         try { oid = new ObjectId(String(query.id)); } catch {}
-        const doc = oid ? await db.collection('sellerPerformanceHistory').findOne({ _id:oid, type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE }) : null;
+        const doc = oid ? await db.collection('sellerPerformanceHistory').findOne({ _id:oid, type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE, ...ownershipQuery }) : null;
         return sendJson(res, 200, { ok:true, found:!!doc, generatedAt:doc?.generatedAt || null, filters:doc?.filters || null, report:doc?.report || null });
       }
-      const list = await db.collection('sellerPerformanceHistory').find({ type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE }).sort({ generatedAt:-1 }).limit(30).project({ report:0 }).toArray().catch(()=>[]);
+      const list = await db.collection('sellerPerformanceHistory').find({ type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE, ...ownershipQuery }).sort({ generatedAt:-1 }).limit(30).project({ report:0 }).toArray().catch(()=>[]);
       return sendJson(res, 200, { ok:true, list });
     }
     if (pathname === '/api/reports/seller-sales-profit/latest') {
@@ -4470,6 +4614,9 @@ async function handleApi(req, res, pathname, query) {
         return sendJalaliDateValidationError(res, error);
       }
       const db = await connectMongo();
+      const scope=await authorizedSellerScope(db,req,reportQuery.seller||reportQuery.employeeAccountNumber||'');
+      if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
+      reportQuery.seller=scope.sellerAccountNumber;
       const doc = await getLatestSellerPerformanceHistory(db, reportQuery);
       return sendJson(res, 200, { ok:true, found:!!doc, generatedAt:doc?.generatedAt || null, filters:doc?.filters || null, report:doc?.report || null });
     }
@@ -4478,6 +4625,9 @@ async function handleApi(req, res, pathname, query) {
       try {
         const reportQuery=normalizeSellerPerformanceQuery(query);
         const db = await connectMongo();
+        const scope=await authorizedSellerScope(db,req,reportQuery.seller||reportQuery.employeeAccountNumber||'');
+        if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
+        reportQuery.seller=scope.sellerAccountNumber;
         const force = String(reportQuery.force || reportQuery.update || '').trim() === '1' || String(reportQuery.force || reportQuery.update || '').toLowerCase() === 'true';
         if (!force) {
           const cached = await getLatestSellerPerformanceHistory(db, reportQuery);
