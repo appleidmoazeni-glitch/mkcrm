@@ -59,6 +59,19 @@ test('maps purchases and purchase returns with deterministic identities and unkn
   assert.equal(returned.netPurchasedQuantity,null);
 });
 
+test('layer upsert keeps immutable createdAt out of $set',()=>{
+  const createdAt=new Date('2026-07-29T00:00:00.000Z');
+  const update=purchaseLayers._layerUpsertUpdate({
+    datasetId:'PLAYER-1',
+    purchaseLineIdentity:'invoice:line',
+    createdAt,
+    updatedAt:createdAt
+  });
+  assert.equal(Object.prototype.hasOwnProperty.call(update.$set,'createdAt'),false);
+  assert.equal(update.$setOnInsert.createdAt,createdAt);
+  assert.equal(update.$set.datasetId,'PLAYER-1');
+});
+
 test('full backfill retries, represents returns, validates quantities, and activates atomically',async()=>{
   const db=new MemoryDb();
   const purchase=invoice(3,10,[line(11,'A',5,100)]);

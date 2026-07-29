@@ -147,6 +147,14 @@ function mapSourceLine(invoice, line, row, datasetId) {
   };
 }
 
+function layerUpsertUpdate(mapped) {
+  const { createdAt, ...current } = mapped;
+  return {
+    $set:{ ...current, updatedAt:new Date() },
+    $setOnInsert:{ createdAt:createdAt || new Date() }
+  };
+}
+
 async function cloneActiveLayers(db, active, datasetId) {
   if (!active?.datasetId) return 0;
   const rows = await db.collection(LAYERS).find({ datasetId:active.datasetId }).toArray();
@@ -352,7 +360,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
             const mapped = mapSourceLine(invoice, body[index], index + 1, datasetId);
             await db.collection(LAYERS).updateOne(
               { datasetId, purchaseLineIdentity:mapped.purchaseLineIdentity },
-              { $set:{ ...mapped, updatedAt:new Date() }, $setOnInsert:{ createdAt:new Date() } },
+              layerUpsertUpdate(mapped),
               { upsert:true }
             );
           }
@@ -518,5 +526,5 @@ module.exports = {
   DATASETS, STATE, LAYERS, DIAGNOSTICS, SCHEMA_VERSION, SOURCE_TYPES,
   ensureIndexes, activeDataset, buildPurchaseLayerDataset, coverage, listDatasets, status, listLayers,
   _mapSourceLine:mapSourceLine, _lineIdentity:lineIdentity, _reconcilePurchaseReturns:reconcilePurchaseReturns,
-  _validateDataset:validateDataset, _safeError:safeError
+  _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate
 };
