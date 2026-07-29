@@ -229,4 +229,5 @@ test('seller report authorization and UI accounting warnings remain explicit',()
   assert.match(server,/buildSellerSalesProfitReportFromSnapshot\(db,\s*reportQuery\)/);
   assert.match(app,/سود، ROI و پورسانت در نسخه جاری عمداً غیرفعال است/);
   assert.match(app,/مرجوعی فروش/);
+  assert.match(app,/Array\.from\(sel\.options\)\.some\(option=>option\.value===key\)/);
 });
