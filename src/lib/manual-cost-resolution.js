@@ -601,9 +601,7 @@ async function readiness(db, filters = {}) {
   return { ok:true, activeSnapshotId:context.saleActive.snapshotId || '', activePurchaseLayerDatasetId:context.purchaseActive?.datasetId || '', total:list.length, list, profitActivationAllowed:false, fifoCalculationActivated:false };
 }
 function percentage(part, total) { return total ? Math.round(part * 10000 / total) / 100 : 0; }
-async function coverage(db, filters = {}) {
-  const dates = normalizeJalaliRange({ dateFrom:filters.dateFrom || '', dateTo:filters.dateTo || '' });
-  const context = await loadReadinessContext(db);
+function coverageFromContext(context, dates) {
   const rows = context.saleRows.filter(row => (!dates.dateFrom || row.saleDate >= dates.dateFrom) && (!dates.dateTo || row.saleDate <= dates.dateTo));
   const totals = { items:new Set(), quantity:0, saleValue:0 };
   const official = { items:new Set(), quantity:0, saleValue:0 };
@@ -656,9 +654,14 @@ async function coverage(db, filters = {}) {
     safety:{ officialPriority:true, unknownIsZero:false, manualIsOfficial:false, profitCalculated:false, fifoAllocationCreated:false }
   };
 }
+async function coverage(db, filters = {}) {
+  const dates = normalizeJalaliRange({ dateFrom:filters.dateFrom || '', dateTo:filters.dateTo || '' });
+  const context = await loadReadinessContext(db);
+  return coverageFromContext(context, dates);
+}
 async function dataHealth(db, build = {}) {
   const context = await loadReadinessContext(db);
-  const cov = await coverage(db, {});
+  const cov = coverageFromContext(context, { dateFrom:'', dateTo:'' });
   const jobs = await allRows(db.collection('appJobs'), {});
   const resolutions = await allRows(db.collection(COLLECTION), {});
   const latestBackup = await db.collection('appLogs').findOne({ type:'mongo_backup' }, { sort:{ at:-1 } }).catch(() => null);
