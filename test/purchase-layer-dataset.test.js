@@ -72,6 +72,23 @@ test('layer upsert keeps immutable createdAt out of $set',()=>{
   assert.equal(update.$set.datasetId,'PLAYER-1');
 });
 
+test('a failed page does not advance its durable resume checkpoint',async()=>{
+  const db=new MemoryDb();
+  const layers=db.collection('supplierPurchaseLayers');
+  const updateOne=layers.updateOne.bind(layers);
+  layers.updateOne=async(filter,update,options)=>{
+    if(filter.purchaseLineIdentity==='GUID-3-10:11')throw new Error('simulated write failure');
+    return updateOne(filter,update,options);
+  };
+  const api=apiFor({'3':{0:[invoice(3,10,[line(11,'A',5,100)])]}});
+  const failed=await purchaseLayers.buildPurchaseLayerDataset(db,{
+    shaygan:api,mode:'full',reset:true,dateFrom:'14050101',pageSize:20,maxPages:3,maxPageAttempts:1
+  });
+  assert.equal(failed.ok,false);
+  assert.equal(failed.status,'failed');
+  assert.equal(failed.checkpoint.nextRowStartByType['3'],0);
+});
+
 test('full backfill retries, represents returns, validates quantities, and activates atomically',async()=>{
   const db=new MemoryDb();
   const purchase=invoice(3,10,[line(11,'A',5,100)]);

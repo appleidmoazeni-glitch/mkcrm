@@ -348,7 +348,6 @@ async function buildPurchaseLayerDataset(db, options = {}) {
         }
         const sourceRows = Array.isArray(response.result) ? response.result.filter(row => invoiceType(row) === type) : [];
         pageDiagnostics.push({ type, page, rowStart, rows:sourceRows.length, attempts, at:new Date() });
-        nextRowStartByType[key] = rowStart + pageSize;
         if (!sourceRows.length) {
           reachedEndByType[key] = true;
           break;
@@ -365,6 +364,8 @@ async function buildPurchaseLayerDataset(db, options = {}) {
             );
           }
         }
+        // Advance only after every row in the page is durable. A failed page is replayed on resume.
+        nextRowStartByType[key] = rowStart + pageSize;
         const checkpointValue = { typeIndex, nextRowStartByType, reachedEndByType };
         await db.collection(DATASETS).updateOne({ datasetId }, { $set:{
           checkpoint:checkpointValue, pageCount, retryCount, lastInvoiceNoByType,
