@@ -10,6 +10,7 @@ const shaygan = require('./lib/shaygan');
 const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
+const manualCostResolution = require('./lib/manual-cost-resolution');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -652,11 +653,11 @@ async function getActiveWarehouseNumbersFromDb() {
 const ROLE_PERMISSIONS = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
+  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  manager: ['dashboard','seller-profit','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
@@ -3191,6 +3192,7 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/sale-snapshot/init': 'sale-snapshot.init',
     'POST /api/sale-snapshot/start': 'sale-snapshot.start',
     'POST /api/sale-snapshot/resume': 'sale-snapshot.resume',
+    'POST /api/manual-cost-resolutions': 'manual-cost-resolutions.create',
     'POST /api/supplier-sleep/init': 'supplier-sleep.init',
     'POST /api/supplier-sleep/sync-purchases': 'supplier-sleep.sync-purchases',
     'POST /api/supplier-sleep/supplier-index': 'supplier-sleep.supplier-index',
@@ -3237,6 +3239,7 @@ function stagingReadOnlyOperation(req, pathname) {
   if ((method === 'PUT' || method === 'PATCH') && /^\/api\/proformas\/\d+$/.test(normalizedPathname)) return 'proformas.update';
   if (method === 'POST' && /^\/api\/proformas\/\d+\/convert$/.test(normalizedPathname)) return 'proformas.convert';
   if (method === 'POST' && /^\/api\/purchase-drafts\/\d+\/issue$/.test(normalizedPathname)) return 'purchase-drafts.issue';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/manual-cost-resolutions\/[^/]+(?:\/(?:submit|approve|reject|expire))?$/.test(normalizedPathname)) return 'manual-cost-resolutions.workflow';
   return '';
 }
 
@@ -3539,6 +3542,102 @@ async function handleApi(req, res, pathname, query) {
         invoiceLimit: Number(query.invoiceLimit || 1000),
         lineLimit: Number(query.lineLimit || 1000)
       }));
+    }
+
+    // 0.9.19.65: accounting readiness and governed manual-cost evidence.
+    // This is deliberately separate from supplierPurchaseLayers and does not calculate FIFO, profit or commission.
+    if (pathname === '/api/manual-cost-resolutions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await manualCostResolution.list(db,query));
+    }
+    if (pathname === '/api/manual-cost-resolutions' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try {
+        return sendJson(res,201,await manualCostResolution.createDraft(db,body,currentUser(req)));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID',error:String(error.message||error)});
+      }
+    }
+    const manualCostMatch=pathname.match(/^\/api\/manual-cost-resolutions\/([^/]+)(?:\/(submit|approve|reject|expire))?$/);
+    if (manualCostMatch && req.method === 'GET' && !manualCostMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,{ok:true,resolution:await manualCostResolution.getById(db,decodeURIComponent(manualCostMatch[1]))});
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||404),{ok:false,code:error.code||'MANUAL_COST_NOT_FOUND',error:String(error.message||error)});
+      }
+    }
+    if (manualCostMatch && ['PUT','PATCH'].includes(req.method) && !manualCostMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,await manualCostResolution.updateDraft(db,decodeURIComponent(manualCostMatch[1]),body,currentUser(req)));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID',error:String(error.message||error)});
+      }
+    }
+    if (manualCostMatch && req.method === 'POST' && manualCostMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,await manualCostResolution.transition(db,decodeURIComponent(manualCostMatch[1]),manualCostMatch[2],currentUser(req),body));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID_TRANSITION',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/missing-purchase-costs' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,await manualCostResolution.missingQueue(db,query));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MISSING_COST_QUEUE_INVALID',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/missing-purchase-costs/export' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        const report=await manualCostResolution.missingQueue(db,{...query,export:true,page:1,pageSize:5000});
+        const csvCell=value=>{
+          let text=String(value??'');
+          if(/^[=+\-@]/.test(text))text=`'${text}`;
+          return `"${text.replace(/"/g,'""')}"`;
+        };
+        const headers=['ItemCode','ItemDescription','ItemGuid','CurrentInventory','SaleCount','SaleQuantity','SaleAmount','Coverage','Reason','FirstSale','LastSale','PurchaseLayerStatus','SuggestedResolution'];
+        const lines=[headers.map(csvCell).join(',')];
+        for(const row of report.list)lines.push([
+          row.itemCode,row.itemDescription,row.itemGuid,row.currentInventory,row.saleCount,row.saleQuantity,row.saleAmount,row.coverage,row.reason,row.firstSaleDate,row.lastSaleDate,row.purchaseLayerStatus,row.suggestedResolution
+        ].map(csvCell).join(','));
+        const body='\uFEFF'+lines.join('\r\n');
+        res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="missing-purchase-costs.csv"','Cache-Control':'no-store'});
+        return res.end(body);
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MISSING_COST_EXPORT_INVALID',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/fifo-readiness' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.readiness(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_READINESS_INVALID',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/cost-coverage' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.coverage(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'COST_COVERAGE_INVALID',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/data-health' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await manualCostResolution.dataHealth(db));
     }
 
     // 0.9.19.64: isolated, versioned purchase-layer foundation. No FIFO/profit is activated here.

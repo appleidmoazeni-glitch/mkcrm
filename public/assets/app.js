@@ -19,11 +19,11 @@ document.addEventListener('DOMContentLoaded',loadBackendVersion,{once:true});
 const ROLE_PAGES = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
+  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
   purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  manager: ['dashboard','seller-profit','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function userRole(){return (state.user&&state.user.role)||'guest'}
@@ -4524,5 +4524,197 @@ async function pageSellerProfit(){
   window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);if(userRole()!=='admin')return;const m=$('#menu');if(m&&!m.querySelector('[data-page="backup-management"]')){const b=document.createElement('button');b.className='navbtn';b.dataset.page='backup-management';b.textContent='مدیریت پشتیبان‌گیری';b.onclick=()=>{location.hash='backup-management';route();};m.appendChild(b);}};
   const inheritedRoute=window.route||route;
   window.route=route=async function(){const p=location.hash.slice(1)||firstAllowedPage();if(p==='turnover')return window.__stablePageTurnover();if(p==='backup-management'&&userRole()==='admin')return window.pageBackupManagement();return inheritedRoute.apply(this,arguments);};
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.65: governed Manual Purchase Cost Resolution.
+   Read models only: no FIFO allocation, profit, commission, inventory or purchase-layer mutation. */
+(function(){
+  const PAGE='manual-cost-resolution';
+  const q=(selector)=>document.querySelector(selector);
+  const safe=(value)=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const number=(value)=>Number(value||0).toLocaleString('fa-IR');
+  let queuePage=1;
+  let selectedResolutionId='';
+  let selectedResolutionRevision=0;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}
+    return payload;
+  }
+  function queryString(extra={}){
+    const values={
+      dateFrom:q('#mcDateFrom')?.value||'',
+      dateTo:q('#mcDateTo')?.value||'',
+      supplier:q('#mcSupplier')?.value||'',
+      brand:q('#mcBrand')?.value||'',
+      store:q('#mcStore')?.value||'',
+      category:q('#mcCategory')?.value||'',
+      coverage:q('#mcCoverage')?.value||'unknown',
+      search:q('#mcSearch')?.value||'',
+      sort:q('#mcSort')?.value||'saleAmount',
+      direction:q('#mcDirection')?.value||'desc',
+      page:queuePage,
+      pageSize:50,
+      ...extra
+    };
+    const params=new URLSearchParams();
+    Object.entries(values).forEach(([key,value])=>{if(value!==''&&value!=null)params.set(key,value);});
+    return params.toString();
+  }
+  function coverageCard(title,row,kind){
+    return `<div class="card" style="min-width:210px;flex:1"><div class="card-body"><b>${safe(title)}</b><div class="${kind||''}" style="font-size:1.4rem;margin:.5rem 0">${safe(row.itemCoveragePercent??0)}٪ کالا</div><div class="small">تعداد فروش: ${safe(row.quantityCoveragePercent??0)}٪</div><div class="small">ارزش فروش: ${safe(row.saleValueCoveragePercent??0)}٪</div><div class="small">${number(row.saleValue||0)} ریال</div></div></div>`;
+  }
+  async function loadCoverage(){
+    const box=q('#mcCoverageCards'); if(!box)return;
+    try{
+      const report=await json('/api/accounting/cost-coverage?'+queryString({coverage:'',page:'',pageSize:'',sort:'',direction:'',supplier:'',brand:'',store:'',category:'',search:''}));
+      box.innerHTML=coverageCard('قبل از Manual (فقط رسمی)',report.beforeManual,'info')+
+        coverageCard('پوشش Manual تأییدشده',report.manual,'warn')+
+        coverageCard('بعد از Manual',report.afterManual,'success')+
+        coverageCard('هزینه نامشخص',report.unknown,'error');
+      q('#mcDatasetMeta').textContent=`Sale Snapshot: ${report.activeSnapshotId||'ندارد'} | Purchase Dataset: ${report.activePurchaseLayerDatasetId||'ندارد'} | سود و FIFO: غیرفعال`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function reasonLabel(reason){
+    return ({
+      no_purchase_found:'بدون سابقه خرید',
+      historical_purchase_outside_range:'خرید تاریخی خارج بازه',
+      item_guid_mismatch:'عدم تطابق ItemGuid',
+      item_code_changed:'تغییر ItemCode',
+      purchase_return_ambiguity:'ابهام برگشت خرید',
+      legacy_layer_only:'فقط لایه Legacy',
+      unknown_cost:'هزینه نامشخص'
+    })[reason]||reason||'—';
+  }
+  async function loadQueue(){
+    const box=q('#mcQueue'); if(!box)return;
+    box.innerHTML='<div class="info">در حال ساخت صف از Snapshot فعال...</div>';
+    try{
+      const report=await json('/api/accounting/missing-purchase-costs?'+queryString());
+      const rows=(report.list||[]).map(row=>`<tr>
+        <td><b>${safe(row.itemCode)}</b><br><small>${safe(row.itemGuid||'بدون GUID')}</small></td>
+        <td style="white-space:normal">${safe(row.itemDescription)}</td>
+        <td>${number(row.currentInventory)}</td><td>${number(row.saleCount)} / ${number(row.saleQuantity)}</td>
+        <td>${number(row.saleAmount)}</td><td>${safe(row.coverage)}</td>
+        <td>${safe(reasonLabel(row.reason))}</td><td>${safe(row.firstSaleDate)}<br>${safe(row.lastSaleDate)}</td>
+        <td>${safe(row.purchaseLayerStatus)}</td><td style="white-space:normal">${safe(row.suggestedResolution)}</td>
+        <td>${row.coverage==='unknown'?`<button class="mini mc-resolve" data-code="${safe(row.itemCode)}" data-guid="${safe(row.itemGuid)}">ثبت Resolution</button>`:'—'}</td>
+      </tr>`).join('');
+      box.innerHTML=`<div class="info">آیتم‌ها: ${number(report.total)} | صفحه ${number(report.page)} | Snapshot: ${safe(report.activeSnapshotId||'')}</div>
+        <table class="table"><thead><tr><th>کد / GUID</th><th>شرح</th><th>موجودی</th><th>فاکتور / تعداد</th><th>مبلغ فروش</th><th>پوشش</th><th>علت</th><th>اولین / آخرین فروش</th><th>وضعیت لایه</th><th>راهکار</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="11">رکوردی وجود ندارد.</td></tr>'}</tbody></table>
+        <div class="actions"><button class="btn" id="mcPrev" ${report.page<=1?'disabled':''}>قبلی</button><button class="btn" id="mcNext" ${report.page*report.pageSize>=report.total?'disabled':''}>بعدی</button></div>`;
+      q('#mcPrev').onclick=()=>{queuePage=Math.max(1,queuePage-1);loadQueue();};
+      q('#mcNext').onclick=()=>{queuePage++;loadQueue();};
+      document.querySelectorAll('.mc-resolve').forEach(button=>button.onclick=()=>{
+        selectedResolutionId='';selectedResolutionRevision=0;
+        q('#mcResolutionId').textContent='Resolution جدید';
+        q('#mcItemCode').value=button.dataset.code||'';
+        q('#mcItemGuid').value=button.dataset.guid||'';
+        q('#mcCost').focus();
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function actionButtons(row){
+    if(row.status==='draft')return `<button class="mini mc-edit" data-id="${safe(row.resolutionId)}">ویرایش</button> <button class="mini mc-action" data-action="submit" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">ارسال تأیید</button>`;
+    if(row.status==='pending')return `<button class="mini mc-action" data-action="approve" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">تأیید</button> <button class="mini mc-action" data-action="reject" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">رد</button>`;
+    if(row.status==='approved')return `<button class="mini mc-action" data-action="expire" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">منقضی‌کردن</button>`;
+    return '—';
+  }
+  async function loadResolutions(){
+    const box=q('#mcResolutions');if(!box)return;
+    try{
+      const report=await json('/api/manual-cost-resolutions?pageSize=100');
+      box.innerHTML=`<table class="table"><thead><tr><th>Resolution</th><th>کالا</th><th>هزینه</th><th>بازه</th><th>منبع</th><th>وضعیت</th><th>ایجادکننده / تأییدکننده</th><th>Audit</th><th></th></tr></thead><tbody>${(report.list||[]).map(row=>`<tr>
+        <td><small>${safe(row.resolutionId)}</small></td><td>${safe(row.itemCode)}<br><small>${safe(row.itemGuid)}</small></td>
+        <td>${number(row.manualCost)} ${safe(row.currency)}</td><td>${safe(row.effectiveFrom)} تا ${safe(row.effectiveTo||'باز')}</td>
+        <td>${safe(row.sourceType)}</td><td>${safe(row.status)}</td>
+        <td>${safe(row.createdBy?.username||'')}<br><small>${safe(row.approvedBy?.username||'')}</small></td>
+        <td><details><summary>${number((row.auditLog||[]).length)} رویداد</summary>${(row.auditLog||[]).map(event=>`<div class="small">${safe(event.action)} | ${safe(event.by?.username)} | ${safe(event.at)}</div>`).join('')}</details></td>
+        <td>${actionButtons(row)}</td></tr>`).join('')||'<tr><td colspan="9">Resolution ثبت نشده است.</td></tr>'}</tbody></table>`;
+      document.querySelectorAll('.mc-edit').forEach(button=>button.onclick=async()=>{
+        const response=await json('/api/manual-cost-resolutions/'+encodeURIComponent(button.dataset.id));
+        const row=response.resolution;selectedResolutionId=row.resolutionId;selectedResolutionRevision=Number(row.revision||1);
+        q('#mcResolutionId').textContent=`ویرایش ${row.resolutionId}`;
+        q('#mcItemCode').value=row.itemCode||'';q('#mcItemGuid').value=row.itemGuid||'';q('#mcCost').value=row.manualCost||'';
+        q('#mcFrom').value=row.effectiveFrom||'';q('#mcTo').value=row.effectiveTo||'';q('#mcSource').value=row.sourceType||'manual';
+        q('#mcReason').value=row.reason||'';q('#mcNotes').value=row.notes||'';q('#mcAttachment').value=row.attachment?.reference||'';
+        q('#mcItemCode').focus();
+      });
+      document.querySelectorAll('.mc-action').forEach(button=>button.onclick=async()=>{
+        let reason='';
+        if(['reject','expire'].includes(button.dataset.action))reason=prompt('علت این تصمیم را ثبت کنید:')||'';
+        if(['reject','expire'].includes(button.dataset.action)&&!reason)return;
+        try{
+          await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`,{method:'POST',body:JSON.stringify({reason,revision:Number(button.dataset.revision||0)})});
+          await refreshAll();
+        }catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadHealth(){
+    const box=q('#mcHealth');if(!box)return;
+    try{
+      const h=await json('/api/accounting/data-health');
+      box.innerHTML=`<div class="row four">
+        <div class="info">نسخه: ${safe(h.version)}<br>Git: ${safe(h.gitSha||'ثبت‌نشده')}<br>Build: ${safe(h.buildTime||'ثبت‌نشده')}</div>
+        <div class="info">Sale: ${number(h.saleSnapshot.headers)} فاکتور / ${number(h.saleSnapshot.lines)} ردیف<br>${safe(h.activeDataset.saleSnapshotId)}</div>
+        <div class="info">Purchase: ${number(h.purchaseLayer.officialRows)} رسمی / ${number(h.purchaseLayer.returnRows)} برگشت<br>هشدار: ${number(h.purchaseLayer.warnings)} | تکراری: ${number(h.purchaseLayer.duplicateRows)}</div>
+        <div class="info">Manual: ${number(h.manualCost.total)}<br>Pending: ${number(h.manualCost.byStatus.pending)} | Approved: ${number(h.manualCost.byStatus.approved)}</div>
+        <div class="info">Missing: ${number(h.missingQueue.itemCount)} کالا / ${number(h.missingQueue.saleValue)} ریال</div>
+        <div class="info">Retry jobs: ${number(h.retry.jobsWithRetry)} | Resume jobs: ${number(h.resume.jobsWithResume)} | Failed: ${number(h.failedJobs)}</div>
+        <div class="info">Returns unresolved: ${number(h.returns.unresolved)} / ${number(h.returns.total)}</div>
+        <div class="info">Backup: ${safe(h.latestBackup?.status||'نامشخص')}<br>${safe(h.latestBackup?.at||'')}</div>
+      </div><div class="warn">این داشبورد فقط آمادگی داده را نشان می‌دهد؛ FIFO، سود، ROI و پورسانت همچنان غیرفعال‌اند.</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function refreshAll(){await Promise.all([loadCoverage(),loadQueue(),loadResolutions(),loadHealth()]);}
+  window.pageManualCostResolution=async function(){
+    setPage('رفع هزینه خرید نامشخص',`<main class="main-content">
+      <div class="card"><div class="card-header"><h5>Accounting Readiness — بدون FIFO و بدون سود</h5></div><div class="card-body"><div id="mcDatasetMeta" class="small muted"></div><div id="mcCoverageCards" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Missing Purchase Cost Queue</h5></div><div class="card-body">
+        <div class="row four"><div class="form-group"><label>از تاریخ شمسی</label><input id="mcDateFrom" placeholder="14050101"></div><div class="form-group"><label>تا تاریخ شمسی</label><input id="mcDateTo" placeholder="14051229"></div><div class="form-group"><label>جستجو</label><input id="mcSearch" placeholder="کد، شرح یا GUID"></div><div class="form-group"><label>پوشش</label><select id="mcCoverage"><option value="unknown">فقط نامشخص</option><option value="all">همه</option><option value="official">رسمی</option><option value="manual">Manual</option></select></div></div>
+        <div class="row four"><div class="form-group"><label>تأمین‌کننده</label><input id="mcSupplier"></div><div class="form-group"><label>برند</label><input id="mcBrand"></div><div class="form-group"><label>فروشگاه</label><input id="mcStore"></div><div class="form-group"><label>دسته</label><input id="mcCategory"></div></div>
+        <div class="row four"><div class="form-group"><label>مرتب‌سازی</label><select id="mcSort"><option value="saleAmount">مبلغ فروش</option><option value="saleCount">تعداد فروش</option><option value="saleQuantity">تعداد کالا</option><option value="currentInventory">موجودی</option><option value="itemCode">کد کالا</option><option value="firstSaleDate">اولین فروش</option><option value="lastSaleDate">آخرین فروش</option></select></div><div class="form-group"><label>جهت</label><select id="mcDirection"><option value="desc">نزولی</option><option value="asc">صعودی</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="mcApply">اعمال فیلتر</button></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="mcExport">Export CSV</button></div></div>
+        <div id="mcQueue"></div></div></div>
+      <div class="card"><div class="card-header"><h5 id="mcResolutionId">Resolution جدید</h5></div><div class="card-body">
+        <div class="warn">Manual Cost هرگز لایه رسمی نیست؛ فقط در نبود لایه رسمی معتبر و پس از Approval برای FIFO آینده eligible خواهد بود.</div>
+        <div class="row four"><div class="form-group"><label>ItemCode</label><input id="mcItemCode"></div><div class="form-group"><label>ItemGuid</label><input id="mcItemGuid"></div><div class="form-group"><label>هزینه دستی (ریال)</label><input id="mcCost" inputmode="decimal"></div><div class="form-group"><label>نوع منبع</label><select id="mcSource"><option value="manual">manual</option><option value="opening_inventory">opening_inventory</option><option value="historical_purchase">historical_purchase</option><option value="accounting_adjustment">accounting_adjustment</option><option value="legacy_cost">legacy_cost</option></select></div></div>
+        <div class="row four"><div class="form-group"><label>شروع اثر</label><input id="mcFrom" placeholder="14050101"></div><div class="form-group"><label>پایان اثر (اختیاری)</label><input id="mcTo"></div><div class="form-group"><label>مرجع پیوست</label><input id="mcAttachment" placeholder="شماره سند یا URL داخلی"></div><div class="form-group"><label>علت</label><input id="mcReason"></div></div>
+        <div class="form-group"><label>یادداشت</label><textarea id="mcNotes"></textarea></div><div class="actions"><button class="btn green" id="mcSave">ذخیره Draft</button><button class="btn" id="mcClear">فرم جدید</button></div><div id="mcFormMsg"></div>
+      </div></div>
+      <div class="card"><div class="card-header"><h5>Workflow و Audit</h5></div><div class="card-body"><div id="mcResolutions"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Data Health</h5></div><div class="card-body"><div id="mcHealth"></div></div></div>
+    </main>`);
+    q('#mcApply').onclick=()=>{queuePage=1;refreshAll();};
+    q('#mcExport').onclick=()=>{location.href='/api/accounting/missing-purchase-costs/export?'+queryString({page:'',pageSize:''});};
+    q('#mcClear').onclick=()=>{selectedResolutionId='';selectedResolutionRevision=0;q('#mcResolutionId').textContent='Resolution جدید';['#mcItemCode','#mcItemGuid','#mcCost','#mcFrom','#mcTo','#mcAttachment','#mcReason','#mcNotes'].forEach(id=>{q(id).value='';});};
+    q('#mcSave').onclick=async()=>{
+      const body={revision:selectedResolutionRevision,itemCode:q('#mcItemCode').value,itemGuid:q('#mcItemGuid').value,manualCost:q('#mcCost').value,effectiveFrom:q('#mcFrom').value,effectiveTo:q('#mcTo').value,sourceType:q('#mcSource').value,currency:'IRR',reason:q('#mcReason').value,notes:q('#mcNotes').value,attachment:q('#mcAttachment').value?{reference:q('#mcAttachment').value}:null};
+      try{
+        const response=await json(selectedResolutionId?`/api/manual-cost-resolutions/${encodeURIComponent(selectedResolutionId)}`:'/api/manual-cost-resolutions',{method:selectedResolutionId?'PUT':'POST',body:JSON.stringify(body)});
+        selectedResolutionId=response.resolution.resolutionId;selectedResolutionRevision=Number(response.resolution.revision||1);q('#mcResolutionId').textContent=`ویرایش ${selectedResolutionId}`;
+        q('#mcFormMsg').innerHTML='<div class="success">Draft با Audit ذخیره شد.</div>';await refreshAll();
+      }catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+    };
+    await refreshAll();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='رفع هزینه خرید نامشخص';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageManualCostResolution();
+    return inheritedRoute.apply(this,arguments);
+  };
   try{renderMenu();}catch{}
 })();

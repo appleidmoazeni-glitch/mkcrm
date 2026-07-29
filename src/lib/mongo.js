@@ -20,7 +20,7 @@ async function initMongo() {
   const database = await connectMongo();
   const collections = await database.listCollections().toArray();
   const existing = new Set(collections.map(c => c.name));
-  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','purchaseLayerDatasets','purchaseLayerDatasetState','purchaseLayerDiagnostics','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','saleSnapshotState','appJobs'];
+  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','purchaseLayerDatasets','purchaseLayerDatasetState','purchaseLayerDiagnostics','manualCostResolutions','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','saleSnapshotState','appJobs'];
   for (const name of needed) if (!existing.has(name)) await database.createCollection(name);
   await database.collection('settings').createIndex({ key: 1 }, { unique: true });
   await database.collection('customers').createIndex({ mobile: 1 });
@@ -75,6 +75,10 @@ async function initMongo() {
   await database.collection('saleInvoiceLines').createIndex({ itemCode: 1, saleDate: 1 });
   await database.collection('saleSnapshotDiagnostics').createIndex({ snapshotId: 1, at: -1 });
   await database.collection('saleSnapshotState').createIndex({ scopeKey: 1 }, { unique: true });
+  await database.collection('manualCostResolutions').createIndex({ resolutionId: 1 }, { unique: true });
+  await database.collection('manualCostResolutions').createIndex({ itemGuid: 1, status: 1, effectiveFrom: 1, effectiveTo: 1 });
+  await database.collection('manualCostResolutions').createIndex({ itemCode: 1, status: 1, effectiveFrom: 1, effectiveTo: 1 });
+  await database.collection('manualCostResolutions').createIndex({ status: 1, updatedAt: -1 });
 
 
   await database.collection('purchaseDrafts').createIndex({ purchaseDraftNo: 1 }, { unique: true });
@@ -101,7 +105,7 @@ async function initMongo() {
     'shaygan.connectionName': 'SampleConnection',
     'shaygan.activeFiscalYear': '1404'
   };
-  const roles = [{code:'admin',title:'مدیر سیستم'},{code:'seller',title:'فروشنده'},{code:'accounting',title:'حسابداری'},{code:'warehouse',title:'انبار'},{code:'purchase',title:'بازرگانی'},{code:'seller_buyer',title:'فروشنده-خریدار'}];
+  const roles = [{code:'admin',title:'مدیر سیستم'},{code:'manager',title:'مدیر'},{code:'seller',title:'فروشنده'},{code:'accounting',title:'حسابداری'},{code:'warehouse',title:'انبار'},{code:'purchase',title:'بازرگانی'},{code:'seller_buyer',title:'فروشنده-خریدار'}];
   for (const r of roles) await database.collection('roles').updateOne({code:r.code}, {$setOnInsert:{...r, createdAt:new Date()}}, {upsert:true});
   await database.collection('users').updateOne({ username:'admin' }, { $setOnInsert: { username:'admin', password:'admin', fullName:'مدیر سیستم', role:'admin', isActive:true, createdAt:new Date() } }, { upsert:true });
   const sellerSeeds = [
