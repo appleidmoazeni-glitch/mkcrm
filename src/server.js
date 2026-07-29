@@ -11,6 +11,7 @@ const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
 const manualCostResolution = require('./lib/manual-cost-resolution');
+const fifoShadowEngine = require('./lib/fifo-shadow-engine');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -28,6 +29,7 @@ const { JobStatus } = require('../dist/core/jobs/JobStatus');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
 const { PurchaseLayerDatasetJob } = require('../dist/jobs/PurchaseLayerDatasetJob');
+const { FifoShadowJob } = require('../dist/jobs/FifoShadowJob');
 const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
 const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
@@ -43,6 +45,9 @@ const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
 const purchaseLayerJobRegistry = new JobRegistry();
 purchaseLayerJobRegistry.register({ name:'purchase-layer-dataset', version:1, factory:input=>new PurchaseLayerDatasetJob(input) });
 const purchaseLayerJobManager = new JobManager(purchaseLayerJobRegistry);
+const fifoShadowJobRegistry = new JobRegistry();
+fifoShadowJobRegistry.register({ name:'fifo-shadow', version:1, factory:input=>new FifoShadowJob(input) });
+const fifoShadowJobManager = new JobManager(fifoShadowJobRegistry);
 const inventorySyncJobRegistry=new JobRegistry();
 inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
 const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
@@ -227,6 +232,39 @@ function startPurchaseLayerBackgroundJob({db,jobId,request}){
     const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;
     const cancelled=snapshot.status===JobStatus.Cancelled;
     const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};
+    if(serviceResult)update.result=serviceResult;
+    return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
+  }).catch(()=>clearInterval(timer));
+  return handle;
+}
+
+function startFifoShadowBackgroundJob({db,jobId,request,requestedBy}){
+  let serviceResult=null;
+  const handle=fifoShadowJobManager.start('fifo-shadow',{
+    db,request,requestedBy,service:fifoShadowEngine,onResult:result=>{serviceResult=result;}
+  });
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{
+    status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt
+  }}).catch(()=>{});
+  const timer=setInterval(()=>{
+    const snapshot=handle.snapshot();
+    db.collection('appJobs').updateOne({jobId},{$set:{
+      heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress
+    }}).catch(()=>{});
+  },15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{
+    clearInterval(timer);
+    await runningUpdate;
+    const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;
+    const cancelled=snapshot.status===JobStatus.Cancelled;
+    const update={
+      status:completed?'completed':(cancelled?'cancelled':'failed'),
+      phase:completed?'done':snapshot.progress.phase,
+      finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,
+      error:snapshot.error?.message||serviceResult?.error||''
+    };
     if(serviceResult)update.result=serviceResult;
     return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
   }).catch(()=>clearInterval(timer));
@@ -653,11 +691,11 @@ async function getActiveWarehouseNumbersFromDb() {
 const ROLE_PERMISSIONS = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','reports','app-logs','tablo'],
+  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
@@ -3193,6 +3231,8 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/sale-snapshot/start': 'sale-snapshot.start',
     'POST /api/sale-snapshot/resume': 'sale-snapshot.resume',
     'POST /api/manual-cost-resolutions': 'manual-cost-resolutions.create',
+    'POST /api/accounting/fifo-shadow/start': 'fifo-shadow.start',
+    'POST /api/accounting/fifo-shadow/resume': 'fifo-shadow.resume',
     'POST /api/supplier-sleep/init': 'supplier-sleep.init',
     'POST /api/supplier-sleep/sync-purchases': 'supplier-sleep.sync-purchases',
     'POST /api/supplier-sleep/supplier-index': 'supplier-sleep.supplier-index',
@@ -3638,6 +3678,110 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.dataHealth(db));
+    }
+
+    // 0.9.19.66: isolated accounting FIFO ledger in SHADOW MODE only.
+    // It reads immutable Sale Snapshot, Purchase Layer and approved Manual Cost sources.
+    // It never writes those sources and never activates profit, ROI or commission.
+    if (pathname === '/api/accounting/fifo-shadow/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      await fifoShadowEngine.ensureIndexes(db);
+      return sendJson(res,200,{
+        ok:true,
+        version:APP_VERSION,
+        algorithmVersion:fifoShadowEngine.ALGORITHM_VERSION,
+        collections:[
+          fifoShadowEngine.DATASETS,
+          fifoShadowEngine.ALLOCATIONS,
+          fifoShadowEngine.DIAGNOSTICS,
+          fifoShadowEngine.EXCEPTIONS,
+          fifoShadowEngine.STATE
+        ],
+        shadowMode:true,
+        accountingApproved:false,
+        profitActivationAllowed:false
+      });
+    }
+    if ((pathname === '/api/accounting/fifo-shadow/start' || pathname === '/api/accounting/fifo-shadow/resume') && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      let dates;
+      try {
+        dates=normalizeJalaliRange({dateFrom:body.dateFrom||query.dateFrom||'',dateTo:body.dateTo||query.dateTo||''});
+      } catch(error) {
+        return sendJalaliDateValidationError(res,error);
+      }
+      const resumeDatasetId=String(
+        body.resumeDatasetId||query.resumeDatasetId||
+        (pathname.endsWith('/resume')?body.datasetId||query.datasetId:'')||''
+      ).trim();
+      const request={
+        dateFrom:dates.dateFrom,
+        dateTo:dates.dateTo,
+        resumeDatasetId,
+        saleSnapshotId:String(body.saleSnapshotId||query.saleSnapshotId||'').trim(),
+        purchaseDatasetId:String(body.purchaseDatasetId||query.purchaseDatasetId||'').trim(),
+        maxAttempts:Math.max(1,Math.min(Number(body.maxAttempts||query.maxAttempts||3),5))
+      };
+      const db=await connectMongo();
+      if(fifoShadowJobManager.isRunning('fifo-shadow')){
+        const running=fifoShadowJobManager.getRunning('fifo-shadow');
+        return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'FIFO Shadow job is already running',jobId:running?.id||''});
+      }
+      const cutoff=new Date(Date.now()-15*60*1000);
+      const recentLock=await db.collection('appJobs').findOne({
+        type:'fifo-shadow',
+        status:{$in:['queued','running']},
+        updatedAt:{$gte:cutoff}
+      },{sort:{updatedAt:-1}});
+      if(recentLock)return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'FIFO Shadow job is already running',jobId:recentLock.jobId||''});
+      const jobId=`JOB-FIFO-SHADOW-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const now=new Date();
+      const requestedBy=currentUser(req);
+      await db.collection('appJobs').updateOne({jobId},{$set:{
+        jobId,type:'fifo-shadow',status:'queued',phase:'pending',createdAt:now,updatedAt:now,request,
+        requestedBy:{username:requestedBy.username||'',role:requestedBy.role||''}
+      }},{upsert:true});
+      try {
+        startFifoShadowBackgroundJob({db,jobId,request,requestedBy});
+      } catch(error) {
+        await db.collection('appJobs').updateOne({jobId},{$set:{
+          status:'failed',finishedAt:new Date(),updatedAt:new Date(),error:String(error.message||error)
+        }}).catch(()=>{});
+        if(error?.code==='JOB_LOCKED')return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:error.message,jobId});
+        throw error;
+      }
+      return sendJson(res,200,{
+        ok:true,jobId,status:'queued',type:'fifo-shadow',shadowMode:true,
+        accountingApproved:false,profitActivationAllowed:false
+      });
+    }
+    if (pathname === '/api/accounting/fifo-shadow/datasets' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.listDatasets(db,Number(query.limit||20)));
+    }
+    if (pathname === '/api/accounting/fifo-shadow/status' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.status(db,query.datasetId||''));
+    }
+    if (pathname === '/api/accounting/fifo-shadow/report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.validationReport(db,query.datasetId||''));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-shadow/allocations' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.listAllocations(db,query));
+    }
+    if (pathname === '/api/accounting/fifo-shadow/exceptions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.listExceptions(db,query));
     }
 
     // 0.9.19.64: isolated, versioned purchase-layer foundation. No FIFO/profit is activated here.

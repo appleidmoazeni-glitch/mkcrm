@@ -19,11 +19,11 @@ document.addEventListener('DOMContentLoaded',loadBackendVersion,{once:true});
 const ROLE_PAGES = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','reports'],
+  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
   purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function userRole(){return (state.user&&state.user.role)||'guest'}
@@ -123,6 +123,173 @@ const uiPageLifecycle=(()=>{
   function add(cleanup){if(typeof cleanup==='function')cleanups.push(cleanup);return cleanup}
   function cleanup(){const pending=cleanups;cleanups=[];pending.reverse().forEach(fn=>{try{fn()}catch{}})}
   return {add,cleanup};
+})();
+
+/* 0.9.19.66 FIFO Shadow Validation.
+   This page reads and writes only isolated FIFO shadow collections.
+   Profit, ROI, commission and accounting approval remain disabled. */
+(()=>{
+  const PAGE='fifo-shadow-validation';
+  const q=selector=>document.querySelector(selector);
+  let selectedDatasetId='';
+  function safe(value){return esc(value==null?'':String(value));}
+  function number(value){
+    const n=Number(value);
+    return Number.isFinite(n)?n.toLocaleString('fa-IR',{maximumFractionDigits:2}):'—';
+  }
+  function pct(value){return `${number(value||0)}٪`;}
+  function query(parameters={}){
+    return new URLSearchParams(Object.entries(parameters).filter(([,value])=>value!==''&&value!=null)).toString();
+  }
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){
+      const error=new Error(payload.error||response.statusText);
+      error.code=payload.code||'';
+      throw error;
+    }
+    return payload;
+  }
+  async function waitForJob(jobId){
+    const deadline=Date.now()+30*60*1000;
+    while(Date.now()<deadline){
+      const response=await json('/api/jobs/status?'+query({jobId}));
+      const job=response.job;
+      q('#fifoJob').innerHTML=`<div class="info">Job: ${safe(jobId)} | ${safe(job?.status||'queued')} | ${safe(job?.phase||'')} ${job?.progress?.percent!=null?`| ${number(job.progress.percent)}٪`:''}</div>`;
+      if(['completed','failed','cancelled'].includes(job?.status)){
+        if(job.status!=='completed')throw new Error(job.error||`FIFO Shadow ${job.status}`);
+        return job;
+      }
+      await new Promise(resolve=>setTimeout(resolve,1500));
+    }
+    throw new Error('مهلت انتظار FIFO Shadow به پایان رسید؛ وضعیت Job را بررسی کنید.');
+  }
+  function coverageCards(summary={}){
+    return [
+      ['Official',summary.official?.quantityPercent,summary.official?.quantity],
+      ['Manual',summary.manual?.quantityPercent,summary.manual?.quantity],
+      ['Unknown',summary.unknown?.quantityPercent,summary.unknown?.quantity]
+    ].map(([label,percent,quantity])=>`<div class="info"><b>${safe(label)}</b><br>${pct(percent)}<br>${number(quantity)} واحد</div>`).join('');
+  }
+  function reconciliationTable(validation={}){
+    const checks=[
+      ['Allocated + Unknown = Sold',validation.allocatedPlusUnknownEqualsSold],
+      ['Duplicate Allocation',Number(validation.duplicateAllocationCount||0)===0],
+      ['Layer Over-consumption',Number(validation.layerOverConsumptionCount||0)===0],
+      ['Orphan Layer',Number(validation.orphanLayerCount||0)===0],
+      ['Negative Remaining',Number(validation.negativeRemainingCount||0)===0],
+      ['Inactive Source',Number(validation.inactiveSourceCount||0)===0]
+    ];
+    return `<table class="table"><thead><tr><th>کنترل</th><th>نتیجه</th></tr></thead><tbody>${checks.map(([label,ok])=>`<tr><td>${safe(label)}</td><td>${ok?'<span class="success">PASS</span>':'<span class="error">FAIL</span>'}</td></tr>`).join('')}</tbody></table>`;
+  }
+  async function loadDatasets(){
+    const response=await json('/api/accounting/fifo-shadow/datasets?limit=30');
+    const list=response.list||[];
+    if(!selectedDatasetId)selectedDatasetId=response.activeDatasetId||list[0]?.datasetId||'';
+    q('#fifoDatasets').innerHTML=`<table class="table"><thead><tr><th>Dataset</th><th>Status</th><th>Sources</th><th>Allocation</th><th>Confidence</th><th>Build</th><th></th></tr></thead><tbody>${list.map(row=>`<tr>
+      <td><small>${safe(row.datasetId)}</small>${row.isActive?'<br><span class="success">ACTIVE SHADOW</span>':''}</td>
+      <td>${safe(row.status)} / ${safe(row.activationStatus)}</td>
+      <td><small>Sale: ${safe(row.sourceSaleSnapshotId)}<br>Purchase: ${safe(row.sourcePurchaseDatasetId)}</small></td>
+      <td>${number(row.allocationCount)}</td><td>${number(row.summary?.confidenceScore)} — ${safe(row.summary?.confidence)}</td>
+      <td>${number(row.performance?.durationMs)} ms</td>
+      <td><button class="mini fifo-select" data-id="${safe(row.datasetId)}">مشاهده</button>${['failed','cancelled','completed_with_errors'].includes(row.status)&&['admin','accounting'].includes(userRole())?` <button class="mini fifo-resume" data-id="${safe(row.datasetId)}">Resume</button>`:''}</td>
+    </tr>`).join('')||'<tr><td colspan="7">Dataset ساخته نشده است.</td></tr>'}</tbody></table>`;
+    document.querySelectorAll('.fifo-select').forEach(button=>button.onclick=async()=>{selectedDatasetId=button.dataset.id;await loadReport();});
+    document.querySelectorAll('.fifo-resume').forEach(button=>button.onclick=()=>startBuild(button.dataset.id));
+  }
+  async function loadReport(){
+    const box=q('#fifoReport');if(!box)return;
+    if(!selectedDatasetId){box.innerHTML='<div class="info">FIFO Shadow Dataset موجود نیست.</div>';return;}
+    try{
+      const report=await json('/api/accounting/fifo-shadow/report?'+query({datasetId:selectedDatasetId}));
+      const dataset=report.dataset||{}, summary=dataset.summary||{}, business=report.businessValidation||{};
+      box.innerHTML=`
+        <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>هیچ سود، ROI یا پورسانتی از این Dataset فعال نیست.</div>
+        <div class="row four">
+          <div class="info"><b>Dataset</b><br><small>${safe(dataset.datasetId)}</small><br>${safe(dataset.status)} / ${safe(dataset.activationStatus)}</div>
+          <div class="info"><b>Coverage</b><br>${coverageCards(summary)}</div>
+          <div class="info"><b>Confidence</b><br>${number(report.confidence?.score)} / 100<br>${safe(report.confidence?.classification)}</div>
+          <div class="info"><b>Unknown Value</b><br>${number(summary.unknown?.saleValue)} ریال<br>${number(summary.unknown?.quantity)} واحد</div>
+        </div>
+        <div class="card"><div class="card-header"><h5>Reconciliation</h5></div><div class="card-body">${reconciliationTable(report.reconciliation)}</div></div>
+        <div class="card"><div class="card-header"><h5>Top Exceptions</h5></div><div class="card-body"><table class="table"><thead><tr><th>Code</th><th>Status</th><th>Item</th><th>Sale / Layer</th><th>Reason</th></tr></thead><tbody>${(report.topExceptions||[]).map(row=>`<tr><td>${safe(row.code)}</td><td>${safe(row.status)}</td><td>${safe(row.itemCode)}</td><td><small>${safe(row.saleLineId||row.purchaseLineIdentity||row.saleReturnLineId)}</small></td><td>${safe(row.reason)}</td></tr>`).join('')||'<tr><td colspan="5">Exception unresolved وجود ندارد.</td></tr>'}</tbody></table></div></div>
+        <div class="card"><div class="card-header"><h5>Business Validation Samples</h5></div><div class="card-body">
+          <h5>Top 10 Invoice by Value</h5><table class="table"><thead><tr><th>Invoice</th><th>Date</th><th>Lines</th><th>Sale Value</th><th>Allocated</th><th>Unknown</th></tr></thead><tbody>${(business.topInvoicesByValue||[]).map(row=>`<tr><td>${safe(row.saleInvoiceNo)}</td><td>${safe(row.saleDate)}</td><td>${number(row.lineCount)}</td><td>${number(row.saleValue)}</td><td>${number(row.allocatedQuantity)}</td><td>${number(row.unknownQuantity)}</td></tr>`).join('')}</tbody></table>
+          <h5>Top Unresolved Items</h5><table class="table"><thead><tr><th>Item</th><th>Description</th><th>Sold</th><th>Unknown</th><th>Sale Value</th></tr></thead><tbody>${(business.topUnresolvedItems||[]).map(row=>`<tr><td>${safe(row.itemCode)}</td><td>${safe(row.itemDescription)}</td><td>${number(row.soldQuantity)}</td><td>${number(row.unknownQuantity)}</td><td>${number(row.saleValue)}</td></tr>`).join('')}</tbody></table>
+          <h5>Purchase Returns</h5><div class="info">کل: ${number(summary.purchaseReturns?.total)} | unresolved: ${number(summary.purchaseReturns?.unresolved)}</div>
+        </div></div>
+        <div class="card"><div class="card-header"><h5>Allocation Drill-down</h5></div><div class="card-body">
+          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Official</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
+          <div id="fifoAllocations"></div>
+        </div></div>
+        <div class="info">Build: ${number(dataset.performance?.durationMs)} ms | Mongo read: ${number(dataset.performance?.mongoReadMs)} ms | Allocate: ${number(dataset.performance?.allocationMs)} ms | Mongo write: ${number(dataset.performance?.mongoWriteMs)} ms | Peak observed heap: ${number((dataset.performance?.peakObservedHeapBytes||0)/1024/1024)} MiB</div>`;
+      q('#fifoDrill').onclick=loadAllocations;
+      await loadAllocations();
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadAllocations(){
+    const box=q('#fifoAllocations');if(!box)return;
+    const response=await json('/api/accounting/fifo-shadow/allocations?'+query({
+      datasetId:selectedDatasetId,
+      invoiceNo:q('#fifoInvoice')?.value||'',
+      itemCode:q('#fifoItem')?.value||'',
+      sourceType:q('#fifoSource')?.value||'',
+      pageSize:200
+    }));
+    box.innerHTML=`<div class="small">Rows: ${number(response.total)}</div><table class="table"><thead><tr><th>Sale</th><th>Item</th><th>Qty</th><th>Source</th><th>Purchase / Manual</th><th>Unit Cost</th><th>Layer Remaining</th><th>Reason</th></tr></thead><tbody>${(response.list||[]).map(row=>`<tr>
+      <td>${safe(row.saleInvoiceNo)} / ${safe(row.saleDate)}<br><small>${safe(row.saleLineId)}</small></td>
+      <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
+      <td>${number(row.allocatedQty||row.unknownQty)}</td><td>${safe(row.sourceType)}</td>
+      <td><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small></td>
+      <td>${row.unitCost==null?'UNKNOWN':number(row.unitCost)}</td><td>${row.layerRemainingQuantity==null?'—':number(row.layerRemainingQuantity)}</td><td>${safe(row.unknownReason)}</td>
+    </tr>`).join('')||'<tr><td colspan="8">رکوردی وجود ندارد.</td></tr>'}</tbody></table>`;
+  }
+  async function startBuild(resumeDatasetId=''){
+    const message=q('#fifoJob');message.innerHTML='<div class="info">در حال ثبت Job...</div>';
+    try{
+      const body={
+        dateFrom:q('#fifoFrom').value.trim(),
+        dateTo:q('#fifoTo').value.trim(),
+        resumeDatasetId
+      };
+      const endpoint=resumeDatasetId?'/api/accounting/fifo-shadow/resume':'/api/accounting/fifo-shadow/start';
+      const response=await json(endpoint,{method:'POST',body:JSON.stringify(body)});
+      await waitForJob(response.jobId);
+      message.innerHTML='<div class="success">FIFO Shadow با موفقیت کامل شد.</div>';
+      selectedDatasetId='';
+      await loadDatasets();
+      await loadReport();
+    }catch(error){message.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  window.pageFifoShadowValidation=async function(){
+    setPage('FIFO Shadow Validation',`<main class="main-content">
+      <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>این ماژول فقط Ledger ایزوله می‌سازد. Profit، ROI و Commission غیرفعال‌اند.</div>
+      ${['admin','accounting'].includes(userRole())?`<div class="card"><div class="card-header"><h5>Build Shadow Dataset</h5></div><div class="card-body"><div class="row four"><div class="form-group"><label>از تاریخ شمسی</label><input id="fifoFrom" placeholder="14050101"></div><div class="form-group"><label>تا تاریخ شمسی</label><input id="fifoTo" placeholder="14051229"></div><div class="form-group"><label>&nbsp;</label><button class="btn green" id="fifoStart">ساخت FIFO Shadow</button></div><div class="form-group"><label>&nbsp;</label><span class="small">Official → Approved Manual → Unknown</span></div></div><div id="fifoJob"></div></div></div>`:'<div id="fifoJob"></div>'}
+      <div class="card"><div class="card-header"><h5>Datasets</h5></div><div class="card-body"><div id="fifoDatasets"></div></div></div>
+      <div id="fifoReport"></div>
+    </main>`);
+    if(q('#fifoStart'))q('#fifoStart').onclick=()=>startBuild('');
+    await loadDatasets();
+    await loadReport();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='FIFO Shadow Validation';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageFifoShadowValidation();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
 })();
 
 /* Admin backup + deterministic turnover/document/Kardex workflows. */
