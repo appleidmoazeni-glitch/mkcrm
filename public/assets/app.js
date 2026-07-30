@@ -156,10 +156,10 @@ const uiPageLifecycle=(()=>{
         <div class="info"><b>Gate</b><br>${safe(base.gateStatus)}<br>Accounting approved: NO</div>
         <div class="info"><b>Confidence</b><br>${num(base.confidenceIndex)} / 100<br>Review coverage ${pct(base.accountingReviewCoverage)}</div>
         <div class="info"><b>Unknown Sale Value</b><br>${num(base.actualUnknownSaleValue)} IRR<br>Actual only</div>
-        <div class="info"><b>Projected Recoverable</b><br>${num(projected.recoverableUnknownValue)} IRR<br>Not approved</div>
+        <div class="info"><b>P0 Under Review</b><br>${num(projected.p0ValueUnderReview)} IRR<br>Recoverable: ${num(projected.recoverableUnknownValue)} IRR</div>
       </div>
       ${table(['Metric','Actual approved','Projected / candidate'],[
-        ['Official/Manual coverage',`${pct(base.saleValueCostCoverage)} / ${pct(base.approvedManualCoverage)}`,pct(projected.saleValueCoverageAfterHumanActions)],
+        ['Official/Manual coverage',`${pct(base.saleValueCostCoverage)} / ${pct(base.approvedManualCoverage)}`,pct(projected.saleValueCoverageAfterApprovedCandidateRecovery)],
         ['Return linkage',pct(base.returnLinkageCoverage),`${num(projected.returnLinkageCandidateCount)} cases / ${pct(projected.returnLinkagePotentialPercent)}`],
         ['Recovery candidates',num(actual.recoveryCandidates),num(projected.recoveryCandidates)],
         ['Identity resolutions',num(actual.identityResolutions),num(projected.identityCandidates)],

@@ -945,11 +945,12 @@ async function impactReport(db) {
     db.collection(BATCHES).find({sourceFifoDatasetId:context.fifo.datasetId}).toArray()
   ]);
   const projectedClassifications=new Set([
-    'official_evidence_found','official_layer_rebuild_candidate','item_identity_repair_candidate',
-    'manual_cost_evidence_found','purchase_return_dependency','sale_return_dependency'
+    'official_evidence_found','official_layer_rebuild_candidate',
+    'item_identity_repair_candidate','manual_cost_evidence_found'
   ]);
   const projectedRows=investigations.filter(row=>projectedClassifications.has(row.systemClassification));
   const projectedRecoverableValue=round(projectedRows.reduce((sum,row)=>sum+finite(row.affectedSaleValue),0),2);
+  const p0ValueUnderReview=round(investigations.reduce((sum,row)=>sum+finite(row.affectedSaleValue),0),2);
   const totalSaleValue=finite(base.confidence?.totals?.saleValueExact);
   const currentCoveredValue=totalSaleValue-finite(base.evidence?.affectedSaleValue);
   const linkedPotential=returns.filter(row=>['deterministic','high_confidence'].includes(row.confidenceBand)).length;
@@ -974,8 +975,9 @@ async function impactReport(db) {
     },
     actualApproved,
     projected:{
+      p0ValueUnderReview,
       recoverableUnknownValue:projectedRecoverableValue,
-      saleValueCoverageAfterHumanActions:percentage(currentCoveredValue+projectedRecoverableValue,totalSaleValue),
+      saleValueCoverageAfterApprovedCandidateRecovery:percentage(currentCoveredValue+projectedRecoverableValue,totalSaleValue),
       returnLinkageCandidateCount:linkedPotential,
       returnLinkagePotentialPercent:percentage(linkedPotential,returns.length),
       recoveryCandidates:recovery.length,identityCandidates:identities.length,

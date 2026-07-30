@@ -224,7 +224,8 @@ test('impact report separates actual approvals from projected candidates and pre
   const report=await operational.impactReport(db);
   assert.equal(report.actualApproved.recoveryCandidates,0);
   assert.equal(report.actualApproved.returnLinks,0);
-  assert.ok(report.projected.recoverableUnknownValue>0);
+  assert.ok(report.projected.p0ValueUnderReview>0);
+  assert.equal(report.projected.recoverableUnknownValue,6500);
   assert.equal(report.gate.thresholds.unknownSaleValueMaximumPercent,5);
   assert.equal(report.gate.thresholds.returnLinkageMinimumPercent,95);
   assert.equal(report.gate.thresholds.accountingSampleMinimumReviewed,30);
