@@ -119,18 +119,22 @@ async function ensureIndexes(db) {
   await db.collection(INVESTIGATIONS).createIndex({ systemClassification:1, reviewStatus:1, assignedTo:1 });
   await db.collection(RECOVERY).createIndex({ candidateId:1 }, { unique:true });
   await db.collection(RECOVERY).createIndex({ sourceFifoDatasetId:1, purchaseLineIdentity:1 }, { unique:true });
+  await db.collection(RECOVERY).createIndex({ sourceFifoDatasetId:1, confidence:-1, purchaseDate:1 });
   await db.collection(RECOVERY).createIndex({ status:1, confidence:-1, purchaseDate:1 });
   await db.collection(IDENTITIES).createIndex({ resolutionId:1 }, { unique:true });
   await db.collection(IDENTITIES).createIndex(
     { sourceFifoDatasetId:1, sourceItemCode:1, targetItemCode:1, targetItemGuid:1 },
     { unique:true }
   );
+  await db.collection(IDENTITIES).createIndex({ sourceFifoDatasetId:1, confidence:-1, sourceItemCode:1 });
   await db.collection(IDENTITIES).createIndex({ status:1, confidence:-1, sourceItemCode:1 });
   await db.collection(RETURN_CASES).createIndex({ caseId:1 }, { unique:true });
   await db.collection(RETURN_CASES).createIndex({ kind:1, resolutionId:1 }, { unique:true });
+  await db.collection(RETURN_CASES).createIndex({ sourceFifoDatasetId:1, kind:1, financialImpact:-1, confidence:-1 });
   await db.collection(RETURN_CASES).createIndex({ kind:1, confidenceBand:1, financialImpact:-1 });
   await db.collection(MANUAL_PACKAGES).createIndex({ packageId:1 }, { unique:true });
   await db.collection(MANUAL_PACKAGES).createIndex({ sourceFifoDatasetId:1, evidenceId:1 }, { unique:true });
+  await db.collection(MANUAL_PACKAGES).createIndex({ sourceFifoDatasetId:1, status:1, projectedCoverageImprovement:-1 });
   await db.collection(MANUAL_PACKAGES).createIndex({ status:1, projectedCoverageImprovement:-1 });
   await db.collection(BATCHES).createIndex({ batchId:1 }, { unique:true });
   await db.collection(BATCHES).createIndex({ sourceFifoDatasetId:1, batchKey:1 }, { unique:true });

@@ -99,12 +99,16 @@ async function initMongo() {
   await database.collection('accountingEvidenceInvestigations').createIndex({ sourceFifoDatasetId:1, priority:1, affectedSaleValue:-1 });
   await database.collection('purchaseLayerRecoveryCandidates').createIndex({ candidateId:1 }, { unique:true });
   await database.collection('purchaseLayerRecoveryCandidates').createIndex({ sourceFifoDatasetId:1, purchaseLineIdentity:1 }, { unique:true });
+  await database.collection('purchaseLayerRecoveryCandidates').createIndex({ sourceFifoDatasetId:1, confidence:-1, purchaseDate:1 });
   await database.collection('accountingItemIdentityResolutions').createIndex({ resolutionId:1 }, { unique:true });
   await database.collection('accountingItemIdentityResolutions').createIndex({ sourceFifoDatasetId:1, sourceItemCode:1, targetItemCode:1, targetItemGuid:1 }, { unique:true });
+  await database.collection('accountingItemIdentityResolutions').createIndex({ sourceFifoDatasetId:1, confidence:-1, sourceItemCode:1 });
   await database.collection('accountingReturnReviewCases').createIndex({ caseId:1 }, { unique:true });
   await database.collection('accountingReturnReviewCases').createIndex({ kind:1, resolutionId:1 }, { unique:true });
+  await database.collection('accountingReturnReviewCases').createIndex({ sourceFifoDatasetId:1, kind:1, financialImpact:-1, confidence:-1 });
   await database.collection('manualCostEvidencePackages').createIndex({ packageId:1 }, { unique:true });
   await database.collection('manualCostEvidencePackages').createIndex({ sourceFifoDatasetId:1, evidenceId:1 }, { unique:true });
+  await database.collection('manualCostEvidencePackages').createIndex({ sourceFifoDatasetId:1, status:1, projectedCoverageImprovement:-1 });
   await database.collection('accountingReviewBatches').createIndex({ batchId:1 }, { unique:true });
   await database.collection('accountingReviewBatches').createIndex({ sourceFifoDatasetId:1, batchKey:1 }, { unique:true });
   await database.collection('fifoDatasets').createIndex({ datasetId: 1 }, { unique: true });
