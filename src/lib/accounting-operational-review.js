@@ -130,6 +130,7 @@ async function ensureIndexes(db) {
   await db.collection(IDENTITIES).createIndex({ status:1, confidence:-1, sourceItemCode:1 });
   await db.collection(RETURN_CASES).createIndex({ caseId:1 }, { unique:true });
   await db.collection(RETURN_CASES).createIndex({ kind:1, resolutionId:1 }, { unique:true });
+  await db.collection(RETURN_CASES).createIndex({ sourceFifoDatasetId:1, financialImpact:-1, confidence:-1 });
   await db.collection(RETURN_CASES).createIndex({ sourceFifoDatasetId:1, kind:1, financialImpact:-1, confidence:-1 });
   await db.collection(RETURN_CASES).createIndex({ kind:1, confidenceBand:1, financialImpact:-1 });
   await db.collection(MANUAL_PACKAGES).createIndex({ packageId:1 }, { unique:true });

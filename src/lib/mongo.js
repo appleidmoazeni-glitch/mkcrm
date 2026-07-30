@@ -105,6 +105,7 @@ async function initMongo() {
   await database.collection('accountingItemIdentityResolutions').createIndex({ sourceFifoDatasetId:1, confidence:-1, sourceItemCode:1 });
   await database.collection('accountingReturnReviewCases').createIndex({ caseId:1 }, { unique:true });
   await database.collection('accountingReturnReviewCases').createIndex({ kind:1, resolutionId:1 }, { unique:true });
+  await database.collection('accountingReturnReviewCases').createIndex({ sourceFifoDatasetId:1, financialImpact:-1, confidence:-1 });
   await database.collection('accountingReturnReviewCases').createIndex({ sourceFifoDatasetId:1, kind:1, financialImpact:-1, confidence:-1 });
   await database.collection('manualCostEvidencePackages').createIndex({ packageId:1 }, { unique:true });
   await database.collection('manualCostEvidencePackages').createIndex({ sourceFifoDatasetId:1, evidenceId:1 }, { unique:true });
