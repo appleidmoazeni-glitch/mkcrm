@@ -382,6 +382,26 @@ test('dataset comparison keeps historical rows and reports material differences'
   assert.equal(db.collection('fifoAllocations').rows.some(row=>row.datasetId==='FIFO-V1'),true);
 });
 
+test('dataset comparison treats equivalent decimal formatting as unchanged', async () => {
+  const db=seedDb();
+  db.collection('fifoDatasets').rows.push({
+    datasetId:'FIFO-V2',status:'completed',activationStatus:'validated-shadow',algorithmVersion:readiness.ALGORITHM_VERSION
+  });
+  db.collection('fifoDatasetState').rows.push({scopeKey:readiness.ALGORITHM_VERSION,activeDatasetId:'FIFO-V2'});
+  const oldRow=db.collection('fifoAllocations').rows.find(row=>row.datasetId==='FIFO-V1');
+  db.collection('fifoAllocations').rows.push({
+    ...oldRow,
+    _id:undefined,
+    datasetId:'FIFO-V2',
+    allocationId:'NEW-EQUIVALENT',
+    unitCostExact:`${oldRow.unitCost}.000000`,
+    allocatedCostAmountExact:Number(oldRow.allocatedCostAmount).toFixed(2)
+  });
+  const result=await readiness.comparison(db);
+  assert.equal(result.counts.changedUnitCosts,0);
+  assert.equal(result.counts.precisionOnlyDifferences,0);
+});
+
 test('route and source contracts deny seller, preserve warnings and contain no Shaygan business write call', () => {
   const root=path.join(__dirname,'..');
   const server=fs.readFileSync(path.join(root,'src/server.js'),'utf8');

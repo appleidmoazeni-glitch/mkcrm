@@ -49,6 +49,13 @@ function exactPercentage(part, total) {
   if (total === 0n) return 0;
   return Number(decimal.divideRounded(part * 10000n, total)) / 100;
 }
+function exactEqual(left, right, scale) {
+  try {
+    return decimal.parse(left, scale) === decimal.parse(right, scale);
+  } catch {
+    return false;
+  }
+}
 function actor(value = {}) {
   return {
     username:clean(value.username || value.user || 'system', 100),
@@ -908,9 +915,17 @@ async function comparison(db, newDatasetId = '', oldDatasetId = '') {
     const kind = !oldRow ? 'new_allocation' : (!newRow ? 'removed_allocation' :
       (oldRow.sourceType !== newRow.sourceType || clean(oldRow.purchaseLineIdentity || oldRow.manualResolutionId) !== clean(newRow.purchaseLineIdentity || newRow.manualResolutionId)
         ? 'changed_source_selection'
-        : (clean(oldRow.unitCostExact || oldRow.unitCost) !== clean(newRow.unitCostExact || newRow.unitCost)
+        : (!exactEqual(
+          oldRow.unitCostExact ?? oldRow.unitCost,
+          newRow.unitCostExact ?? newRow.unitCost,
+          decimal.UNIT_COST_SCALE
+        )
           ? 'changed_unit_cost'
-          : (clean(oldRow.allocatedCostAmountExact || oldRow.allocatedCostAmount) !== clean(newRow.allocatedCostAmountExact || newRow.allocatedCostAmount)
+          : (!exactEqual(
+            oldRow.allocatedCostAmountExact ?? oldRow.allocatedCostAmount,
+            newRow.allocatedCostAmountExact ?? newRow.allocatedCostAmount,
+            decimal.MONEY_SCALE
+          )
             ? 'precision_only_or_changed_value'
             : 'unchanged'))));
     if(kind!=='unchanged')differences.push({key:keyValue,kind,old:oldRow||null,new:newRow||null});
