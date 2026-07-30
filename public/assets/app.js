@@ -5049,3 +5049,29 @@ async function pageSellerProfit(){
   };
   try{renderMenu();}catch{}
 })();
+
+/* Final Phase 5.2.7 registration after the last legacy UI override. */
+(()=>{
+  const PAGE='accounting-fifo-readiness';
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=document.querySelector('#menu');
+    if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');
+    button.className='navbtn';
+    button.dataset.page=PAGE;
+    button.textContent='آمادگی حسابداری FIFO';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFifoReadiness();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
