@@ -148,6 +148,17 @@ test('sale return explicit linkage with excess quantity remains high confidence 
   assert.equal(db.collection('saleReturnResolutions').rows[0].status,'unresolved');
 });
 
+test('sale return is deterministic only when one exact compatible candidate exists',async()=>{
+  const db=seedDb();
+  db.collection('saleReturnResolutions').rows[0].returnQuantity=1;
+  db.collection('saleSnapshotDatasetLines').rows.find(row=>row.saleInvoiceType===6).qty=1;
+  await operational.synchronize(db,admin);
+  const row=db.collection(operational.RETURN_CASES).rows.find(value=>value.kind==='sale');
+  assert.equal(row.deterministicCandidateCount,1);
+  assert.equal(row.confidenceBand,'deterministic');
+  assert.ok(row.confidence<=100);
+});
+
 test('manual cost evidence package rejects missing amount and accepts only an explicit documented draft',async()=>{
   const db=seedDb();await operational.synchronize(db,admin);
   await assert.rejects(

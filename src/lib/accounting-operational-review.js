@@ -499,7 +499,13 @@ function saleCandidateScore(resolution, returnLine, sale) {
   const saleDate = canonicalDate(sale.saleDate);
   const dateConsistent = !returnDate || !saleDate || saleDate <= returnDate;
   if (dateConsistent) { score += 5; reasons.push('sale-before-return'); }
-  return { score, reasons, compatibleQuantity, dateConsistent, deterministic:reasons.includes('explicit-document-reference') && (guidMatch || codeMatch) && compatibleQuantity };
+  return {
+    score:Math.min(100,score),
+    reasons,
+    compatibleQuantity,
+    dateConsistent,
+    deterministic:reasons.includes('explicit-document-reference') && (guidMatch || codeMatch) && compatibleQuantity
+  };
 }
 
 function confidenceBand(candidate) {
@@ -592,7 +598,12 @@ async function syncReturnCases(db, context, by) {
     }
     candidates.sort((a,b)=>b.score-a.score || Number(b.allocatedCostExact)-Number(a.allocatedCostExact));
     const best = candidates[0] || null;
-    const band = confidenceBand(best);
+    const deterministicCandidateCount = candidates.filter(candidate=>candidate.deterministic).length;
+    const band = best?.deterministic && deterministicCandidateCount === 1
+      ? 'deterministic'
+      : best?.deterministic
+        ? 'high_confidence'
+        : confidenceBand(best);
     result.sale.bands[band] = (result.sale.bands[band] || 0) + 1;
     const caseId = deterministicId('ARETURN', `sale|${resolution.resolutionId}`);
     const proposal = best ? {
@@ -612,14 +623,16 @@ async function syncReturnCases(db, context, by) {
         returnLineIdentity:resolution.returnLineIdentity, itemGuid:resolution.itemGuid,
         itemCode:resolution.itemCode, returnQuantity:resolution.returnQuantity,
         returnDate:resolution.returnDate, confidenceBand:band, confidence:best?.score || 0,
-        confidenceReasons:best?.reasons || [], candidates:candidates.slice(0, 20),
+        confidenceReasons:best?.reasons || [], deterministicCandidateCount,
+        candidates:candidates.slice(0, 20),
         proposedLink:best?.originalSaleLineId || '', reversalProposal:proposal,
         financialImpact:finite(best?.proposedReversedCostExact),
         reviewStatus:'prepared', assignedTo:'', accountingNotes:'', createdBy:actor(by)
       },
       { candidates:candidates.slice(0,20), proposedLink:best?.originalSaleLineId || '',
         reversalProposal:proposal, confidenceBand:band, confidence:best?.score || 0,
-        confidenceReasons:best?.reasons || [], financialImpact:finite(best?.proposedReversedCostExact) },
+        confidenceReasons:best?.reasons || [], deterministicCandidateCount,
+        financialImpact:finite(best?.proposedReversedCostExact) },
       by, 'sale-return-review-case'
     );
   }
