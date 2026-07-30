@@ -12,6 +12,7 @@ const purchaseSleep = require('./lib/purchase-sleep');
 const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
 const manualCostResolution = require('./lib/manual-cost-resolution');
 const fifoShadowEngine = require('./lib/fifo-shadow-engine');
+const accountingEvidenceConfidence = require('./lib/accounting-evidence-confidence');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -691,11 +692,11 @@ async function getActiveWarehouseNumbersFromDb() {
 const ROLE_PERMISSIONS = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports','app-logs','tablo'],
+  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
@@ -3678,6 +3679,76 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.dataHealth(db));
+    }
+
+    // 0.9.19.67: evidence, return linkage, precision and approval-gate diagnostics.
+    // All writes are isolated to Phase-owned audit collections. Official sources,
+    // Profit, ROI, Commission and Shaygan business documents remain untouched.
+    if (pathname === '/api/accounting/fifo-readiness/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.ensureIndexes(db));
+    }
+    if (pathname === '/api/accounting/fifo-readiness/synchronize' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.synchronize(db,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_EVIDENCE_SYNC_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/evidence' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listEvidence(db,query));
+    }
+    const evidenceMatch=pathname.match(/^\/api\/accounting\/evidence\/([^/]+)$/);
+    if (evidenceMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.transitionEvidence(db,decodeURIComponent(evidenceMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_EVIDENCE_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/purchase-return-resolutions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listReturnResolutions(db,'purchase',query));
+    }
+    if (pathname === '/api/accounting/sale-return-resolutions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listReturnResolutions(db,'sale',query));
+    }
+    const returnResolutionMatch=pathname.match(/^\/api\/accounting\/(purchase|sale)-return-resolutions\/([^/]+)$/);
+    if (returnResolutionMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.transitionReturn(db,returnResolutionMatch[1],decodeURIComponent(returnResolutionMatch[2]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'RETURN_RESOLUTION_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-readiness/samples' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listSamples(db,query));
+    }
+    const sampleMatch=pathname.match(/^\/api\/accounting\/fifo-readiness\/samples\/([^/]+)$/);
+    if (sampleMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.reviewSample(db,decodeURIComponent(sampleMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SAMPLE_REVIEW_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-readiness/comparison' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.comparison(db,query.newDatasetId||'',query.oldDatasetId||''));
+    }
+    if (pathname === '/api/accounting/fifo-readiness/report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.readinessReport(db,query.datasetId||''));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_READINESS_REPORT_FAILED',error:String(error.message||error)});}
     }
 
     // 0.9.19.66: isolated accounting FIFO ledger in SHADOW MODE only.

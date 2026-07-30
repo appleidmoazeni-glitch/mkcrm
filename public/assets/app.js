@@ -19,11 +19,11 @@ document.addEventListener('DOMContentLoaded',loadBackendVersion,{once:true});
 const ROLE_PAGES = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
+  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
   purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function userRole(){return (state.user&&state.user.role)||'guest'}
@@ -123,6 +123,170 @@ const uiPageLifecycle=(()=>{
   function add(cleanup){if(typeof cleanup==='function')cleanups.push(cleanup);return cleanup}
   function cleanup(){const pending=cleanups;cleanups=[];pending.reverse().forEach(fn=>{try{fn()}catch{}})}
   return {add,cleanup};
+})();
+
+/* 0.9.19.67 Accounting FIFO Readiness.
+   Evidence and review writes remain isolated and audited. The page never
+   activates Profit, ROI, Commission, inventory writes or Shaygan writes. */
+(()=>{
+  const PAGE='accounting-fifo-readiness';
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const num=value=>Number.isFinite(Number(value))?Number(value).toLocaleString('fa-IR',{maximumFractionDigits:6}):'—';
+  const pct=value=>`${num(value||0)}٪`;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}
+    return payload;
+  }
+  function table(headers,rows,empty='داده‌ای موجود نیست'){
+    return `<table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">${safe(empty)}</td></tr>`}</tbody></table>`;
+  }
+  function check(value){return value?'<span class="success">PASS</span>':'<span class="error">BLOCKED</span>';}
+  async function loadReport(){
+    const box=q('#afrSummary');if(!box)return;
+    try{
+      const r=await json('/api/accounting/fifo-readiness/report');
+      if(!r.available){box.innerHTML='<div class="warn">Dataset آماده برای گزارش وجود ندارد.</div>';return;}
+      const c=r.confidence||{},g=r.gate||{},comparison=r.comparison||{};
+      const components=c.components||{};
+      box.innerHTML=`
+        <div class="row four">
+          <div class="info"><b>Accounting Confidence Index</b><br>${num(c.index)} / 100<br><small>${safe(c.version)}</small></div>
+          <div class="info"><b>Approval Gate</b><br>${safe(g.status)}<br>Auto approval: NO</div>
+          <div class="info"><b>Evidence Queue</b><br>${num(r.evidence?.total)} item<br>${num(r.evidence?.affectedSaleValue)} IRR</div>
+          <div class="info"><b>Dataset</b><br><small>${safe(r.dataset?.datasetId)}</small><br>${safe(r.dataset?.algorithmVersion)}</div>
+        </div>
+        ${table(['Metric','Coverage'],[
+          ['Quantity Cost Coverage',pct(components.quantityCostCoverage)],
+          ['Sale Value Cost Coverage',pct(components.saleValueCostCoverage)],
+          ['Line Coverage',pct(components.lineCoverage)],
+          ['Official Evidence Coverage',pct(components.officialEvidenceCoverage)],
+          ['Manual Evidence Coverage',pct(components.manualEvidenceCoverage)],
+          ['Return Linkage Coverage',pct(components.returnLinkageCoverage)],
+          ['Accounting Review Coverage',pct(components.accountingReviewCoverage)]
+        ].map(row=>`<tr><td>${safe(row[0])}</td><td>${safe(row[1])}</td></tr>`))}
+        <div class="small muted">${safe(c.formula)} — ${safe(c.interpretation)}</div>
+        <h5>Accounting Approval Gate</h5>
+        ${table(['Check','Result'],[
+          ...Object.entries(g.technicalChecks||{}),
+          ...Object.entries(g.accountingChecks||{})
+        ].map(([name,value])=>`<tr><td>${safe(name)}</td><td>${check(value)}</td></tr>`))}
+        <h5>Precision Diagnostics</h5>
+        <div class="info">Model: ${safe(r.precision?.model)} | Quantity scale: ${num(r.precision?.quantityScale)} | Unit cost scale: ${num(r.precision?.unitCostScale)} | Value scale: ${num(r.precision?.allocationValueScale)} | Rounding: ${safe(r.precision?.roundingMode)}<br>Historical datasets mutated: NO</div>
+        <h5>Dataset Comparison</h5>
+        <div class="info">Old: ${safe(comparison.oldDatasetId||'—')}<br>New: ${safe(comparison.newDatasetId||'—')}<br>Changed allocations: ${num(comparison.counts?.changedAllocations)} | Source changes: ${num(comparison.counts?.changedSourceSelections)} | Precision differences: ${num(comparison.counts?.precisionOnlyDifferences)} | Return corrections: ${num(comparison.counts?.returnCorrections)}<br>Unknown quantity: ${num(comparison.unknownQuantity?.before)} → ${num(comparison.unknownQuantity?.after)}</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadEvidence(){
+    const box=q('#afrEvidence');if(!box)return;
+    try{
+      const r=await json('/api/accounting/evidence?pageSize=100');
+      box.innerHTML=`<div class="info">P0: ${num(r.impact?.byPriority?.P0)} | P1: ${num(r.impact?.byPriority?.P1)} | P2: ${num(r.impact?.byPriority?.P2)} | P3: ${num(r.impact?.byPriority?.P3)} | Impact: ${num(r.impact?.affectedSaleValue)} IRR</div>`+
+        table(['Priority','Item','Impact','Coverage gain','Status','Assigned','Action'],(r.list||[]).map(row=>`<tr>
+          <td>${safe(row.priority)}<br><small>${num(row.priorityScore)}</small></td>
+          <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
+          <td>${num(row.affectedSaleValue)} IRR<br>${num(row.affectedQuantity)} qty / ${num(row.affectedSaleCount)} invoices</td>
+          <td>${pct(row.cumulativeCoverageGainPercent)}<br>Index +${num(row.projectedConfidenceImprovement)}</td>
+          <td>${safe(row.status)}<br><small>${safe(row.reasonCode)}</small></td>
+          <td>${safe(row.assignedTo||'—')}</td>
+          <td><button class="mini afr-evidence" data-id="${safe(row.evidenceId)}" data-revision="${Number(row.revision||0)}">بررسی</button></td>
+        </tr>`));
+      document.querySelectorAll('.afr-evidence').forEach(button=>button.onclick=async()=>{
+        const status=prompt('وضعیت جدید: accounting_investigation / evidence_requested / evidence_found / manual_cost_draft / pending_approval / approved_manual / official_layer_resolved / return_dependency / manager_decision / confirmed_unknown / deferred');
+        if(!status)return;
+        const reason=prompt('دلیل/یادداشت حسابداری:')||'';
+        const evidenceReference=prompt('مرجع Evidence (در صورت وجود):')||'';
+        try{
+          await json(`/api/accounting/evidence/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify({status,reason,accountingNotes:reason,evidenceReference,revision:Number(button.dataset.revision)})});
+          await refresh();
+        }catch(error){alert(error.message);}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadReturns(kind){
+    const box=q(kind==='purchase'?'#afrPurchaseReturns':'#afrSaleReturns');if(!box)return;
+    try{
+      const r=await json(`/api/accounting/${kind}-return-resolutions?pageSize=500`);
+      box.innerHTML=table(['Return','Item','Qty','Candidates','Confidence','Status','Action'],(r.list||[]).map(row=>{
+        const candidates=kind==='purchase'?row.candidatePurchaseLayers:row.candidateSaleLines;
+        const selected=kind==='purchase'?row.selectedPurchaseLayer:row.selectedOriginalSaleLineId;
+        return `<tr><td>${safe(row.returnInvoiceIdentity)}<br><small>${safe(row.returnLineIdentity)}</small></td><td>${safe(row.itemCode)}</td><td>${num(row.returnQuantity)}</td><td>${num(candidates?.length)}<br><small>${safe(selected||candidates?.[0]?.purchaseLineIdentity||candidates?.[0]?.originalSaleLineId||'')}</small></td><td>${pct(row.confidence)}</td><td>${safe(row.status)}<br><small>${safe(row.reason)}</small></td><td>${row.status==='confirmed_linked'?'—':`<button class="mini afr-return" data-kind="${kind}" data-id="${safe(row.resolutionId)}" data-revision="${Number(row.revision||0)}" data-candidate="${safe(candidates?.[0]?.purchaseLineIdentity||candidates?.[0]?.originalSaleLineId||'')}">Review</button>`}</td></tr>`;
+      }));
+      box.querySelectorAll('.afr-return').forEach(button=>button.onclick=async()=>{
+        const status=prompt('وضعیت: pending_review / confirmed_linked / confirmed_unmatched / deferred')||'';
+        if(!status)return;
+        const selected=prompt('شناسه ردیف اصلی (فقط برای confirmed_linked):',button.dataset.candidate)||'';
+        const reason=prompt('دلیل و Evidence:')||'';
+        const body={status,reason,revision:Number(button.dataset.revision),confidence:status==='confirmed_linked'?100:0};
+        if(button.dataset.kind==='purchase')body.selectedPurchaseLayer=selected;else body.selectedOriginalSaleLineId=selected;
+        try{await json(`/api/accounting/${button.dataset.kind}-return-resolutions/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify(body)});await refresh();}
+        catch(error){alert(error.message);}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadSamples(){
+    const box=q('#afrSamples');if(!box)return;
+    try{
+      const r=await json('/api/accounting/fifo-readiness/samples');
+      box.innerHTML=table(['Category','Sale','Purchase/Manual','Cost','Classification','Review'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.category)}</td><td>${safe(row.sourceSaleInvoice||'—')}<br><small>${safe(row.saleLine)}</small></td>
+        <td><small>${safe(row.sourcePurchaseLayer||row.manualEvidence||'—')}</small></td><td>${safe(row.unitCostExact||'—')} / ${safe(row.allocationCostExact||'—')}</td>
+        <td>${safe(row.confidenceClassification)}<br><small>${safe(row.unresolvedReason)}</small></td>
+        <td>${safe(row.reviewStatus)}${row.reviewStatus==='not_reviewed'?`<br><button class="mini afr-sample" data-id="${safe(row.sampleId)}" data-revision="${Number(row.revision||0)}">ثبت بررسی</button>`:''}</td>
+      </tr>`));
+      box.querySelectorAll('.afr-sample').forEach(button=>button.onclick=async()=>{
+        const reviewStatus=prompt('accounting_confirmed / accounting_disputed / needs_evidence')||'';
+        if(!reviewStatus)return;
+        const reviewNotes=prompt('یادداشت بررسی:')||'';
+        try{await json(`/api/accounting/fifo-readiness/samples/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify({reviewStatus,reviewNotes,revision:Number(button.dataset.revision)})});await refresh();}
+        catch(error){alert(error.message);}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function synchronize(){
+    const box=q('#afrSyncStatus');
+    try{
+      box.innerHTML='<div class="info">در حال همگام‌سازی Evidence از Datasetهای immutable…</div>';
+      const r=await json('/api/accounting/fifo-readiness/synchronize',{method:'POST',body:'{}'});
+      box.innerHTML=`<div class="success">Evidence ${num(r.evidence?.total)} | Purchase Returns ${num(r.purchaseReturns?.total)} | Sale Returns ${num(r.saleReturns?.total)} | Samples ${num(r.samples?.total)} | ${num(r.durationMs)} ms</div>`;
+      await refresh();
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function refresh(){await Promise.all([loadReport(),loadEvidence(),loadReturns('purchase'),loadReturns('sale'),loadSamples()]);}
+  window.pageAccountingFifoReadiness=async function(){
+    setPage('Accounting FIFO Readiness',`<main class="main-content">
+      <div class="warn"><b>SHADOW MODE</b><br><b>NOT APPROVED FOR PROFIT OR COMMISSION</b><br><b>Unknown Cost Is Not Zero</b></div>
+      <div class="actions">${['admin','accounting'].includes(userRole())?'<button class="btn" id="afrSync">Synchronize Evidence Queues</button>':''}<button class="btn" id="afrRefresh">Refresh</button></div><div id="afrSyncStatus"></div>
+      <div class="card"><div class="card-header"><h5>Financial Impact, Confidence, Precision and Approval Gate</h5></div><div class="card-body"><div id="afrSummary"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Accounting Evidence Queue</h5></div><div class="card-body"><div id="afrEvidence"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Manual Cost Approvals</h5></div><div class="card-body"><div class="info">Workflow مستقل Manual Cost در صفحه «رفع هزینه خرید نامشخص» باقی مانده است. فقط رکورد Approved با دو کاربر و Evidence معتبر در FIFO آینده مصرف می‌شود.</div></div></div>
+      <div class="card"><div class="card-header"><h5>Purchase Return Queue</h5></div><div class="card-body"><div id="afrPurchaseReturns"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Sale Return Queue</h5></div><div class="card-body"><div id="afrSaleReturns"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Accounting Validation Samples</h5></div><div class="card-body"><div id="afrSamples"></div></div></div>
+    </main>`);
+    if(q('#afrSync'))q('#afrSync').onclick=synchronize;
+    q('#afrRefresh').onclick=refresh;
+    await refresh();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='آمادگی حسابداری FIFO';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFifoReadiness();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
 })();
 
 /* 0.9.19.66 FIFO Shadow Validation.

@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
 const manualCostResolution = require('./manual-cost-resolution');
 const saleSnapshot = require('./sale-snapshot');
+const accountingDecimal = require('./accounting-decimal');
 const { APP_VERSION } = require('./app-version');
 const { normalizeJalaliRange } = require('./jalali-date');
 
@@ -12,9 +13,9 @@ const ALLOCATIONS = 'fifoAllocations';
 const DIAGNOSTICS = 'fifoDiagnostics';
 const EXCEPTIONS = 'fifoExceptions';
 const STATE = 'fifoDatasetState';
-const SCOPE_KEY = 'fifo-shadow-v1';
-const SCHEMA_VERSION = 1;
-const ALGORITHM_VERSION = 'fifo-shadow-1.0.0';
+const SCOPE_KEY = 'fifo-shadow-v2-precision-evidence';
+const SCHEMA_VERSION = 2;
+const ALGORITHM_VERSION = 'fifo-shadow-v2-precision-evidence';
 const QUANTITY_SCALE = 6;
 const VALUE_SCALE = 2;
 const EPSILON = 0.000001;
@@ -99,6 +100,52 @@ function manualEffective(row, saleDate) {
     (!row.effectiveTo || row.effectiveTo >= saleDate) &&
     finite(row.manualCost) > 0;
 }
+function precisionFields(quantity, unitCost) {
+  const precise = accountingDecimal.allocation(quantity, unitCost);
+  return {
+    precisionModel:'fixed-scale-bigint',
+    quantityScale:accountingDecimal.QUANTITY_SCALE,
+    unitCostScale:accountingDecimal.UNIT_COST_SCALE,
+    allocationValueScale:accountingDecimal.MONEY_SCALE,
+    roundingMode:accountingDecimal.ROUNDING_MODE,
+    quantityExact:precise.quantityExact,
+    unitCostExact:precise.unitCostExact,
+    allocatedCostAmountExact:precise.allocationValueExact
+  };
+}
+function unknownPrecisionFields(quantity) {
+  const quantityScaled = accountingDecimal.parse(quantity, accountingDecimal.QUANTITY_SCALE);
+  return {
+    precisionModel:'fixed-scale-bigint',
+    quantityScale:accountingDecimal.QUANTITY_SCALE,
+    unitCostScale:accountingDecimal.UNIT_COST_SCALE,
+    allocationValueScale:accountingDecimal.MONEY_SCALE,
+    roundingMode:accountingDecimal.ROUNDING_MODE,
+    quantityExact:accountingDecimal.format(quantityScaled, accountingDecimal.QUANTITY_SCALE),
+    unitCostExact:null,
+    allocatedCostAmountExact:null
+  };
+}
+function assignSaleValuePrecision(rows, totalQuantity, totalSaleValue) {
+  if (!rows.length) return;
+  const totalQuantityScaled = accountingDecimal.parse(Math.abs(Number(totalQuantity || 0)), accountingDecimal.QUANTITY_SCALE);
+  const totalValueScaled = accountingDecimal.parse(totalSaleValue || 0, accountingDecimal.MONEY_SCALE);
+  if (totalQuantityScaled === 0n) return;
+  let assigned = 0n;
+  rows.forEach((row, index) => {
+    const quantityScaled = accountingDecimal.parse(
+      Math.abs(Number(row.allocatedQty || row.unknownQty || 0)),
+      accountingDecimal.QUANTITY_SCALE
+    );
+    const valueScaled = index === rows.length - 1
+      ? totalValueScaled - assigned
+      : accountingDecimal.divideRounded(totalValueScaled * quantityScaled, totalQuantityScaled);
+    assigned += valueScaled;
+    row.saleValueExact = accountingDecimal.format(totalValueScaled, accountingDecimal.MONEY_SCALE);
+    row.allocatedSaleValueExact = accountingDecimal.format(valueScaled, accountingDecimal.MONEY_SCALE);
+    row.allocatedSaleValue = accountingDecimal.toNumber(valueScaled, accountingDecimal.MONEY_SCALE);
+  });
+}
 function eligibleOfficial(row) {
   const quantity = finite(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity);
   const unitCost = finite(row.netUnitCost ?? row.grossUnitCost);
@@ -146,7 +193,11 @@ function immutableProjection(row) {
     allocatedQty:round(row.allocatedQty),
     unknownQty:round(row.unknownQty),
     unitCost:row.unitCost == null ? null : round(row.unitCost, VALUE_SCALE),
-    allocatedCostAmount:row.allocatedCostAmount == null ? null : round(row.allocatedCostAmount, VALUE_SCALE)
+    allocatedCostAmountExact:row.allocatedCostAmountExact ?? null,
+    allocatedSaleValueExact:row.allocatedSaleValueExact ?? null,
+    quantityExact:row.quantityExact ?? null,
+    unitCostExact:row.unitCostExact ?? null,
+    returnResolutionId:row.saleReturnResolutionId || row.purchaseReturnResolutionId || ''
   };
 }
 
@@ -270,13 +321,15 @@ async function loadSources(db, pinned = {}) {
   if (!purchaseActive?.datasetId || !purchaseActive.dataset || purchaseActive.dataset.status !== 'completed') {
     fail('FIFO_SOURCE_PURCHASE_MISSING', 'Purchase Layer Dataset کامل و قابل استفاده پیدا نشد.', 409);
   }
-  const [saleLines, saleHeaders, purchaseLayers, manuals] = await Promise.all([
+  const [saleLines, saleHeaders, purchaseLayers, manuals, purchaseReturnResolutions, saleReturnResolutions] = await Promise.all([
     db.collection(saleActive.lineCollection).find(saleActive.lineQuery).toArray(),
     db.collection(saleActive.headerCollection).find(saleActive.headerQuery).toArray(),
     db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:purchaseActive.datasetId }).toArray(),
-    db.collection(manualCostResolution.COLLECTION).find({ status:'approved', deleted:{ $ne:true } }).toArray()
+    db.collection(manualCostResolution.COLLECTION).find({ status:'approved', deleted:{ $ne:true } }).toArray(),
+    db.collection('purchaseReturnResolutions').find({ status:'confirmed_linked' }).toArray(),
+    db.collection('saleReturnResolutions').find({ status:'confirmed_linked' }).toArray()
   ]);
-  return { saleActive, purchaseActive, saleLines, saleHeaders, purchaseLayers, manuals };
+  return { saleActive, purchaseActive, saleLines, saleHeaders, purchaseLayers, manuals, purchaseReturnResolutions, saleReturnResolutions };
 }
 async function loadSourcesWithRetry(db, pinned, options, datasetId) {
   const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts || 3), 5));
@@ -338,9 +391,23 @@ function allocateSources(datasetId, source, filters = {}) {
   const saleReturns = source.saleLines.filter(row => Number(row.saleInvoiceType) === 6).sort(compareSales);
   const officialRows = source.purchaseLayers.filter(eligibleOfficial).sort(compareLayers).map(row => ({
     ...row,
-    fifoRemainingQuantity:round(finite(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity))
+    fifoRemainingQuantity:round(finite(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity)),
+    confirmedReturnAdjustmentQuantity:0,
+    purchaseReturnResolutionIds:[]
   }));
   const purchaseReturns = source.purchaseLayers.filter(row => row.layerKind === 'purchase-return');
+  const purchaseReturnByIdentity = new Map(purchaseReturns.map(row => [purchaseIdentity(row), row]));
+  const officialByIdentity = new Map(officialRows.map(row => [purchaseIdentity(row), row]));
+  for (const resolution of source.purchaseReturnResolutions || []) {
+    const returnRow = purchaseReturnByIdentity.get(clean(resolution.returnLineIdentity, 500));
+    const target = officialByIdentity.get(clean(resolution.selectedPurchaseLayer, 500));
+    if (!returnRow || !target || returnRow.returnMatchStatus === 'matched') continue;
+    const returnQuantity = Math.abs(finite(resolution.returnQuantity) || finite(returnRow.originalQuantity || returnRow.returnedQuantity) || 0);
+    if (returnQuantity <= EPSILON) continue;
+    target.fifoRemainingQuantity = round(Math.max(0, target.fifoRemainingQuantity - returnQuantity));
+    target.confirmedReturnAdjustmentQuantity = round(target.confirmedReturnAdjustmentQuantity + returnQuantity);
+    target.purchaseReturnResolutionIds.push(clean(resolution.resolutionId, 100));
+  }
   const officialIndex = indexRows(officialRows);
   const manualIndex = indexRows(source.manuals);
   const allocations = [];
@@ -430,7 +497,10 @@ function allocateSources(datasetId, source, filters = {}) {
         allocatedCostAmount,
         layerAvailableBefore:available,
         layerRemainingQuantity:sourceRemaining,
+        purchaseReturnResolutionIds:[...(layer.purchaseReturnResolutionIds || [])],
+        confirmedReturnAdjustmentQuantity:round(layer.confirmedReturnAdjustmentQuantity || 0),
         unknownReason:'',
+        ...precisionFields(quantity, layer.netUnitCost ?? layer.grossUnitCost),
         createdAt:new Date()
       });
     }
@@ -488,6 +558,7 @@ function allocateSources(datasetId, source, filters = {}) {
           layerAvailableBefore:null,
           layerRemainingQuantity:null,
           unknownReason:'',
+          ...precisionFields(quantity, manual.manualCost),
           createdAt:new Date()
         });
       } else {
@@ -544,6 +615,7 @@ function allocateSources(datasetId, source, filters = {}) {
           layerAvailableBefore:null,
           layerRemainingQuantity:null,
           unknownReason,
+          ...unknownPrecisionFields(need),
           createdAt:new Date()
         });
         exceptions.push(exception(datasetId, 'UNKNOWN_COST', 'unresolved', {
@@ -551,6 +623,11 @@ function allocateSources(datasetId, source, filters = {}) {
         }));
       }
     }
+    assignSaleValuePrecision(
+      allocations.filter(row => row.saleLineId === saleLineId && Number(row.saleInvoiceType) === 2),
+      soldQuantity,
+      saleValue
+    );
   }
 
   const saleHeadersByGuid = new Map();
@@ -558,11 +635,86 @@ function allocateSources(datasetId, source, filters = {}) {
     const key = identity(header.guId);
     if (key) addIndex(saleHeadersByGuid, key, header);
   }
+  const confirmedSaleReturns = new Map((source.saleReturnResolutions || []).map(row => [clean(row.returnLineIdentity, 500), row]));
+  const originalAllocations = new Map();
+  for (const row of allocations.filter(item => Number(item.saleInvoiceType) === 2)) addIndex(originalAllocations, row.saleLineId, row);
   for (const row of saleReturns) {
+    const returnLineId = saleIdentity(row);
+    const resolution = confirmedSaleReturns.get(returnLineId);
+    if (resolution?.selectedOriginalSaleLineId) {
+      const originals = (originalAllocations.get(clean(resolution.selectedOriginalSaleLineId, 500)) || [])
+        .sort((a,b)=>Number(a.allocationSequence||0)-Number(b.allocationSequence||0));
+      let returnNeed = round(Math.abs(finite(row.qty) || finite(resolution.returnQuantity) || 0));
+      const returnSaleValue = Math.abs(finite(row.saleValue) || 0);
+      const returnUnitSaleValue = returnNeed > EPSILON ? returnSaleValue / returnNeed : 0;
+      let returnSequence = 0;
+      for (const original of originals) {
+        if (returnNeed <= EPSILON) break;
+        const originalQuantity = round(finite(original.allocatedQty || original.unknownQty) || 0);
+        const reversedQuantity = round(Math.min(returnNeed, originalQuantity));
+        if (reversedQuantity <= EPSILON) continue;
+        returnNeed = round(returnNeed - reversedQuantity);
+        returnSequence++;
+        allocationSequenceGlobal++;
+        const isUnknown = original.sourceType === 'unknown_cost';
+        const unitCostSource = original.unitCostExact ?? original.unitCost;
+        const exact = isUnknown
+          ? unknownPrecisionFields(-reversedQuantity)
+          : precisionFields(-reversedQuantity, unitCostSource);
+        allocations.push({
+          ...original,
+          allocationId:`FA-${sha256(`${datasetId}|${returnLineId}|${returnSequence}|${original.allocationId}|reversal`).slice(0, 32)}`,
+          allocationSequence:returnSequence,
+          globalSequence:allocationSequenceGlobal,
+          sourceType:'sale_return_reversal',
+          reversedSourceType:original.sourceType,
+          sourceConfidence:'confirmed-return-linkage',
+          saleLineId:returnLineId,
+          originalSaleLineId:clean(resolution.selectedOriginalSaleLineId, 500),
+          saleInvoiceType:6,
+          saleInvoiceNo:Number(row.saleInvoiceNo || 0),
+          saleGuid:clean(row.saleGuid, 100),
+          saleDate:clean(row.saleDate, 8),
+          saleRow:Number(row.row || 0),
+          soldQuantity:-Math.abs(finite(row.qty) || finite(resolution.returnQuantity) || 0),
+          saleValue:-returnSaleValue,
+          allocatedSaleValue:round(-reversedQuantity * returnUnitSaleValue, VALUE_SCALE),
+          allocatedQty:isUnknown ? 0 : -reversedQuantity,
+          unknownQty:isUnknown ? -reversedQuantity : 0,
+          saleRemainingQuantity:returnNeed,
+          unitCost:isUnknown ? null : round(finite(unitCostSource), VALUE_SCALE),
+          allocatedCostAmount:isUnknown ? null : accountingDecimal.toNumber(
+            accountingDecimal.parse(exact.allocatedCostAmountExact, accountingDecimal.MONEY_SCALE),
+            accountingDecimal.MONEY_SCALE
+          ),
+          saleReturnResolutionId:clean(resolution.resolutionId, 100),
+          returnEffect:'deterministic-reversal-of-original-allocation',
+          layerAvailableBefore:null,
+          layerRemainingQuantity:null,
+          ...exact,
+          createdAt:new Date()
+        });
+      }
+      assignSaleValuePrecision(
+        allocations.filter(item => item.saleLineId === returnLineId && item.sourceType === 'sale_return_reversal'),
+        Math.abs(finite(row.qty) || finite(resolution.returnQuantity) || 0),
+        -returnSaleValue
+      );
+      exceptions.push(exception(datasetId, 'SALE_RETURN_RESOLUTION', returnNeed <= EPSILON ? 'confirmed-linked-reversed' : 'confirmed-link-insufficient-original-quantity', {
+        saleReturnLineId:returnLineId,
+        itemGuid:row.itemGuid,
+        itemCode:row.itemCode,
+        reference:resolution.resolutionId,
+        reason:returnNeed <= EPSILON
+          ? 'Confirmed sale return reversed the original allocation deterministically.'
+          : `Confirmed original allocation was insufficient by ${returnNeed}; no arbitrary allocation was invented.`
+      }));
+      continue;
+    }
     const reference = identity(row.relatedInvHeaderId || row.invHeaderIdRoot);
     const candidates = reference ? saleHeadersByGuid.get(reference) || [] : [];
     exceptions.push(exception(datasetId, 'SALE_RETURN_NOT_ALLOCATED', candidates.length === 1 ? 'linked-not-allocated' : 'unresolved', {
-      saleReturnLineId:saleIdentity(row),
+      saleReturnLineId:returnLineId,
       itemGuid:row.itemGuid,
       itemCode:row.itemCode,
       reference,
@@ -572,14 +724,20 @@ function allocateSources(datasetId, source, filters = {}) {
     }));
   }
   for (const row of purchaseReturns) {
-    const resolved = row.returnMatchStatus === 'matched';
+    const confirmedResolution = (source.purchaseReturnResolutions || []).find(resolution =>
+      clean(resolution.returnLineIdentity, 500) === purchaseIdentity(row) &&
+      clean(resolution.selectedPurchaseLayer, 500)
+    );
+    const resolved = row.returnMatchStatus === 'matched' || Boolean(confirmedResolution);
     exceptions.push(exception(datasetId, 'PURCHASE_RETURN_STATUS', resolved ? 'linked-netted-in-source' : 'unresolved', {
       purchaseLineIdentity:purchaseIdentity(row),
       itemGuid:row.itemGuid,
       itemCode:row.itemCode,
-      reference:row.returnInvHeaderReference,
+      reference:confirmedResolution?.resolutionId || row.returnInvHeaderReference,
       reason:resolved
-        ? 'Matched purchase return is already reflected in source netPurchasedQuantity; no allocation row was generated.'
+        ? (row.returnMatchStatus === 'matched'
+          ? 'Matched purchase return is already reflected in source netPurchasedQuantity; no allocation row was generated.'
+          : 'Confirmed purchase return resolution adjusted the selected source layer before allocation.')
         : `Purchase return remains ${clean(row.returnMatchStatus || 'unmatched')}; no fake allocation was generated.`
     }));
   }
@@ -599,7 +757,11 @@ function reconcile(result) {
   let soldQuantity = 0;
   let allocatedQuantity = 0;
   let unknownQuantity = 0;
+  let soldQuantityScaled = 0n;
+  let allocatedQuantityScaled = 0n;
+  let unknownQuantityScaled = 0n;
   let saleQuantityMismatchCount = 0;
+  let saleValueMismatchCount = 0;
   for (const sale of result.sales) {
     const id = saleIdentity(sale);
     const quantity = round(finite(sale.qty) || 0);
@@ -610,7 +772,16 @@ function reconcile(result) {
     soldQuantity = round(soldQuantity + quantity);
     allocatedQuantity = round(allocatedQuantity + allocated);
     unknownQuantity = round(unknownQuantity + unknown);
-    if (Math.abs(quantity - allocated - unknown) > EPSILON) saleQuantityMismatchCount++;
+    const soldExact = accountingDecimal.parse(quantity, accountingDecimal.QUANTITY_SCALE);
+    const allocatedExact = rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedQty || 0,accountingDecimal.QUANTITY_SCALE),0n);
+    const unknownExact = rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.unknownQty || 0,accountingDecimal.QUANTITY_SCALE),0n);
+    soldQuantityScaled += soldExact;
+    allocatedQuantityScaled += allocatedExact;
+    unknownQuantityScaled += unknownExact;
+    if (soldExact !== allocatedExact + unknownExact) saleQuantityMismatchCount++;
+    const expectedSaleValue = accountingDecimal.parse(sale.saleValue || 0, accountingDecimal.MONEY_SCALE);
+    const allocatedSaleValue = rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedSaleValueExact || row.allocatedSaleValue || 0,accountingDecimal.MONEY_SCALE),0n);
+    if (expectedSaleValue !== allocatedSaleValue) saleValueMismatchCount++;
   }
   let layerOverConsumptionCount = 0;
   let negativeRemainingCount = 0;
@@ -628,33 +799,63 @@ function reconcile(result) {
     }
   }
   const inactiveSourceCount = result.allocations.filter(row =>
-    !['official_purchase_layer', 'approved_manual_cost', 'unknown_cost'].includes(row.sourceType)
+    !['official_purchase_layer', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
   ).length;
+  let monetaryReconciliationDifference = 0n;
+  let monetaryPrecisionMismatchCount = 0;
+  for (const row of result.allocations) {
+    if (row.allocatedCostAmountExact == null) continue;
+    try {
+      const quantity = row.quantityExact ?? row.allocatedQty;
+      const unitCost = row.unitCostExact ?? row.unitCost;
+      const expected = accountingDecimal.allocation(quantity, unitCost).valueScaled;
+      const actual = accountingDecimal.parse(row.allocatedCostAmountExact, accountingDecimal.MONEY_SCALE);
+      const difference = actual - expected;
+      monetaryReconciliationDifference += difference;
+      if (difference !== 0n) monetaryPrecisionMismatchCount++;
+    } catch (_) {
+      monetaryPrecisionMismatchCount++;
+    }
+  }
   const validation = {
     soldQuantity,
     allocatedQuantity,
     unknownQuantity,
-    allocatedPlusUnknownEqualsSold:Math.abs(soldQuantity - allocatedQuantity - unknownQuantity) <= EPSILON,
+    soldQuantityExact:accountingDecimal.format(soldQuantityScaled,accountingDecimal.QUANTITY_SCALE),
+    allocatedQuantityExact:accountingDecimal.format(allocatedQuantityScaled,accountingDecimal.QUANTITY_SCALE),
+    unknownQuantityExact:accountingDecimal.format(unknownQuantityScaled,accountingDecimal.QUANTITY_SCALE),
+    allocatedPlusUnknownEqualsSold:soldQuantityScaled === allocatedQuantityScaled + unknownQuantityScaled,
     saleQuantityMismatchCount,
+    saleValueMismatchCount,
     duplicateAllocationCount:duplicateAllocationIds.size,
     layerOverConsumptionCount,
     orphanLayerCount,
     negativeRemainingCount,
     inactiveSourceCount,
+    monetaryPrecisionMismatchCount,
+    monetaryReconciliationDifferenceExact:accountingDecimal.format(monetaryReconciliationDifference, accountingDecimal.MONEY_SCALE),
+    monetaryModel:'fixed-scale-bigint',
+    roundingMode:accountingDecimal.ROUNDING_MODE,
     checkedAt:new Date()
   };
   validation.valid = validation.allocatedPlusUnknownEqualsSold &&
     validation.saleQuantityMismatchCount === 0 &&
+    validation.saleValueMismatchCount === 0 &&
     validation.duplicateAllocationCount === 0 &&
     validation.layerOverConsumptionCount === 0 &&
     validation.orphanLayerCount === 0 &&
     validation.negativeRemainingCount === 0 &&
-    validation.inactiveSourceCount === 0;
+    validation.inactiveSourceCount === 0 &&
+    validation.monetaryPrecisionMismatchCount === 0 &&
+    monetaryReconciliationDifference === 0n;
   return validation;
 }
 
 function summarize(result, validation) {
   const totals = { quantity:0, saleValue:0 };
+  let totalQuantityScaled = 0n;
+  let totalSaleValueScaled = 0n;
+  const returnReversals = { rows:0, quantity:0, saleValue:0, costValue:0 };
   const bySource = {
     official_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_cost:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
@@ -667,8 +868,17 @@ function summarize(result, validation) {
     saleSeen.add(id);
     totals.quantity += Number(sale.qty || 0);
     totals.saleValue += Number(sale.saleValue || 0);
+    totalQuantityScaled += accountingDecimal.parse(sale.qty || 0, accountingDecimal.QUANTITY_SCALE);
+    totalSaleValueScaled += accountingDecimal.parse(sale.saleValue || 0, accountingDecimal.MONEY_SCALE);
   }
   for (const row of result.allocations) {
+    if (row.sourceType === 'sale_return_reversal') {
+      returnReversals.rows++;
+      returnReversals.quantity += Math.abs(Number(row.allocatedQty || row.unknownQty || 0));
+      returnReversals.saleValue += Math.abs(Number(row.allocatedSaleValue || 0));
+      returnReversals.costValue += Math.abs(Number(row.allocatedCostAmount || 0));
+      continue;
+    }
     const group = bySource[row.sourceType];
     group.rows++;
     group.quantity += Number(row.allocatedQty || row.unknownQty || 0);
@@ -687,6 +897,19 @@ function summarize(result, validation) {
       saleValuePercent:percentage(group.saleValue, totals.saleValue),
       allocatedCostAmount:group.costValue == null ? null : round(group.costValue, VALUE_SCALE)
     };
+    const sourceRows = result.allocations.filter(row => row.sourceType === sourceType);
+    shaped[sourceType].quantityExact = accountingDecimal.format(
+      sourceRows.reduce((sum,row)=>sum+accountingDecimal.parse(row.quantityExact || row.allocatedQty || row.unknownQty || 0,accountingDecimal.QUANTITY_SCALE),0n),
+      accountingDecimal.QUANTITY_SCALE
+    );
+    shaped[sourceType].saleValueExact = accountingDecimal.format(
+      sourceRows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedSaleValueExact || row.allocatedSaleValue || 0,accountingDecimal.MONEY_SCALE),0n),
+      accountingDecimal.MONEY_SCALE
+    );
+    shaped[sourceType].allocatedCostAmountExact = group.costValue == null ? null : accountingDecimal.format(
+      sourceRows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedCostAmountExact || 0,accountingDecimal.MONEY_SCALE),0n),
+      accountingDecimal.MONEY_SCALE
+    );
   }
   const confidenceScore = round(
     shaped.official_purchase_layer.quantityPercent +
@@ -706,13 +929,24 @@ function summarize(result, validation) {
     allocationCount:result.allocations.length,
     soldQuantity:round(totals.quantity),
     saleValue:round(totals.saleValue, VALUE_SCALE),
+    soldQuantityExact:accountingDecimal.format(totalQuantityScaled,accountingDecimal.QUANTITY_SCALE),
+    saleValueExact:accountingDecimal.format(totalSaleValueScaled,accountingDecimal.MONEY_SCALE),
     official:shaped.official_purchase_layer,
     manual:shaped.approved_manual_cost,
     unknown:shaped.unknown_cost,
     confidenceScore,
     confidence,
-    purchaseReturns:{ total:result.purchaseReturns.length, unresolved:result.purchaseReturns.filter(row => row.returnMatchStatus !== 'matched').length },
+    purchaseReturns:{
+      total:result.purchaseReturns.length,
+      unresolved:result.exceptions.filter(row => row.code === 'PURCHASE_RETURN_STATUS' && row.status === 'unresolved').length
+    },
     saleReturns:{ total:result.saleReturns.length, unresolved:result.exceptions.filter(row => row.code === 'SALE_RETURN_NOT_ALLOCATED' && row.status === 'unresolved').length },
+    saleReturnReversals:{
+      rows:returnReversals.rows,
+      quantity:round(returnReversals.quantity),
+      saleValue:round(returnReversals.saleValue,VALUE_SCALE),
+      costValue:round(returnReversals.costValue,VALUE_SCALE)
+    },
     exceptionCount:result.exceptions.length,
     unresolvedExceptionCount:result.exceptions.filter(row => row.status === 'unresolved').length,
     reconciliation:validation,
@@ -844,6 +1078,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
     retryCount += loaded.retryCount;
     sourceReadAttempts = loaded.attempts;
     const source = loaded.bundle;
+    source.purchaseReturnResolutions = Array.isArray(source.purchaseReturnResolutions) ? source.purchaseReturnResolutions : [];
+    source.saleReturnResolutions = Array.isArray(source.saleReturnResolutions) ? source.saleReturnResolutions : [];
     pinned.saleSnapshotId = source.saleActive.snapshotId;
     pinned.purchaseDatasetId = source.purchaseActive.datasetId;
     const mongoReadMs = Date.now() - readStartedMs;
@@ -862,6 +1098,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       saleLines:source.saleLines.length,
       purchaseLayers:source.purchaseLayers.length,
       approvedManualResolutions:source.manuals.length,
+      confirmedPurchaseReturnResolutions:source.purchaseReturnResolutions.length,
+      confirmedSaleReturnResolutions:source.saleReturnResolutions.length,
       mongoReadMs,
       retryCount
     });
@@ -880,9 +1118,29 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       purchases:result.officialRows.map(row => [purchaseIdentity(row), row.purchaseInvoiceDate, round(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity), round(row.netUnitCost ?? row.grossUnitCost, VALUE_SCALE)]),
       manuals:[...source.manuals]
         .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
-        .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, round(row.manualCost, VALUE_SCALE)])
+        .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, clean(row.manualCost)]),
+      purchaseReturnResolutions:[...source.purchaseReturnResolutions]
+        .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
+        .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedPurchaseLayer,clean(row.returnQuantity)]),
+      saleReturnResolutions:[...source.saleReturnResolutions]
+        .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
+        .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedOriginalSaleLineId,clean(row.returnQuantity)]),
+      precision:{
+        quantityScale:accountingDecimal.QUANTITY_SCALE,
+        unitCostScale:accountingDecimal.UNIT_COST_SCALE,
+        moneyScale:accountingDecimal.MONEY_SCALE,
+        roundingMode:accountingDecimal.ROUNDING_MODE
+      }
     }));
     const allocationFingerprint = sha256(stableStringify(result.allocations.map(immutableProjection)));
+    const deterministicPeer = await db.collection(DATASETS).findOne({
+      datasetId:{ $ne:datasetId },
+      status:'completed',
+      algorithmVersion:ALGORITHM_VERSION,
+      sourceFingerprint,
+      allocationFingerprint
+    });
+    const deterministicReplayVerified = Boolean(deterministicPeer);
     const heapBeforeWrite = process.memoryUsage().heapUsed;
     await renewLock(db, datasetId);
     options.jobControl?.progress?.({ phase:'Writing Isolated Shadow Ledger', current:0, total:result.allocations.length + result.exceptions.length, message:'Writing shadow collections only' });
@@ -920,6 +1178,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       sourcePurchaseDatasetId:pinned.purchaseDatasetId,
       sourceFingerprint,
       allocationFingerprint,
+      deterministicReplayVerified,
+      deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
       retryCount,
       sourceReadAttempts,
       summary,
@@ -959,6 +1219,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       exceptionCount:persistedExceptionCount,
       sourceFingerprint,
       allocationFingerprint,
+      deterministicReplayVerified,
+      deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
       summary,
       performance
     });
@@ -977,6 +1239,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       resumeCount:Number(existing?.resumeCount || 0) + (existing ? 1 : 0),
       sourceFingerprint,
       allocationFingerprint,
+      deterministicReplayVerified,
+      deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
       summary,
       validation,
       performance,
