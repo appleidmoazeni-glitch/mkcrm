@@ -13,6 +13,7 @@ const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
 const manualCostResolution = require('./lib/manual-cost-resolution');
 const fifoShadowEngine = require('./lib/fifo-shadow-engine');
 const accountingEvidenceConfidence = require('./lib/accounting-evidence-confidence');
+const accountingOperationalReview = require('./lib/accounting-operational-review');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -692,11 +693,11 @@ async function getActiveWarehouseNumbersFromDb() {
 const ROLE_PERMISSIONS = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports','app-logs','tablo'],
+  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
@@ -3679,6 +3680,86 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.dataHealth(db));
+    }
+
+    // 0.9.19.68: operational accounting review workbench.
+    // Candidate and workflow writes are restricted to module-owned audit
+    // collections. No invoice, Shaygan, Sale Snapshot, Purchase Layer,
+    // completed FIFO dataset or financial activation write is performed.
+    if (pathname === '/api/accounting/operational-review/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingOperationalReview.ensureIndexes(db));
+    }
+    if (pathname === '/api/accounting/operational-review/synchronize' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.synchronize(db,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_SYNC_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.impactReport(db));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    const operationalListMatch=pathname.match(/^\/api\/accounting\/operational-review\/(investigations|recovery|identities|returns|manualPackages|batches|samples)$/);
+    if (operationalListMatch && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.list(db,operationalListMatch[1],query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_LIST_FAILED',error:String(error.message||error)});}
+    }
+    const operationalTransitionMatch=pathname.match(/^\/api\/accounting\/operational-review\/(investigations|recovery|identities|returns)\/([^/]+)$/);
+    if (operationalTransitionMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.transitionReview(
+        db,operationalTransitionMatch[1],decodeURIComponent(operationalTransitionMatch[2]),body,currentUser(req)
+      ));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/manual-packages' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,201,await accountingOperationalReview.createManualPackage(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_EVIDENCE_PACKAGE_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/batches' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,201,await accountingOperationalReview.createBatch(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_BATCH_CREATE_FAILED',error:String(error.message||error)});}
+    }
+    const batchTransitionMatch=pathname.match(/^\/api\/accounting\/operational-review\/batches\/([^/]+)$/);
+    if (batchTransitionMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.transitionBatch(db,decodeURIComponent(batchTransitionMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_BATCH_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/export.csv' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        const report=await accountingOperationalReview.exportReview(db,query);
+        const cell=value=>{
+          let text=String(value??'').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,5000);
+          if(/^[=+\-@]/.test(text))text=`'${text}`;
+          return `"${text.replace(/"/g,'""')}"`;
+        };
+        const headers=['investigationId','evidenceId','sourceFifoDatasetId','revision','priority','itemCode','itemDescription','affectedSaleValue','affectedQuantity','systemClassification','confidence','reviewStatus','recommendedNextAction','unresolvedQuestions'];
+        const lines=[headers.map(cell).join(',')];
+        for(const row of report.rows)lines.push(headers.map(name=>cell(row[name])).join(','));
+        res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="accounting-operational-review.csv"','Cache-Control':'no-store','X-Accounting-Decision-Import':'disabled'});
+        return res.end('\uFEFF'+lines.join('\r\n'));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_EXPORT_FAILED',error:String(error.message||error)});
+      }
     }
 
     // 0.9.19.67: evidence, return linkage, precision and approval-gate diagnostics.

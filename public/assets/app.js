@@ -19,11 +19,11 @@ document.addEventListener('DOMContentLoaded',loadBackendVersion,{once:true});
 const ROLE_PAGES = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports'],
+  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
   purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function userRole(){return (state.user&&state.user.role)||'guest'}
@@ -123,6 +123,199 @@ const uiPageLifecycle=(()=>{
   function add(cleanup){if(typeof cleanup==='function')cleanups.push(cleanup);return cleanup}
   function cleanup(){const pending=cleanups;cleanups=[];pending.reverse().forEach(fn=>{try{fn()}catch{}})}
   return {add,cleanup};
+})();
+
+/* 0.9.19.68 Operational Accounting Review Workbench.
+   This UI prepares evidence and human review tasks only. It cannot issue
+   invoices, write Shaygan, approve accounting automatically or activate
+   Profit, ROI or Commission. */
+(()=>{
+  const PAGE='accounting-review-workbench';
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const num=value=>Number.isFinite(Number(value))?Number(value).toLocaleString('fa-IR',{maximumFractionDigits:6}):'—';
+  const pct=value=>`${num(value||0)}٪`;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}
+    return payload;
+  }
+  function table(headers,rows,empty='داده‌ای موجود نیست'){
+    return `<div style="overflow:auto"><table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">${safe(empty)}</td></tr>`}</tbody></table></div>`;
+  }
+  function section(id,title){
+    return `<div class="card"><div class="card-header"><h5>${safe(title)}</h5></div><div class="card-body"><div id="${safe(id)}"><div class="muted">در حال بارگذاری…</div></div></div></div>`;
+  }
+  async function loadReport(){
+    const box=q('#aowReport');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/report');
+      const actual=r.actualApproved||{},projected=r.projected||{},base=r.baseline||{};
+      box.innerHTML=`<div class="row four">
+        <div class="info"><b>Gate</b><br>${safe(base.gateStatus)}<br>Accounting approved: NO</div>
+        <div class="info"><b>Confidence</b><br>${num(base.confidenceIndex)} / 100<br>Review coverage ${pct(base.accountingReviewCoverage)}</div>
+        <div class="info"><b>Unknown Sale Value</b><br>${num(base.actualUnknownSaleValue)} IRR<br>Actual only</div>
+        <div class="info"><b>Projected Recoverable</b><br>${num(projected.recoverableUnknownValue)} IRR<br>Not approved</div>
+      </div>
+      ${table(['Metric','Actual approved','Projected / candidate'],[
+        ['Official/Manual coverage',`${pct(base.saleValueCostCoverage)} / ${pct(base.approvedManualCoverage)}`,pct(projected.saleValueCoverageAfterHumanActions)],
+        ['Return linkage',pct(base.returnLinkageCoverage),`${num(projected.returnLinkageCandidateCount)} cases / ${pct(projected.returnLinkagePotentialPercent)}`],
+        ['Recovery candidates',num(actual.recoveryCandidates),num(projected.recoveryCandidates)],
+        ['Identity resolutions',num(actual.identityResolutions),num(projected.identityCandidates)],
+        ['Manual packages',num(actual.manualPackages),num(projected.manualEvidencePackages)],
+        ['Reviewed samples',num(actual.accountingReviewedSamples),num(r.counts?.validationSamples)]
+      ].map(row=>`<tr>${row.map(cell=>`<td>${safe(cell)}</td>`).join('')}</tr>`))}
+      <div class="warn"><b>Actual and projected values are intentionally separate.</b><br>
+      No candidate, package or batch is an accounting approval. Decision import is disabled.</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function reviewAction(type,row){
+    const id=row.investigationId||row.caseId||row.candidateId||row.resolutionId;
+    if(!id)return'';
+    return `<button class="mini aow-review" data-type="${safe(type)}" data-id="${safe(id)}" data-revision="${Number(row.revision||0)}">بررسی موردی</button>`;
+  }
+  async function loadInvestigations(){
+    const box=q('#aowP0');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/investigations?pageSize=200&priority=P0');
+      box.innerHTML=`<div class="info">همهٔ ${num(r.total)} مورد P0 دارای classification، source reference، سؤال باز و اقدام بعدی هستند.</div>`+
+      table(['Item','Impact','Classification','Evidence','Questions / next action','Review'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
+        <td>${num(row.affectedSaleValue)} IRR<br>${num(row.affectedQuantity)} qty</td>
+        <td>${safe(row.systemClassification)}<br><small>${pct(row.confidence)}</small></td>
+        <td><small>Invoices: ${safe((row.diagnostic?.invoiceReferences||[]).join(', ')||'—')}<br>Suppliers: ${safe((row.diagnostic?.supplierEvidence||[]).join(', ')||'—')}</small></td>
+        <td><small>${safe((row.diagnostic?.unresolvedQuestions||[]).join(' | '))}<br><b>${safe(row.diagnostic?.recommendedNextAction)}</b></small></td>
+        <td>${safe(row.reviewStatus)}<br>${reviewAction('investigations',row)}</td>
+      </tr>`));
+      bindReview(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadSimple(type,boxId,titleFields){
+    const box=q(boxId);if(!box)return;
+    try{
+      const r=await json(`/api/accounting/operational-review/${type}?pageSize=200`);
+      box.innerHTML=table(titleFields.headers,(r.list||[]).map(row=>titleFields.row(row)+`<td>${reviewAction(type,row)}</td></tr>`));
+      bindReview(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadReturns(){
+    const box=q('#aowReturns');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/returns?pageSize=500');
+      const groups=(r.list||[]).reduce((map,row)=>{map[row.confidenceBand]=(map[row.confidenceBand]||0)+1;return map;},{});
+      box.innerHTML=`<div class="info">Deterministic ${num(groups.deterministic)} | High ${num(groups.high_confidence)} | Medium ${num(groups.medium_confidence)} | Low ${num(groups.low_confidence)} | No candidate ${num(groups.no_candidate)}</div>`+
+      table(['Type/Return','Item','Confidence','Candidate comparison','Expected impact','Human review'],(r.list||[]).map(row=>{
+        const proposal=row.reversalProposal||{};
+        const candidate=(row.candidates||[])[0]||{};
+        return `<tr><td>${safe(row.kind)}<br>${safe(row.returnInvoiceIdentity)}</td><td>${safe(row.itemCode)}<br>${num(row.returnQuantity)}</td>
+          <td>${safe(row.confidenceBand)}<br>${pct(row.confidence)}<br><small>${safe((row.confidenceReasons||[]).join(', '))}</small></td>
+          <td><small>${safe(row.proposedLink||'—')}<br>score ${num(candidate.score)}<br>${safe((candidate.reasons||[]).join(', '))}</small></td>
+          <td><small>Cost ${safe(proposal.proposedReversedCostExact||candidate.remainingLayerImpact||'—')}<br>Qty ${safe(proposal.proposedReversedQuantityExact||'—')}<br>Remaining ${safe(proposal.remainingOriginalQuantityExact||'—')}<br>Over-allocation prevented: ${proposal.overAllocationPrevented?'YES':'NO'}</small></td>
+          <td>${safe(row.reviewStatus)}<br>${reviewAction('returns',row)}</td></tr>`;
+      }));
+      bindReview(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadSamples(){
+    const box=q('#aowSamples');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/samples?pageSize=200');
+      box.innerHTML=table(['Category','Invoice/Line','Item','Quantity/value','Cost/return','Review'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.category)}</td><td>${safe(row.sourceSaleInvoice||'—')}<br><small>${safe(row.saleLine||'')}</small></td>
+        <td>${safe(row.itemCode||'—')}<br><small>${safe(row.itemGuid||'')}</small></td>
+        <td>${num(row.saleQuantity)} / ${safe(row.saleValueExact||'—')}<br>allocated ${num(row.allocatedQuantity)} / unknown ${num(row.unknownQuantity)}</td>
+        <td>${safe(row.unitCostExact||'—')} / ${safe(row.allocationCostExact||'—')}<br><small>${safe(JSON.stringify(row.returnEffect||{}))}</small></td>
+        <td>${safe(row.reviewStatus)}<br><small>${safe(row.reviewedBy?.username||'—')}</small></td></tr>`));
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadBatches(){
+    const box=q('#aowBatches');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/batches?pageSize=50');
+      box.innerHTML=table(['Batch','Assignments','Counts','Impact','Status','Audit'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.title)}<br><small>${safe(row.batchId)}</small></td>
+        <td>Accounting: ${safe(row.assignedAccountingUser||'—')}<br>Manager: ${safe(row.assignedManagerUser||'—')}</td>
+        <td><small>${safe(JSON.stringify(row.itemCounts||{}))}</small></td><td>${num(row.financialImpact)} IRR</td>
+        <td>${safe(row.status)}</td><td>${num(row.auditLog?.length)} events<br><small>Batch completion never approves items.</small></td></tr>`));
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function bindReview(container){
+    container.querySelectorAll('.aow-review').forEach(button=>button.onclick=async()=>{
+      const type=button.dataset.type;
+      const allowed=type==='recovery'?'detected / evidence_verified / pending_accounting_review / approved_for_dataset_rebuild / rejected / deferred'
+        :type==='identities'?'detected / pending_accounting_review / approved / rejected / deferred'
+          :'prepared / in_review / needs_evidence / ready_for_human_decision / deferred';
+      const status=prompt(`وضعیت جدید (${allowed})`)||'';
+      if(!status)return;
+      const assignedTo=prompt('Assigned user (اختیاری):')||'';
+      const reason=prompt('یادداشت و دلیل مستند:')||'';
+      const evidenceReference=prompt('مرجع Evidence (برای approval الزامی):')||'';
+      try{
+        await json(`/api/accounting/operational-review/${type}/${encodeURIComponent(button.dataset.id)}`,{
+          method:'PATCH',body:JSON.stringify({status,assignedTo,reason,accountingNotes:reason,evidenceReference,revision:Number(button.dataset.revision)})
+        });
+        await refresh();
+      }catch(error){alert(`${error.code||''} ${error.message}`);}
+    });
+  }
+  async function synchronize(){
+    const box=q('#aowSyncStatus');
+    try{
+      box.innerHTML='<div class="info">در حال تحلیل read-only منابع و ایجاد candidateهای audit شده…</div>';
+      const r=await json('/api/accounting/operational-review/synchronize',{method:'POST',body:'{}'});
+      box.innerHTML=`<div class="success">P0 ${num(r.investigations?.total)} | Purchase Returns ${num(r.returns?.purchase?.total)} | Sale Returns ${num(r.returns?.sale?.total)} | Samples ${num(r.samples?.total)} | ${num(r.durationMs)} ms<br>Automatic approvals: ${num(r.automaticApprovals)} | Business writes: ${num(r.businessDocumentWrites)}</div>`;
+      await refresh();
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function refresh(){
+    await Promise.all([
+      loadReport(),loadInvestigations(),
+      loadSimple('recovery','#aowRecovery',{headers:['Invoice/line','Item','Supplier/date','Quantity/cost','Status','Review'],row:row=>`<tr><td>${safe(row.purchaseInvoiceIdentity)}<br><small>${safe(row.purchaseLineIdentity)}</small></td><td>${safe(row.itemCode)}<br><small>${safe(row.itemGuid)}</small></td><td>${safe(row.supplierIdentity)}<br>${safe(row.purchaseDate)}</td><td>${num(row.purchaseQuantity)} / ${safe(row.unitCostExact)}</td><td>${safe(row.status)}<br>${pct(row.confidence)}</td>`}),
+      loadSimple('identities','#aowIdentity',{headers:['Source','Target','Reason','Evidence','Status','Review'],row:row=>`<tr><td>${safe(row.sourceItemCode)}<br><small>${safe(row.sourceItemGuid)}</small></td><td>${safe(row.targetItemCode)}<br><small>${safe(row.targetItemGuid)}</small></td><td>${safe(row.reason)}<br>${pct(row.confidence)}</td><td><small>${safe(JSON.stringify(row.evidence||{}))}</small></td><td>${safe(row.status)}</td>`}),
+      loadReturns(),
+      loadSimple('manualPackages','#aowManual',{headers:['Item','Source','Amount','Period','Projected impact','Status'],row:row=>`<tr><td>${safe(row.itemCode)}<br><small>${safe(row.packageId)}</small></td><td>${safe(row.documentedSource)}<br><small>${safe(row.evidenceReference)}</small></td><td>${safe(row.sourceAmountExact)} ${safe(row.sourceCurrency)}</td><td>${safe(row.proposedEffectiveFrom)}..${safe(row.proposedEffectiveTo)}</td><td>${pct(row.projectedCoverageImprovement)} / index +${num(row.projectedConfidenceImprovement)}</td><td>${safe(row.status)}</td>`}),
+      loadSamples(),loadBatches()
+    ]);
+  }
+  window.pageAccountingReviewWorkbench=async function(){
+    setPage('Accounting Review Workbench',`<main class="main-content">
+      <div class="warn"><b>HUMAN ACCOUNTING REVIEW REQUIRED</b><br><b>NO AUTOMATIC APPROVAL — NO PROFIT / ROI / COMMISSION</b><br>این صفحه هیچ سند شایگان یا فاکتور تجاری ایجاد یا ویرایش نمی‌کند.</div>
+      <div class="actions">${['admin','accounting'].includes(userRole())?'<button class="btn" id="aowSync">Prepare / Refresh Review Package</button>':''}<button class="btn" id="aowRefresh">Refresh</button><button class="btn" id="aowExport">Export CSV</button><button class="btn" id="aowPrint">Printable Review Packet</button><button class="btn" id="aowNext">Next P0 Review</button></div>
+      <div id="aowSyncStatus"></div>
+      ${section('aowReport','Gate Progress, Actual vs Projected Impact and FIFO Dataset')}
+      ${section('aowP0','1. P0 Evidence Review')}
+      ${section('aowRecovery','2. Official Layer Recovery Candidates')}
+      ${section('aowIdentity','3. Item Identity Candidates')}
+      ${section('aowReturns','4–5. Purchase and Sale Return Review')}
+      ${section('aowManual','6. Manual Cost Evidence Packages')}
+      ${section('aowSamples','7. Validation Samples')}
+      ${section('aowBatches','8–10. Review Batches and Audit Activity')}
+    </main>`);
+    if(q('#aowSync'))q('#aowSync').onclick=synchronize;
+    q('#aowRefresh').onclick=refresh;
+    q('#aowExport').onclick=()=>{location.href='/api/accounting/operational-review/export.csv?priority=P0';};
+    q('#aowPrint').onclick=()=>window.print();
+    q('#aowNext').onclick=()=>q('#aowP0')?.scrollIntoView({behavior:'smooth',block:'start'});
+    await refresh();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='میزکار بررسی حسابداری';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="accounting-fifo-readiness"]')||menu.querySelector('[data-page="seller-profit"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingReviewWorkbench();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
 })();
 
 /* 0.9.19.67 Accounting FIFO Readiness.
@@ -5071,6 +5264,32 @@ async function pageSellerProfit(){
   window.route=route=async function(){
     const page=location.hash.slice(1)||firstAllowedPage();
     if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFifoReadiness();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* Final Phase 5.2.8 registration after every legacy menu/route override. */
+(()=>{
+  const PAGE='accounting-review-workbench';
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=document.querySelector('#menu');
+    if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');
+    button.className='navbtn';
+    button.dataset.page=PAGE;
+    button.textContent='میزکار بررسی حسابداری';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="accounting-fifo-readiness"]')||menu.querySelector('[data-page="seller-profit"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingReviewWorkbench();
     return inheritedRoute.apply(this,arguments);
   };
   try{renderMenu();}catch{}

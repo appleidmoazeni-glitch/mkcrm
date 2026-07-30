@@ -20,7 +20,7 @@ async function initMongo() {
   const database = await connectMongo();
   const collections = await database.listCollections().toArray();
   const existing = new Set(collections.map(c => c.name));
-  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','purchaseLayerDatasets','purchaseLayerDatasetState','purchaseLayerDiagnostics','manualCostResolutions','accountingCostEvidence','purchaseReturnResolutions','saleReturnResolutions','accountingValidationSamples','accountingReadinessState','fifoDatasets','fifoAllocations','fifoDiagnostics','fifoExceptions','fifoDatasetState','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','saleSnapshotState','appJobs'];
+  const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemInventoryCatalog','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','purchaseLayerDatasets','purchaseLayerDatasetState','purchaseLayerDiagnostics','manualCostResolutions','accountingCostEvidence','purchaseReturnResolutions','saleReturnResolutions','accountingValidationSamples','accountingReadinessState','accountingEvidenceInvestigations','purchaseLayerRecoveryCandidates','accountingItemIdentityResolutions','accountingReturnReviewCases','manualCostEvidencePackages','accountingReviewBatches','fifoDatasets','fifoAllocations','fifoDiagnostics','fifoExceptions','fifoDatasetState','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','saleSnapshotState','appJobs'];
   for (const name of needed) if (!existing.has(name)) await database.createCollection(name);
   await database.collection('settings').createIndex({ key: 1 }, { unique: true });
   await database.collection('customers').createIndex({ mobile: 1 });
@@ -43,6 +43,7 @@ async function initMongo() {
   await database.collection('itemInventoryCatalog').createIndex({ itemCode: 1, stockNumber: 1 }, { unique: true });
   await database.collection('itemInventoryCatalog').createIndex({ searchText: 1 });
   await database.collection('itemCatalogAll').createIndex({ itemCode: 1 }, { unique: true });
+  await database.collection('itemCatalogAll').createIndex({ itemGuid: 1 });
   await database.collection('itemCatalogAll').createIndex({ searchText: 1 });
   await database.collection('accountCatalog').createIndex({ accountNumber: 1 }, { unique: true });
   await database.collection('accountCatalog').createIndex({ searchText: 1 });
@@ -93,6 +94,19 @@ async function initMongo() {
   await database.collection('accountingValidationSamples').createIndex({ datasetId:1, sampleKey:1 }, { unique:true });
   await database.collection('accountingValidationSamples').createIndex({ datasetId:1, reviewStatus:1, category:1 });
   await database.collection('accountingReadinessState').createIndex({ scopeKey:1 }, { unique:true });
+  await database.collection('accountingEvidenceInvestigations').createIndex({ investigationId:1 }, { unique:true });
+  await database.collection('accountingEvidenceInvestigations').createIndex({ sourceFifoDatasetId:1, evidenceId:1 }, { unique:true });
+  await database.collection('accountingEvidenceInvestigations').createIndex({ sourceFifoDatasetId:1, priority:1, affectedSaleValue:-1 });
+  await database.collection('purchaseLayerRecoveryCandidates').createIndex({ candidateId:1 }, { unique:true });
+  await database.collection('purchaseLayerRecoveryCandidates').createIndex({ sourceFifoDatasetId:1, purchaseLineIdentity:1 }, { unique:true });
+  await database.collection('accountingItemIdentityResolutions').createIndex({ resolutionId:1 }, { unique:true });
+  await database.collection('accountingItemIdentityResolutions').createIndex({ sourceFifoDatasetId:1, sourceItemCode:1, targetItemCode:1, targetItemGuid:1 }, { unique:true });
+  await database.collection('accountingReturnReviewCases').createIndex({ caseId:1 }, { unique:true });
+  await database.collection('accountingReturnReviewCases').createIndex({ kind:1, resolutionId:1 }, { unique:true });
+  await database.collection('manualCostEvidencePackages').createIndex({ packageId:1 }, { unique:true });
+  await database.collection('manualCostEvidencePackages').createIndex({ sourceFifoDatasetId:1, evidenceId:1 }, { unique:true });
+  await database.collection('accountingReviewBatches').createIndex({ batchId:1 }, { unique:true });
+  await database.collection('accountingReviewBatches').createIndex({ sourceFifoDatasetId:1, batchKey:1 }, { unique:true });
   await database.collection('fifoDatasets').createIndex({ datasetId: 1 }, { unique: true });
   await database.collection('fifoDatasets').createIndex({ status: 1, completedAt: -1 });
   await database.collection('fifoDatasets').createIndex({ sourceSaleSnapshotId: 1, sourcePurchaseDatasetId: 1, algorithmVersion: 1 });
