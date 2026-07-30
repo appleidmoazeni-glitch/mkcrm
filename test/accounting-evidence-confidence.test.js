@@ -162,6 +162,30 @@ test('synchronization creates prioritized evidence, return queues and accounting
   assert.ok(db.collection(readiness.SAMPLES).rows.length>=1);
 });
 
+test('a new FIFO dataset preserves historical evidence but exposes only the active queue by default', async () => {
+  const db=seedDb();
+  await readiness.synchronize(db,accounting);
+  db.collection('fifoDatasets').rows.push({
+    ...structuredClone(db.collection('fifoDatasets').rows[0]),
+    datasetId:'FIFO-V2',
+    algorithmVersion:readiness.ALGORITHM_VERSION
+  });
+  db.collection('fifoDatasetState').rows.push({scopeKey:readiness.ALGORITHM_VERSION,activeDatasetId:'FIFO-V2'});
+  db.collection('fifoAllocations').rows.push(...db.collection('fifoAllocations').rows
+    .filter(row=>row.datasetId==='FIFO-V1')
+    .map(row=>({...structuredClone(row),datasetId:'FIFO-V2',allocationId:`V2-${row.allocationId}`})));
+  db.collection('fifoExceptions').rows.push(...db.collection('fifoExceptions').rows
+    .filter(row=>row.datasetId==='FIFO-V1')
+    .map(row=>({...structuredClone(row),datasetId:'FIFO-V2',exceptionKey:`V2-${row.exceptionKey}`})));
+  await readiness.synchronize(db,accounting);
+  const all=db.collection(readiness.EVIDENCE).rows;
+  assert.equal(all.length,4);
+  assert.equal(all.filter(row=>row.sourceDatasetId==='FIFO-V1'&&row.sourceActive===false).length,2);
+  const active=await readiness.listEvidence(db,{pageSize:50});
+  assert.equal(active.total,2);
+  assert.equal(active.list.every(row=>row.sourceDatasetId==='FIFO-V2'),true);
+});
+
 test('priority uses financial impact before low-impact quantity', () => {
   const groups=new Map([
     ['high',{itemCode:'HIGH',affectedSaleValue:900,affectedQuantity:1,saleFrequency:1,affectedSaleCount:1,returnDependency:false}],

@@ -173,6 +173,25 @@ function priorityRows(groups, totalQuantity, totalValue) {
 
 async function syncEvidence(db, dataset, by) {
   const current = actor(by);
+  const historical = await db.collection(EVIDENCE).find({
+    sourceDatasetId:{ $ne:dataset.datasetId },
+    sourceActive:{ $ne:false }
+  }).toArray();
+  for (const row of historical) {
+    await db.collection(EVIDENCE).updateOne(
+      { evidenceId:row.evidenceId, revision:row.revision },
+      { $set:{
+        sourceActive:false,
+        updatedBy:current,
+        revision:Number(row.revision || 0) + 1,
+        auditLog:[...(row.auditLog || []),audit('superseded-by-new-fifo-dataset',current,{
+          oldDatasetId:row.sourceDatasetId,
+          newDatasetId:dataset.datasetId
+        })].slice(-200),
+        updatedAt:new Date()
+      } }
+    );
+  }
   const [allocations, exceptions] = await Promise.all([
     db.collection('fifoAllocations').find({ datasetId:dataset.datasetId }).toArray(),
     db.collection('fifoExceptions').find({ datasetId:dataset.datasetId }).toArray()
@@ -625,7 +644,9 @@ async function transitionEvidence(db, evidenceId, input, by) {
 
 async function listEvidence(db, filters = {}) {
   await ensureIndexes(db);
-  const query = {};
+  const query = filters.includeHistory === true || String(filters.includeHistory) === 'true'
+    ? {}
+    : { sourceActive:{ $ne:false } };
   if (filters.status) query.status = clean(filters.status, 80);
   if (filters.priority) query.priority = clean(filters.priority, 10);
   if (filters.assignedTo) query.assignedTo = clean(filters.assignedTo, 100);
