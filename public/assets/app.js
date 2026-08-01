@@ -19,11 +19,11 @@ document.addEventListener('DOMContentLoaded',loadBackendVersion,{once:true});
 const ROLE_PAGES = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports'],
+  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
   purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function userRole(){return (state.user&&state.user.role)||'guest'}
@@ -5292,5 +5292,134 @@ async function pageSellerProfit(){
     if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingReviewWorkbench();
     return inheritedRoute.apply(this,arguments);
   };
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.69 Human Accounting Final Acceptance.
+   Every source reference is frozen. This page never creates an invoice,
+   writes Shaygan, approves a decision automatically, or enables Profit. */
+(()=>{
+  const PAGE='accounting-fat';
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const num=value=>Number.isFinite(Number(value))?Number(value).toLocaleString('fa-IR',{maximumFractionDigits:6}):'—';
+  let selectedSessionId='';
+  let selectedSession=null;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';error.status=response.status;throw error;}
+    return payload;
+  }
+  function table(headers,rows,empty='داده‌ای موجود نیست'){
+    return `<div style="overflow:auto"><table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">${safe(empty)}</td></tr>`}</tbody></table></div>`;
+  }
+  function section(id,title){return `<div class="card"><div class="card-header"><h5>${safe(title)}</h5></div><div class="card-body"><div id="${id}"><div class="muted">در حال بارگذاری…</div></div></div></div>`;}
+  async function loadSessions(){
+    const box=q('#fatSessions');if(!box)return;
+    try{
+      const r=await json('/api/accounting/fat/sessions?pageSize=50');
+      if(!selectedSessionId&&r.list?.length)selectedSessionId=r.list[0].sessionId;
+      selectedSession=(r.list||[]).find(row=>row.sessionId===selectedSessionId)||r.list?.[0]||null;
+      box.innerHTML=table(['Session','Frozen datasets','Assignments','Targets','Status','Action'],(r.list||[]).map(row=>`<tr>
+        <td><button class="mini fat-select-session" data-id="${safe(row.sessionId)}">${safe(row.sessionId)}</button><br><small>${safe(row.title)}</small></td>
+        <td><small>Sale ${safe(row.frozen?.saleSnapshotId)}<br>Purchase ${safe(row.frozen?.purchaseDatasetId)}<br>FIFO ${safe(row.frozen?.fifoDatasetId)}<br>SHA ${safe(row.frozen?.gitSha)}</small></td>
+        <td>Accounting: ${safe(row.assignedAccountingUser?.username)}<br>Manager: ${safe(row.assignedManagerUser?.username)}</td>
+        <td><small>${safe(JSON.stringify(row.minimumTargets||{}))}</small></td><td>${safe(row.status)}<br>r${num(row.revision)}</td>
+        <td>${transitionButtons(row)}</td></tr>`));
+      box.querySelectorAll('.fat-select-session').forEach(button=>button.onclick=async()=>{selectedSessionId=button.dataset.id;await refreshSelected();});
+      bindTransitions(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  function transitionButtons(row){
+    const role=userRole();
+    if(role==='accounting'&&row.status==='prepared')return `<button class="mini fat-transition" data-id="${safe(row.sessionId)}" data-revision="${Number(row.revision)}" data-status="in_progress">شروع جلسه</button>`;
+    if(role==='accounting'&&['in_progress','waiting_evidence'].includes(row.status))return `<button class="mini fat-transition" data-id="${safe(row.sessionId)}" data-revision="${Number(row.revision)}" data-status="ready_for_manager_review">ارسال برای مدیر</button>`;
+    if(['manager','admin'].includes(role)&&row.status==='ready_for_manager_review')return `<button class="mini fat-transition" data-id="${safe(row.sessionId)}" data-revision="${Number(row.revision)}" data-status="completed">تصمیم Manager</button>`;
+    return '<small>بدون اقدام مجاز در این وضعیت</small>';
+  }
+  function bindTransitions(container){
+    container.querySelectorAll('.fat-transition').forEach(button=>button.onclick=async()=>{
+      const reason=prompt('دلیل مستند این transition:')||'';if(!reason)return;
+      const evidenceReference=button.dataset.status==='completed'?(prompt('Evidence reference:')||''):'';
+      try{await json(`/api/accounting/fat/sessions/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify({status:button.dataset.status,revision:Number(button.dataset.revision),reason,evidenceReference,authorizedScope:userRole()==='admin'?'manager':''})});await refresh();}
+      catch(error){alert(`${error.code||''} ${error.message}`);}
+    });
+  }
+  async function loadSessionReport(){
+    const box=q('#fatSessionReport');if(!box)return;if(!selectedSessionId){box.innerHTML='<div class="warn">Session آماده‌ای وجود ندارد.</div>';return;}
+    try{
+      const r=await json(`/api/accounting/fat/sessions/${encodeURIComponent(selectedSessionId)}/report`);const c=r.coverage||{},p=r.progress||{};
+      box.innerHTML=`<div class="row four">
+        <div class="info"><b>Frozen Session</b><br>${safe(r.session.sessionId)}<br>${safe(r.session.status)}</div>
+        <div class="info"><b>Confidence</b><br>${num(c.confidence)} / 100<br>Accounting approved: ${r.accountingApproved?'YES':'NO'}</div>
+        <div class="info"><b>Unknown Sale Value</b><br>${num(c.unknownSaleValue)} IRR<br>Profit activation: NO</div>
+        <div class="info"><b>Minimum target</b><br>${p.met?'COMPLETE':'INCOMPLETE'}<br>${safe(JSON.stringify(p.completed||{}))}</div></div>
+        ${table(['Metric','Actual'],[
+          ['Quantity coverage',`${num(c.quantity)}%`],['Sale-value coverage',`${num(c.saleValue)}%`],['Line coverage',`${num(c.line)}%`],['Return linkage',`${num(c.returnLinkage)}%`]
+        ].map(row=>`<tr><td>${safe(row[0])}</td><td>${safe(row[1])}</td></tr>`))}
+        <div class="warn"><b>Frozen means immutable references—not accounting approval.</b><br>Active Snapshot changes cannot retarget this session.</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function loadFat(){
+    const box=q('#fatRuns');if(!box)return;
+    try{
+      const [defs,runs]=await Promise.all([json('/api/accounting/fat/definitions'),json(`/api/accounting/fat/runs?pageSize=50${selectedSessionId?`&sessionId=${encodeURIComponent(selectedSessionId)}`:''}`)]);
+      box.innerHTML=`<div class="info">FAT version ${safe(defs.fatVersion)} — ${num(defs.total)} versioned definitions. Automated technical pass never implies Accounting pass.</div>`+
+      table(['Run','Dimensions','Scenario summary','Status','Technical action'],(runs.list||[]).map(row=>`<tr><td>${safe(row.fatRunId)}</td><td><small>${safe(JSON.stringify(row.dimensions||{}))}</small></td><td><small>${safe(JSON.stringify(row.scenarioSummary||{}))}</small></td><td>${safe(row.status)}<br>Accounting pass: NO</td><td>${['admin','accounting'].includes(userRole())?`<button class="mini fat-execute" data-id="${safe(row.fatRunId)}">Execute technical checks</button>`:'—'}</td></tr>`));
+      box.querySelectorAll('.fat-execute').forEach(button=>button.onclick=async()=>{try{await json(`/api/accounting/fat/runs/${encodeURIComponent(button.dataset.id)}/execute-technical`,{method:'POST',body:'{}'});await loadFat();}catch(error){alert(`${error.code||''} ${error.message}`);}});
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function loadImports(){
+    const box=q('#fatImports');if(!box)return;
+    try{const r=await json(`/api/accounting/comparison/imports${selectedSessionId?`?sessionId=${encodeURIComponent(selectedSessionId)}`:''}`);box.innerHTML=table(['Import','File hash','Mapping/progress','Status'],(r.list||[]).map(row=>`<tr><td>${safe(row.importId)}<br>${safe(row.sourceFileName)}</td><td><small>${safe(row.sourceFileHash)}</small></td><td><small>${safe(JSON.stringify(row.mapping||{}))}<br>${safe(JSON.stringify(row.progress||{}))}</small></td><td>${safe(row.status)}<br>Reference approved: NO</td></tr>`));}
+    catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function loadSimulator(){
+    const box=q('#fatSimulator');if(!box)return;if(!selectedSessionId){box.innerHTML='<div class="muted">Session انتخاب نشده است.</div>';return;}
+    try{const r=await json(`/api/accounting/fat/sessions/${encodeURIComponent(selectedSessionId)}/simulator`,{method:'POST',body:JSON.stringify({decisions:[]})});box.innerHTML=table(['Metric','ACTUAL APPROVED','PROJECTED'],[
+      ['Quantity coverage',r.actual.quantityCoverage,r.projected.quantityCoverage],['Sale-value coverage',r.actual.saleValueCoverage,r.projected.saleValueCoverage],['Line coverage',r.actual.lineCoverage,r.projected.lineCoverage],['Return linkage',r.actual.returnLinkageCoverage,r.projected.returnLinkageCoverage],['Confidence',r.actual.accountingConfidenceIndex,r.projected.accountingConfidenceIndex],['Unknown sale value',r.actual.unknownSaleValue,r.projected.unknownSaleValue]
+    ].map(row=>`<tr>${row.map(cell=>`<td>${safe(num(cell))}</td>`).join('')}</tr>`))+`<div class="warn">PROJECTED is read-only and never changes workflow state.</div>`;}
+    catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function refreshSelected(){await Promise.all([loadSessionReport(),loadFat(),loadImports(),loadSimulator()]);}
+  async function refresh(){await loadSessions();await refreshSelected();}
+  async function createSession(){
+    const reviewBatchId=prompt('Accounting Review Batch ID:','ARBATCH-50d898607288a7ac51947874')||'';if(!reviewBatchId)return;
+    const accounting=prompt('Username کاربر Accounting موجود:')||'';if(!accounting)return;
+    const manager=prompt('Username کاربر Manager یا Admin موجود:')||'';if(!manager)return;
+    try{const r=await json('/api/accounting/fat/sessions',{method:'POST',body:JSON.stringify({reviewBatchId,assignedAccountingUser:accounting,assignedManagerUser:manager})});selectedSessionId=r.session.sessionId;await refresh();}
+    catch(error){alert(`${error.code||''} ${error.message}`);}
+  }
+  async function registerReference(){
+    const file=q('#fatReferenceFile')?.files?.[0];if(!file||!selectedSessionId){alert('Session و فایل مرجع الزامی است.');return;}
+    if(file.size>3000000){alert('حد امن فایل 3MB است؛ برای فایل بزرگ مسیر batch/streaming لازم است.');return;}
+    let mapping;try{mapping=JSON.parse(q('#fatMapping').value);}catch{alert('Mapping JSON معتبر نیست.');return;}
+    const base64=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]||'');reader.onerror=reject;reader.readAsDataURL(file);});
+    try{await json('/api/accounting/comparison/imports',{method:'POST',body:JSON.stringify({sessionId:selectedSessionId,sourceFileName:file.name,sourceMimeType:file.type,sourceFileBase64:base64,mapping})});await loadImports();}
+    catch(error){alert(`${error.code||''} ${error.message}`);}
+  }
+  window.pageAccountingFat=async function(){
+    setPage('Human Accounting FAT',`<main class="main-content">
+      <div class="warn"><b>HUMAN ACCOUNTING AUTHORITY REQUIRED</b><br>Technical checks, candidates and imported references cannot approve Accounting, enable Profit, or write Shaygan.</div>
+      <div class="actions">${['admin','accounting'].includes(userRole())?'<button class="btn" id="fatInit">Initialize versioned FAT</button><button class="btn" id="fatCreateSession">Prepare frozen session</button><button class="btn" id="fatPrepareRun">Prepare FAT run</button>':''}<button class="btn" id="fatRefresh">Refresh</button><button class="btn" id="fatPrint">Print</button><button class="btn" id="fatExport">Export frozen packet</button></div>
+      ${section('fatSessions','1. Frozen Accounting Review Sessions')}
+      ${section('fatSessionReport','2. Human Session Progress and Accounting Report')}
+      ${section('fatRuns','3. Final Acceptance Test Scenarios')}
+      <div class="card"><div class="card-header"><h5>4. Accounting Excel/Reference Registration</h5></div><div class="card-body"><div class="warn">Reference values are not assumed correct. Binary is hashed, not stored. Row ingestion remains batched and audited.</div><input id="fatReferenceFile" type="file"><textarea id="fatMapping" rows="5" placeholder='{"invoiceType":"نوع فاکتور","invoiceNumber":"شماره فاکتور","invoiceDate":"تاریخ","itemCode":"کد کالا","quantity":"تعداد","saleAmount":"مبلغ فروش"}'></textarea>${['admin','accounting'].includes(userRole())?'<button class="btn" id="fatRegisterReference">Register hash and mapping</button>':''}<div id="fatImports"></div></div></div>
+      ${section('fatSimulator','5. Coverage Gain Simulator — Actual vs Projected')}
+    </main>`);
+    q('#fatRefresh').onclick=refresh;q('#fatPrint').onclick=()=>window.print();
+    q('#fatExport').onclick=()=>{if(selectedSessionId)location.href=`/api/accounting/fat/sessions/${encodeURIComponent(selectedSessionId)}/export.csv`;};
+    if(q('#fatInit'))q('#fatInit').onclick=async()=>{try{await json('/api/accounting/fat/init',{method:'POST',body:'{}'});await loadFat();}catch(error){alert(`${error.code||''} ${error.message}`);}};
+    if(q('#fatCreateSession'))q('#fatCreateSession').onclick=createSession;
+    if(q('#fatPrepareRun'))q('#fatPrepareRun').onclick=async()=>{if(!selectedSessionId)return;try{await json('/api/accounting/fat/runs',{method:'POST',body:JSON.stringify({sessionId:selectedSessionId})});await loadFat();}catch(error){alert(`${error.code||''} ${error.message}`);}};
+    if(q('#fatRegisterReference'))q('#fatRegisterReference').onclick=registerReference;
+    await refresh();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);if(!['admin','accounting','manager'].includes(userRole()))return;const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='پذیرش نهایی حسابداری';button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};const before=menu.querySelector('[data-page="accounting-review-workbench"]')||menu.querySelector('[data-page="accounting-fifo-readiness"]');if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);};
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){const page=location.hash.slice(1)||firstAllowedPage();if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFat();return inheritedRoute.apply(this,arguments);};
   try{renderMenu();}catch{}
 })();

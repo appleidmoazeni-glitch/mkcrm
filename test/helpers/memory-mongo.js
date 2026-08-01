@@ -3,6 +3,16 @@
 function valueAt(doc, path) {
   return String(path).split('.').reduce((value, key) => value == null ? undefined : value[key], doc);
 }
+function setAt(doc,path,value){
+  const keys=String(path).split('.');let target=doc;
+  for(const key of keys.slice(0,-1)){if(!target[key]||typeof target[key]!=='object')target[key]={};target=target[key];}
+  target[keys.at(-1)]=value;
+}
+function unsetAt(doc,path){
+  const keys=String(path).split('.');let target=doc;
+  for(const key of keys.slice(0,-1)){target=target?.[key];if(!target)return;}
+  delete target[keys.at(-1)];
+}
 function same(a, b) {
   if (a instanceof Date || b instanceof Date) return new Date(a).getTime() === new Date(b).getTime();
   return a === b;
@@ -16,12 +26,15 @@ function matchesValue(value, expected) {
   if ('$nin' in expected && expected.$nin.some(item => same(value, item))) return false;
   if ('$gte' in expected && value < expected.$gte) return false;
   if ('$lte' in expected && value > expected.$lte) return false;
+  if ('$gt' in expected && value <= expected.$gt) return false;
+  if ('$lt' in expected && value >= expected.$lt) return false;
   if ('$regex' in expected && !new RegExp(expected.$regex, expected.$options || '').test(String(value ?? ''))) return false;
   return true;
 }
 function matches(doc, query = {}) {
   if (query.$or && !query.$or.some(part => matches(doc, part))) return false;
-  return Object.entries(query).every(([key, expected]) => key === '$or' || matchesValue(valueAt(doc, key), expected));
+  if (query.$and && !query.$and.every(part => matches(doc, part))) return false;
+  return Object.entries(query).every(([key, expected]) => ['$or','$and'].includes(key) || matchesValue(valueAt(doc, key), expected));
 }
 function compareBy(spec) {
   return (a, b) => {
@@ -53,7 +66,16 @@ class MemoryCollection {
   async updateOne(filter, update, options={}) {
     const index=this.rows.findIndex(row=>matches(row,filter));
     if(index>=0) {
-      if(update.$set)Object.assign(this.rows[index],structuredClone(update.$set));
+      if(update.$set)for(const [path,value] of Object.entries(structuredClone(update.$set)))setAt(this.rows[index],path,value);
+      if(update.$inc)for(const [path,value] of Object.entries(update.$inc))setAt(this.rows[index],path,Number(valueAt(this.rows[index],path)||0)+Number(value||0));
+      if(update.$unset)for(const path of Object.keys(update.$unset))unsetAt(this.rows[index],path);
+      if(update.$push)for(const [path,spec] of Object.entries(structuredClone(update.$push))){
+        const current=Array.isArray(valueAt(this.rows[index],path))?valueAt(this.rows[index],path):[];
+        const additions=spec&&typeof spec==='object'&&Array.isArray(spec.$each)?spec.$each:[spec];
+        let next=[...current,...additions];
+        if(spec&&typeof spec==='object'&&Number(spec.$slice)<0)next=next.slice(Number(spec.$slice));
+        setAt(this.rows[index],path,next);
+      }
       return {acknowledged:true,matchedCount:1,modifiedCount:1,upsertedCount:0};
     }
     if(!options.upsert)return {acknowledged:true,matchedCount:0,modifiedCount:0,upsertedCount:0};
@@ -68,6 +90,28 @@ class MemoryCollection {
   async indexes() { return structuredClone(this.indexList); }
   async dropIndex(name) { this.indexList=this.indexList.filter(index=>index.name!==name); }
   async estimatedDocumentCount() { return this.rows.length; }
+  aggregate(pipeline=[]){
+    let rows=this.rows.map(row=>structuredClone(row));
+    for(const stage of pipeline){
+      if(stage.$match)rows=rows.filter(row=>matches(row,stage.$match));
+      else if(stage.$group){
+        const groups=new Map();
+        for(const row of rows){
+          const resolve=value=>typeof value==='string'&&value.startsWith('$')?valueAt(row,value.slice(1)):value;
+          const id=stage.$group._id&&typeof stage.$group._id==='object'&&!Array.isArray(stage.$group._id)
+            ?Object.fromEntries(Object.entries(stage.$group._id).map(([key,value])=>[key,resolve(value)]))
+            :resolve(stage.$group._id);
+          const marker=JSON.stringify(id);const group=groups.get(marker)||{_id:id};
+          for(const [key,spec] of Object.entries(stage.$group)){if(key==='_id')continue;if(spec.$sum!=null)group[key]=Number(group[key]||0)+Number(resolve(spec.$sum)||0);}
+          groups.set(marker,group);
+        }
+        rows=[...groups.values()];
+      }else if(stage.$sort)rows.sort(compareBy(stage.$sort));
+      else if(stage.$limit)rows=rows.slice(0,Number(stage.$limit));
+      else if(stage.$count)rows=rows.length?[{[stage.$count]:rows.length}]:[];
+    }
+    return new Cursor(rows);
+  }
 }
 class MemoryDb {
   constructor(seed={}) { this.collections=new Map(Object.entries(seed).map(([name,rows])=>[name,new MemoryCollection(name,rows)])); }

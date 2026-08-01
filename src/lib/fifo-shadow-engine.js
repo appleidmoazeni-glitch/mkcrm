@@ -67,6 +67,24 @@ function safeError(value) {
 function actor(input = {}) {
   return { username:clean(input.username || input.user || 'system', 100), role:clean(input.role || 'system', 50) };
 }
+function accountingReviewContext(input = {}) {
+  if (!input || typeof input !== 'object') return null;
+  const approvedDecisionIds = Array.isArray(input.approvedDecisionIds)
+    ? [...new Set(input.approvedDecisionIds.map(value => clean(value, 100)).filter(Boolean))].slice(0, 5000)
+    : [];
+  const sessionId = clean(input.sessionId, 100);
+  if (!sessionId) return null;
+  return {
+    sessionId,
+    priorFifoDatasetId:clean(input.priorFifoDatasetId, 100),
+    approvedDecisionIds,
+    sourceSaleSnapshotId:clean(input.sourceSaleSnapshotId, 100),
+    sourcePurchaseDatasetId:clean(input.sourcePurchaseDatasetId, 100),
+    algorithmVersion:clean(input.algorithmVersion, 100),
+    expectedProjectedImpact:finite(input.expectedProjectedImpact) || 0,
+    shadowOnly:true
+  };
+}
 function sourceKey(row) {
   const guid = identity(row.itemGuid);
   return guid ? `guid:${guid}` : `code:${identity(row.itemCode)}`;
@@ -1058,6 +1076,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
         dateTo:dates.dateTo,
         sourceSaleSnapshotId:pinned.saleSnapshotId,
         sourcePurchaseDatasetId:pinned.purchaseDatasetId,
+        accountingReviewContext:accountingReviewContext(options.accountingReviewContext),
         requestedBy:requestedByActor,
         resumeCount:0,
         retryCount:0,

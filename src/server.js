@@ -14,6 +14,7 @@ const manualCostResolution = require('./lib/manual-cost-resolution');
 const fifoShadowEngine = require('./lib/fifo-shadow-engine');
 const accountingEvidenceConfidence = require('./lib/accounting-evidence-confidence');
 const accountingOperationalReview = require('./lib/accounting-operational-review');
+const accountingFinalAcceptance = require('./lib/accounting-final-acceptance');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -693,11 +694,11 @@ async function getActiveWarehouseNumbersFromDb() {
 const ROLE_PERMISSIONS = {
   admin: 'all',
   seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports','app-logs','tablo'],
+  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
-  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','reports'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports'],
   supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
@@ -3762,6 +3763,163 @@ async function handleApi(req, res, pathname, query) {
       }
     }
 
+    // 0.9.19.69: Human Accounting session freeze, reference comparison and
+    // versioned Final Acceptance Tests. All writes are isolated to review/FAT
+    // collections. No source snapshot, Purchase Layer, completed FIFO,
+    // invoice, Shaygan, Profit, ROI or Commission write is performed.
+    if (pathname === '/api/accounting/fat/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      try {
+        const indexes=await accountingFinalAcceptance.ensureIndexes(db);
+        const definitions=await accountingFinalAcceptance.initializeFatDefinitions(db,currentUser(req));
+        return sendJson(res,200,{ok:true,indexes,definitions,profitActivationAllowed:false});
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_FAT_INIT_FAILED',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/fat/definitions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingFinalAcceptance.listFatDefinitions(db));
+    }
+    if (pathname === '/api/accounting/fat/sessions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingFinalAcceptance.listSessions(db,query));
+    }
+    if (pathname === '/api/accounting/fat/sessions' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.createSession(db,body,currentUser(req),{gitSha:process.env.GIT_COMMIT||process.env.COMMIT_SHA||''}));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_CREATE_FAILED',error:String(error.message||error)});}
+    }
+    const fatSessionMatch=pathname.match(/^\/api\/accounting\/fat\/sessions\/([^/]+)(?:\/(report|simulator|fifo-rerun-gate|export\.csv))?$/);
+    if (fatSessionMatch && req.method === 'GET' && !fatSessionMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,{ok:true,session:await accountingFinalAcceptance.getSession(db,decodeURIComponent(fatSessionMatch[1]))});}
+      catch(error){return sendJson(res,Number(error.statusCode||404),{ok:false,code:error.code||'ACCOUNTING_SESSION_NOT_FOUND',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'PATCH' && !fatSessionMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.transitionSession(db,decodeURIComponent(fatSessionMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'GET' && fatSessionMatch[2] === 'report') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.sessionReport(db,decodeURIComponent(fatSessionMatch[1])));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'POST' && fatSessionMatch[2] === 'simulator') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.coverageSimulator(db,decodeURIComponent(fatSessionMatch[1]),body));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SIMULATOR_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'GET' && fatSessionMatch[2] === 'fifo-rerun-gate') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.fifoRerunGate(db,decodeURIComponent(fatSessionMatch[1])));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RERUN_GATE_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'GET' && fatSessionMatch[2] === 'export.csv') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        const exported=await accountingFinalAcceptance.exportSession(db,decodeURIComponent(fatSessionMatch[1]));
+        const cell=value=>{let text=String(value??'').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,5000);if(/^[=+\-@]/.test(text))text=`'${text}`;return `"${text.replace(/"/g,'""')}"`;};
+        const headers=['sessionId','category','recordId','frozenFifoDatasetId','status','revision'];
+        const lines=[headers.map(cell).join(',')];for(const row of exported.rows)lines.push(headers.map(name=>cell(row[name])).join(','));
+        res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="accounting-fat-session.csv"','Cache-Control':'no-store','X-Accounting-Decision-Import':'disabled'});
+        return res.end('\uFEFF'+lines.join('\r\n'));
+      } catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_EXPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/comparison/imports' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();const filter=query.sessionId?{frozenSessionId:String(query.sessionId)}:{};
+      const list=await db.collection(accountingFinalAcceptance.COMPARISON_IMPORTS).find(filter).sort({createdAt:-1}).limit(50).toArray();
+      return sendJson(res,200,{ok:true,total:list.length,list});
+    }
+    if (pathname === '/api/accounting/comparison/imports' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.createComparisonImport(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_IMPORT_FAILED',error:String(error.message||error)});}
+    }
+    const comparisonImportMatch=pathname.match(/^\/api\/accounting\/comparison\/imports\/([^/]+)\/(rows|recover|cancel)$/);
+    if (comparisonImportMatch && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();const id=decodeURIComponent(comparisonImportMatch[1]);
+      try {
+        const result=comparisonImportMatch[2]==='rows'
+          ?await accountingFinalAcceptance.ingestComparisonRows(db,id,body,currentUser(req))
+          :comparisonImportMatch[2]==='recover'
+            ?await accountingFinalAcceptance.recoverComparisonImport(db,id,body,currentUser(req))
+            :await accountingFinalAcceptance.cancelComparisonImport(db,id,body,currentUser(req));
+        return sendJson(res,200,result);
+      } catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_IMPORT_ACTION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/comparison/runs' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();const filter=query.sessionId?{sessionId:String(query.sessionId)}:{};
+      const list=await db.collection(accountingFinalAcceptance.COMPARISON_RUNS).find(filter).sort({createdAt:-1}).limit(50).toArray();
+      return sendJson(res,200,{ok:true,total:list.length,list});
+    }
+    if (pathname === '/api/accounting/comparison/runs' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.prepareComparisonRun(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_RUN_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/comparison/differences' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.listComparisonDifferences(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_DIFFERENCES_FAILED',error:String(error.message||error)});}
+    }
+    const comparisonRunMatch=pathname.match(/^\/api\/accounting\/comparison\/runs\/([^/]+)\/(execute|recover)$/);
+    if (comparisonRunMatch && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();const id=decodeURIComponent(comparisonRunMatch[1]);
+      try{return sendJson(res,200,comparisonRunMatch[2]==='execute'?await accountingFinalAcceptance.executeComparisonBatch(db,id,body,currentUser(req)):await accountingFinalAcceptance.recoverComparisonRun(db,id,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_RUN_ACTION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fat/runs' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();return sendJson(res,200,await accountingFinalAcceptance.listFatRuns(db,query));
+    }
+    if (pathname === '/api/accounting/fat/runs' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.prepareFatRun(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FAT_RUN_PREPARE_FAILED',error:String(error.message||error)});}
+    }
+    const fatRunReportMatch=pathname.match(/^\/api\/accounting\/fat\/runs\/([^/]+)\/report$/);
+    if (fatRunReportMatch && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.fatRunReport(db,decodeURIComponent(fatRunReportMatch[1]),query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FAT_RUN_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    const fatRunActionMatch=pathname.match(/^\/api\/accounting\/fat\/runs\/([^/]+)\/(execute-technical|evidence|differences|approve)$/);
+    if (fatRunActionMatch && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);const db=await connectMongo();const id=decodeURIComponent(fatRunActionMatch[1]);
+      try {
+        const result=fatRunActionMatch[2]==='execute-technical'
+          ?await accountingFinalAcceptance.executeTechnicalFat(db,id,currentUser(req))
+          :fatRunActionMatch[2]==='evidence'
+            ?await accountingFinalAcceptance.recordFatEvidence(db,id,body,currentUser(req))
+            :fatRunActionMatch[2]==='differences'
+              ?await accountingFinalAcceptance.recordFatDifference(db,id,body,currentUser(req))
+            :await accountingFinalAcceptance.approveFatScenario(db,id,body,currentUser(req));
+        return sendJson(res,200,result);
+      } catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FAT_RUN_ACTION_FAILED',error:String(error.message||error)});}
+    }
+
     // 0.9.19.67: evidence, return linkage, precision and approval-gate diagnostics.
     // All writes are isolated to Phase-owned audit collections. Official sources,
     // Profit, ROI, Commission and Shaygan business documents remain untouched.
@@ -3868,15 +4026,36 @@ async function handleApi(req, res, pathname, query) {
         body.resumeDatasetId||query.resumeDatasetId||
         (pathname.endsWith('/resume')?body.datasetId||query.datasetId:'')||''
       ).trim();
+      const reviewSessionId=String(body.reviewSessionId||query.reviewSessionId||'').trim();
       const request={
         dateFrom:dates.dateFrom,
         dateTo:dates.dateTo,
         resumeDatasetId,
+        reviewSessionId,
         saleSnapshotId:String(body.saleSnapshotId||query.saleSnapshotId||'').trim(),
         purchaseDatasetId:String(body.purchaseDatasetId||query.purchaseDatasetId||'').trim(),
         maxAttempts:Math.max(1,Math.min(Number(body.maxAttempts||query.maxAttempts||3),5))
       };
       const db=await connectMongo();
+      if (pathname.endsWith('/start')) {
+        if (!reviewSessionId) return sendJson(res,409,{ok:false,code:'FIFO_REVIEW_SESSION_REQUIRED',error:'شروع FIFO جدید فقط با Accounting Review Session frozen مجاز است.'});
+        let rerunGate;
+        try { rerunGate=await accountingFinalAcceptance.fifoRerunGate(db,reviewSessionId); }
+        catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RERUN_GATE_FAILED',error:String(error.message||error)});}
+        if (!rerunGate.allowed) return sendJson(res,409,{ok:false,code:'FIFO_AUTHORIZED_ACCOUNTING_DECISION_REQUIRED',error:'حداقل یک تصمیم انسانی مجاز قبل از FIFO rerun الزامی است.',gate:rerunGate});
+        request.saleSnapshotId=rerunGate.sourceSaleSnapshotId;
+        request.purchaseDatasetId=rerunGate.sourcePurchaseDatasetId;
+        request.accountingReviewContext={
+          sessionId:rerunGate.sessionId,
+          priorFifoDatasetId:rerunGate.priorFifoDatasetId,
+          approvedDecisionIds:rerunGate.approvedDecisionIds,
+          sourceSaleSnapshotId:rerunGate.sourceSaleSnapshotId,
+          sourcePurchaseDatasetId:rerunGate.sourcePurchaseDatasetId,
+          algorithmVersion:rerunGate.algorithmVersion,
+          expectedProjectedImpact:rerunGate.expectedProjectedImpact,
+          shadowOnly:true
+        };
+      }
       if(fifoShadowJobManager.isRunning('fifo-shadow')){
         const running=fifoShadowJobManager.getRunning('fifo-shadow');
         return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'FIFO Shadow job is already running',jobId:running?.id||''});
