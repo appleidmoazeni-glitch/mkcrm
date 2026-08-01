@@ -342,6 +342,10 @@ test('FAT differences remain immutable, classified and drillable without automat
 
 test('coverage simulator keeps actual/projected separate and never invents cost recovery',async()=>{
   const { db,session }=await createSession();
+  const lightweight=await fat.lightweightReadinessSummary(db,session.frozen.fifoDatasetId);
+  assert.equal(lightweight.reportMode,'lightweight-projected-fields');
+  assert.equal(lightweight.comparisonLoaded,false);
+  assert.equal(lightweight.confidence.components.saleValueCostCoverage,50);
   const baseline=await fat.coverageSimulator(db,session.sessionId,{decisions:[]});
   const projected=await fat.coverageSimulator(db,session.sessionId,{decisions:[{type:'return',id:'SC-1',decision:'confirmed_linked'}]});
   assert.equal(baseline.mode,'PROJECTED_READ_ONLY');

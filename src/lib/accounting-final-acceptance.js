@@ -72,6 +72,7 @@ const HUMAN_DECISIONS = new Set([
 const ALLOWED_ROLES = Object.freeze(['admin', 'accounting', 'manager']);
 const MAX_SOURCE_BYTES = 3_000_000;
 const MAX_ROW_BATCH = 1000;
+const readinessSummaryInFlight = new Map();
 
 function clean(value, max = 1000) {
   return String(value == null ? '' : value).trim().slice(0, max);
@@ -560,7 +561,7 @@ async function sessionReport(db, sessionId) {
   const session = await getSession(db, sessionId);
   const [progress, base, fatRuns, imports] = await Promise.all([
     minimumTargetProgress(db, session),
-    readiness.readinessReport(db, session.frozen.fifoDatasetId),
+    lightweightReadinessSummary(db, session.frozen.fifoDatasetId),
     db.collection(FAT_RUNS).find({ sessionId:session.sessionId }).sort({ createdAt:-1 }).limit(20).toArray(),
     db.collection(COMPARISON_IMPORTS).find({ frozenSessionId:session.sessionId }).sort({ createdAt:-1 }).limit(20).toArray()
   ]);
@@ -584,6 +585,56 @@ async function sessionReport(db, sessionId) {
     comparisonImports:imports.map(row => ({ importId:row.importId, status:row.status, sourceFileName:row.sourceFileName, sourceFileHash:row.sourceFileHash })),
     profitActivationAllowed:false, commissionEnabled:false, accountingApproved:session.status === 'completed'
   };
+}
+
+async function buildLightweightReadinessSummary(db, datasetId) {
+  const dataset = await db.collection('fifoDatasets').findOne({ datasetId:clean(datasetId, 100) });
+  if (!dataset) fail('FIFO_DATASET_MISSING', 'FIFO Shadow Dataset برای گزارش سبک موجود نیست.', 404);
+  const [allocations, evidence, purchaseReturns, saleReturns, samples] = await Promise.all([
+    db.collection('fifoAllocations').find(
+      { datasetId:dataset.datasetId },
+      { projection:{ _id:0, saleInvoiceType:1, saleLineId:1, quantityExact:1, allocatedQty:1, unknownQty:1, allocatedSaleValueExact:1, allocatedSaleValue:1, sourceType:1 } }
+    ).toArray(),
+    db.collection(readiness.EVIDENCE).find(
+      { sourceActive:{ $ne:false } },
+      { projection:{ _id:0, status:1, priority:1, affectedSaleValue:1, affectedQuantity:1 } }
+    ).toArray(),
+    db.collection(readiness.PURCHASE_RETURNS).find({}, { projection:{ _id:0, status:1 } }).toArray(),
+    db.collection(readiness.SALE_RETURNS).find({}, { projection:{ _id:0, status:1 } }).toArray(),
+    db.collection(readiness.SAMPLES).find(
+      { datasetId:dataset.datasetId },
+      { projection:{ _id:0, reviewStatus:1 } }
+    ).toArray()
+  ]);
+  const confidence = readiness._confidenceFromRows(dataset, allocations, evidence, purchaseReturns, saleReturns, samples);
+  return {
+    ok:true, available:true,
+    dataset:{
+      datasetId:dataset.datasetId, status:dataset.status, activationStatus:dataset.activationStatus,
+      algorithmVersion:dataset.algorithmVersion, sourceSaleSnapshotId:dataset.sourceSaleSnapshotId,
+      sourcePurchaseDatasetId:dataset.sourcePurchaseDatasetId, validation:dataset.validation
+    },
+    confidence,
+    evidence:{
+      total:evidence.length,
+      affectedSaleValue:round(evidence.reduce((sum, row) => sum + finite(row.affectedSaleValue), 0), 2),
+      affectedQuantity:round(evidence.reduce((sum, row) => sum + finite(row.affectedQuantity), 0), 6)
+    },
+    samples:{ total:samples.length, reviewed:samples.filter(row => row.reviewStatus !== 'not_reviewed').length },
+    reportMode:'lightweight-projected-fields',
+    comparisonLoaded:false,
+    accountingApproved:false,
+    profitActivationAllowed:false
+  };
+}
+
+async function lightweightReadinessSummary(db, datasetId) {
+  const key = clean(datasetId, 100);
+  if (readinessSummaryInFlight.has(key)) return readinessSummaryInFlight.get(key);
+  const promise = buildLightweightReadinessSummary(db, key);
+  readinessSummaryInFlight.set(key, promise);
+  try { return await promise; }
+  finally { readinessSummaryInFlight.delete(key); }
 }
 
 function validateMapping(mapping = {}, requiredFields = DEFAULT_REQUIRED_MAPPING) {
@@ -1367,7 +1418,7 @@ async function fatRunReport(db, fatRunId, filters = {}) {
 
 async function coverageSimulator(db, sessionId, input = {}) {
   const session = await getSession(db, sessionId);
-  const base = await readiness.readinessReport(db, session.frozen.fifoDatasetId);
+  const base = await lightweightReadinessSummary(db, session.frozen.fifoDatasetId);
   const proposals = Array.isArray(input.decisions) ? input.decisions.slice(0, 1000) : [];
   const returnIds = proposals.filter(row => row.type === 'return' && ['confirmed_linked', 'confirmed_unmatched'].includes(row.decision)).map(row => clean(row.id, 100));
   const sampleIds = proposals.filter(row => row.type === 'sample' && HUMAN_DECISIONS.has(row.decision)).map(row => clean(row.id, 100));
@@ -1468,5 +1519,6 @@ module.exports = {
   executeComparisonBatch, recoverComparisonRun, listComparisonDifferences,
   validateMapping, normalizeComparisonRow, classifyDifference, compareExact,
   prepareFatRun, executeTechnicalFat, recordFatEvidence, recordFatDifference, approveFatScenario,
-  listFatDefinitions, listFatRuns, fatRunReport, coverageSimulator, fifoRerunGate, exportSession
+  listFatDefinitions, listFatRuns, fatRunReport, lightweightReadinessSummary,
+  coverageSimulator, fifoRerunGate, exportSession
 };
