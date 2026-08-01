@@ -250,7 +250,13 @@ async function ensureIndexes(db) {
     if (!existing.has(name)) await db.createCollection(name).catch(() => {});
   }
   await db.collection(SESSIONS).createIndex({ sessionId:1 }, { unique:true });
-  await db.collection(SESSIONS).createIndex({ reviewBatchId:1, 'frozen.fifoDatasetId':1 }, { unique:true });
+  const sessionIndexes = await db.collection(SESSIONS).indexes();
+  const legacySessionIndex = sessionIndexes.find(index => index.name === 'reviewBatchId_1_frozen.fifoDatasetId_1');
+  if (legacySessionIndex?.unique) await db.collection(SESSIONS).dropIndex(legacySessionIndex.name);
+  await db.collection(SESSIONS).createIndex(
+    { reviewBatchId:1, 'frozen.fifoDatasetId':1, 'frozen.gitSha':1 },
+    { unique:true, name:'review_batch_fifo_git_unique_v2' }
+  );
   await db.collection(SESSIONS).createIndex({ status:1, updatedAt:-1 });
   await db.collection(COMPARISON_IMPORTS).createIndex({ importId:1 }, { unique:true });
   await db.collection(COMPARISON_IMPORTS).createIndex({ sourceFileHash:1, frozenSessionId:1 }, { unique:true });
@@ -407,7 +413,7 @@ async function createSession(db, input = {}, by = {}, runtime = {}) {
     allocationFingerprint:clean(context.fifo.allocationFingerprint, 128)
   };
   if (!frozen.gitSha) fail('ACCOUNTING_SESSION_GIT_SHA_REQUIRED', 'Git SHA برای Freeze session الزامی است.', 409);
-  const sessionId = deterministicId('ASESSION', `${reviewBatchId}|${frozen.fifoDatasetId}|${MODULE_VERSION}`);
+  const sessionId = deterministicId('ASESSION', `${reviewBatchId}|${frozen.fifoDatasetId}|${frozen.gitSha}|${MODULE_VERSION}`);
   if (await db.collection(SESSIONS).findOne({ sessionId })) {
     fail('ACCOUNTING_SESSION_DUPLICATE', 'برای این Batch و Dataset قبلاً session ساخته شده است.', 409);
   }

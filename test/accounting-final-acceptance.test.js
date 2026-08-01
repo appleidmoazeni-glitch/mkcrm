@@ -153,6 +153,18 @@ test('session rejects missing users, same-person assignments and duplicate creat
   await assert.rejects(createSession(db),error=>error.code==='ACCOUNTING_SESSION_DUPLICATE');
 });
 
+test('a new Git SHA creates a separate frozen session without mutating the prior session',async()=>{
+  const db=seedDb();
+  const first=(await createSession(db)).session;
+  const nextSha='772ac2c3216853a0cdb4e3c788a167a2743cd7e8';
+  const second=(await fat.createSession(db,{
+    reviewBatchId:'BATCH-1',assignedAccountingUser:'accountant-1',assignedManagerUser:'manager-1'
+  },admin,{gitSha:nextSha})).session;
+  assert.notEqual(second.sessionId,first.sessionId);
+  assert.equal(first.frozen.gitSha,SHA);assert.equal(second.frozen.gitSha,nextSha);
+  assert.equal(db.collection(fat.SESSIONS).rows.length,2);
+});
+
 test('seller cannot prepare a session or initialize FAT definitions',async()=>{
   const db=seedDb();
   await assert.rejects(fat.createSession(db,{},seller,{gitSha:SHA}),error=>error.code==='ACCOUNTING_FAT_FORBIDDEN');

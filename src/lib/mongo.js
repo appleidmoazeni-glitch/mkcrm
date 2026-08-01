@@ -113,7 +113,13 @@ async function initMongo() {
   await database.collection('accountingReviewBatches').createIndex({ batchId:1 }, { unique:true });
   await database.collection('accountingReviewBatches').createIndex({ sourceFifoDatasetId:1, batchKey:1 }, { unique:true });
   await database.collection('accountingReviewSessions').createIndex({ sessionId:1 }, { unique:true });
-  await database.collection('accountingReviewSessions').createIndex({ reviewBatchId:1, 'frozen.fifoDatasetId':1 }, { unique:true });
+  const accountingSessionIndexes=await database.collection('accountingReviewSessions').indexes();
+  const legacyAccountingSessionIndex=accountingSessionIndexes.find(index=>index.name==='reviewBatchId_1_frozen.fifoDatasetId_1');
+  if(legacyAccountingSessionIndex?.unique)await database.collection('accountingReviewSessions').dropIndex(legacyAccountingSessionIndex.name);
+  await database.collection('accountingReviewSessions').createIndex(
+    { reviewBatchId:1, 'frozen.fifoDatasetId':1, 'frozen.gitSha':1 },
+    { unique:true,name:'review_batch_fifo_git_unique_v2' }
+  );
   await database.collection('accountingReviewSessions').createIndex({ status:1, updatedAt:-1 });
   await database.collection('accountingComparisonImports').createIndex({ importId:1 }, { unique:true });
   await database.collection('accountingComparisonImports').createIndex({ sourceFileHash:1, frozenSessionId:1 }, { unique:true });
