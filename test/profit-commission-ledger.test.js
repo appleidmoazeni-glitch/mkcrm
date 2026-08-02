@@ -84,6 +84,10 @@ test('approved rate overlap is rejected and missing/exceptional resolution stays
   const db=seedDb();const created=await ledger.createRateVersion(db,{sellerIdentity:'11701013',commissionCategory:'NOTEBOOK',effectiveFrom:'14050415',effectiveTo:'14050501',rate:'0.15',sourceReference:'contract'},accountant);await assert.rejects(ledger.approveRateVersion(db,created.rateVersion.rateVersionId,{},manager),e=>e.code==='RATE_APPROVED_OVERLAP');const missing=await ledger.resolveRate(db,'OTHER','NOTEBOOK','14050410');assert.equal(missing.status,'missing');const resolved=await ledger.resolveRate(db,'11701013','NOTEBOOK','14050410');assert.equal(resolved.rateVersion.rate,'0.14000000');
 });
 
+test('missing rates keep draft commission unavailable and total null rather than zero',async()=>{
+  const db=seedDb();db.collection(ledger.RATE_VERSIONS).rows=[];await ledger.materializeFifoProfitFacts(db,{},accountant);const result=await ledger.calculateDraftCommission(db,{fifoDatasetId:'FIFO-APPROVED',periodFrom:'14050401',periodTo:'14050431'},accountant);const knownCostLines=db.collection(ledger.COMMISSION_LINES).rows.filter(row=>row.actualFifoProfitExact!=null);assert.equal(knownCostLines.length,2);assert.equal(knownCostLines.every(row=>row.status==='unavailable'&&row.draftCommissionExact===null),true);assert.equal(knownCostLines.some(row=>row.unavailableReason==='rate-missing'),true);assert.equal(result.totals.draftCommissionExact,null);
+});
+
 test('rate approval is serialized per seller and category',async()=>{
   const db=seedDb();const created=await ledger.createRateVersion(db,{sellerIdentity:'OTHER',commissionCategory:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431',rate:'0.15',sourceReference:'contract'},accountant);db.collection(ledger.RATE_APPROVAL_LOCKS).rows.push({lockKey:'OTHER|NOTEBOOK',owner:'another-manager',expiresAt:new Date(Date.now()+10000)});await assert.rejects(ledger.approveRateVersion(db,created.rateVersion.rateVersionId,{},manager),e=>e.code==='RATE_APPROVAL_LOCKED');assert.equal(db.collection(ledger.RATE_VERSIONS).rows.find(row=>row.rateVersionId===created.rateVersion.rateVersionId).status,'pending');
 });
