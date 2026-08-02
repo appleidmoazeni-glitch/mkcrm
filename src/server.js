@@ -15,6 +15,7 @@ const fifoShadowEngine = require('./lib/fifo-shadow-engine');
 const accountingEvidenceConfidence = require('./lib/accounting-evidence-confidence');
 const accountingOperationalReview = require('./lib/accounting-operational-review');
 const accountingFinalAcceptance = require('./lib/accounting-final-acceptance');
+const profitCommissionLedger = require('./lib/profit-commission-ledger');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -3236,6 +3237,17 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/manual-cost-resolutions': 'manual-cost-resolutions.create',
     'POST /api/accounting/fifo-shadow/start': 'fifo-shadow.start',
     'POST /api/accounting/fifo-shadow/resume': 'fifo-shadow.resume',
+    'POST /api/accounting/profit-ledger/init': 'profit-ledger.init',
+    'POST /api/accounting/profit-ledger/facts/materialize': 'profit-ledger.facts.materialize',
+    'POST /api/accounting/profit-ledger/adjustments': 'profit-ledger.adjustments.create',
+    'POST /api/accounting/profit-ledger/categories': 'profit-ledger.categories.create',
+    'POST /api/accounting/profit-ledger/rates': 'profit-ledger.rates.create',
+    'POST /api/accounting/profit-ledger/rates/seed-tir': 'profit-ledger.rates.seed-tir',
+    'POST /api/accounting/profit-ledger/discounts/extract': 'profit-ledger.discounts.extract',
+    'POST /api/accounting/profit-ledger/commission-drafts': 'profit-ledger.commission-drafts.create',
+    'POST /api/accounting/profit-ledger/excel/export': 'profit-ledger.excel.export',
+    'POST /api/accounting/profit-ledger/excel/import': 'profit-ledger.excel.import',
+    'POST /api/accounting/profit-ledger/tir-reconstruction': 'profit-ledger.tir-reconstruction.create',
     'POST /api/supplier-sleep/init': 'supplier-sleep.init',
     'POST /api/supplier-sleep/sync-purchases': 'supplier-sleep.sync-purchases',
     'POST /api/supplier-sleep/supplier-index': 'supplier-sleep.supplier-index',
@@ -3283,6 +3295,7 @@ function stagingReadOnlyOperation(req, pathname) {
   if (method === 'POST' && /^\/api\/proformas\/\d+\/convert$/.test(normalizedPathname)) return 'proformas.convert';
   if (method === 'POST' && /^\/api\/purchase-drafts\/\d+\/issue$/.test(normalizedPathname)) return 'purchase-drafts.issue';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/manual-cost-resolutions\/[^/]+(?:\/(?:submit|approve|reject|expire))?$/.test(normalizedPathname)) return 'manual-cost-resolutions.workflow';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/profit-ledger\/(?:adjustments|categories|rates)\/[^/]+(?:\/(?:submit|approve|reject|expire|reverse))?$/.test(normalizedPathname)) return 'profit-ledger.workflow';
   return '';
 }
 
@@ -3681,6 +3694,120 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.dataHealth(db));
+    }
+
+    // 0.9.19.70: immutable FIFO profit facts, governed adjustments and
+    // preliminary commission review. This boundary owns no invoice, Shaygan,
+    // inventory, Sale Snapshot, Purchase Layer or FIFO source writes.
+    const sendLedgerError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error)});
+    if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.ensureIndexes(db));}catch(error){return sendLedgerError(error,'PROFIT_LEDGER_INIT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/health'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.health(db));}catch(error){return sendLedgerError(error,'PROFIT_LEDGER_HEALTH_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/facts'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listFacts(db,query));}catch(error){return sendLedgerError(error,'FIFO_PROFIT_FACTS_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/facts/materialize'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.materializeFifoProfitFacts(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'FIFO_PROFIT_FACTS_MATERIALIZE_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/adjustments'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listAdjustments(db,query));}catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENTS_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/adjustments'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createAdjustment(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENT_CREATE_FAILED');}
+    }
+    const profitAdjustmentMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/adjustments\/([^/]+)(?:\/(submit|approve|reject|expire|reverse))?$/);
+    if(profitAdjustmentMatch&&['PUT','PATCH'].includes(req.method)&&!profitAdjustmentMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.updateAdjustmentDraft(db,decodeURIComponent(profitAdjustmentMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENT_UPDATE_FAILED');}
+    }
+    if(profitAdjustmentMatch&&req.method==='POST'&&profitAdjustmentMatch[2]){
+      if(!requireRole(req,res,profitAdjustmentMatch[2]==='submit'?['admin','accounting']:['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,profitAdjustmentMatch[2]==='reverse'
+        ?await profitCommissionLedger.reverseAdjustment(db,decodeURIComponent(profitAdjustmentMatch[1]),body,currentUser(req))
+        :await profitCommissionLedger.transitionAdjustment(db,decodeURIComponent(profitAdjustmentMatch[1]),profitAdjustmentMatch[2],body,currentUser(req)));
+      }catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENT_TRANSITION_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/saved-profit'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listSavedLedger(db,query));}catch(error){return sendLedgerError(error,'SAVED_PROFIT_LEDGER_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/supplier-incentives'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listSupplierIncentives(db,query));}catch(error){return sendLedgerError(error,'SUPPLIER_INCENTIVE_LEDGER_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/categories'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listCategoryMappings(db,query));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORIES_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/categories'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createCategoryMapping(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_CREATE_FAILED');}
+    }
+    const categoryApprovalMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/categories\/([^/]+)\/approve$/);
+    if(categoryApprovalMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.approveCategoryMapping(db,decodeURIComponent(categoryApprovalMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_APPROVAL_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/rates'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listRateVersions(db,query));}catch(error){return sendLedgerError(error,'COMMISSION_RATES_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/rates'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createRateVersion(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_CREATE_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/rates/seed-tir'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.seedTirRateCandidates(db,currentUser(req)));}catch(error){return sendLedgerError(error,'TIR_RATE_SEED_FAILED');}
+    }
+    const rateApprovalMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)\/approve$/);
+    if(rateApprovalMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.approveRateVersion(db,decodeURIComponent(rateApprovalMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_APPROVAL_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/discounts'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listDiscountFacts(db,query));}catch(error){return sendLedgerError(error,'INVOICE_DISCOUNT_FACTS_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/discounts/extract'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.extractInvoiceDiscountFacts(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'INVOICE_DISCOUNT_EXTRACT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/commission-drafts'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.calculateDraftCommission(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_DRAFT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/commission-drafts'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.commissionReport(db,query));}catch(error){return sendLedgerError(error,'COMMISSION_DRAFT_REPORT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/excel/export'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createExcelExport(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'ACCOUNTING_EXCEL_EXPORT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/excel/import'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.importExcelEdits(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'ACCOUNTING_EXCEL_IMPORT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/excel/audit'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listExcelAudit(db,query));}catch(error){return sendLedgerError(error,'ACCOUNTING_EXCEL_AUDIT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/tir-reconstruction'&&['GET','POST'].includes(req.method)){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const body=req.method==='POST'?await collectBody(req):query;const db=await connectMongo();
+      try{return sendJson(res,200,req.method==='POST'
+        ?await profitCommissionLedger.buildTirReconstruction(db,body,currentUser(req))
+        :await profitCommissionLedger.readTirReconstruction(db,body,currentUser(req)));
+      }catch(error){return sendLedgerError(error,'TIR_RECONSTRUCTION_FAILED');}
     }
 
     // 0.9.19.68: operational accounting review workbench.

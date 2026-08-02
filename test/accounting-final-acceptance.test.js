@@ -127,7 +127,7 @@ test('review session freezes exact Sale, Purchase, FIFO, algorithm, batch, versi
   assert.deepEqual(session.frozen,{
     saleSnapshotId:'SALE-A',purchaseDatasetId:'PURCHASE-A',fifoDatasetId:'FIFO-V2',
     fifoAlgorithmVersion:'fifo-shadow-v2-precision-evidence',reviewBatchId:'BATCH-1',
-    reviewBatchRevision:1,applicationVersion:'0.9.19.69-dev.1',gitSha:SHA,
+    reviewBatchRevision:1,applicationVersion:'0.9.19.70-dev.1',gitSha:SHA,
     sourceFingerprint:'SOURCE-FP',allocationFingerprint:'ALLOC-FP'
   });
   assert.equal(session.status,'prepared');
@@ -307,11 +307,11 @@ test('interrupted comparison recovery preserves checkpoint and differences',asyn
   assert.equal(recovered.checkpointPreserved,true);assert.equal(recovered.run.progress.checkpointRowNumber,1);
 });
 
-test('FAT definitions are versioned and include all 12 required scenarios plus disabled future Commission',async()=>{
+test('FAT definitions are versioned and include all 20 required scenarios plus disabled payment activation',async()=>{
   const db=seedDb();const result=await fat.initializeFatDefinitions(db,admin);
-  assert.equal(result.total,13);
+  assert.equal(result.total,21);
   const definitions=(await fat.listFatDefinitions(db)).list;
-  for(let index=1;index<=12;index++)assert.ok(definitions.some(row=>row.scenarioCode===`FAT-${String(index).padStart(2,'0')}`));
+  for(let index=1;index<=20;index++)assert.ok(definitions.some(row=>row.scenarioCode===`FAT-${String(index).padStart(2,'0')}`));
   assert.equal(definitions.find(row=>row.scenarioCode==='FAT-COMMISSION-FUTURE').enabled,false);
 });
 

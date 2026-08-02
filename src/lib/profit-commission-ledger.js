@@ -1,0 +1,499 @@
+'use strict';
+
+/*
+ * Phase 5.3.0 — Profit Adjustment & Commission Ledger
+ *
+ * This module owns accounting review facts and workflow records only. It never
+ * mutates Sale Snapshot, FIFO allocations/datasets, Purchase Layers, inventory,
+ * invoices or Shaygan. Actual FIFO profit is copied once from a validated
+ * Shadow FIFO dataset into immutable facts; all human changes are separate,
+ * versioned and approval-gated.
+ */
+const crypto = require('crypto');
+const decimal = require('./accounting-decimal');
+const fifoShadow = require('./fifo-shadow-engine');
+const { canonicalSaleDate } = require('./jalali-date');
+
+const FIFO_FACTS = 'fifoProfitFacts';
+const ADJUSTMENTS = 'profitAdjustments';
+const SAVED_LEDGER = 'savedProfitLedgerEntries';
+const SUPPLIER_LEDGER = 'supplierIncentiveLedgerEntries';
+const CATEGORY_MAPPINGS = 'commissionCategoryMappings';
+const RATE_VERSIONS = 'commissionRateVersions';
+const RATE_APPROVAL_LOCKS = 'commissionRateApprovalLocks';
+const DISCOUNT_FACTS = 'invoiceDiscountFacts';
+const COMMISSION_RUNS = 'commissionDraftRuns';
+const COMMISSION_LINES = 'commissionDraftLines';
+const EXPORT_BATCHES = 'accountingExcelExportBatches';
+const IMPORT_BATCHES = 'accountingExcelImportBatches';
+const IMPORT_ROWS = 'accountingExcelImportRows';
+const TIR_RECONSTRUCTION = 'tir1405ReconstructionIssues';
+
+const OWNED_COLLECTIONS = Object.freeze([
+  FIFO_FACTS, ADJUSTMENTS, SAVED_LEDGER, SUPPLIER_LEDGER,
+  CATEGORY_MAPPINGS, RATE_VERSIONS, RATE_APPROVAL_LOCKS, DISCOUNT_FACTS,
+  COMMISSION_RUNS, COMMISSION_LINES, EXPORT_BATCHES, IMPORT_BATCHES,
+  IMPORT_ROWS, TIR_RECONSTRUCTION
+]);
+const SCHEMA_VERSION = 1;
+const MODULE_VERSION = 'profit-commission-ledger-1.0.0';
+const ALLOWED_ROLES = Object.freeze(['admin', 'accounting', 'manager']);
+const EDIT_ROLES = Object.freeze(['admin', 'accounting']);
+const APPROVE_ROLES = Object.freeze(['admin', 'manager']);
+const POOLS = Object.freeze(['NOTEBOOK', 'COMPONENT']);
+const CATEGORIES = Object.freeze(['NOTEBOOK', 'COMPONENT', 'OTHER', 'SERVICE', 'NON_COMMISSIONABLE', 'UNKNOWN']);
+const ADJUSTMENT_TYPES = Object.freeze([
+  'saved_profit_credit', 'saved_profit_subsidy', 'invoice_discount',
+  'accounting_correction', 'category_correction',
+  'seller_mapping_correction', 'management_adjustment'
+]);
+const ADJUSTMENT_STATUSES = Object.freeze(['draft', 'pending', 'approved', 'rejected', 'expired', 'reversed']);
+const SAVED_ENTRY_TYPES = Object.freeze([
+  'CREDIT_FROM_REDUCED_COMMISSIONABLE_PROFIT',
+  'DEBIT_FOR_LOW_PROFIT_SUBSIDY', 'REVERSAL', 'OPENING_BALANCE',
+  'APPROVED_MANAGEMENT_ADJUSTMENT'
+]);
+const SUPPLIER_INCENTIVE_TYPES = Object.freeze(['DROP', 'REBATE', 'BONUS_PAYMENT']);
+const FORMULA_ERRORS = /#(?:VALUE!|NAME\?|REF!|DIV\/0!|N\/A|NUM!|NULL!)/i;
+const MAX_IMPORT_ROWS = 5000;
+
+function clean(value, max = 1000) {
+  return String(value == null ? '' : value).trim().slice(0, max);
+}
+function actor(value = {}) {
+  return { username:clean(value.username || value.user || 'system', 100), role:clean(value.role || 'system', 50) };
+}
+function fail(code, message, statusCode = 400) {
+  const error = new Error(message); error.code = code; error.statusCode = statusCode; throw error;
+}
+function requireRole(value, allowed = ALLOWED_ROLES) {
+  const current = actor(value);
+  if (!allowed.includes(current.role)) fail('PROFIT_LEDGER_FORBIDDEN', 'دسترسی به دفتر تعدیلات سود مجاز نیست.', 403);
+  return current;
+}
+function sha256(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
+function stable(value) {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function deterministicId(prefix, material) { return `${prefix}-${sha256(material).slice(0, 24)}`; }
+function newId(prefix) { return `${prefix}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`; }
+function exact(value, scale = decimal.MONEY_SCALE) { return decimal.format(decimal.parse(value == null || value === '' ? '0' : value, scale), scale); }
+function exactOrNull(value, scale = decimal.MONEY_SCALE) { return value == null || value === '' ? null : exact(value, scale); }
+function add(values, scale = decimal.MONEY_SCALE) { return decimal.format(values.reduce((sum, value) => sum + decimal.parse(value || 0, scale), 0n), scale); }
+function subtract(left, right, scale = decimal.MONEY_SCALE) { return decimal.format(decimal.parse(left || 0, scale) - decimal.parse(right || 0, scale), scale); }
+function compare(left, right, scale = decimal.MONEY_SCALE) {
+  const result = decimal.parse(left || 0, scale) - decimal.parse(right || 0, scale);
+  return result < 0n ? -1 : result > 0n ? 1 : 0;
+}
+function multiplyMoneyRate(money, rate) {
+  const amount = decimal.parse(money || 0, decimal.MONEY_SCALE);
+  const rateScaled = decimal.parse(rate || 0, 8);
+  return decimal.format(decimal.multiply(amount, decimal.MONEY_SCALE, rateScaled, 8, decimal.MONEY_SCALE), decimal.MONEY_SCALE);
+}
+function date8(value, field, optional = false) {
+  if (optional && !clean(value)) return '';
+  return canonicalSaleDate(value, { field });
+}
+function audit(action, by, details = {}) {
+  return { action:clean(action, 100), by:actor(by), at:new Date(), details:JSON.parse(JSON.stringify(details, (_, value) => typeof value === 'string' ? clean(value, 2000) : value)) };
+}
+async function count(collection, query = {}) {
+  if (typeof collection.countDocuments === 'function') return Number(await collection.countDocuments(query));
+  return (await collection.find(query).toArray()).length;
+}
+async function insertMany(collection, rows) {
+  if (!rows.length) return 0;
+  if (typeof collection.insertMany === 'function') return Number((await collection.insertMany(rows, { ordered:true })).insertedCount || rows.length);
+  for (const row of rows) await collection.insertOne(row);
+  return rows.length;
+}
+function pageRows(rows, filters = {}) {
+  const page = Math.max(1, Number(filters.page || 1));
+  const pageSize = Math.max(1, Math.min(Number(filters.pageSize || 100), 500));
+  return { page, pageSize, total:rows.length, list:rows.slice((page - 1) * pageSize, page * pageSize) };
+}
+
+async function ensureIndexes(db) {
+  const existing = new Set((await db.listCollections().toArray()).map(row => row.name));
+  for (const name of OWNED_COLLECTIONS) if (!existing.has(name)) await db.createCollection(name).catch(() => {});
+  await db.collection(FIFO_FACTS).createIndex({ factId:1 }, { unique:true });
+  await db.collection(FIFO_FACTS).createIndex({ fifoDatasetId:1, saleLineIdentity:1 }, { unique:true });
+  await db.collection(FIFO_FACTS).createIndex({ fifoDatasetId:1, sellerIdentity:1, saleDate:1 });
+  await db.collection(ADJUSTMENTS).createIndex({ adjustmentId:1 }, { unique:true });
+  await db.collection(ADJUSTMENTS).createIndex({ fifoDatasetId:1, saleLineIdentity:1, status:1 });
+  await db.collection(SAVED_LEDGER).createIndex({ ledgerEntryId:1 }, { unique:true });
+  await db.collection(SAVED_LEDGER).createIndex({ sourceAdjustmentId:1 }, { unique:true, sparse:true });
+  await db.collection(SAVED_LEDGER).createIndex({ pool:1, accountingPeriod:1, postedAt:1 });
+  await db.collection(SUPPLIER_LEDGER).createIndex({ ledgerEntryId:1 }, { unique:true });
+  await db.collection(CATEGORY_MAPPINGS).createIndex({ mappingId:1 }, { unique:true });
+  await db.collection(CATEGORY_MAPPINGS).createIndex({ identityType:1, identityValue:1, effectiveFrom:1, effectiveTo:1, status:1 });
+  await db.collection(RATE_VERSIONS).createIndex({ rateVersionId:1 }, { unique:true });
+  await db.collection(RATE_VERSIONS).createIndex({ sellerIdentity:1, commissionCategory:1, effectiveFrom:1, effectiveTo:1, status:1 });
+  await db.collection(RATE_APPROVAL_LOCKS).createIndex({ lockKey:1 }, { unique:true });
+  await db.collection(DISCOUNT_FACTS).createIndex({ discountFactId:1 }, { unique:true });
+  await db.collection(DISCOUNT_FACTS).createIndex({ saleSnapshotId:1, saleInvoiceIdentity:1 }, { unique:true });
+  await db.collection(COMMISSION_RUNS).createIndex({ commissionRunId:1 }, { unique:true });
+  await db.collection(COMMISSION_LINES).createIndex({ commissionRunId:1, saleLineIdentity:1 }, { unique:true });
+  await db.collection(EXPORT_BATCHES).createIndex({ exportBatchId:1 }, { unique:true });
+  await db.collection(IMPORT_BATCHES).createIndex({ importBatchId:1 }, { unique:true });
+  await db.collection(IMPORT_BATCHES).createIndex({ exportBatchId:1, sourceWorkbookHash:1 }, { unique:true });
+  await db.collection(IMPORT_ROWS).createIndex({ importBatchId:1, originalExcelRowNumber:1 }, { unique:true });
+  await db.collection(TIR_RECONSTRUCTION).createIndex({ issueId:1 }, { unique:true });
+  return { ok:true, moduleVersion:MODULE_VERSION, collections:OWNED_COLLECTIONS };
+}
+
+function categoryIdentity(row) {
+  if (clean(row.itemGuid)) return { identityType:'itemGuid', identityValue:clean(row.itemGuid, 100) };
+  if (clean(row.itemCode)) return { identityType:'itemCode', identityValue:clean(row.itemCode, 100) };
+  if (clean(row.mainGroupCode)) return { identityType:'groupCode', identityValue:clean(row.mainGroupCode, 100) };
+  fail('CATEGORY_IDENTITY_REQUIRED', 'شناسه کالا یا گروه برای دسته‌بندی الزامی است.');
+}
+function rangesOverlap(aFrom, aTo, bFrom, bTo) {
+  return aFrom <= (bTo || '99999999') && bFrom <= (aTo || '99999999');
+}
+async function resolveCategory(db, saleLine, saleDate) {
+  const candidates = await db.collection(CATEGORY_MAPPINGS).find({ status:'approved' }).toArray();
+  const ordered = [
+    ['itemGuid', clean(saleLine?.itemGuid, 100)], ['itemCode', clean(saleLine?.itemCode, 100)],
+    ['groupCode', clean(saleLine?.mainGroupCode, 100)]
+  ];
+  for (const [identityType, identityValue] of ordered) {
+    if (!identityValue) continue;
+    const rows = candidates.filter(row => row.identityType === identityType && row.identityValue === identityValue && row.effectiveFrom <= saleDate && (!row.effectiveTo || row.effectiveTo >= saleDate));
+    if (rows.length === 1) return { category:rows[0].commissionCategory, mappingId:rows[0].mappingId, status:'resolved' };
+    if (rows.length > 1) return { category:'UNKNOWN', mappingId:'', status:'ambiguous' };
+  }
+  return { category:'UNKNOWN', mappingId:'', status:'missing' };
+}
+
+async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
+  const current = requireRole(requestedBy, EDIT_ROLES);
+  await ensureIndexes(db);
+  const active = input.fifoDatasetId
+    ? { datasetId:clean(input.fifoDatasetId, 100), dataset:await db.collection(fifoShadow.DATASETS).findOne({ datasetId:clean(input.fifoDatasetId, 100) }) }
+    : await fifoShadow.activeDataset(db);
+  const dataset = active?.dataset;
+  if (!dataset || dataset.status !== 'completed' || dataset.activationStatus !== 'validated-shadow' || dataset.validation?.valid === false) {
+    fail('FIFO_FACT_SOURCE_NOT_APPROVED', 'فقط FIFO Shadow کامل و validated-shadow می‌تواند منبع Fact باشد.', 409);
+  }
+  const existing = await count(db.collection(FIFO_FACTS), { fifoDatasetId:dataset.datasetId });
+  if (existing) {
+    const facts = await db.collection(FIFO_FACTS).find({ fifoDatasetId:dataset.datasetId }).toArray();
+    const fingerprint = sha256(stable(facts.map(factImmutableProjection).sort((a,b)=>a.saleLineIdentity.localeCompare(b.saleLineIdentity))));
+    return { ok:true, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint:fingerprint, duplicate:true, immutable:true };
+  }
+  const allocations = await db.collection(fifoShadow.ALLOCATIONS).find({ datasetId:dataset.datasetId }).sort({ globalSequence:1 }).toArray();
+  const saleLines = await db.collection('saleSnapshotDatasetLines').find({ snapshotId:dataset.sourceSaleSnapshotId }).toArray();
+  const saleHeaders = await db.collection('saleSnapshotDatasetHeaders').find({ snapshotId:dataset.sourceSaleSnapshotId }).toArray();
+  const lineById = new Map(saleLines.map(row => [clean(row.saleLineId, 500), row]));
+  const headerByIdentity = new Map(saleHeaders.map(row => [`${Number(row.invTyp)}:${Number(row.invNo)}`, row]));
+  const grouped = new Map();
+  for (const row of allocations) {
+    const key = clean(row.saleLineId, 500);
+    if (!grouped.has(key)) grouped.set(key, []);
+    grouped.get(key).push(row);
+  }
+  const now = new Date();
+  const facts = [];
+  for (const [saleLineIdentity, rows] of grouped) {
+    const first = rows[0];
+    const saleLine = lineById.get(saleLineIdentity) || {};
+    const invoiceIdentity = `${Number(first.saleInvoiceType)}:${Number(first.saleInvoiceNo)}`;
+    const header = headerByIdentity.get(invoiceIdentity) || {};
+    const category = await resolveCategory(db, { ...saleLine, ...first }, clean(first.saleDate, 8));
+    const quantityExact = add(rows.map(row => row.quantityExact || row.allocatedQty || row.unknownQty || 0), decimal.QUANTITY_SCALE);
+    const saleAmountExact = add(rows.map(row => row.allocatedSaleValueExact || row.allocatedSaleValue || 0));
+    const unknown = rows.some(row => row.sourceType === 'unknown_cost' || row.allocatedCostAmountExact == null);
+    const knownQuantity = rows.filter(row => row.sourceType !== 'unknown_cost').map(row => row.quantityExact || row.allocatedQty || 0);
+    const knownQtyExact = add(knownQuantity, decimal.QUANTITY_SCALE);
+    const fifoCostExact = unknown ? null : add(rows.map(row => row.allocatedCostAmountExact || 0));
+    const actualFifoProfitExact = fifoCostExact == null ? null : subtract(saleAmountExact, fifoCostExact);
+    const originalQuantity = exact(first.soldQuantity || saleLine.qty || quantityExact, decimal.QUANTITY_SCALE);
+    const coverage = unknown
+      ? (compare(knownQtyExact, '0', decimal.QUANTITY_SCALE) > 0 ? 'partial' : 'unknown')
+      : (compare(quantityExact, originalQuantity, decimal.QUANTITY_SCALE) === 0 ? 'complete' : 'partial');
+    const officialLineDiscount = saleLine.lineDiscountAmount;
+    const invoiceDiscountExact = officialLineDiscount == null ? null : exact(officialLineDiscount);
+    const immutable = {
+      fifoDatasetId:dataset.datasetId,
+      fifoAlgorithmVersion:dataset.algorithmVersion || first.algorithmVersion || '',
+      saleSnapshotId:dataset.sourceSaleSnapshotId,
+      saleInvoiceIdentity:invoiceIdentity,
+      saleInvoiceType:Number(first.saleInvoiceType), saleInvoiceNumber:Number(first.saleInvoiceNo), saleDate:clean(first.saleDate, 8),
+      saleLineIdentity,
+      sellerIdentity:clean(first.sellerAccountNumber || saleLine.sellerAccountNumber, 100),
+      sellerName:clean(first.sellerName || saleLine.sellerName, 200),
+      itemGuid:clean(first.itemGuid || saleLine.itemGuid, 100), itemCode:clean(first.itemCode || saleLine.itemCode, 100),
+      itemDescription:clean(first.itemDescription || saleLine.itemName, 500),
+      commissionCategory:category.category, categoryMappingId:category.mappingId, categoryResolutionStatus:category.status,
+      quantityExact, saleAmountExact, invoiceDiscountExact,
+      invoiceDiscountAttributionStatus:officialLineDiscount == null && Number(header.discountAmount || 0) > 0 ? 'unresolved-invoice-level' : 'official-line-or-zero',
+      fifoCostExact, actualFifoProfitExact, costCoverageStatus:coverage,
+      sourceFingerprint:dataset.sourceFingerprint || '', allocationFingerprint:dataset.allocationFingerprint || ''
+    };
+    facts.push({ factId:deterministicId('PF', `${dataset.datasetId}|${saleLineIdentity}`), schemaVersion:SCHEMA_VERSION, ...immutable, factContentHash:sha256(stable(immutable)), immutable:true, createdBy:current, createdAt:now });
+  }
+  await insertMany(db.collection(FIFO_FACTS), facts);
+  const factsFingerprint = sha256(stable(facts.map(factImmutableProjection).sort((a,b)=>a.saleLineIdentity.localeCompare(b.saleLineIdentity))));
+  return { ok:true, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint, duplicate:false, immutable:true, unknownCostCount:facts.filter(row=>row.costCoverageStatus!=='complete').length };
+}
+function factImmutableProjection(row) {
+  const copy = { ...row }; delete copy._id; delete copy.createdAt; delete copy.createdBy; return copy;
+}
+async function listFacts(db, filters = {}) {
+  await ensureIndexes(db);
+  let rows = await db.collection(FIFO_FACTS).find({}).toArray();
+  if (filters.fifoDatasetId) rows = rows.filter(row => row.fifoDatasetId === clean(filters.fifoDatasetId, 100));
+  if (filters.sellerIdentity) rows = rows.filter(row => row.sellerIdentity === clean(filters.sellerIdentity, 100));
+  if (filters.category) rows = rows.filter(row => row.commissionCategory === clean(filters.category, 50));
+  if (filters.coverage) rows = rows.filter(row => row.costCoverageStatus === clean(filters.coverage, 50));
+  if (filters.search) { const q=clean(filters.search).toLowerCase(); rows=rows.filter(row=>[row.saleLineIdentity,row.saleInvoiceIdentity,row.itemCode,row.itemDescription,row.sellerIdentity,row.sellerName].some(value=>clean(value).toLowerCase().includes(q))); }
+  rows.sort((a,b)=>clean(a.saleDate).localeCompare(clean(b.saleDate)) || clean(a.saleLineIdentity).localeCompare(clean(b.saleLineIdentity)));
+  return { ok:true, ...pageRows(rows, filters), immutable:true, actualFifoProfitEditable:false, unknownCostIsZero:false };
+}
+
+function normalizeAdjustment(input = {}) {
+  const adjustmentType = clean(input.adjustmentType, 80);
+  if (!ADJUSTMENT_TYPES.includes(adjustmentType)) fail('ADJUSTMENT_TYPE_INVALID', 'نوع تعدیل معتبر نیست.');
+  const categoryPool = clean(input.categoryPool, 30).toUpperCase();
+  if (['saved_profit_credit','saved_profit_subsidy'].includes(adjustmentType) && !POOLS.includes(categoryPool)) fail('ADJUSTMENT_POOL_REQUIRED', 'Pool نوت‌بوک یا کامپوننت الزامی است.');
+  const proposedAmountExact = exact(input.proposedAmountExact);
+  if (compare(proposedAmountExact, '0') <= 0) fail('ADJUSTMENT_AMOUNT_INVALID', 'مبلغ تعدیل باید مثبت باشد.');
+  const effectivePeriod = clean(input.effectivePeriod, 8);
+  if (!/^\d{6,8}$/.test(effectivePeriod)) fail('ADJUSTMENT_PERIOD_INVALID', 'دوره مؤثر شمسی معتبر الزامی است.');
+  return {
+    fifoDatasetId:clean(input.fifoDatasetId, 100), saleInvoiceIdentity:clean(input.saleInvoiceIdentity, 200),
+    saleLineIdentity:clean(input.saleLineIdentity, 500), sellerIdentity:clean(input.sellerIdentity, 100),
+    categoryPool, adjustmentType, proposedAmountExact,
+    reasonCode:clean(input.reasonCode, 100), reasonText:clean(input.reasonText, 2000),
+    sourceType:clean(input.sourceType || 'manual_accounting', 100), sourceReference:clean(input.sourceReference, 500),
+    evidenceMetadata:input.evidenceMetadata && typeof input.evidenceMetadata === 'object' ? JSON.parse(JSON.stringify(input.evidenceMetadata)) : {},
+    effectivePeriod
+  };
+}
+async function createAdjustment(db, input, requestedBy) {
+  const current = requireRole(requestedBy, EDIT_ROLES); await ensureIndexes(db);
+  const normalized = normalizeAdjustment(input);
+  const openingBalance = normalized.adjustmentType === 'management_adjustment' && normalized.sourceType === 'opening_balance';
+  const fact = openingBalance ? null : await db.collection(FIFO_FACTS).findOne({ fifoDatasetId:normalized.fifoDatasetId, saleLineIdentity:normalized.saleLineIdentity });
+  if (!fact && !openingBalance) fail('ADJUSTMENT_FIFO_FACT_NOT_FOUND', 'Fact غیرقابل‌تغییر FIFO پیدا نشد.', 404);
+  if (openingBalance && !POOLS.includes(normalized.categoryPool)) fail('ADJUSTMENT_POOL_REQUIRED', 'Opening balance باید Pool مشخص داشته باشد.');
+  if (!normalized.sellerIdentity && fact) normalized.sellerIdentity = fact.sellerIdentity;
+  if (!normalized.saleInvoiceIdentity && fact) normalized.saleInvoiceIdentity = fact.saleInvoiceIdentity;
+  const now = new Date();
+  const row = {
+    adjustmentId:newId('PADJ'), schemaVersion:SCHEMA_VERSION, ...normalized,
+    approvedAmountExact:null, status:'draft', revision:1,
+    createdBy:current, submittedBy:null, approvedBy:null, rejectedBy:null, reversedBy:null,
+    auditLog:[audit('draft-created', current, { proposedAmountExact:normalized.proposedAmountExact, adjustmentType:normalized.adjustmentType })],
+    deleted:false, createdAt:now, updatedAt:now
+  };
+  await db.collection(ADJUSTMENTS).insertOne(row);
+  return { ok:true, adjustment:row, actualFifoProfitChanged:false, ledgerPosted:false };
+}
+async function getAdjustment(db, adjustmentId) {
+  const row = await db.collection(ADJUSTMENTS).findOne({ adjustmentId:clean(adjustmentId, 100) });
+  if (!row) fail('ADJUSTMENT_NOT_FOUND', 'تعدیل پیدا نشد.', 404); return row;
+}
+async function listAdjustments(db, filters = {}) {
+  await ensureIndexes(db); let rows=await db.collection(ADJUSTMENTS).find({}).toArray();
+  if(filters.status)rows=rows.filter(row=>row.status===clean(filters.status));
+  if(filters.type)rows=rows.filter(row=>row.adjustmentType===clean(filters.type));
+  if(filters.pool)rows=rows.filter(row=>row.categoryPool===clean(filters.pool).toUpperCase());
+  if(filters.saleLineIdentity)rows=rows.filter(row=>row.saleLineIdentity===clean(filters.saleLineIdentity,500));
+  rows.sort((a,b)=>new Date(b.updatedAt||0)-new Date(a.updatedAt||0));
+  return {ok:true,...pageRows(rows,filters),physicalDeleteAllowed:false};
+}
+async function updateAdjustmentDraft(db, adjustmentId, input, requestedBy) {
+  const current=requireRole(requestedBy,EDIT_ROLES); const row=await getAdjustment(db,adjustmentId);
+  if(!['draft','rejected'].includes(row.status))fail('ADJUSTMENT_IMMUTABLE','فقط draft یا rejected قابل ویرایش است.',409);
+  const revision=Number(input.revision); if(revision!==Number(row.revision))fail('ADJUSTMENT_CONFLICT','Revision تغییر کرده است.',409);
+  const normalized=normalizeAdjustment({...row,...input});
+  const patch={...normalized,status:'draft',revision:revision+1,updatedAt:new Date(),auditLog:[...(row.auditLog||[]),audit('draft-updated',current,{revision})].slice(-300)};
+  const result=await db.collection(ADJUSTMENTS).updateOne({adjustmentId:row.adjustmentId,status:row.status,revision},{$set:patch});
+  if(!result.matchedCount)fail('ADJUSTMENT_CONFLICT','Revision هم‌زمان تغییر کرده است.',409);
+  return {ok:true,adjustment:{...row,...patch},actualFifoProfitChanged:false};
+}
+async function savedBalance(db, pool, periodTo = '') {
+  if(!POOLS.includes(pool))fail('SAVED_POOL_INVALID','Pool معتبر نیست.');
+  let rows=await db.collection(SAVED_LEDGER).find({pool}).toArray();
+  if(periodTo)rows=rows.filter(row=>row.accountingPeriod<=periodTo);
+  const debit=add(rows.map(row=>row.debitAmountExact||'0'));
+  const credit=add(rows.map(row=>row.creditAmountExact||'0'));
+  return {pool,debitAmountExact:debit,creditAmountExact:credit,balanceExact:subtract(credit,debit),entryCount:rows.length,derived:true};
+}
+function ledgerEffect(adjustment) {
+  if(adjustment.adjustmentType==='saved_profit_credit')return {entryType:'CREDIT_FROM_REDUCED_COMMISSIONABLE_PROFIT',debitAmountExact:'0.00',creditAmountExact:adjustment.approvedAmountExact,sourceSaleLineIdentity:adjustment.saleLineIdentity,beneficiarySaleLineIdentity:''};
+  if(adjustment.adjustmentType==='saved_profit_subsidy')return {entryType:'DEBIT_FOR_LOW_PROFIT_SUBSIDY',debitAmountExact:adjustment.approvedAmountExact,creditAmountExact:'0.00',sourceSaleLineIdentity:'',beneficiarySaleLineIdentity:adjustment.saleLineIdentity};
+  if(adjustment.adjustmentType==='management_adjustment'&&adjustment.sourceType==='opening_balance')return {entryType:'OPENING_BALANCE',debitAmountExact:'0.00',creditAmountExact:adjustment.approvedAmountExact,sourceSaleLineIdentity:'',beneficiarySaleLineIdentity:''};
+  if(adjustment.adjustmentType==='management_adjustment'&&POOLS.includes(adjustment.categoryPool)){
+    const direction=clean(adjustment.evidenceMetadata?.ledgerDirection,20).toLowerCase();
+    if(direction==='credit')return {entryType:'APPROVED_MANAGEMENT_ADJUSTMENT',debitAmountExact:'0.00',creditAmountExact:adjustment.approvedAmountExact,sourceSaleLineIdentity:adjustment.saleLineIdentity,beneficiarySaleLineIdentity:''};
+    if(direction==='debit')return {entryType:'APPROVED_MANAGEMENT_ADJUSTMENT',debitAmountExact:adjustment.approvedAmountExact,creditAmountExact:'0.00',sourceSaleLineIdentity:'',beneficiarySaleLineIdentity:adjustment.saleLineIdentity};
+  }
+  return null;
+}
+async function postSavedLedger(db, adjustment, current) {
+  const effect=ledgerEffect(adjustment); if(!effect)return null;
+  if(!POOLS.includes(adjustment.categoryPool))fail('SAVED_POOL_INVALID','Pool تعدیل معتبر نیست.');
+  if(effect.entryType==='DEBIT_FOR_LOW_PROFIT_SUBSIDY'){
+    const balance=await savedBalance(db,adjustment.categoryPool,adjustment.effectivePeriod);
+    if(compare(balance.balanceExact,effect.debitAmountExact)<0)fail('SAVED_POOL_INSUFFICIENT','مانده ذخیره برای یارانه کافی نیست.',409);
+  }
+  const row={ledgerEntryId:deterministicId('SPL',adjustment.adjustmentId),schemaVersion:SCHEMA_VERSION,pool:adjustment.categoryPool,...effect,sourceAdjustmentId:adjustment.adjustmentId,accountingPeriod:adjustment.effectivePeriod,description:clean(adjustment.reasonText,1000),createdBy:adjustment.createdBy,approvedBy:current,postedAt:new Date(),reversalOf:'',auditMetadata:{reasonCode:adjustment.reasonCode,sourceReference:adjustment.sourceReference},appendOnly:true};
+  row.contentHash=sha256(stable({...row,postedAt:row.postedAt.toISOString()}));
+  await db.collection(SAVED_LEDGER).insertOne(row); return row;
+}
+async function transitionAdjustment(db, adjustmentId, action, input, requestedBy) {
+  const current=requireRole(requestedBy,action==='submit'?EDIT_ROLES:APPROVE_ROLES); const row=await getAdjustment(db,adjustmentId);
+  const revision=Number(input?.revision); if(revision!==Number(row.revision))fail('ADJUSTMENT_CONFLICT','Revision تغییر کرده است.',409);
+  const rules={submit:{from:['draft'],to:'pending'},approve:{from:['pending'],to:'approved'},reject:{from:['pending'],to:'rejected'},expire:{from:['approved'],to:'expired'}};
+  const rule=rules[action]; if(!rule||!rule.from.includes(row.status))fail('ADJUSTMENT_TRANSITION_INVALID','انتقال وضعیت مجاز نیست.',409);
+  if(action==='approve'&&clean(row.createdBy?.username)===current.username)fail('ADJUSTMENT_SELF_APPROVAL','ایجادکننده نمی‌تواند تعدیل خود را تأیید کند.',403);
+  const now=new Date(); const patch={status:rule.to,revision:revision+1,updatedAt:now,auditLog:[...(row.auditLog||[]),audit(action,current,{from:row.status,to:rule.to,reason:clean(input?.reason,1000)})].slice(-300)};
+  if(action==='submit')patch.submittedBy=current;
+  if(action==='approve'){patch.approvedBy=current;patch.approvedAt=now;patch.approvedAmountExact=exact(input?.approvedAmountExact||row.proposedAmountExact);}
+  if(action==='reject'){patch.rejectedBy=current;patch.rejectedAt=now;patch.rejectionReason=clean(input?.reason,1000);}
+  if(action==='expire'){patch.expiredBy=current;patch.expiredAt=now;}
+  let ledgerEntry=null;
+  if(action==='approve')ledgerEntry=await postSavedLedger(db,{...row,...patch},current);
+  const result=await db.collection(ADJUSTMENTS).updateOne({adjustmentId:row.adjustmentId,status:row.status,revision},{$set:patch});
+  if(!result.matchedCount)fail('ADJUSTMENT_CONFLICT','Revision هم‌زمان تغییر کرده است.',409);
+  return {ok:true,adjustment:{...row,...patch},ledgerEntry,actualFifoProfitChanged:false,companyProfitChanged:false,commissionableProfitChanged:action==='approve'};
+}
+async function reverseAdjustment(db, adjustmentId, input, requestedBy) {
+  const current=requireRole(requestedBy,APPROVE_ROLES); const row=await getAdjustment(db,adjustmentId);
+  const revision=Number(input?.revision); if(row.status!=='approved')fail('ADJUSTMENT_REVERSAL_INVALID','فقط تعدیل approved قابل reversal است.',409);
+  if(revision!==Number(row.revision))fail('ADJUSTMENT_CONFLICT','Revision تغییر کرده است.',409);
+  const original=await db.collection(SAVED_LEDGER).findOne({sourceAdjustmentId:row.adjustmentId});
+  let reversal=null;
+  if(original){
+    reversal={...original,_id:undefined,ledgerEntryId:deterministicId('SPLREV',row.adjustmentId),entryType:'REVERSAL',debitAmountExact:original.creditAmountExact,creditAmountExact:original.debitAmountExact,sourceAdjustmentId:`REVERSAL:${row.adjustmentId}`,reversalOf:original.ledgerEntryId,description:clean(input?.reason||`Reversal ${row.adjustmentId}`,1000),createdBy:current,approvedBy:current,postedAt:new Date(),appendOnly:true};
+    delete reversal._id; reversal.contentHash=sha256(stable({...reversal,postedAt:reversal.postedAt.toISOString()}));
+    if(compare(reversal.debitAmountExact,'0')>0){const balance=await savedBalance(db,row.categoryPool,row.effectivePeriod);if(compare(balance.balanceExact,reversal.debitAmountExact)<0)fail('SAVED_POOL_REVERSAL_INSUFFICIENT','Reversal باعث مانده منفی می‌شود.',409);}
+    await db.collection(SAVED_LEDGER).insertOne(reversal);
+  }
+  const patch={status:'reversed',revision:revision+1,reversedBy:current,reversedAt:new Date(),reversalReason:clean(input?.reason,1000),updatedAt:new Date(),auditLog:[...(row.auditLog||[]),audit('reversed',current,{reason:input?.reason})].slice(-300)};
+  await db.collection(ADJUSTMENTS).updateOne({adjustmentId:row.adjustmentId,status:'approved',revision},{$set:patch});
+  return {ok:true,adjustment:{...row,...patch},reversalEntry:reversal,actualFifoProfitChanged:false};
+}
+async function listSavedLedger(db, filters={}){
+  await ensureIndexes(db);let rows=await db.collection(SAVED_LEDGER).find({}).toArray();if(filters.pool)rows=rows.filter(row=>row.pool===clean(filters.pool).toUpperCase());rows.sort((a,b)=>new Date(a.postedAt)-new Date(b.postedAt));
+  const balances=await Promise.all(POOLS.map(pool=>savedBalance(db,pool,filters.periodTo||'')));return {ok:true,...pageRows(rows,filters),balances,appendOnly:true,crossPoolTransferAllowed:false};
+}
+async function listSupplierIncentives(db,filters={}){await ensureIndexes(db);let rows=await db.collection(SUPPLIER_LEDGER).find({}).toArray();if(filters.type)rows=rows.filter(row=>row.incentiveType===clean(filters.type));return {ok:true,...pageRows(rows,filters),types:SUPPLIER_INCENTIVE_TYPES,separateFromSavedProfit:true,automaticCommissionApplication:false,appendOnly:true};}
+
+async function createCategoryMapping(db,input,requestedBy){
+  const current=requireRole(requestedBy,EDIT_ROLES);await ensureIndexes(db);const identity=categoryIdentity(input);const commissionCategory=clean(input.commissionCategory).toUpperCase();if(!CATEGORIES.includes(commissionCategory))fail('CATEGORY_INVALID','دسته کمیسیون معتبر نیست.');
+  const effectiveFrom=date8(input.effectiveFrom,'effectiveFrom');const effectiveTo=date8(input.effectiveTo,'effectiveTo',true);if(effectiveTo&&effectiveTo<effectiveFrom)fail('CATEGORY_RANGE_INVALID','بازه دسته‌بندی معتبر نیست.');
+  const now=new Date();const row={mappingId:newId('CMAP'),schemaVersion:SCHEMA_VERSION,...identity,commissionCategory,effectiveFrom,effectiveTo,source:clean(input.source||'accounting-review',200),status:'pending',revision:1,createdBy:current,approvedBy:null,auditLog:[audit('mapping-created',current,{commissionCategory,...identity})],createdAt:now,updatedAt:now};await db.collection(CATEGORY_MAPPINGS).insertOne(row);return{ok:true,mapping:row,automaticApproval:false};
+}
+async function approveCategoryMapping(db,mappingId,input,requestedBy){
+  const current=requireRole(requestedBy,APPROVE_ROLES);const row=await db.collection(CATEGORY_MAPPINGS).findOne({mappingId:clean(mappingId,100)});if(!row)fail('CATEGORY_MAPPING_NOT_FOUND','Mapping پیدا نشد.',404);if(row.status!=='pending')fail('CATEGORY_MAPPING_STATUS_INVALID','فقط pending قابل تأیید است.',409);if(row.createdBy?.username===current.username)fail('CATEGORY_MAPPING_SELF_APPROVAL','تفکیک نقش نقض شده است.',403);
+  const overlaps=(await db.collection(CATEGORY_MAPPINGS).find({status:'approved',identityType:row.identityType,identityValue:row.identityValue}).toArray()).some(other=>rangesOverlap(row.effectiveFrom,row.effectiveTo,other.effectiveFrom,other.effectiveTo));if(overlaps)fail('CATEGORY_MAPPING_OVERLAP','Mapping approved هم‌پوشان وجود دارد.',409);
+  const patch={status:'approved',revision:Number(row.revision)+1,approvedBy:current,approvedAt:new Date(),updatedAt:new Date(),auditLog:[...(row.auditLog||[]),audit('mapping-approved',current,{reason:input?.reason})]};await db.collection(CATEGORY_MAPPINGS).updateOne({mappingId:row.mappingId,status:'pending',revision:row.revision},{$set:patch});return{ok:true,mapping:{...row,...patch}};
+}
+async function listCategoryMappings(db,filters={}){await ensureIndexes(db);let rows=await db.collection(CATEGORY_MAPPINGS).find({}).toArray();if(filters.status)rows=rows.filter(row=>row.status===clean(filters.status));return{ok:true,...pageRows(rows,filters),categories:CATEGORIES};}
+
+async function createRateVersion(db,input,requestedBy){
+  const current=requireRole(requestedBy,EDIT_ROLES);await ensureIndexes(db);const commissionCategory=clean(input.commissionCategory).toUpperCase();if(!CATEGORIES.includes(commissionCategory)||commissionCategory==='UNKNOWN')fail('RATE_CATEGORY_INVALID','دسته نرخ معتبر نیست.');const rate=exact(input.rate,8);if(compare(rate,'0',8)<0||compare(rate,'1',8)>0)fail('RATE_INVALID','نرخ باید بین صفر و یک باشد.');const effectiveFrom=date8(input.effectiveFrom,'effectiveFrom');const effectiveTo=date8(input.effectiveTo,'effectiveTo',true);if(effectiveTo&&effectiveTo<effectiveFrom)fail('RATE_RANGE_INVALID','بازه نرخ معتبر نیست.');
+  const now=new Date();const row={rateVersionId:newId('CRATE'),schemaVersion:SCHEMA_VERSION,sellerIdentity:clean(input.sellerIdentity,100)||'*',commissionCategory,effectiveFrom,effectiveTo,rate,contractType:clean(input.contractType||'candidate',100),sourceReference:clean(input.sourceReference,500),status:clean(input.status)==='draft'?'draft':'pending',revision:1,createdBy:current,approvedBy:null,auditLog:[audit('rate-created',current,{rate,commissionCategory,effectiveFrom,effectiveTo})],createdAt:now,updatedAt:now};await db.collection(RATE_VERSIONS).insertOne(row);return{ok:true,rateVersion:row,automaticApproval:false};
+}
+async function approveRateVersion(db,rateVersionId,input,requestedBy){
+  const current=requireRole(requestedBy,APPROVE_ROLES);await ensureIndexes(db);const row=await db.collection(RATE_VERSIONS).findOne({rateVersionId:clean(rateVersionId,100)});if(!row)fail('RATE_NOT_FOUND','Rate version پیدا نشد.',404);if(!['draft','pending'].includes(row.status))fail('RATE_STATUS_INVALID','Rate قابل تأیید نیست.',409);if(row.createdBy?.username===current.username)fail('RATE_SELF_APPROVAL','تفکیک نقش نقض شده است.',403);
+  const lockKey=`${row.sellerIdentity}|${row.commissionCategory}`;const lockOwner=`${row.rateVersionId}:${crypto.randomBytes(4).toString('hex')}`;const now=new Date();const expiresAt=new Date(now.getTime()+15000);let acquired=false;
+  try{
+    const currentLock=await db.collection(RATE_APPROVAL_LOCKS).findOne({lockKey});if(currentLock?.owner&&new Date(currentLock.expiresAt||0)>now)fail('RATE_APPROVAL_LOCKED','تأیید نرخ دیگری هم‌زمان در جریان است.',409);
+    const lockResult=await db.collection(RATE_APPROVAL_LOCKS).updateOne({lockKey,$or:[{owner:''},{expiresAt:{$lte:now}},{owner:lockOwner}]},{$set:{lockKey,owner:lockOwner,expiresAt,updatedAt:now},$setOnInsert:{createdAt:now}},{upsert:true});acquired=Boolean(lockResult.matchedCount||lockResult.upsertedCount);if(!acquired)fail('RATE_APPROVAL_LOCKED','تأیید نرخ دیگری هم‌زمان در جریان است.',409);
+    const rows=await db.collection(RATE_VERSIONS).find({status:'approved',sellerIdentity:row.sellerIdentity,commissionCategory:row.commissionCategory}).toArray();if(rows.some(other=>rangesOverlap(row.effectiveFrom,row.effectiveTo,other.effectiveFrom,other.effectiveTo)))fail('RATE_APPROVED_OVERLAP','نرخ approved هم‌پوشان است.',409);
+    const patch={status:'approved',revision:Number(row.revision)+1,approvedBy:current,approvedAt:new Date(),updatedAt:new Date(),auditLog:[...(row.auditLog||[]),audit('rate-approved',current,{reason:input?.reason})]};const updated=await db.collection(RATE_VERSIONS).updateOne({rateVersionId:row.rateVersionId,status:row.status,revision:row.revision},{$set:patch});if(!updated.matchedCount)fail('RATE_APPROVAL_CONFLICT','Rate version هم‌زمان تغییر کرده است.',409);return{ok:true,rateVersion:{...row,...patch},approvalSerialized:true};
+  }catch(error){if(error?.code===11000)fail('RATE_APPROVAL_LOCKED','تأیید نرخ دیگری هم‌زمان در جریان است.',409);throw error;}
+  finally{if(acquired)await db.collection(RATE_APPROVAL_LOCKS).updateOne({lockKey,owner:lockOwner},{$set:{owner:'',expiresAt:new Date(0),updatedAt:new Date()}}).catch(()=>{});}
+}
+async function resolveRate(db,sellerIdentity,category,saleDate){const rows=await db.collection(RATE_VERSIONS).find({status:'approved',commissionCategory:category}).toArray();const eligible=rows.filter(row=>(row.sellerIdentity===sellerIdentity||row.sellerIdentity==='*')&&row.effectiveFrom<=saleDate&&(!row.effectiveTo||row.effectiveTo>=saleDate)).sort((a,b)=>(a.sellerIdentity==='*')-(b.sellerIdentity==='*'));if(eligible.length!==1&&!(eligible.length>1&&eligible[0].sellerIdentity!=='*'&&eligible[1].sellerIdentity==='*'))return{status:eligible.length?'ambiguous':'missing',rateVersion:null};return{status:'resolved',rateVersion:eligible[0]};}
+async function listRateVersions(db,filters={}){await ensureIndexes(db);let rows=await db.collection(RATE_VERSIONS).find({}).toArray();if(filters.status)rows=rows.filter(row=>row.status===clean(filters.status));if(filters.sellerIdentity)rows=rows.filter(row=>row.sellerIdentity===clean(filters.sellerIdentity));return{ok:true,...pageRows(rows,filters),historicalVersionPinned:true,missingRateIsZero:false};}
+async function seedTirRateCandidates(db,requestedBy){const current=requireRole(requestedBy,EDIT_ROLES);const seeds=[{sellerIdentity:'*',commissionCategory:'NOTEBOOK',rate:'0.14000000'},{sellerIdentity:'*',commissionCategory:'COMPONENT',rate:'0.20000000'}];const created=[];for(const seed of seeds){const existing=await db.collection(RATE_VERSIONS).findOne({...seed,effectiveFrom:'14050401',effectiveTo:'14050431',sourceReference:'TIR-1405-WORKBOOK-EVIDENCE'});if(existing){created.push(existing);continue;}created.push((await createRateVersion(db,{...seed,effectiveFrom:'14050401',effectiveTo:'14050431',contractType:'tir-workbook-candidate',sourceReference:'TIR-1405-WORKBOOK-EVIDENCE',status:'pending'},current)).rateVersion);}return{ok:true,list:created,approved:0,evidenceOnly:true};}
+
+async function extractInvoiceDiscountFacts(db,input={},requestedBy={}){
+  const current=requireRole(requestedBy,EDIT_ROLES);await ensureIndexes(db);const snapshotId=clean(input.saleSnapshotId,100)||(await fifoShadow.activeDataset(db))?.dataset?.sourceSaleSnapshotId;if(!snapshotId)fail('DISCOUNT_SNAPSHOT_REQUIRED','Sale Snapshot معتبر لازم است.',409);
+  const headers=await db.collection('saleSnapshotDatasetHeaders').find({snapshotId}).toArray();const lines=await db.collection('saleSnapshotDatasetLines').find({snapshotId}).toArray();let created=0;
+  for(const header of headers.filter(row=>Number(row.invTyp)===2)){
+    const invoiceIdentity=`${Number(header.invTyp)}:${Number(header.invNo)}`;const invoiceLines=lines.filter(row=>Number(row.saleInvoiceType)===Number(header.invTyp)&&Number(row.saleInvoiceNo)===Number(header.invNo));const categories=new Set();for(const line of invoiceLines)categories.add((await resolveCategory(db,line,clean(line.saleDate,8))).category);const unresolved=Number(header.discountAmount||0)>0&&(categories.size!==1||categories.has('UNKNOWN'));const immutable={saleSnapshotId:snapshotId,saleInvoiceIdentity:invoiceIdentity,sellerIdentity:clean(header.sellerAccountNumber,100),invoiceDiscountExact:header.discountAmount==null?null:exact(header.discountAmount),sourceField:header.discountAmount==null?'missing':'DiscAmount/DiscountAmount',commissionCategories:[...categories].sort(),categoryAttributionStatus:Number(header.discountAmount||0)===0?'not-applicable':(unresolved?'unresolved-multi-category':'resolved-single-category')};const row={discountFactId:deterministicId('IDF',`${snapshotId}|${invoiceIdentity}`),schemaVersion:SCHEMA_VERSION,...immutable,contentHash:sha256(stable(immutable)),immutable:true,createdBy:current,createdAt:new Date()};const result=await db.collection(DISCOUNT_FACTS).updateOne({discountFactId:row.discountFactId},{$setOnInsert:row},{upsert:true});if(result.upsertedCount)created++;}
+  return{ok:true,saleSnapshotId:snapshotId,total:await count(db.collection(DISCOUNT_FACTS),{saleSnapshotId:snapshotId}),created,source:'official-sale-snapshot-header-discount',shayganWriteCount:0};
+}
+async function listDiscountFacts(db,filters={}){await ensureIndexes(db);let rows=await db.collection(DISCOUNT_FACTS).find({}).toArray();if(filters.saleSnapshotId)rows=rows.filter(row=>row.saleSnapshotId===clean(filters.saleSnapshotId));if(filters.status)rows=rows.filter(row=>row.categoryAttributionStatus===clean(filters.status));return{ok:true,...pageRows(rows,filters),manualWorkbookAggregateAuthoritative:false};}
+
+function adjustmentEffect(row){const amount=row.approvedAmountExact||'0.00';if(row.adjustmentType==='saved_profit_credit'||row.adjustmentType==='invoice_discount')return decimal.parse(amount,decimal.MONEY_SCALE)*-1n;if(['saved_profit_subsidy','accounting_correction','management_adjustment'].includes(row.adjustmentType))return decimal.parse(amount,decimal.MONEY_SCALE);return 0n;}
+async function calculateDraftCommission(db,input={},requestedBy={}){
+  const current=requireRole(requestedBy,EDIT_ROLES);await ensureIndexes(db);const fifoDatasetId=clean(input.fifoDatasetId,100)||(await fifoShadow.activeDataset(db))?.datasetId;if(!fifoDatasetId)fail('COMMISSION_FIFO_REQUIRED','FIFO dataset لازم است.',409);const periodFrom=date8(input.periodFrom,'periodFrom');const periodTo=date8(input.periodTo,'periodTo');if(periodTo<periodFrom)fail('COMMISSION_PERIOD_INVALID','بازه کمیسیون معتبر نیست.');
+  const facts=(await db.collection(FIFO_FACTS).find({fifoDatasetId}).toArray()).filter(row=>row.saleDate>=periodFrom&&row.saleDate<=periodTo);const approved=await db.collection(ADJUSTMENTS).find({fifoDatasetId,status:'approved'}).toArray();const runId=newId('CDRAFT');const lines=[];
+  for(const fact of facts){const applicable=approved.filter(row=>row.saleLineIdentity===fact.saleLineIdentity);const remapped=fact.commissionCategory==='UNKNOWN'?await resolveCategory(db,fact,fact.saleDate):{category:fact.commissionCategory,mappingId:fact.categoryMappingId,status:fact.categoryResolutionStatus};const effectiveCategory=remapped.status==='resolved'?remapped.category:fact.commissionCategory;let unavailableReason='';if(fact.costCoverageStatus!=='complete'||fact.actualFifoProfitExact==null)unavailableReason='unknown-or-partial-cost';if(effectiveCategory==='UNKNOWN')unavailableReason=unavailableReason||'unknown-category';if(fact.invoiceDiscountAttributionStatus==='unresolved-invoice-level')unavailableReason=unavailableReason||'unresolved-invoice-discount';const rate=await resolveRate(db,fact.sellerIdentity,effectiveCategory,fact.saleDate);if(rate.status!=='resolved')unavailableReason=unavailableReason||`rate-${rate.status}`;const effect=applicable.reduce((sum,row)=>sum+adjustmentEffect(row),0n);const commissionable=fact.actualFifoProfitExact==null?null:decimal.format(decimal.parse(fact.actualFifoProfitExact,decimal.MONEY_SCALE)+effect,decimal.MONEY_SCALE);const draft=unavailableReason||commissionable==null?null:multiplyMoneyRate(commissionable,rate.rateVersion.rate);lines.push({commissionLineId:deterministicId('CDL',`${runId}|${fact.saleLineIdentity}`),commissionRunId:runId,fifoDatasetId,saleLineIdentity:fact.saleLineIdentity,saleInvoiceIdentity:fact.saleInvoiceIdentity,sellerIdentity:fact.sellerIdentity,commissionCategory:effectiveCategory,categoryMappingId:remapped.mappingId||fact.categoryMappingId||'',actualFifoProfitExact:fact.actualFifoProfitExact,approvedAdjustmentEffectExact:decimal.format(effect,decimal.MONEY_SCALE),commissionableProfitExact:commissionable,rateVersionId:rate.rateVersion?.rateVersionId||'',rateExact:rate.rateVersion?.rate||null,draftCommissionExact:draft,status:unavailableReason?'unavailable':'preliminary',unavailableReason,nonPayable:true,sellerFacing:false,createdAt:new Date()});}
+  const run={commissionRunId:runId,schemaVersion:SCHEMA_VERSION,fifoDatasetId,periodFrom,periodTo,status:'PRELIMINARY_ACCOUNTING_REVIEW_REQUIRED',lineCount:lines.length,availableLineCount:lines.filter(row=>row.status==='preliminary').length,unavailableLineCount:lines.filter(row=>row.status==='unavailable').length,sourceFingerprint:sha256(stable(lines.map(row=>({...row,createdAt:undefined})))),createdBy:current,createdAt:new Date(),nonPayable:true,sellerFacing:false,payrollApproved:false};await db.collection(COMMISSION_RUNS).insertOne(run);await insertMany(db.collection(COMMISSION_LINES),lines);return{ok:true,run,totals:{actualFifoProfitExact:add(lines.map(row=>row.actualFifoProfitExact||0)),commissionableProfitExact:add(lines.filter(row=>row.commissionableProfitExact!=null).map(row=>row.commissionableProfitExact)),draftCommissionExact:add(lines.filter(row=>row.draftCommissionExact!=null).map(row=>row.draftCommissionExact))},preliminary:true,payable:false};
+}
+async function commissionReport(db,filters={}){await ensureIndexes(db);const runId=clean(filters.commissionRunId,100);const run=runId?await db.collection(COMMISSION_RUNS).findOne({commissionRunId:runId}):null;let lines=runId?await db.collection(COMMISSION_LINES).find({commissionRunId:runId}).toArray():[];return{ok:true,run,...pageRows(lines,filters),preliminary:true,payable:false,sellerFacing:false};}
+
+const IMMUTABLE_EXPORT_FIELDS=Object.freeze(['exportBatchId','rowId','fifoDatasetId','fifoAlgorithmVersion','saleInvoiceIdentity','saleLineIdentity','itemGuid','itemCode','sellerIdentity','commissionCategory','quantityExact','saleAmountExact','invoiceDiscountExact','fifoCostExact','actualFifoProfitExact','costCoverageStatus','currentApprovedAdjustmentsExact','savedProfitPool','commissionRateVersionId']);
+const EDITABLE_EXPORT_FIELDS=Object.freeze(['proposedAdjustmentAmountExact','adjustmentType','proposedSavedProfitPool','reasonCode','reasonText','evidenceReference','reviewerNotes']);
+function immutableExportProjection(row){return Object.fromEntries(IMMUTABLE_EXPORT_FIELDS.filter(field=>field!=='exportBatchId'&&field!=='rowId').map(field=>[field,row[field]??null]));}
+function csvCell(value){let text=String(value??'').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,10000);if(/^[=+\-@]/.test(text))text=`'${text}`;return `"${text.replace(/"/g,'""')}"`;}
+function xmlEscape(value){return String(value??'').replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f]/g,' ').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[char]));}
+function spreadsheetMl(headers,rows){
+  const immutable=new Set([...IMMUTABLE_EXPORT_FIELDS,'integrityHash']);
+  const headerCells=headers.map(field=>`<Cell ss:StyleID="${immutable.has(field)?'ImmutableHeader':'EditableHeader'}"><Data ss:Type="String">${xmlEscape(field)}</Data></Cell>`).join('');
+  const dataRows=rows.map(row=>`<Row>${headers.map(field=>`<Cell ss:StyleID="${immutable.has(field)?'Immutable':'Editable'}"><Data ss:Type="String">${xmlEscape(row[field]??'')}</Data></Cell>`).join('')}</Row>`).join('');
+  const instructions=[
+    ['Contract','Actual FIFO Profit is immutable. Only editable columns may be changed.'],
+    ['Workflow','Imported edits become pending adjustments and require independent approval.'],
+    ['Safety','Unknown cost is not zero. Draft commission is not payable or seller-facing.'],
+    ['Pools','NOTEBOOK and COMPONENT reserves are isolated; cross-pool transfer is forbidden.'],
+    ['Formula policy','Workbook formulas are presentation-only and never authoritative.']
+  ].map(row=>`<Row>${row.map(value=>`<Cell><Data ss:Type="String">${xmlEscape(value)}</Data></Cell>`).join('')}</Row>`).join('');
+  return `<?xml version="1.0" encoding="UTF-8"?><?mso-application progid="Excel.Sheet"?>\n<Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet" xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"><Styles><Style ss:ID="Default"><Alignment ss:Vertical="Top"/></Style><Style ss:ID="ImmutableHeader"><Font ss:Bold="1"/><Interior ss:Color="#D9EAF7" ss:Pattern="Solid"/></Style><Style ss:ID="EditableHeader"><Font ss:Bold="1"/><Interior ss:Color="#FFF2CC" ss:Pattern="Solid"/></Style><Style ss:ID="Immutable"><Interior ss:Color="#EEF5FA" ss:Pattern="Solid"/></Style><Style ss:ID="Editable"><Interior ss:Color="#FFFBE6" ss:Pattern="Solid"/></Style></Styles><Worksheet ss:Name="Accounting Review"><Table><Row>${headerCells}</Row>${dataRows}</Table><WorksheetOptions xmlns="urn:schemas-microsoft-com:office:excel"><FreezePanes/><FrozenNoSplit/><SplitHorizontal>1</SplitHorizontal><TopRowBottomPane>1</TopRowBottomPane><ProtectObjects>False</ProtectObjects><ProtectScenarios>False</ProtectScenarios></WorksheetOptions></Worksheet><Worksheet ss:Name="Instructions"><Table>${instructions}</Table></Worksheet></Workbook>`;
+}
+async function createExcelExport(db,input={},requestedBy={}){
+  const current=requireRole(requestedBy,EDIT_ROLES);await ensureIndexes(db);const fifoDatasetId=clean(input.fifoDatasetId,100)||(await fifoShadow.activeDataset(db))?.datasetId;let facts=await db.collection(FIFO_FACTS).find({fifoDatasetId}).toArray();if(input.periodFrom)facts=facts.filter(row=>row.saleDate>=date8(input.periodFrom,'periodFrom'));if(input.periodTo)facts=facts.filter(row=>row.saleDate<=date8(input.periodTo,'periodTo'));facts.sort((a,b)=>a.saleLineIdentity.localeCompare(b.saleLineIdentity));const exportBatchId=newId('XEXP');const adjustments=await db.collection(ADJUSTMENTS).find({fifoDatasetId,status:'approved'}).toArray();const rows=[];
+  for(const fact of facts){const currentApprovedAdjustmentsExact=add(adjustments.filter(row=>row.saleLineIdentity===fact.saleLineIdentity).map(row=>row.approvedAmountExact||0));const remapped=fact.commissionCategory==='UNKNOWN'?await resolveCategory(db,fact,fact.saleDate):{category:fact.commissionCategory,status:'resolved'};const effectiveCategory=remapped.status==='resolved'?remapped.category:fact.commissionCategory;const rate=await resolveRate(db,fact.sellerIdentity,effectiveCategory,fact.saleDate);const base={exportBatchId,rowId:deterministicId('XROW',`${exportBatchId}|${fact.saleLineIdentity}`),fifoDatasetId,fifoAlgorithmVersion:fact.fifoAlgorithmVersion,saleInvoiceIdentity:fact.saleInvoiceIdentity,saleLineIdentity:fact.saleLineIdentity,itemGuid:fact.itemGuid,itemCode:fact.itemCode,sellerIdentity:fact.sellerIdentity,commissionCategory:effectiveCategory,quantityExact:fact.quantityExact,saleAmountExact:fact.saleAmountExact,invoiceDiscountExact:fact.invoiceDiscountExact,fifoCostExact:fact.fifoCostExact,actualFifoProfitExact:fact.actualFifoProfitExact,costCoverageStatus:fact.costCoverageStatus,currentApprovedAdjustmentsExact,savedProfitPool:POOLS.includes(effectiveCategory)?effectiveCategory:'',commissionRateVersionId:rate.rateVersion?.rateVersionId||''};const integrityHash=sha256(stable(immutableExportProjection(base)));rows.push({...base,integrityHash,...Object.fromEntries(EDITABLE_EXPORT_FIELDS.map(field=>[field,'']))});}
+  const headers=[...IMMUTABLE_EXPORT_FIELDS,'integrityHash',...EDITABLE_EXPORT_FIELDS];const workbook=spreadsheetMl(headers,rows);const workbookHash=sha256(workbook);const batch={exportBatchId,schemaVersion:SCHEMA_VERSION,fifoDatasetId,rowCount:rows.length,headers,immutableFields:IMMUTABLE_EXPORT_FIELDS,editableFields:EDITABLE_EXPORT_FIELDS,rows,sourceWorkbookHash:workbookHash,format:'excel-spreadsheetml-2003',createdBy:current,createdAt:new Date(),immutable:true};await db.collection(EXPORT_BATCHES).insertOne(batch);return{ok:true,exportBatchId,rowCount:rows.length,sourceWorkbookHash:workbookHash,filename:`commission-review-${exportBatchId}.xml`,contentType:'application/vnd.ms-excel; charset=utf-8',content:workbook,immutableFields:IMMUTABLE_EXPORT_FIELDS,editableFields:EDITABLE_EXPORT_FIELDS,authoritativeEngine:'CRM-ledger-not-formulas'};
+}
+async function importExcelEdits(db,input={},requestedBy={}){
+  const current=requireRole(requestedBy,EDIT_ROLES);await ensureIndexes(db);const exportBatchId=clean(input.exportBatchId,100);const sourceWorkbookHash=clean(input.sourceWorkbookHash,64);const batch=await db.collection(EXPORT_BATCHES).findOne({exportBatchId});if(!batch)fail('EXCEL_EXPORT_BATCH_NOT_FOUND','Export batch پیدا نشد.',404);if(sourceWorkbookHash!==batch.sourceWorkbookHash)fail('EXCEL_SOURCE_HASH_MISMATCH','Hash workbook منبع تطابق ندارد.',409);const rows=Array.isArray(input.rows)?input.rows.slice(0,MAX_IMPORT_ROWS):[];if(!rows.length)fail('EXCEL_IMPORT_ROWS_REQUIRED','ردیف import لازم است.');if(await db.collection(IMPORT_BATCHES).findOne({exportBatchId,sourceWorkbookHash}))fail('EXCEL_IMPORT_DUPLICATE','این workbook قبلاً import شده است.',409);const exportById=new Map(batch.rows.map(row=>[row.rowId,row]));const seen=new Set();const auditRows=[];const pending=[];
+  for(let index=0;index<rows.length;index++){const edited=rows[index]||{};const originalExcelRowNumber=Number(edited.originalExcelRowNumber||index+2);let status='accepted';let code='';const original=exportById.get(clean(edited.rowId,100));if(!original){status='rejected';code='UNKNOWN_ROW';}else if(seen.has(original.rowId)){status='rejected';code='DUPLICATE_ROW';}else{seen.add(original.rowId);const expected=sha256(stable(immutableExportProjection(original)));if(clean(edited.integrityHash,64)!==expected||original.integrityHash!==expected){status='rejected';code='IMMUTABLE_HASH_MISMATCH';}for(const field of IMMUTABLE_EXPORT_FIELDS){if(Object.prototype.hasOwnProperty.call(edited,field)&&String(edited[field]??'')!==String(original[field]??'')){status='rejected';code='IMMUTABLE_FIELD_CHANGED';break;}}if(EDITABLE_EXPORT_FIELDS.some(field=>FORMULA_ERRORS.test(clean(edited[field],500)))){status='rejected';code='FORMULA_ERROR';}}
+    const proposed=clean(edited.proposedAdjustmentAmountExact,100);if(status==='accepted'&&!proposed){status='skipped';code='NO_EDIT';}if(status==='accepted'){try{const normalized=normalizeAdjustment({fifoDatasetId:original.fifoDatasetId,saleInvoiceIdentity:original.saleInvoiceIdentity,saleLineIdentity:original.saleLineIdentity,sellerIdentity:original.sellerIdentity,categoryPool:edited.proposedSavedProfitPool,adjustmentType:edited.adjustmentType,proposedAmountExact:proposed,reasonCode:edited.reasonCode,reasonText:edited.reasonText,sourceType:'excel_import',sourceReference:`${exportBatchId}:row:${originalExcelRowNumber}`,evidenceMetadata:{evidenceReference:clean(edited.evidenceReference,500),reviewerNotes:clean(edited.reviewerNotes,2000)},effectivePeriod:clean(input.effectivePeriod,8)});pending.push({normalized,originalExcelRowNumber,original,edited});}catch(error){status='rejected';code=error.code||'INVALID_EDIT';}}
+    auditRows.push({originalExcelRowNumber,rowId:clean(edited.rowId,100),status,code,originalValue:original?Object.fromEntries(EDITABLE_EXPORT_FIELDS.map(field=>[field,original[field]])):null,editedValue:Object.fromEntries(EDITABLE_EXPORT_FIELDS.map(field=>[field,clean(edited[field],2000)]))});}
+  const importBatchId=newId('XIMP');const importDoc={importBatchId,schemaVersion:SCHEMA_VERSION,exportBatchId,sourceWorkbookHash,status:auditRows.some(row=>row.status==='rejected')?'completed_with_rejections':'completed',rowCount:rows.length,acceptedCount:pending.length,rejectedCount:auditRows.filter(row=>row.status==='rejected').length,skippedCount:auditRows.filter(row=>row.status==='skipped').length,createdBy:current,createdAt:new Date(),automaticApproval:false,ledgerPosted:false};await db.collection(IMPORT_BATCHES).insertOne(importDoc);await insertMany(db.collection(IMPORT_ROWS),auditRows.map(row=>({...row,importBatchId,createdAt:new Date()})));
+  for(const item of pending){
+    const created=await createAdjustment(db,{...item.normalized,sourceReference:`${importBatchId}:${item.originalExcelRowNumber}`},current);
+    await transitionAdjustment(db,created.adjustment.adjustmentId,'submit',{revision:created.adjustment.revision,reason:'Validated Excel import; independent approval required.'},current);
+  }
+  return{ok:true,import:importDoc,rows:auditRows,pendingAdjustmentsCreated:pending.length,approvedAdjustmentsCreated:0,ledgerEntriesCreated:0,fifoFactsChanged:0};
+}
+async function listExcelAudit(db,filters={}){await ensureIndexes(db);const exports=await db.collection(EXPORT_BATCHES).find({}).sort({createdAt:-1}).limit(50).toArray();const imports=await db.collection(IMPORT_BATCHES).find({}).sort({createdAt:-1}).limit(50).toArray();let rows=[];if(filters.importBatchId)rows=await db.collection(IMPORT_ROWS).find({importBatchId:clean(filters.importBatchId,100)}).toArray();return{ok:true,exports:exports.map(({rows:_,content:__,...row})=>row),imports,rows,formulaAuthority:false};}
+
+const TIR_ISSUES=Object.freeze([
+  ['TIR-ERR-4691-2357','confirmed_accounting_transfer_error','4691','2357','Confirmed workbook transfer error; excluded from rule inference.'],
+  ['TIR-ERR-4031-483','confirmed_accounting_transfer_error','4031','483','Confirmed workbook transfer error; excluded from rule inference.'],
+  ['TIR-ERR-4079-51','confirmed_accounting_transfer_error','4079','51','Confirmed workbook transfer error; excluded from rule inference.'],
+  ['TIR-ERR-3917-1502','confirmed_accounting_transfer_error','3917','1502','Confirmed workbook transfer error; excluded from rule inference.'],
+  ['TIR-COST-3801-1700','purchase_cost_conflict','3801','1700','Purchase-cost conflict requires evidence review.'],
+  ['TIR-COST-4495-2068','corrupted_cost_candidate','4495','2068','Corrupted cost candidate; never auto-applied.'],
+  ['TIR-RES-CONSOLE','unreconciled_residual','','','Console residual 99,500,000 IRR.'],
+  ['TIR-RES-HESAM','unreconciled_residual','','','Hesam residual 360,000 IRR.'],
+  ['TIR-RES-MASHHADKALA','unreconciled_residual','','','MashhadKala residual 22,000 IRR.'],
+  ['TIR-ORPHAN-24','orphan_formula_row','','24','Orphan formula row 24.'],
+  ['TIR-CACHED-VALUE','cached_formula_error','','','Cached #VALUE! cells.'],
+  ['TIR-SELLER-ALIAS','seller_identity_issue','','','Seller aliases/spelling require explicit mapping.'],
+  ['TIR-COMP-OPENING','missing_opening_balance','','','Component saved-profit opening balance is missing.']
+]);
+async function buildTirReconstruction(db,input={},requestedBy={}){const current=requireRole(requestedBy,ALLOWED_ROLES);await ensureIndexes(db);let created=0;for(const [issueId,classification,invoiceNumber,lineNumber,description] of TIR_ISSUES){const row={issueId,schemaVersion:SCHEMA_VERSION,period:'140504',classification,invoiceNumber,lineNumber,description,status:'unresolved_or_confirmed_as_noted',excludedFromRuleInference:classification==='confirmed_accounting_transfer_error'||classification==='corrupted_cost_candidate',immutable:true,createdBy:current,createdAt:new Date()};const result=await db.collection(TIR_RECONSTRUCTION).updateOne({issueId},{$setOnInsert:row},{upsert:true});if(result.upsertedCount)created++;}const issues=await db.collection(TIR_RECONSTRUCTION).find({period:'140504'}).toArray();const fifoDatasetId=clean(input.fifoDatasetId,100)||(await fifoShadow.activeDataset(db))?.datasetId;const facts=fifoDatasetId?await db.collection(FIFO_FACTS).find({fifoDatasetId}).toArray():[];const adjustments=fifoDatasetId?await db.collection(ADJUSTMENTS).find({fifoDatasetId}).toArray():[];return{ok:true,period:'140504',fifoDatasetId,created,issues,comparisonDimensions:['workbookArithmeticProfit','workbookAdjustedProfit','immutableCrmFifoProfit','approvedOrPendingCrmAdjustments','commissionableProfit','draftCommission'],crm:{factCount:facts.length,completeProfitFactCount:facts.filter(row=>row.costCoverageStatus==='complete').length,actualFifoProfitExact:add(facts.filter(row=>row.actualFifoProfitExact!=null).map(row=>row.actualFifoProfitExact)),approvedAdjustmentCount:adjustments.filter(row=>row.status==='approved').length,pendingAdjustmentCount:adjustments.filter(row=>row.status==='pending').length},drillable:true,accountingApproved:false};}
+async function readTirReconstruction(db,input={},requestedBy={}){requireRole(requestedBy,ALLOWED_ROLES);const stored=await db.collection(TIR_RECONSTRUCTION).find({period:'140504'}).toArray();const issues=stored.length?stored:TIR_ISSUES.map(([issueId,classification,invoiceNumber,lineNumber,description])=>({issueId,schemaVersion:SCHEMA_VERSION,period:'140504',classification,invoiceNumber,lineNumber,description,status:'catalog-not-persisted',excludedFromRuleInference:classification==='confirmed_accounting_transfer_error'||classification==='corrupted_cost_candidate',immutable:true}));const fifoDatasetId=clean(input.fifoDatasetId,100)||(await fifoShadow.activeDataset(db))?.datasetId;const facts=fifoDatasetId?await db.collection(FIFO_FACTS).find({fifoDatasetId}).toArray():[];const adjustments=fifoDatasetId?await db.collection(ADJUSTMENTS).find({fifoDatasetId}).toArray():[];return{ok:true,period:'140504',fifoDatasetId,created:0,issues,comparisonDimensions:['workbookArithmeticProfit','workbookAdjustedProfit','immutableCrmFifoProfit','approvedOrPendingCrmAdjustments','commissionableProfit','draftCommission'],crm:{factCount:facts.length,completeProfitFactCount:facts.filter(row=>row.costCoverageStatus==='complete').length,actualFifoProfitExact:add(facts.filter(row=>row.actualFifoProfitExact!=null).map(row=>row.actualFifoProfitExact)),approvedAdjustmentCount:adjustments.filter(row=>row.status==='approved').length,pendingAdjustmentCount:adjustments.filter(row=>row.status==='pending').length},drillable:true,accountingApproved:false,readOnly:true};}
+
+async function health(db){await ensureIndexes(db);const counts={};for(const name of OWNED_COLLECTIONS)counts[name]=await count(db.collection(name),{});return{ok:true,moduleVersion:MODULE_VERSION,counts,safety:{actualFifoImmutable:true,commissionPreliminary:true,payrollEnabled:false,sellerFacing:false,shayganWrites:0,inventoryWrites:0,sourceDatasetWrites:0,crossPoolTransfers:false}};}
+
+module.exports={
+  FIFO_FACTS,ADJUSTMENTS,SAVED_LEDGER,SUPPLIER_LEDGER,CATEGORY_MAPPINGS,RATE_VERSIONS,RATE_APPROVAL_LOCKS,DISCOUNT_FACTS,COMMISSION_RUNS,COMMISSION_LINES,EXPORT_BATCHES,IMPORT_BATCHES,IMPORT_ROWS,TIR_RECONSTRUCTION,OWNED_COLLECTIONS,
+  SCHEMA_VERSION,MODULE_VERSION,POOLS,CATEGORIES,ADJUSTMENT_TYPES,ADJUSTMENT_STATUSES,SAVED_ENTRY_TYPES,SUPPLIER_INCENTIVE_TYPES,IMMUTABLE_EXPORT_FIELDS,EDITABLE_EXPORT_FIELDS,TIR_ISSUES,
+  ensureIndexes,materializeFifoProfitFacts,listFacts,createAdjustment,updateAdjustmentDraft,transitionAdjustment,reverseAdjustment,listAdjustments,listSavedLedger,savedBalance,listSupplierIncentives,createCategoryMapping,approveCategoryMapping,listCategoryMappings,resolveCategory,createRateVersion,approveRateVersion,listRateVersions,resolveRate,seedTirRateCandidates,extractInvoiceDiscountFacts,listDiscountFacts,calculateDraftCommission,commissionReport,createExcelExport,importExcelEdits,listExcelAudit,buildTirReconstruction,readTirReconstruction,health,
+  _stable:stable,_sha256:sha256,_exact:exact,_add:add,_subtract:subtract,_multiplyMoneyRate:multiplyMoneyRate,_immutableExportProjection:immutableExportProjection,_normalizeAdjustment:normalizeAdjustment
+};

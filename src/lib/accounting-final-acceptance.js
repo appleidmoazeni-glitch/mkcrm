@@ -6,6 +6,7 @@ const saleSnapshot = require('./sale-snapshot');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
 const readiness = require('./accounting-evidence-confidence');
 const operational = require('./accounting-operational-review');
+const profitLedger = require('./profit-commission-ledger');
 const { normalizeJalaliDate } = require('./jalali-date');
 const { APP_VERSION } = require('./app-version');
 
@@ -35,7 +36,7 @@ const OWNED_COLLECTIONS = Object.freeze([
 
 const SCHEMA_VERSION = 1;
 const MODULE_VERSION = 'accounting-final-acceptance-1.0.0';
-const FAT_VERSION = 'fat-1.0.0';
+const FAT_VERSION = 'fat-2.0.0';
 const COMPARISON_VERSION = 'accounting-comparison-1.0.0';
 const SESSION_STATUSES = Object.freeze([
   'prepared', 'in_progress', 'waiting_evidence',
@@ -236,6 +237,46 @@ const FAT_SCENARIOS = Object.freeze([
     expectedInvariants:['seller-denied', 'creator-approver-separated', 'unauthorized-rejected', 'reference-import-cannot-approve'],
     tolerance:{ authorization:'exact' },
     blockingSeverity:'critical', approvalRequirements:['manager'], evidenceRequirements:['http-audit', 'permission-tests']
+  },
+  {
+    scenarioCode:'FAT-13', title:'Actual FIFO profit immutability', purpose:'Prove copied FIFO profit facts remain immutable and unknown cost is not zero.',
+    requiredInputs:['validated-shadow-fifo', 'fifo-profit-facts'], expectedInvariants:['source-validated-shadow', 'fact-content-hash', 'no-manual-overwrite', 'unknown-cost-null'],
+    tolerance:{ irr:'exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['fact-fingerprint','immutability-test']
+  },
+  {
+    scenarioCode:'FAT-14', title:'Profit adjustment workflow', purpose:'Validate pending-only human edits and creator/approver separation.',
+    requiredInputs:['profit-adjustment-workflow'], expectedInvariants:['draft-pending-approved', 'creator-approver-separated', 'revision-locked', 'no-physical-delete'],
+    tolerance:{ status:'exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['adjustment-audit']
+  },
+  {
+    scenarioCode:'FAT-15', title:'Saved-profit double-entry balance', purpose:'Reconcile append-only debit and credit entries to derived pool balances.',
+    requiredInputs:['saved-profit-ledger'], expectedInvariants:['entry-balanced', 'balance-derived', 'append-only', 'historically-reproducible'],
+    tolerance:{ irr:'exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['ledger-reconciliation']
+  },
+  {
+    scenarioCode:'FAT-16', title:'Notebook/Component pool isolation', purpose:'Prove saved-profit reserves cannot cross pools.',
+    requiredInputs:['saved-profit-ledger'], expectedInvariants:['notebook-isolated', 'component-isolated', 'cross-pool-rejected', 'no-negative-balance'],
+    tolerance:{ irr:'exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['pool-isolation-test']
+  },
+  {
+    scenarioCode:'FAT-17', title:'Versioned commission-rate resolution', purpose:'Validate historical, exceptional and missing rate handling.',
+    requiredInputs:['commission-rate-versions'], expectedInvariants:['effective-period', 'no-approved-overlap', 'exception-supported', 'missing-unavailable'],
+    tolerance:{ rate:'fixed-scale-exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['rate-resolution-report']
+  },
+  {
+    scenarioCode:'FAT-18', title:'Invoice discount reconciliation', purpose:'Prove discounts originate from official invoice fields without guessed allocation.',
+    requiredInputs:['invoice-discount-facts'], expectedInvariants:['official-source-field', 'immutable-fact', 'multi-category-unresolved', 'workbook-total-not-authoritative'],
+    tolerance:{ irr:'exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['discount-reconciliation']
+  },
+  {
+    scenarioCode:'FAT-19', title:'Editable Excel export/import integrity', purpose:'Validate immutable hashes and pending-only accounting edits.',
+    requiredInputs:['excel-export-import-audit'], expectedInvariants:['batch-hash', 'row-hash', 'identity-protected', 'pending-only', 'formula-errors-rejected'],
+    tolerance:{ hashes:'exact' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['excel-roundtrip-audit']
+  },
+  {
+    scenarioCode:'FAT-20', title:'Tir 1405 commission reconstruction', purpose:'Reconcile workbook arithmetic, CRM facts and preliminary commission without treating file errors as rules.',
+    requiredInputs:['tir-1405-reconstruction'], expectedInvariants:['four-transfer-errors-excluded', 'differences-drillable', 'draft-nonpayable', 'unresolved-explicit'],
+    tolerance:{ irr:'exact-unless-human-approved-evidence' }, blockingSeverity:'critical', approvalRequirements:['accounting','manager'], evidenceRequirements:['tir-reconstruction-report']
   },
   {
     scenarioCode:'FAT-COMMISSION-FUTURE', title:'Commission reconciliation (disabled)', purpose:'Reserved definition for the future Commission phase.',
@@ -1140,7 +1181,7 @@ async function executeTechnicalFat(db, fatRunId, by = {}) {
   if (['passed', 'passed_with_tolerance', 'cancelled'].includes(run.status)) fail('FAT_RUN_IMMUTABLE', 'FAT run نهایی immutable است.', 409);
   const session = await getSession(db, run.sessionId);
   const fifo = await db.collection('fifoDatasets').findOne({ datasetId:session.frozen.fifoDatasetId });
-  const [invalidFifo, duplicateAllocations, comparisonReady, humanProgress] = await Promise.all([
+  const [invalidFifo, duplicateAllocations, comparisonReady, humanProgress, profitFacts, savedEntries, rateVersions, discountFacts, excelExports, tirIssues] = await Promise.all([
     count(db.collection('fifoDatasets'), { datasetId:session.frozen.fifoDatasetId, $or:[{status:{$ne:'completed'}},{activationStatus:{$ne:'validated-shadow'}}] }),
     db.collection('fifoAllocations').aggregate([
       { $match:{ datasetId:session.frozen.fifoDatasetId } },
@@ -1148,10 +1189,25 @@ async function executeTechnicalFat(db, fatRunId, by = {}) {
       { $match:{ count:{ $gt:1 } } }, { $count:'count' }
     ]).toArray().then(rows => rows[0]?.count || 0),
     count(db.collection(COMPARISON_IMPORTS), { frozenSessionId:session.sessionId, status:'ready' }),
-    minimumTargetProgress(db, session)
+    minimumTargetProgress(db, session),
+    count(db.collection(profitLedger.FIFO_FACTS), { fifoDatasetId:session.frozen.fifoDatasetId }),
+    db.collection(profitLedger.SAVED_LEDGER).find({}).toArray(),
+    db.collection(profitLedger.RATE_VERSIONS).find({ status:'approved' }).toArray(),
+    count(db.collection(profitLedger.DISCOUNT_FACTS), { saleSnapshotId:session.frozen.saleSnapshotId }),
+    count(db.collection(profitLedger.EXPORT_BATCHES), { fifoDatasetId:session.frozen.fifoDatasetId }),
+    count(db.collection(profitLedger.TIR_RECONSTRUCTION), { period:'140504' })
   ]);
   const backupReady = Boolean(run.backupEvidence?.path && run.backupEvidence?.sourceSha);
   const deterministicReady = Boolean(fifo?.deterministicReplayVerified && fifo?.sourceFingerprint && fifo?.allocationFingerprint);
+  const savedLedgerStructurallyValid = savedEntries.length > 0 && savedEntries.every(row =>
+    ['NOTEBOOK','COMPONENT'].includes(row.pool) &&
+    ((decimal.parse(row.debitAmountExact || 0, decimal.MONEY_SCALE) > 0n) !== (decimal.parse(row.creditAmountExact || 0, decimal.MONEY_SCALE) > 0n))
+  );
+  const approvedRateOverlap = rateVersions.some((row,index) => rateVersions.slice(index + 1).some(other =>
+    row.sellerIdentity === other.sellerIdentity && row.commissionCategory === other.commissionCategory &&
+    row.effectiveFrom <= (other.effectiveTo || '99999999') && other.effectiveFrom <= (row.effectiveTo || '99999999')
+  ));
+  const profitFactReady = profitFacts > 0;
   const scenarioEvidence = {
     'FAT-01':{ technicalStatus:comparisonReady ? 'ready' : 'blocked_missing_evidence', status:comparisonReady ? 'blocked_human_review' : 'blocked_missing_evidence' },
     'FAT-02':{ technicalStatus:fifo?.validation?.valid ? 'technical_pass' : 'failed', status:'blocked_human_review' },
@@ -1164,7 +1220,15 @@ async function executeTechnicalFat(db, fatRunId, by = {}) {
     'FAT-09':{ technicalStatus:!invalidFifo && !duplicateAllocations ? 'technical_pass' : 'failed', status:'blocked_human_review' },
     'FAT-10':{ technicalStatus:'ready', status:'blocked_human_review' },
     'FAT-11':{ technicalStatus:backupReady ? 'technical_pass' : 'blocked_missing_evidence', status:backupReady ? 'blocked_human_review' : 'blocked_missing_evidence' },
-    'FAT-12':{ technicalStatus:'ready', status:'blocked_human_review' }
+    'FAT-12':{ technicalStatus:'ready', status:'blocked_human_review' },
+    'FAT-13':{ technicalStatus:profitFactReady ? 'technical_pass' : 'blocked_missing_evidence', status:profitFactReady ? 'blocked_human_review' : 'blocked_missing_evidence' },
+    'FAT-14':{ technicalStatus:'ready', status:'blocked_human_review' },
+    'FAT-15':{ technicalStatus:savedLedgerStructurallyValid ? 'technical_pass' : (savedEntries.length ? 'failed' : 'blocked_missing_evidence'), status:savedLedgerStructurallyValid ? 'blocked_human_review' : (savedEntries.length ? 'failed' : 'blocked_missing_evidence') },
+    'FAT-16':{ technicalStatus:savedLedgerStructurallyValid ? 'technical_pass' : (savedEntries.length ? 'failed' : 'blocked_missing_evidence'), status:savedLedgerStructurallyValid ? 'blocked_human_review' : (savedEntries.length ? 'failed' : 'blocked_missing_evidence') },
+    'FAT-17':{ technicalStatus:approvedRateOverlap ? 'failed' : (rateVersions.length ? 'technical_pass' : 'blocked_missing_evidence'), status:approvedRateOverlap ? 'failed' : (rateVersions.length ? 'blocked_human_review' : 'blocked_missing_evidence') },
+    'FAT-18':{ technicalStatus:discountFacts ? 'technical_pass' : 'blocked_missing_evidence', status:discountFacts ? 'blocked_human_review' : 'blocked_missing_evidence' },
+    'FAT-19':{ technicalStatus:excelExports ? 'technical_pass' : 'blocked_missing_evidence', status:excelExports ? 'blocked_human_review' : 'blocked_missing_evidence' },
+    'FAT-20':{ technicalStatus:tirIssues >= 13 ? 'technical_pass' : 'blocked_missing_evidence', status:tirIssues >= 13 ? 'blocked_human_review' : 'blocked_missing_evidence' }
   };
   const scenarios = run.scenarios.map(row => ({ ...row, ...(scenarioEvidence[row.scenarioCode] || {}), accountingStatus:'blocked_human_review', humanApprovalStatus:'pending' }));
   const anyFailed = scenarios.some(row => row.technicalStatus === 'failed');
@@ -1183,7 +1247,7 @@ async function executeTechnicalFat(db, fatRunId, by = {}) {
       blocked:scenarios.filter(row => row.status.startsWith('blocked_')).length,
       failed:scenarios.filter(row => row.technicalStatus === 'failed').length
     },
-    technicalEvidence:{ invalidFifo, duplicateAllocations, comparisonReady, humanMinimumTargetsMet:humanProgress.met, deterministicReplayVerified:deterministicReady, backupReady },
+    technicalEvidence:{ invalidFifo, duplicateAllocations, comparisonReady, humanMinimumTargetsMet:humanProgress.met, deterministicReplayVerified:deterministicReady, backupReady, profitFacts, savedLedgerStructurallyValid, approvedRateOverlap, discountFacts, excelExports, tirIssues },
     revision:Number(run.revision) + 1,
     auditLog:[...(run.auditLog || []), audit('fat-technical-evaluation', current, { status, invalidFifo, duplicateAllocations, comparisonReady, deterministicReady, backupReady })].slice(-500),
     updatedAt:now
