@@ -127,6 +127,10 @@ function mapItem(row) {
     itemGuid: row.ItemGuId || row.GuId,
     groupNumber: row.ItemGroupNumber || row.ProductGroupNumber,
     groupGuid: row.ItemGroupGuId || row.ProductGroupGuId,
+    groupName: row.ItemGroupName || row.ProductGroupName || '',
+    parentGroupGuid: row.ParentItemGroupGuId || row.ParentGroupGuId || row.MainItemGroupGuId || '',
+    parentGroupNumber: row.ParentItemGroupNumber || row.ParentGroupNumber || row.MainItemGroupNumber || '',
+    parentGroupName: row.ParentItemGroupName || row.ParentGroupName || row.MainItemGroupName || '',
     raw: row
   };
 }

@@ -16,6 +16,7 @@ const accountingEvidenceConfidence = require('./lib/accounting-evidence-confiden
 const accountingOperationalReview = require('./lib/accounting-operational-review');
 const accountingFinalAcceptance = require('./lib/accounting-final-acceptance');
 const profitCommissionLedger = require('./lib/profit-commission-ledger');
+const accountingGovernance = require('./lib/accounting-governance');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -3241,6 +3242,8 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/accounting/profit-ledger/facts/materialize': 'profit-ledger.facts.materialize',
     'POST /api/accounting/profit-ledger/adjustments': 'profit-ledger.adjustments.create',
     'POST /api/accounting/profit-ledger/categories': 'profit-ledger.categories.create',
+    'POST /api/accounting/governance/group-catalog/refresh': 'accounting-governance.group-catalog.refresh',
+    'POST /api/accounting/governance/opening-balances': 'accounting-governance.opening-balances.create',
     'POST /api/accounting/profit-ledger/rates': 'profit-ledger.rates.create',
     'POST /api/accounting/profit-ledger/rates/seed-tir': 'profit-ledger.rates.seed-tir',
     'POST /api/accounting/profit-ledger/discounts/extract': 'profit-ledger.discounts.extract',
@@ -3295,7 +3298,8 @@ function stagingReadOnlyOperation(req, pathname) {
   if (method === 'POST' && /^\/api\/proformas\/\d+\/convert$/.test(normalizedPathname)) return 'proformas.convert';
   if (method === 'POST' && /^\/api\/purchase-drafts\/\d+\/issue$/.test(normalizedPathname)) return 'purchase-drafts.issue';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/manual-cost-resolutions\/[^/]+(?:\/(?:submit|approve|reject|expire))?$/.test(normalizedPathname)) return 'manual-cost-resolutions.workflow';
-  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/profit-ledger\/(?:adjustments|categories|rates)\/[^/]+(?:\/(?:submit|approve|reject|expire|reverse))?$/.test(normalizedPathname)) return 'profit-ledger.workflow';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/profit-ledger\/(?:adjustments|categories|rates)\/[^/]+(?:\/(?:submit|approve|reject|return|cancel|expire|reverse))?$/.test(normalizedPathname)) return 'profit-ledger.workflow';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/governance\/opening-balances\/[^/]+(?:\/(?:submit|approve|reject|return|cancel))?$/.test(normalizedPathname)) return 'accounting-governance.opening-balances.workflow';
   return '';
 }
 
@@ -3699,7 +3703,7 @@ async function handleApi(req, res, pathname, query) {
     // 0.9.19.70: immutable FIFO profit facts, governed adjustments and
     // preliminary commission review. This boundary owns no invoice, Shaygan,
     // inventory, Sale Snapshot, Purchase Layer or FIFO source writes.
-    const sendLedgerError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error)});
+    const sendLedgerError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error),...(error.blockers?{blockers:error.blockers}:{}),...(error.readiness?{readiness:error.readiness}:{}),...(error.details?{details:error.details}:{})});
     if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
       try{return sendJson(res,200,await profitCommissionLedger.ensureIndexes(db));}catch(error){return sendLedgerError(error,'PROFIT_LEDGER_INIT_FAILED');}
@@ -3752,10 +3756,14 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
       try{return sendJson(res,201,await profitCommissionLedger.createCategoryMapping(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_CREATE_FAILED');}
     }
-    const categoryApprovalMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/categories\/([^/]+)\/approve$/);
-    if(categoryApprovalMatch&&req.method==='POST'){
-      if(!requireRole(req,res,['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
-      try{return sendJson(res,200,await profitCommissionLedger.approveCategoryMapping(db,decodeURIComponent(categoryApprovalMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_APPROVAL_FAILED');}
+    const categoryWorkflowMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/categories\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    if(categoryWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!categoryWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.updateCategoryMapping(db,decodeURIComponent(categoryWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_UPDATE_FAILED');}
+    }
+    if(categoryWorkflowMatch&&req.method==='POST'&&categoryWorkflowMatch[2]){
+      if(!requireRole(req,res,['approve','reject','return'].includes(categoryWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.transitionCategoryMapping(db,decodeURIComponent(categoryWorkflowMatch[1]),categoryWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_WORKFLOW_FAILED');}
     }
     if(pathname==='/api/accounting/profit-ledger/rates'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
@@ -3769,10 +3777,14 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
       try{return sendJson(res,201,await profitCommissionLedger.seedTirRateCandidates(db,currentUser(req)));}catch(error){return sendLedgerError(error,'TIR_RATE_SEED_FAILED');}
     }
-    const rateApprovalMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)\/approve$/);
-    if(rateApprovalMatch&&req.method==='POST'){
-      if(!requireRole(req,res,['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
-      try{return sendJson(res,200,await profitCommissionLedger.approveRateVersion(db,decodeURIComponent(rateApprovalMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_APPROVAL_FAILED');}
+    const rateWorkflowMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    if(rateWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!rateWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.updateRateVersion(db,decodeURIComponent(rateWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_UPDATE_FAILED');}
+    }
+    if(rateWorkflowMatch&&req.method==='POST'&&rateWorkflowMatch[2]){
+      if(!requireRole(req,res,['approve','reject','return'].includes(rateWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.transitionRateVersion(db,decodeURIComponent(rateWorkflowMatch[1]),rateWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_WORKFLOW_FAILED');}
     }
     if(pathname==='/api/accounting/profit-ledger/discounts'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
@@ -3808,6 +3820,43 @@ async function handleApi(req, res, pathname, query) {
         ?await profitCommissionLedger.buildTirReconstruction(db,body,currentUser(req))
         :await profitCommissionLedger.readTirReconstruction(db,body,currentUser(req)));
       }catch(error){return sendLedgerError(error,'TIR_RECONSTRUCTION_FAILED');}
+    }
+
+    // 0.9.19.71: governed accounting evidence and human approval UI. The
+    // official group refresh performs Item/Get reads only; all writes below
+    // are limited to module-owned governance/audit collections.
+    if(pathname==='/api/accounting/governance/group-catalog/refresh'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.refreshOfficialGroupCatalog(db,shaygan,body,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_CATALOG_REFRESH_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/group-review'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.groupReviewMatrix(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_REVIEW_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/rate-review'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.rateReviewMatrix(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'RATE_REVIEW_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/readiness'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.readiness(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_READINESS_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/opening-balances'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.listOpeningBalances(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_LIST_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/opening-balances'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingGovernance.createOpeningBalance(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_CREATE_FAILED');}
+    }
+    const openingWorkflowMatch=pathname.match(/^\/api\/accounting\/governance\/opening-balances\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    if(openingWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!openingWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.updateOpeningBalance(db,decodeURIComponent(openingWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_UPDATE_FAILED');}
+    }
+    if(openingWorkflowMatch&&req.method==='POST'&&openingWorkflowMatch[2]){
+      if(!requireRole(req,res,['approve','reject','return'].includes(openingWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.transitionOpeningBalance(db,decodeURIComponent(openingWorkflowMatch[1]),openingWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_WORKFLOW_FAILED');}
     }
 
     // 0.9.19.68: operational accounting review workbench.
