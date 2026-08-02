@@ -152,6 +152,8 @@ function categoryIdentity(row) {
   if (clean(row.groupPathIdentity)) return { identityType:'groupPathIdentity', identityValue:clean(row.groupPathIdentity, 500) };
   if (clean(row.groupGuid)) return { identityType:'groupGuid', identityValue:clean(row.groupGuid, 100) };
   if (clean(row.mainGroupCode)) return { identityType:'groupCode', identityValue:clean(row.mainGroupCode, 100) };
+  const storedType=clean(row.identityType,100);const storedValue=clean(row.identityValue,500);
+  if(['itemGuid','itemCode','groupPathIdentity','groupGuid','groupCode'].includes(storedType)&&storedValue)return{identityType:storedType,identityValue:storedValue};
   fail('CATEGORY_IDENTITY_REQUIRED', 'شناسه کالا یا گروه برای دسته‌بندی الزامی است.');
 }
 function rangesOverlap(aFrom, aTo, bFrom, bTo) {

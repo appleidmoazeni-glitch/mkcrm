@@ -37,6 +37,10 @@ test('category mapping workflow requires evidence, role separation, revision and
   const overlap=await ledger.createCategoryMapping(db,{itemGuid:'I1',commissionCategory:'COMPONENT',effectiveFrom:'14050415',effectiveTo:'14050501',...evidence},accounting);const pending=await ledger.transitionCategoryMapping(db,overlap.mapping.mappingId,'submit',{revision:1,...evidence},accounting);await assert.rejects(ledger.transitionCategoryMapping(db,overlap.mapping.mappingId,'approve',{revision:pending.mapping.revision,...evidence},manager),e=>e.code==='CATEGORY_MAPPING_OVERLAP');
 });
 
+test('stored canonical group identity survives draft editing',async()=>{
+  const db=dbSeed();const created=await ledger.createCategoryMapping(db,{groupPathIdentity:'parent:P1/child:C1',commissionCategory:'COMPONENT',effectiveFrom:'14050401',effectiveTo:'14050431',...evidence},accounting);const updated=await ledger.updateCategoryMapping(db,created.mapping.mappingId,{revision:1,commissionCategory:'OTHER',reason:'human draft correction'},accounting);assert.equal(updated.mapping.identityType,'groupPathIdentity');assert.equal(updated.mapping.identityValue,'parent:P1/child:C1');assert.equal(updated.mapping.commissionCategory,'OTHER');assert.equal(updated.mapping.revision,2);
+});
+
 test('category approval is serialized per stable identity',async()=>{
   const db=dbSeed();const created=await ledger.createCategoryMapping(db,{itemGuid:'I1',commissionCategory:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431',...evidence},accounting);const submitted=await ledger.transitionCategoryMapping(db,created.mapping.mappingId,'submit',{revision:1,...evidence},accounting);db.collection(ledger.CATEGORY_APPROVAL_LOCKS).rows.push({lockKey:'itemGuid|I1',owner:'other-approver',expiresAt:new Date(Date.now()+10000)});await assert.rejects(ledger.transitionCategoryMapping(db,created.mapping.mappingId,'approve',{revision:submitted.mapping.revision,...evidence},manager),e=>e.code==='APPROVAL_LOCKED');assert.equal(db.collection(ledger.CATEGORY_MAPPINGS).rows[0].status,'pending');
 });
