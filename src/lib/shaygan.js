@@ -353,6 +353,22 @@ async function getItemsPage(rowStart = 0, rowCount = 100, itemCodeFrom = '') {
   return { ...res, list: res.result.map(mapItem) };
 }
 
+function itemGroupDomain(groupNumber = '') {
+  return {
+    Sort: sortRange('0'),
+    SortOnAuxId: range(),
+    GroupNumber: groupNumber ? range(groupNumber, groupNumber) : range()
+  };
+}
+
+async function getItemGroupsPage(rowStart = 0, rowCount = 100, groupNumber = '', opts = {}) {
+  const res = await post('/api/ItemGroup/GetList', itemGroupDomain(groupNumber), rowStart, rowCount, {
+    maxRowCount: 100,
+    timeoutMs: opts.timeoutMs || Math.min(config.shayganTimeoutMs || 15000, 10000)
+  });
+  return { ...res, list: res.result };
+}
+
 async function getProductListPage(rowStart = 0, rowCount = 100, itemCodeFrom = '') {
   const domain = { WithExtraFields: 'false', Sort: range(), ItemCode: range(itemCodeFrom, ''), ItemGuId: range(), ItemGroupGuId: range() };
   const res = await post('/api/Item/GetProductList', domain, rowStart, rowCount);
@@ -892,4 +908,4 @@ async function putPurchaseInvoice(input) {
   return await put('/api/Invoice/Put', buildPurchaseInvoicePut(input));
 }
 
-module.exports = { searchAccounts, getAccountsPage, getStocks, getInventoryByItemCode, getInventoryPage, getKardexByItemCode, getItemsPage, getProductListPage, getInvoice, getInvoiceByGuid, getInvoicePageByDate, getInvoicePageByTypeRange, getInvoicePageByTypeNumberRange, getLastInvoiceNumber, getLastSaleInvoiceNumber, getLastPurchaseInvoiceNumber, putSaleInvoice, buildSaleInvoicePut, putPurchaseInvoice, buildPurchaseInvoicePut, formatDate8, getAccountStatement, getSerialsByItemStock };
+module.exports = { searchAccounts, getAccountsPage, getStocks, getInventoryByItemCode, getInventoryPage, getKardexByItemCode, getItemsPage, getItemGroupsPage, getProductListPage, getInvoice, getInvoiceByGuid, getInvoicePageByDate, getInvoicePageByTypeRange, getInvoicePageByTypeNumberRange, getLastInvoiceNumber, getLastSaleInvoiceNumber, getLastPurchaseInvoiceNumber, putSaleInvoice, buildSaleInvoicePut, putPurchaseInvoice, buildPurchaseInvoicePut, formatDate8, getAccountStatement, getSerialsByItemStock, _itemGroupDomain:itemGroupDomain };

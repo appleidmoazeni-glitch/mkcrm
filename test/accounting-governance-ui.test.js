@@ -7,6 +7,7 @@ const path=require('node:path');
 const {MemoryDb}=require('./helpers/memory-mongo');
 const governance=require('../src/lib/accounting-governance');
 const ledger=require('../src/lib/profit-commission-ledger');
+const shaygan=require('../src/lib/shaygan');
 
 const accounting={username:'khedmati-test',role:'accounting'};
 const manager={username:'manager-test',role:'manager'};
@@ -21,15 +22,47 @@ function facts(){return[
 ];}
 function dbSeed(extra={}){return new MemoryDb({fifoProfitFacts:facts(),...extra});}
 
-test('official Item/Get normalization preserves stable child and parent identities and duplicate group numbers',async()=>{
-  const db=dbSeed();let call=0;const shaygan={getItemsPage:async()=>{call++;return call===1?{ok:true,totalRecords:2,list:[
-    {raw:{ItemGuId:'I1',ItemCode:'NB-1',ItemGroupGuId:'G-A',ItemGroupNumber:'10',ItemGroupName:'Notebook',ParentItemGroupGuId:'P-A',ParentItemGroupNumber:'1',ParentItemGroupName:'Portable'}},
-    {raw:{ItemGuId:'I2',ItemCode:'CP-1',ItemGroupGuId:'G-B',ItemGroupNumber:'10',ItemGroupName:'Component',ParentItemGroupGuId:'P-B',ParentItemGroupNumber:'2',ParentItemGroupName:'Parts'}}
-  ]}:{ok:true,totalRecords:2,list:[]};}};const result=await governance.refreshOfficialGroupCatalog(db,shaygan,{pageSize:100},accounting);assert.equal(result.run.pagesRead,1);assert.equal(result.run.groupCount,2);assert.equal(result.run.ambiguousNumbers.length,1);assert.deepEqual(result.run.ambiguousNumbers[0].groupIdentities.sort(),['guid:G-A','guid:G-B']);assert.equal(db.collection(governance.ITEM_GROUP_ASSIGNMENTS).rows[0].source,'shaygan-official-read');assert.equal(result.inventoryWrites,0);assert.equal(result.automaticMappingsApproved,0);
+test('ItemGroup/GetList wrapper uses the Swagger POST contract and read-only body',async()=>{
+  const original=global.fetch;let observed;global.fetch=async(url,options)=>{observed={url,options,body:JSON.parse(options.body)};return{ok:true,status:200,json:async()=>({Result:[{GroupGuid:'G1',GroupNumber:'1',GroupName:'Notebook',IsMainGroup:true}],CurrentVersion:'42'})};};try{const result=await shaygan.getItemGroupsPage(0,100);assert.equal(result.ok,true);assert.equal(result.list.length,1);assert.match(observed.url,/\/api\/ItemGroup\/GetList\?RowStart=0&RowCount=100$/);assert.equal(observed.options.method,'POST');assert.deepEqual(Object.keys(observed.body.Domain).sort(),['GroupNumber','Sort','SortOnAuxId']);assert.equal(observed.body.StartVersion,'0');assert.equal(observed.body.EndVersion,'');assert.ok(observed.body.Config.ConnectionName);assert.equal(observed.url.includes('/Put'),false);}finally{global.fetch=original;}
 });
 
-test('missing parent hierarchy is explicit and never treated as accounting evidence',async()=>{
-  const normalized=governance.normalizeOfficialItem({ItemGuId:'I1',ItemCode:'1',ItemGroupGuId:'G1',ItemGroupNumber:'10',ItemGroupName:'Notebook'});assert.equal(normalized.hierarchyStatus,'parent-unavailable-from-official-response');assert.equal(normalized.parentGroupGuid,'');const db=dbSeed({accountingOfficialItemGroupAssignments:[{...normalized,active:true}]});const report=await governance.groupReviewMatrix(db,{fifoDatasetId:'FIFO-1',periodFrom:'14050401',periodTo:'14050431'},accounting);assert.equal(report.list[0].hierarchyStatus,'parent-unavailable-from-official-response');assert.match(report.list[0].suggestionEvidence,/human evidence required|never auto-approved/i);assert.equal(report.automaticApproval,false);
+test('official hierarchy uses GUID identity, resolves main traversal and preserves duplicate numbers',async()=>{
+  const hierarchy=governance.resolveGroupHierarchy([
+    {GroupGuid:'P-A',GroupNumber:'1',GroupName:'Notebook',IsMainGroup:true},
+    {GroupGuid:'G-A',GroupNumber:'00030',GroupName:'Notebook child',ParentGroupGuId:'P-A',ParentGroupNumber:'1',ParentGroupName:'Notebook',IsMainGroup:false},
+    {GroupGuid:'G-A2',GroupNumber:'00031',GroupName:'Notebook grandchild',ParentGroupGuId:'G-A',ParentGroupNumber:'00030',ParentGroupName:'Notebook child',IsMainGroup:false},
+    {GroupGuid:'P-B',GroupNumber:'2',GroupName:'Parts',IsMainGroup:true},
+    {GroupGuid:'G-B',GroupNumber:'00030',GroupName:'Parts child',ParentGroupGuId:'P-B',ParentGroupNumber:'2',ParentGroupName:'Parts',IsMainGroup:false}
+  ],{sourceVersion:'42'});assert.equal(hierarchy.diagnostics.groupCount,5);assert.equal(hierarchy.diagnostics.mainGroupCount,2);assert.equal(hierarchy.diagnostics.parentResolvedCount,5);assert.equal(hierarchy.diagnostics.ambiguousNumbers.length,1);const child=hierarchy.rows.find(x=>x.sourceGroupGuid==='G-A');assert.equal(child.groupIdentity,'guid:G-A');assert.equal(child.resolvedMainGroupIdentity,'guid:P-A');assert.equal(child.hierarchyDepth,1);assert.deepEqual(child.hierarchyPath.map(x=>x.groupGuid),['P-A','G-A']);const grandchild=hierarchy.rows.find(x=>x.sourceGroupGuid==='G-A2');assert.equal(grandchild.resolvedMainGroupIdentity,'guid:P-A');assert.equal(grandchild.hierarchyDepth,2);assert.deepEqual(grandchild.hierarchyPath.map(x=>x.groupGuid),['P-A','G-A','G-A2']);
+});
+
+test('GUID-less fallback identity remains parent-aware and never uses GroupNumber alone',()=>{
+  assert.equal(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'A',ParentGroupNumber:'1',ParentGroupName:'Main A'}).groupIdentity,'parent-number:1|parent-name:Main A|number:00030');
+  assert.equal(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'Main A',IsMainGroup:true}).groupIdentity,'number:00030|name:Main A|parent:UNRESOLVED');
+  assert.notEqual(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'Main A',IsMainGroup:true}).groupIdentity,governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'Main B',IsMainGroup:true}).groupIdentity);
+});
+
+test('orphan and cycle hierarchy remain diagnostic-only',async()=>{
+  const hierarchy=governance.resolveGroupHierarchy([{GroupGuid:'O1',GroupNumber:'10',ParentGroupGuId:'MISSING',IsMainGroup:false},{GroupGuid:'C1',GroupNumber:'20',ParentGroupGuId:'C2',IsMainGroup:false},{GroupGuid:'C2',GroupNumber:'21',ParentGroupGuId:'C1',IsMainGroup:false}]);assert.equal(hierarchy.rows.find(x=>x.sourceGroupGuid==='O1').validationStatus,'orphan-parent');assert.equal(hierarchy.rows.find(x=>x.sourceGroupGuid==='C1').validationStatus,'cycle');assert.equal(hierarchy.diagnostics.orphanParentCount,1);assert.equal(hierarchy.diagnostics.cycleCount,2);const item=governance.resolveItemGroup(governance.normalizeOfficialItem({ItemGuId:'I1',ItemCode:'100',ItemGroupGuId:'O1'}),hierarchy);assert.equal(item.isOfficialEvidence,false);assert.equal(item.resolutionStatus,'orphan');assert.equal(item.prefixFallbackOnly,true);
+});
+
+test('full catalog refresh is idempotent, GUID-resolved and never approves mappings',async()=>{
+  const db=dbSeed();const immutableFacts=structuredClone(db.collection(ledger.FIFO_FACTS).rows);const wrapper={getItemGroupsPage:async()=>({ok:true,list:[{GroupGuid:'P1',GroupNumber:'1',GroupName:'Notebook',IsMainGroup:true},{GroupGuid:'G1',GroupNumber:'10',GroupName:'Child',ParentGroupGuId:'P1',ParentGroupNumber:'1',ParentGroupName:'Notebook',IsMainGroup:false}],raw:{CurrentVersion:'7'}}),getItemsPage:async()=>({ok:true,totalRecords:2,list:[{raw:{ItemGuId:'I1',ItemCode:'NB-1',ItemGroupGuId:'G1'}},{raw:{ItemGuId:'I2',ItemCode:'CP-1',ItemGroupGuId:'G1'}}]}),putSaleInvoice:async()=>{throw new Error('write must not be called');},putPurchaseInvoice:async()=>{throw new Error('write must not be called');}};const first=await governance.refreshOfficialGroupCatalog(db,wrapper,{pageSize:100},accounting);const second=await governance.refreshOfficialGroupCatalog(db,wrapper,{pageSize:100},accounting);assert.equal(first.run.groupCount,2);assert.equal(first.run.itemOfficialResolutionCount,2);assert.equal(first.run.itemResolutionCounts['guid-resolved'],2);assert.equal(db.collection(governance.GROUP_CATALOG).rows.length,2);assert.equal(db.collection(governance.ITEM_GROUP_ASSIGNMENTS).rows.length,2);assert.equal(db.collection(governance.GROUP_CATALOG_RUNS).rows.length,2);assert.equal(second.automaticMappingsApproved,0);assert.equal(db.collection(ledger.CATEGORY_MAPPINGS).rows.length,0);assert.deepEqual(db.collection(ledger.FIFO_FACTS).rows,immutableFacts);assert.equal(first.inventoryWrites,0);assert.equal(first.snapshotWrites,0);assert.equal(first.fifoWrites,0);assert.equal(first.invoiceWrites,0);const report=await governance.groupReviewMatrix(db,{fifoDatasetId:'FIFO-1',periodFrom:'14050401',periodTo:'14050431'},accounting);assert.equal(report.coverage.officialResolvedLinePercent,100);assert.equal(report.list[0].groupIdentity,'guid:P1');assert.equal(report.list[0].childGroupCount,1);
+});
+
+test('official group paging follows TotalRecords and stops at the exact expected page',async()=>{
+  const starts=[];const groups=[
+    {GroupGuid:'P1',GroupNumber:'1',GroupName:'Main',IsMainGroup:true,TotalRecords:3},
+    {GroupGuid:'G1',GroupNumber:'10',GroupName:'Child 1',ParentGroupGuId:'P1'},
+    {GroupGuid:'G2',GroupNumber:'11',GroupName:'Child 2',ParentGroupGuId:'P1'}
+  ];
+  const wrapper={getItemGroupsPage:async(start,count)=>{starts.push(start);return{ok:true,list:groups.slice(start,start+count),raw:{Result:groups.slice(start,start+count)}};},getItemsPage:async()=>({ok:true,totalRecords:0,list:[]})};
+  const result=await governance.refreshOfficialGroupCatalog(dbSeed(),wrapper,{pageSize:2,maxGroupPages:10},accounting);
+  assert.deepEqual(starts,[0,2]);assert.equal(result.run.groupTotalRecords,3);assert.equal(result.run.groupExpectedPages,2);assert.equal(result.run.groupPagesRead,2);
+});
+
+test('prefix fallback is explicit and never treated as official accounting evidence',async()=>{
+  const item=governance.normalizeOfficialItem({ItemGuId:'I1',ItemCode:'14400F',ItemGroupGuId:'MISSING'});const assignment=governance.resolveItemGroup(item,{rows:[]});assert.equal(assignment.isOfficialEvidence,false);assert.equal(assignment.prefixFallbackOnly,true);const db=dbSeed({accountingOfficialItemGroupAssignments:[{...assignment,catalogRunId:'RUN1',active:true}],accountingOfficialGroupCatalogRuns:[{catalogRunId:'RUN1',fetchedAt:new Date()}]});const report=await governance.groupReviewMatrix(db,{fifoDatasetId:'FIFO-1',periodFrom:'14050401',periodTo:'14050431'},accounting);assert.equal(report.coverage.officialResolvedLineCount,0);assert.equal(report.list[0].groupIdentity,'UNRESOLVED');assert.match(report.list[0].suggestionEvidence,/diagnostic-only/);assert.equal(report.automaticApproval,false);
 });
 
 test('category mapping workflow requires evidence, role separation, revision and overlap safety',async()=>{

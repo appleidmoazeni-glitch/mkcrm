@@ -4,7 +4,7 @@
  * Phase 5.3.1 — accounting governance boundary.
  *
  * This module owns evidence catalogues and human approval workflow only. It
- * reads official Shaygan Item/Get and immutable accounting facts; it never
+ * reads official Shaygan ItemGroup/GetList, Item/Get and immutable accounting facts; it never
  * writes inventory, snapshots, purchase layers, FIFO datasets or invoices.
  */
 const crypto = require('crypto');
@@ -22,6 +22,7 @@ const EDIT_ROLES = Object.freeze(['admin', 'accounting']);
 const APPROVE_ROLES = Object.freeze(['admin', 'manager']);
 const READ_ROLES = Object.freeze(['admin', 'accounting', 'manager']);
 const POOLS = Object.freeze(['NOTEBOOK', 'COMPONENT']);
+let lastCatalogFetchMs = 0;
 
 function clean(value, max = 1000) { return String(value == null ? '' : value).trim().slice(0, max); }
 function actor(value = {}) { return { username:clean(value.username || value.user || 'system', 100), role:clean(value.role || 'system', 50) }; }
@@ -42,10 +43,12 @@ async function ensureIndexes(db) {
   const existing=new Set((await db.listCollections().toArray()).map(row=>row.name));
   for(const name of COLLECTIONS)if(!existing.has(name))await db.createCollection(name).catch(()=>{});
   await db.collection(GROUP_CATALOG).createIndex({groupIdentity:1},{unique:true});
+  await db.collection(GROUP_CATALOG).createIndex({sourceGroupGuid:1},{unique:true,partialFilterExpression:{sourceGroupGuid:{$gt:''}}});
   await db.collection(GROUP_CATALOG).createIndex({groupNumber:1,parentGroupGuid:1});
   await db.collection(ITEM_GROUP_ASSIGNMENTS).createIndex({itemIdentity:1},{unique:true});
   await db.collection(ITEM_GROUP_ASSIGNMENTS).createIndex({itemGuid:1});
   await db.collection(ITEM_GROUP_ASSIGNMENTS).createIndex({itemCode:1});
+  await db.collection(ITEM_GROUP_ASSIGNMENTS).createIndex({resolvedMainGroupGuid:1,resolutionStatus:1});
   await db.collection(GROUP_CATALOG_RUNS).createIndex({catalogRunId:1},{unique:true});
   await db.collection(OPENING_BALANCES).createIndex({openingBalanceId:1},{unique:true});
   await db.collection(OPENING_BALANCES).createIndex({pool:1,accountingPeriod:1,status:1});
@@ -56,26 +59,88 @@ async function ensureIndexes(db) {
 }
 
 function first(row, keys) { for(const key of keys)if(clean(row?.[key]))return clean(row[key],500); return ''; }
+function bool(value) { return value===true||value===1||/^(true|1|yes)$/i.test(clean(value)); }
+function groupIdentity(row={}) {
+  const sourceGroupGuid=first(row,['GroupGuid','GroupGuId','sourceGroupGuid','groupGuid']);
+  const groupNumber=first(row,['GroupNumber','groupNumber']);
+  const parentGroupGuid=first(row,['ParentGroupGuId','ParentGroupGuid','parentGroupGuid']);
+  const parentGroupNumber=first(row,['ParentGroupNumber','parentGroupNumber']);
+  const parentGroupName=first(row,['ParentGroupName','parentGroupName']);
+  const groupName=first(row,['GroupName','groupName']);
+  if(sourceGroupGuid)return `guid:${sourceGroupGuid}`;
+  if(parentGroupGuid&&groupNumber)return `parent-guid:${parentGroupGuid}|number:${groupNumber}`;
+  if(parentGroupNumber&&groupNumber)return `parent-number:${parentGroupNumber}|parent-name:${parentGroupName||'UNKNOWN'}|number:${groupNumber}`;
+  return groupNumber?`number:${groupNumber}|name:${groupName||'UNKNOWN'}|parent:UNRESOLVED`:'';
+}
+function normalizeOfficialGroup(row={}) {
+  const sourceGroupGuid=first(row,['GroupGuid','GroupGuId','sourceGroupGuid','groupGuid']);
+  const normalized={
+    sourceGroupGuid,
+    groupNumber:first(row,['GroupNumber','groupNumber']),
+    groupName:first(row,['GroupName','groupName']),
+    isMainGroup:bool(row.IsMainGroup??row.isMainGroup),
+    parentGroupGuid:first(row,['ParentGroupGuId','ParentGroupGuid','parentGroupGuid']),
+    parentGroupNumber:first(row,['ParentGroupNumber','parentGroupNumber']),
+    parentGroupName:first(row,['ParentGroupName','parentGroupName']),
+    sourceVersion:first(row,['SourceVersion','sourceVersion'])
+  };
+  normalized.groupIdentity=groupIdentity(normalized);
+  return normalized;
+}
+function resolveGroupHierarchy(sourceRows=[], metadata={}) {
+  const unique=new Map();const duplicateGuidIdentities=[];const missingIdentity=[];
+  for(const raw of sourceRows){const row=normalizeOfficialGroup(raw);if(!row.groupIdentity){missingIdentity.push(row);continue;}if(row.sourceGroupGuid&&unique.has(row.groupIdentity)){duplicateGuidIdentities.push(row.sourceGroupGuid);continue;}unique.set(row.groupIdentity,row);}
+  const rows=[...unique.values()];const byGuid=new Map(rows.filter(r=>r.sourceGroupGuid).map(r=>[r.sourceGroupGuid.toLowerCase(),r]));const byNumber=new Map();
+  for(const row of rows){if(!row.groupNumber)continue;const key=row.groupNumber;if(!byNumber.has(key))byNumber.set(key,[]);byNumber.get(key).push(row);}
+  const ambiguousNumbers=[...byNumber.entries()].filter(([,list])=>list.length>1).map(([number,list])=>({groupNumber:number,groupIdentities:list.map(x=>x.groupIdentity)}));
+  function parentFor(row){if(row.parentGroupGuid)return byGuid.get(row.parentGroupGuid.toLowerCase())||null;if(!row.parentGroupNumber)return null;const candidates=byNumber.get(row.parentGroupNumber)||[];if(candidates.length===1)return candidates[0];const named=candidates.filter(x=>row.parentGroupName&&x.groupName===row.parentGroupName);return named.length===1?named[0]:null;}
+  const resolved=[];let cycleCount=0,orphanParentCount=0,ambiguousParentCount=0;
+  for(const row of rows){const seen=new Set();const path=[];let cursor=row,main=null,status='valid-child';
+    while(cursor){if(seen.has(cursor.groupIdentity)){status='cycle';cycleCount++;break;}seen.add(cursor.groupIdentity);path.unshift({groupIdentity:cursor.groupIdentity,groupGuid:cursor.sourceGroupGuid,groupNumber:cursor.groupNumber,groupName:cursor.groupName,isMainGroup:cursor.isMainGroup});if(cursor.isMainGroup){main=cursor;status=cursor===row?'valid-main':'valid-child';break;}const parent=parentFor(cursor);if(!parent){const candidates=cursor.parentGroupNumber?(byNumber.get(cursor.parentGroupNumber)||[]):[];if(candidates.length>1){status='ambiguous-parent-number';ambiguousParentCount++;}else{status='orphan-parent';orphanParentCount++;}break;}cursor=parent;}
+    resolved.push({...row,resolvedMainGroupGuid:main?.sourceGroupGuid||'',resolvedMainGroupNumber:main?.groupNumber||'',resolvedMainGroupName:main?.groupName||'',resolvedMainGroupIdentity:main?.groupIdentity||'',hierarchyDepth:Math.max(0,path.length-1),hierarchyPath:path,sourceVersion:row.sourceVersion||clean(metadata.sourceVersion),fetchedAt:metadata.fetchedAt||new Date(),sourceEndpoint:'ItemGroup/GetList',validationStatus:status,hierarchyStatus:main?'resolved':status,active:true});
+  }
+  return{rows:resolved,diagnostics:{sourceRowCount:sourceRows.length,groupCount:resolved.length,mainGroupCount:resolved.filter(r=>r.isMainGroup).length,childGroupCount:resolved.filter(r=>!r.isMainGroup).length,parentResolvedCount:resolved.filter(r=>r.resolvedMainGroupIdentity).length,orphanParentCount,ambiguousParentCount,cycleCount,duplicateGuidCount:duplicateGuidIdentities.length,duplicateGuidIdentities:[...new Set(duplicateGuidIdentities)],ambiguousNumbers,missingIdentityCount:missingIdentity.length}};
+}
 function normalizeOfficialItem(row={}) {
   const itemGuid=first(row,['ItemGuId','ItemGuid','GuId','itemGuid']);
   const itemCode=first(row,['ItemCode','ProductCode','itemCode']);
   const groupGuid=first(row,['ItemGroupGuId','ItemGroupGuid','ProductGroupGuId','groupGuid']);
   const groupNumber=first(row,['ItemGroupNumber','ProductGroupNumber','groupNumber']);
   const groupName=first(row,['ItemGroupName','ProductGroupName','groupName']);
-  const parentGroupGuid=first(row,['ParentItemGroupGuId','ParentGroupGuId','MainItemGroupGuId','ItemMainGroupGuId','parentGroupGuid']);
-  const parentGroupNumber=first(row,['ParentItemGroupNumber','ParentGroupNumber','MainItemGroupNumber','ItemMainGroupNumber','parentGroupNumber']);
-  const parentGroupName=first(row,['ParentItemGroupName','ParentGroupName','MainItemGroupName','ItemMainGroupName','parentGroupName']);
   const itemIdentity=itemGuid?`guid:${itemGuid}`:`code:${itemCode}`;
-  const groupIdentity=groupGuid?`guid:${groupGuid}`:`number:${groupNumber}|parent:${parentGroupGuid||parentGroupNumber||'UNRESOLVED'}`;
-  const hierarchyStatus=parentGroupGuid||parentGroupNumber?'resolved':'parent-unavailable-from-official-response';
-  return {itemIdentity,itemGuid,itemCode,itemDescription:first(row,['ItemDesc','ProductDesc','ItemDescription','itemDescription']),groupIdentity,groupGuid,groupNumber,groupName,parentGroupGuid,parentGroupNumber,parentGroupName,hierarchyStatus,sourceEndpoint:'Invoice-independent Item/Get'};
+  return {itemIdentity,itemGuid,itemCode,itemDescription:first(row,['ItemDesc','ProductDesc','ItemDescription','itemDescription']),groupGuid,groupNumber,groupName,sourceEndpoint:'Item/Get'};
+}
+
+function resolveItemGroup(item, hierarchy) {
+  const byGuid=new Map(hierarchy.rows.filter(r=>r.sourceGroupGuid).map(r=>[r.sourceGroupGuid.toLowerCase(),r]));const byNumber=new Map();for(const row of hierarchy.rows){if(!row.groupNumber)continue;if(!byNumber.has(row.groupNumber))byNumber.set(row.groupNumber,[]);byNumber.get(row.groupNumber).push(row);}
+  let group=null,resolutionStatus='missing-group-identity';
+  if(item.groupGuid){group=byGuid.get(item.groupGuid.toLowerCase())||null;resolutionStatus=group?'guid-resolved':'orphan';}
+  else if(item.groupNumber){const candidates=byNumber.get(item.groupNumber)||[];if(candidates.length===1){group=candidates[0];resolutionStatus='number-resolved-with-parent-evidence';}else resolutionStatus=candidates.length>1?'ambiguous':'orphan';}
+  const valid=Boolean(group?.resolvedMainGroupIdentity&&['valid-main','valid-child'].includes(group.validationStatus));
+  if(group&&!valid&&resolutionStatus.endsWith('resolved'))resolutionStatus=group.validationStatus==='cycle'?'cycle':group.validationStatus.startsWith('ambiguous')?'ambiguous':'orphan';
+  return{...item,groupIdentity:group?.groupIdentity||'',groupGuid:group?.sourceGroupGuid||item.groupGuid||'',groupNumber:group?.groupNumber||item.groupNumber||'',groupName:group?.groupName||item.groupName||'',parentGroupGuid:group?.parentGroupGuid||'',parentGroupNumber:group?.parentGroupNumber||'',parentGroupName:group?.parentGroupName||'',resolvedMainGroupGuid:group?.resolvedMainGroupGuid||'',resolvedMainGroupNumber:group?.resolvedMainGroupNumber||'',resolvedMainGroupName:group?.resolvedMainGroupName||'',resolvedMainGroupIdentity:group?.resolvedMainGroupIdentity||'',hierarchyDepth:group?.hierarchyDepth??null,hierarchyPath:group?.hierarchyPath||[],validationStatus:group?.validationStatus||resolutionStatus,resolutionStatus,isOfficialEvidence:valid,prefixFallbackOnly:!valid&&Boolean(item.itemCode),sourceEndpoint:'Item/Get + ItemGroup/GetList'};
 }
 
 async function refreshOfficialGroupCatalog(db, shaygan, input={}, requestedBy={}) {
   const current=requireRole(requestedBy,EDIT_ROLES); await ensureIndexes(db);
   const pageSize=Math.max(1,Math.min(Number(input.pageSize||100),100));
   const maxPages=Math.max(1,Math.min(Number(input.maxPages||1000),2000));
-  const catalogRunId=newId('IGCAT'); const fetchedAt=new Date(); let pagesRead=0,totalRows=0,totalRecords=null;
+  const maxGroupPages=Math.max(1,Math.min(Number(input.maxGroupPages||100),500));
+  const catalogRunId=newId('IGCAT');
+  const fetchMs=Math.max(Date.now(),lastCatalogFetchMs+1);lastCatalogFetchMs=fetchMs;
+  const fetchedAt=new Date(fetchMs); let pagesRead=0,totalRows=0,totalRecords=null,groupPagesRead=0,groupTotalRows=0,groupTotalRecords=null,groupSourceVersion='';
+  if(typeof shaygan.getItemGroupsPage!=='function')fail('OFFICIAL_ITEM_GROUP_CONTRACT_MISSING','Wrapper رسمی ItemGroup/GetList در دسترس نیست.',500);
+  const sourceGroups=[];
+  for(let page=0;page<maxGroupPages;page++){
+    const response=await shaygan.getItemGroupsPage(page*pageSize,pageSize);
+    if(!response?.ok)fail('OFFICIAL_ITEM_GROUP_READ_FAILED','خواندن read-only سلسله‌مراتب از ItemGroup/GetList ناموفق بود.',502,{details:{endpoint:'ItemGroup/GetList',page,status:response?.status||0,error:clean(response?.error,500)}});
+    const list=Array.isArray(response.list)?response.list:[];groupPagesRead++;groupTotalRows+=list.length;sourceGroups.push(...list);groupSourceVersion=clean(response.raw?.CurrentVersion||response.currentVersion||groupSourceVersion);
+    const candidate=Number(response.totalRecords??response.TotalRecords??response.raw?.TotalRecords??response.result?.[0]?.TotalRecords??response.raw?.Result?.[0]?.TotalRecords);
+    if(Number.isFinite(candidate)&&candidate>=0)groupTotalRecords=candidate;
+    if(groupTotalRecords!=null&&groupTotalRows>=groupTotalRecords)break;
+    if(groupTotalRecords==null&&list.length<pageSize)break;
+  }
+  const hierarchy=resolveGroupHierarchy(sourceGroups,{fetchedAt,sourceVersion:groupSourceVersion});
   const items=[];
   for(let page=0;page<maxPages;page++){
     const response=await shaygan.getItemsPage(page*pageSize,pageSize);
@@ -87,24 +152,21 @@ async function refreshOfficialGroupCatalog(db, shaygan, input={}, requestedBy={}
     if(totalRecords!=null&&totalRows>=totalRecords)break;
     if(totalRecords==null&&list.length<pageSize)break;
   }
-  const groups=new Map();
   const assignments=[];
   for(const item of items){
-    const assignment={...item,catalogRunId,source:'shaygan-official-read',fetchedAt,active:true};assignments.push(assignment);
-    if(!groups.has(item.groupIdentity))groups.set(item.groupIdentity,{groupIdentity:item.groupIdentity,groupGuid:item.groupGuid,groupNumber:item.groupNumber,groupName:item.groupName,parentGroupGuid:item.parentGroupGuid,parentGroupNumber:item.parentGroupNumber,parentGroupName:item.parentGroupName,hierarchyStatus:item.hierarchyStatus,source:'shaygan-official-read',sourceEndpoint:'Item/Get',fetchedAt,catalogRunId,active:true});
+    const assignment={...resolveItemGroup(item,hierarchy),catalogRunId,source:'shaygan-official-read',fetchedAt,active:true};assignments.push(assignment);
   }
-  await bulkUpsert(db.collection(ITEM_GROUP_ASSIGNMENTS),assignments,'itemIdentity');await bulkUpsert(db.collection(GROUP_CATALOG),[...groups.values()],'groupIdentity');
-  const ambiguousNumbers=[]; const byNumber=new Map();
-  for(const group of groups.values()){if(!byNumber.has(group.groupNumber))byNumber.set(group.groupNumber,new Set());byNumber.get(group.groupNumber).add(group.groupIdentity);}
-  for(const [groupNumber,identities] of byNumber)if(groupNumber&&identities.size>1)ambiguousNumbers.push({groupNumber,groupIdentities:[...identities]});
-  const run={catalogRunId,source:'shaygan-official-read',sourceEndpoint:'Item/Get',fetchedAt,pagesRead,totalRows,totalRecords,groupCount:groups.size,hierarchyResolvedCount:[...groups.values()].filter(row=>row.hierarchyStatus==='resolved').length,hierarchyUnresolvedCount:[...groups.values()].filter(row=>row.hierarchyStatus!=='resolved').length,ambiguousNumbers,createdBy:current,readOnlySource:true};
+  const groupRows=hierarchy.rows.map(row=>({...row,catalogRunId,source:'shaygan-official-read'}));
+  await bulkUpsert(db.collection(ITEM_GROUP_ASSIGNMENTS),assignments,'itemIdentity');await bulkUpsert(db.collection(GROUP_CATALOG),groupRows,'groupIdentity');
+  const resolutionCounts={};for(const row of assignments)resolutionCounts[row.resolutionStatus]=(resolutionCounts[row.resolutionStatus]||0)+1;
+  const run={catalogRunId,source:'shaygan-official-read',sourceEndpoint:'ItemGroup/GetList + Item/Get',sourceVersion:groupSourceVersion,fetchedAt,groupPagesRead,groupTotalRows,groupTotalRecords,groupExpectedPages:groupTotalRecords==null?null:Math.ceil(groupTotalRecords/pageSize),itemPagesRead:pagesRead,pagesRead,totalRows,totalRecords,...hierarchy.diagnostics,hierarchyResolvedCount:hierarchy.diagnostics.parentResolvedCount,hierarchyUnresolvedCount:hierarchy.diagnostics.groupCount-hierarchy.diagnostics.parentResolvedCount,itemCount:assignments.length,itemOfficialResolutionCount:assignments.filter(r=>r.isOfficialEvidence).length,itemResolutionCounts:resolutionCounts,endpointDiagnostics:[{route:'/api/ItemGroup/GetList',method:'POST',requestShape:{StartVersion:'0',EndVersion:'',Domain:['Sort','SortOnAuxId','GroupNumber'],Config:'ConnectionName redacted'},status:200,responseShape:['GroupGuid','GroupNumber','GroupName','ParentGroupNumber','ParentGroupName','ParentGroupGuId','IsMainGroup']}],createdBy:current,readOnlySource:true};
   await db.collection(GROUP_CATALOG_RUNS).insertOne(run);
   return {ok:true,run,inventoryWrites:0,snapshotWrites:0,fifoWrites:0,invoiceWrites:0,automaticMappingsApproved:0};
 }
 
-async function assignmentMaps(db){const latest=await db.collection(GROUP_CATALOG_RUNS).findOne({}, {sort:{fetchedAt:-1}});const query=latest?.catalogRunId?{catalogRunId:latest.catalogRunId}:{active:true};const rows=await db.collection(ITEM_GROUP_ASSIGNMENTS).find(query).toArray();return{byGuid:new Map(rows.filter(r=>r.itemGuid).map(r=>[r.itemGuid,r])),byCode:new Map(rows.filter(r=>r.itemCode).map(r=>[r.itemCode,r]))};}
+async function assignmentMaps(db){const latest=await db.collection(GROUP_CATALOG_RUNS).findOne({}, {sort:{fetchedAt:-1}});const query=latest?.catalogRunId?{catalogRunId:latest.catalogRunId}:{active:true};const rows=await db.collection(ITEM_GROUP_ASSIGNMENTS).find(query).toArray();return{run:latest,rows,byGuid:new Map(rows.filter(r=>r.itemGuid).map(r=>[r.itemGuid,r])),byCode:new Map(rows.filter(r=>r.itemCode).map(r=>[r.itemCode,r]))};}
 function assignmentFor(maps,fact){return maps.byGuid.get(clean(fact.itemGuid))||maps.byCode.get(clean(fact.itemCode))||null;}
-function enrichFact(fact,assignment){return assignment?{...fact,groupGuid:assignment.groupGuid,groupPathIdentity:assignment.groupIdentity,mainGroupCode:assignment.parentGroupNumber||''}:fact;}
+function enrichFact(fact,assignment){return assignment?.isOfficialEvidence?{...fact,groupGuid:assignment.resolvedMainGroupGuid,groupPathIdentity:assignment.resolvedMainGroupIdentity,mainGroupCode:assignment.resolvedMainGroupNumber||''}:fact;}
 
 async function groupReviewMatrix(db, filters={}, requestedBy={}) {
   requireRole(requestedBy,READ_ROLES); await ensureIndexes(db);
@@ -113,21 +175,23 @@ async function groupReviewMatrix(db, filters={}, requestedBy={}) {
   const periodFrom=filters.periodFrom?date8(filters.periodFrom,'periodFrom'):''; const periodTo=filters.periodTo?date8(filters.periodTo,'periodTo'):'';
   if(periodFrom)facts=facts.filter(r=>r.saleDate>=periodFrom);if(periodTo)facts=facts.filter(r=>r.saleDate<=periodTo);
   const maps=await assignmentMaps(db); const mappings=await db.collection(ledger.CATEGORY_MAPPINGS).find({}).toArray();
-  const grouped=new Map();
-  for(const fact of facts){const assignment=assignmentFor(maps,fact);const key=assignment?.groupIdentity||'UNRESOLVED';const row=grouped.get(key)||{groupIdentity:key,groupGuid:assignment?.groupGuid||'',groupNumber:assignment?.groupNumber||'',groupName:assignment?.groupName||'Unresolved official group',parentGroupGuid:assignment?.parentGroupGuid||'',parentGroupNumber:assignment?.parentGroupNumber||'',parentGroupName:assignment?.parentGroupName||'',hierarchyStatus:assignment?.hierarchyStatus||'item-not-in-official-catalog',saleLineCount:0,saleQuantity:'0.000000',saleValue:'0.00',knownFifoProfit:'0.00',unknownCostValue:'0.00',_items:new Set(),_invoices:new Set()};
-    row.saleLineCount++;row._items.add(fact.itemGuid||fact.itemCode);row._invoices.add(fact.saleInvoiceIdentity);row.saleQuantity=add([row.saleQuantity,fact.quantityExact||0],6);row.saleValue=add([row.saleValue,fact.saleAmountExact||0]);if(fact.actualFifoProfitExact!=null)row.knownFifoProfit=add([row.knownFifoProfit,fact.actualFifoProfitExact]);else row.unknownCostValue=add([row.unknownCostValue,fact.saleAmountExact||0]);grouped.set(key,row);}
+  const grouped=new Map();let resolvedLineCount=0,resolvedSaleValue='0.00',prefixOnlyLineCount=0,prefixOnlySaleValue='0.00';const resolutionCounts={};
+  for(const fact of facts){const assignment=assignmentFor(maps,fact);const official=Boolean(assignment?.isOfficialEvidence);const status=official?assignment.resolutionStatus:(assignment?.resolutionStatus||((fact.itemCode||'')?'prefix-fallback-only':'missing-group-identity'));resolutionCounts[status]=(resolutionCounts[status]||0)+1;if(official){resolvedLineCount++;resolvedSaleValue=add([resolvedSaleValue,fact.saleAmountExact||0]);}else if(status==='prefix-fallback-only'||assignment?.prefixFallbackOnly){prefixOnlyLineCount++;prefixOnlySaleValue=add([prefixOnlySaleValue,fact.saleAmountExact||0]);}
+    const key=official?assignment.resolvedMainGroupIdentity:`UNRESOLVED:${status}`;const row=grouped.get(key)||{groupIdentity:official?assignment.resolvedMainGroupIdentity:'UNRESOLVED',groupGuid:official?assignment.resolvedMainGroupGuid:'',groupNumber:official?assignment.resolvedMainGroupNumber:'',groupName:official?assignment.resolvedMainGroupName:'Unresolved official group',mainGroupIdentity:official?assignment.resolvedMainGroupIdentity:'',mainGroupGuid:official?assignment.resolvedMainGroupGuid:'',mainGroupNumber:official?assignment.resolvedMainGroupNumber:'',mainGroupName:official?assignment.resolvedMainGroupName:'',hierarchyStatus:official?'resolved':status,validationStatus:official?'official-main-resolved':status,resolutionStatus:status,officialEvidence:official,saleLineCount:0,saleQuantity:'0.000000',saleValue:'0.00',knownFifoProfit:'0.00',unknownCostValue:'0.00',unresolvedGroupValue:'0.00',_items:new Set(),_invoices:new Set(),_children:new Map()};
+    row.saleLineCount++;row._items.add(fact.itemGuid||fact.itemCode);row._invoices.add(fact.saleInvoiceIdentity);if(assignment?.groupIdentity)row._children.set(assignment.groupIdentity,{groupIdentity:assignment.groupIdentity,groupGuid:assignment.groupGuid,groupNumber:assignment.groupNumber,groupName:assignment.groupName,resolutionStatus:assignment.resolutionStatus});row.saleQuantity=add([row.saleQuantity,fact.quantityExact||0],6);row.saleValue=add([row.saleValue,fact.saleAmountExact||0]);if(!official)row.unresolvedGroupValue=add([row.unresolvedGroupValue,fact.saleAmountExact||0]);if(fact.actualFifoProfitExact!=null)row.knownFifoProfit=add([row.knownFifoProfit,fact.actualFifoProfitExact]);else row.unknownCostValue=add([row.unknownCostValue,fact.saleAmountExact||0]);grouped.set(key,row);}
   const totalSaleValue=add(facts.map(row=>row.saleAmountExact||0));
   for(const row of grouped.values()){
     const relevant=mappings.filter(m=>['groupPathIdentity','groupGuid'].includes(m.identityType)&&(m.identityValue===row.groupIdentity||m.identityValue===row.groupGuid));
     row.currentMappingStatus=relevant.some(m=>m.status==='approved')?'approved':relevant.some(m=>m.status==='pending')?'pending':relevant.some(m=>m.status==='draft')?'draft':'missing';
     row.currentCommissionCategory=relevant.find(m=>m.status==='approved')?.commissionCategory||'UNKNOWN';
-    const haystack=`${row.groupName} ${row.parentGroupName}`.toLowerCase();
-    row.suggestedCommissionCategory=/notebook|laptop|نوت|لپ/.test(haystack)?'NOTEBOOK':row.hierarchyStatus==='resolved'?'COMPONENT':'UNKNOWN';
-    row.suggestionEvidence=row.suggestedCommissionCategory==='UNKNOWN'?'Official parent hierarchy unavailable; human evidence required.':'Name-based review suggestion only; never auto-approved.';
-    row.itemCount=row._items.size;row.representativeItems=[...row._items].slice(0,10);row.representativeInvoices=[...row._invoices].slice(0,10);row.projectedSaleValueGain=row.currentMappingStatus==='approved'?'0.00':row.saleValue;row.projectedCoverageGainPercent=row.currentMappingStatus==='approved'?0:pct(row.saleValue,totalSaleValue);delete row._items;delete row._invoices;
+    row.childGroups=[...row._children.values()];row.childGroupCount=row.childGroups.length;const haystack=`${row.groupName} ${row.childGroups.map(x=>x.groupName).join(' ')}`.toLowerCase();
+    row.suggestedCommissionCategory=/notebook|laptop|نوت|لپ/.test(haystack)?'NOTEBOOK':row.officialEvidence?'COMPONENT':'UNKNOWN';
+    row.suggestionEvidence=row.suggestedCommissionCategory==='UNKNOWN'?'Official hierarchy unresolved; prefix fallback is diagnostic-only and human evidence is required.':'Suggestion derived from official main/child group names; never auto-approved.';
+    row.itemCount=row._items.size;row.representativeItems=[...row._items].slice(0,10);row.representativeInvoices=[...row._invoices].slice(0,10);row.projectedSaleValueGain=row.currentMappingStatus==='approved'?'0.00':row.saleValue;row.projectedCoverageGainPercent=row.currentMappingStatus==='approved'?0:pct(row.saleValue,totalSaleValue);delete row._items;delete row._invoices;delete row._children;
   }
-  let rows=[...grouped.values()].sort((a,b)=>Number(b.saleValue)-Number(a.saleValue));if(filters.minSaleValue)rows=rows.filter(row=>Number(row.saleValue)>=Number(filters.minSaleValue));if(filters.search){const query=clean(filters.search).toLowerCase();rows=rows.filter(row=>[row.groupIdentity,row.groupNumber,row.groupName,row.parentGroupName,...row.representativeItems,...row.representativeInvoices].some(value=>clean(value).toLowerCase().includes(query)));}
-  return {ok:true,fifoDatasetId,periodFrom,periodTo,...pageRows(rows,filters),catalog:{assignmentCount:maps.byGuid.size||maps.byCode.size,unresolvedLineCount:rows.filter(r=>r.groupIdentity==='UNRESOLVED').reduce((n,r)=>n+r.saleLineCount,0)},automaticApproval:false};
+  let rows=[...grouped.values()].sort((a,b)=>Number(b.saleValue)-Number(a.saleValue));if(filters.minSaleValue)rows=rows.filter(row=>Number(row.saleValue)>=Number(filters.minSaleValue));if(filters.search){const query=clean(filters.search).toLowerCase();rows=rows.filter(row=>[row.groupIdentity,row.groupNumber,row.groupName,...row.childGroups.map(x=>`${x.groupNumber} ${x.groupName}`),...row.representativeItems,...row.representativeInvoices].some(value=>clean(value).toLowerCase().includes(query)));}
+  const coverage={factLineCount:facts.length,factSaleValue:totalSaleValue,officialResolvedLineCount:resolvedLineCount,officialResolvedSaleValue:resolvedSaleValue,officialResolvedLinePercent:pct(resolvedLineCount,facts.length),officialResolvedSaleValuePercent:pct(resolvedSaleValue,totalSaleValue),unresolvedLineCount:facts.length-resolvedLineCount,unresolvedSaleValue:ledger._subtract(totalSaleValue,resolvedSaleValue),prefixOnlyLineCount,prefixOnlySaleValue,prefixOnlyLinePercent:pct(prefixOnlyLineCount,facts.length),prefixOnlySaleValuePercent:pct(prefixOnlySaleValue,totalSaleValue),resolutionCounts};
+  return {ok:true,fifoDatasetId,periodFrom,periodTo,...pageRows(rows,filters),coverage,catalog:{catalogRunId:maps.run?.catalogRunId||'',assignmentCount:maps.rows.length,groupCount:maps.run?.groupCount||0,mainGroupCount:maps.run?.mainGroupCount||0,childGroupCount:maps.run?.childGroupCount||0,parentResolvedCount:maps.run?.parentResolvedCount||0,orphanParentCount:maps.run?.orphanParentCount||0,cycleCount:maps.run?.cycleCount||0,ambiguousNumbers:maps.run?.ambiguousNumbers||[],unresolvedLineCount:coverage.unresolvedLineCount},automaticApproval:false};
 }
 
 async function rateReviewMatrix(db,filters={},requestedBy={}){
@@ -174,11 +238,11 @@ async function readiness(db,input={},requestedBy={}) {
   const facts=(await db.collection(ledger.FIFO_FACTS).find({fifoDatasetId}).toArray()).filter(r=>r.saleDate>=periodFrom&&r.saleDate<=periodTo);
   const maps=await assignmentMaps(db);const mappings=await db.collection(ledger.CATEGORY_MAPPINGS).find({}).toArray();const rates=await db.collection(ledger.RATE_VERSIONS).find({}).toArray();const openings=await db.collection(OPENING_BALANCES).find({accountingPeriod:periodFrom.slice(0,6)}).toArray();
   const metrics={lineCount:facts.length,saleValue:add(facts.map(r=>r.saleAmountExact||0)),officialGroupLineCount:0,officialGroupSaleValue:'0.00',mappedLineCount:0,mappedSaleValue:'0.00',projectedMappedLineCount:0,projectedMappedSaleValue:'0.00',approvedRateLineCount:0,completeCostLineCount:0,partialCostLineCount:0,unknownCostLineCount:0,completeCostValue:'0.00',partialCostValue:'0.00',unknownCostValue:'0.00',unknownCategoryLineCount:0,unknownCategoryValue:'0.00',unresolvedDiscountLineCount:0,unresolvedSellerLineCount:0};const missingRates=new Set();
-  for(const fact of facts){const assignment=assignmentFor(maps,fact);if(assignment){metrics.officialGroupLineCount++;metrics.officialGroupSaleValue=add([metrics.officialGroupSaleValue,fact.saleAmountExact||0]);}const enriched=enrichFact(fact,assignment);const approved=ledger._resolveCategoryFromMappings(mappings.filter(m=>m.status==='approved'),enriched,fact.saleDate);const projected=approved.status==='resolved'?approved:ledger._resolveCategoryFromMappings(mappings.filter(m=>['pending','draft'].includes(m.status)),enriched,fact.saleDate);if(approved.status==='resolved'&&approved.category!=='UNKNOWN'){metrics.mappedLineCount++;metrics.mappedSaleValue=add([metrics.mappedSaleValue,fact.saleAmountExact||0]);const rate=ledger._resolveRateFromRows(rates.filter(r=>r.status==='approved'),fact.sellerIdentity,approved.category,fact.saleDate);if(rate.status==='resolved')metrics.approvedRateLineCount++;else missingRates.add(`${fact.sellerIdentity}|${approved.category}`);}else{metrics.unknownCategoryLineCount++;metrics.unknownCategoryValue=add([metrics.unknownCategoryValue,fact.saleAmountExact||0]);}if(projected.status==='resolved'&&projected.category!=='UNKNOWN'){metrics.projectedMappedLineCount++;metrics.projectedMappedSaleValue=add([metrics.projectedMappedSaleValue,fact.saleAmountExact||0]);}const kind=fact.costCoverageStatus==='complete'?'complete':fact.costCoverageStatus==='partial'?'partial':'unknown';metrics[`${kind}CostLineCount`]++;metrics[`${kind}CostValue`]=add([metrics[`${kind}CostValue`],fact.saleAmountExact||0]);if(fact.invoiceDiscountAttributionStatus==='unresolved-invoice-level')metrics.unresolvedDiscountLineCount++;if(!clean(fact.sellerIdentity))metrics.unresolvedSellerLineCount++;}
+  for(const fact of facts){const assignment=assignmentFor(maps,fact);if(assignment?.isOfficialEvidence){metrics.officialGroupLineCount++;metrics.officialGroupSaleValue=add([metrics.officialGroupSaleValue,fact.saleAmountExact||0]);}const enriched=enrichFact(fact,assignment);const approved=ledger._resolveCategoryFromMappings(mappings.filter(m=>m.status==='approved'),enriched,fact.saleDate);const projected=approved.status==='resolved'?approved:ledger._resolveCategoryFromMappings(mappings.filter(m=>['pending','draft'].includes(m.status)),enriched,fact.saleDate);if(approved.status==='resolved'&&approved.category!=='UNKNOWN'){metrics.mappedLineCount++;metrics.mappedSaleValue=add([metrics.mappedSaleValue,fact.saleAmountExact||0]);const rate=ledger._resolveRateFromRows(rates.filter(r=>r.status==='approved'),fact.sellerIdentity,approved.category,fact.saleDate);if(rate.status==='resolved')metrics.approvedRateLineCount++;else missingRates.add(`${fact.sellerIdentity}|${approved.category}`);}else{metrics.unknownCategoryLineCount++;metrics.unknownCategoryValue=add([metrics.unknownCategoryValue,fact.saleAmountExact||0]);}if(projected.status==='resolved'&&projected.category!=='UNKNOWN'){metrics.projectedMappedLineCount++;metrics.projectedMappedSaleValue=add([metrics.projectedMappedSaleValue,fact.saleAmountExact||0]);}const kind=fact.costCoverageStatus==='complete'?'complete':fact.costCoverageStatus==='partial'?'partial':'unknown';metrics[`${kind}CostLineCount`]++;metrics[`${kind}CostValue`]=add([metrics[`${kind}CostValue`],fact.saleAmountExact||0]);if(fact.invoiceDiscountAttributionStatus==='unresolved-invoice-level')metrics.unresolvedDiscountLineCount++;if(!clean(fact.sellerIdentity))metrics.unresolvedSellerLineCount++;}
   metrics.officialGroupLinePercent=pct(metrics.officialGroupLineCount,metrics.lineCount);metrics.officialGroupSaleValuePercent=pct(metrics.officialGroupSaleValue,metrics.saleValue);metrics.mappedLinePercent=pct(metrics.mappedLineCount,metrics.lineCount);metrics.mappedSaleValuePercent=pct(metrics.mappedSaleValue,metrics.saleValue);metrics.pendingMappedLineCount=Math.max(0,metrics.projectedMappedLineCount-metrics.mappedLineCount);metrics.pendingMappedSaleValue=ledger._subtract(metrics.projectedMappedSaleValue,metrics.mappedSaleValue);metrics.projectedMappedLinePercent=pct(metrics.projectedMappedLineCount,metrics.lineCount);metrics.projectedMappedSaleValuePercent=pct(metrics.projectedMappedSaleValue,metrics.saleValue);metrics.approvedRateCoveragePercent=pct(metrics.approvedRateLineCount,metrics.mappedLineCount);metrics.unknownCategoryLinePercent=pct(metrics.unknownCategoryLineCount,metrics.lineCount);metrics.unknownCategoryValuePercent=pct(metrics.unknownCategoryValue,metrics.saleValue);for(const kind of ['complete','partial','unknown']){metrics[`${kind}CostLinePercent`]=pct(metrics[`${kind}CostLineCount`],metrics.lineCount);metrics[`${kind}CostValuePercent`]=pct(metrics[`${kind}CostValue`],metrics.saleValue);}
   const openingReadiness=Object.fromEntries(POOLS.map(pool=>{const rows=openings.filter(r=>r.pool===pool&&r.entryKind==='OPENING');return[pool,{approved:rows.some(r=>r.status==='approved'),pending:rows.some(r=>r.status==='pending'),draft:rows.some(r=>r.status==='draft'),count:rows.length}];}));const blockers=[];if(metrics.mappedSaleValuePercent<policy.mappedSaleValueMinimumPercent)blockers.push({code:'MAPPED_SALE_VALUE_BELOW_THRESHOLD',actual:metrics.mappedSaleValuePercent,required:policy.mappedSaleValueMinimumPercent});if(policy.requireMappedLines&&metrics.mappedLineCount<metrics.lineCount)blockers.push({code:'UNMAPPED_LINES',count:metrics.lineCount-metrics.mappedLineCount});if(policy.requireApprovedRates&&metrics.approvedRateLineCount<metrics.mappedLineCount)blockers.push({code:'MISSING_APPROVED_RATES',count:metrics.mappedLineCount-metrics.approvedRateLineCount,identities:[...missingRates].slice(0,100)});if(policy.requireNotebookOpening&&!openingReadiness.NOTEBOOK.approved)blockers.push({code:'NOTEBOOK_OPENING_BALANCE_NOT_APPROVED'});if(policy.requireComponentOpening&&!openingReadiness.COMPONENT.approved)blockers.push({code:'COMPONENT_OPENING_BALANCE_NOT_APPROVED'});if(policy.requireCompleteCostCoverage&&(metrics.partialCostLineCount||metrics.unknownCostLineCount))blockers.push({code:'COST_COVERAGE_INCOMPLETE',partial:metrics.partialCostLineCount,unknown:metrics.unknownCostLineCount});if(policy.requireResolvedDiscounts&&metrics.unresolvedDiscountLineCount)blockers.push({code:'DISCOUNT_ATTRIBUTION_UNRESOLVED',count:metrics.unresolvedDiscountLineCount});if(policy.requireSellerIdentity&&metrics.unresolvedSellerLineCount)blockers.push({code:'SELLER_IDENTITY_UNRESOLVED',count:metrics.unresolvedSellerLineCount});
   const exceptionalRateCandidates=rates.filter(row=>row.sellerIdentity!=='*'&&['draft','pending'].includes(row.status)&&row.effectiveFrom<=periodTo&&(!row.effectiveTo||row.effectiveTo>=periodFrom)).map(row=>({rateVersionId:row.rateVersionId,sellerIdentity:row.sellerIdentity,commissionCategory:row.commissionCategory,rate:row.rate,status:row.status}));return{ok:true,fifoDatasetId,periodFrom,periodTo,policy,metrics,openingReadiness,missingRateSellers:[...missingRates],exceptionalRateCandidates,blockers,normalExportReady:blockers.length===0,diagnosticExportPayable:false,profitRoiCommissionEnabled:false};
 }
 async function authorizeDiagnosticExport(db,input={},requestedBy={}){const current=requireRole(requestedBy,['admin']);const ev=evidence(input);requireEvidence(ev,'DIAGNOSTIC_EXPORT_EVIDENCE_REQUIRED');const override={overrideId:newId('XOVR'),schemaVersion:1,exportMode:'diagnostic',reason:ev.reason,sourceReference:ev.sourceReference,attachmentMetadata:ev.attachmentMetadata,evidenceUnavailableReason:ev.evidenceUnavailableReason,createdBy:current,createdAt:new Date(),audited:true,payable:false};await db.collection(EXPORT_OVERRIDES).insertOne(override);return override;}
 
-module.exports={GROUP_CATALOG,ITEM_GROUP_ASSIGNMENTS,GROUP_CATALOG_RUNS,OPENING_BALANCES,OPENING_LOCKS,EXPORT_OVERRIDES,COLLECTIONS,ensureIndexes,normalizeOfficialItem,refreshOfficialGroupCatalog,groupReviewMatrix,rateReviewMatrix,createOpeningBalance,listOpeningBalances,updateOpeningBalance,transitionOpeningBalance,readiness,authorizeDiagnosticExport,enrichFact,_assignmentMaps:assignmentMaps};
+module.exports={GROUP_CATALOG,ITEM_GROUP_ASSIGNMENTS,GROUP_CATALOG_RUNS,OPENING_BALANCES,OPENING_LOCKS,EXPORT_OVERRIDES,COLLECTIONS,ensureIndexes,normalizeOfficialGroup,resolveGroupHierarchy,normalizeOfficialItem,resolveItemGroup,refreshOfficialGroupCatalog,groupReviewMatrix,rateReviewMatrix,createOpeningBalance,listOpeningBalances,updateOpeningBalance,transitionOpeningBalance,readiness,authorizeDiagnosticExport,enrichFact,_assignmentMaps:assignmentMaps};
