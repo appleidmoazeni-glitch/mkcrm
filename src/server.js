@@ -3823,7 +3823,7 @@ async function handleApi(req, res, pathname, query) {
     }
 
     // 0.9.19.71: governed accounting evidence and human approval UI. The
-    // official group refresh performs Item/Get reads only; all writes below
+    // official group refresh performs ItemGroup/GetList + Item/Get reads only; all writes below
     // are limited to module-owned governance/audit collections.
     if(pathname==='/api/accounting/governance/group-catalog/refresh'&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
