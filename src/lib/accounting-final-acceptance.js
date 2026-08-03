@@ -1203,8 +1203,12 @@ async function executeTechnicalFat(db, fatRunId, by = {}) {
     ['NOTEBOOK','COMPONENT'].includes(row.pool) &&
     ((decimal.parse(row.debitAmountExact || 0, decimal.MONEY_SCALE) > 0n) !== (decimal.parse(row.creditAmountExact || 0, decimal.MONEY_SCALE) > 0n))
   );
-  const approvedRateOverlap = rateVersions.some((row,index) => rateVersions.slice(index + 1).some(other =>
-    row.sellerIdentity === other.sellerIdentity && row.commissionCategory === other.commissionCategory &&
+  const normalizedRates = rateVersions.map(row => profitLedger._normalizedStoredRate(row));
+  const approvedRateOverlap = normalizedRates.some((row,index) => normalizedRates.slice(index + 1).some(other =>
+    row.sellerIdentity === other.sellerIdentity && row.rateScope === other.rateScope &&
+    (row.rateScope === 'product_category'
+      ? row.officialProductCategoryIdentity === other.officialProductCategoryIdentity
+      : row.commissionRatePool === other.commissionRatePool) &&
     row.effectiveFrom <= (other.effectiveTo || '99999999') && other.effectiveFrom <= (row.effectiveTo || '99999999')
   ));
   const profitFactReady = profitFacts > 0;

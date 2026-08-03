@@ -1,6 +1,6 @@
 {
   "name": "mkcrm",
-  "version": "0.9.19.71-dev.2",
+  "version": "0.9.19.71-dev.3",
   "private": true,
   "description": "MKCRM release readiness version and sales accounting audit",
   "main": "src/server.js",
