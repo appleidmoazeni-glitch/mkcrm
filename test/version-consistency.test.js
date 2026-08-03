@@ -24,6 +24,7 @@ test('server endpoints use the shared package-derived payload',()=>{
   assert.ok(server.includes("pathname === '/health'"));
   assert.ok(server.includes("pathname === '/api/version'"));
   assert.ok(server.includes('versionPayload()'));
+  for(const field of ['activeSaleSnapshotId','activePurchaseDatasetId','activeFifoDatasetId','policyVersionId','sellerReadModelRunId','supplierReadModelRunId'])assert.ok(server.includes(field),`${field} must remain in the release metadata contract`);
   assert.doesNotMatch(server,/const APP_VERSION\\s*=\\s*['"]/);
 });
 

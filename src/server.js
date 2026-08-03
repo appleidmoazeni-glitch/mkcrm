@@ -3306,7 +3306,7 @@ function stagingReadOnlyOperation(req, pathname) {
 }
 
 async function releaseRuntimeMetadata() {
-  const empty={activeSaleSnapshotId:null,activePurchaseLayerDatasetId:null,activeFifoDatasetId:null,policyVersionId:null,sellerFinancialReadModelId:null,supplierSleepReadModelId:null};
+  const empty={activeSaleSnapshotId:null,activePurchaseDatasetId:null,activePurchaseLayerDatasetId:null,activeFifoDatasetId:null,policyVersionId:null,sellerReadModelRunId:null,supplierReadModelRunId:null,sellerFinancialReadModelId:null,supplierSleepReadModelId:null};
   try {
     const db=await connectMongo();
     const [saleState,purchaseState,fifoState,policyVersionId]=await Promise.all([
@@ -3315,7 +3315,8 @@ async function releaseRuntimeMetadata() {
       db.collection(fifoShadowEngine.STATE).findOne({scopeKey:fifoShadowEngine.SCOPE_KEY}).catch(()=>null),
       commissionPolicyGovernance.activePolicyId(db).catch(()=>null)
     ]);
-    return {...empty,activeSaleSnapshotId:saleState?.activeSnapshotId||null,activePurchaseLayerDatasetId:purchaseState?.activeDatasetId||null,activeFifoDatasetId:fifoState?.activeDatasetId||null,policyVersionId};
+    const activePurchaseDatasetId=purchaseState?.activeDatasetId||null;
+    return {...empty,activeSaleSnapshotId:saleState?.activeSnapshotId||null,activePurchaseDatasetId,activePurchaseLayerDatasetId:activePurchaseDatasetId,activeFifoDatasetId:fifoState?.activeDatasetId||null,policyVersionId};
   } catch (_) { return empty; }
 }
 
