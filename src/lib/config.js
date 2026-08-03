@@ -27,6 +27,9 @@ const config = {
   host: process.env.APP_HOST || '0.0.0.0',
   publicBaseUrl: process.env.PUBLIC_BASE_URL || '',
   stagingReadOnly: envFlag(process.env.STAGING_READ_ONLY),
+  // Phase C is opt-in. Production remains on the legacy report until an
+  // explicit release decision enables the materialized read model.
+  sellerFinancialReadModelEnabled: envFlag(process.env.SELLER_FINANCIAL_READ_MODEL_ENABLED),
   mongoUri: process.env.MONGO_URI || 'mongodb://127.0.0.1:27017/mkcrm',
   mongoBackupAllowedRoots: String(process.env.MONGO_BACKUP_ALLOWED_ROOTS || process.env.MONGO_BACKUP_ROOT || '').split(',').map(x=>x.trim()).filter(Boolean),
   mongoDumpBinary: process.env.MONGODUMP_BINARY || 'mongodump',

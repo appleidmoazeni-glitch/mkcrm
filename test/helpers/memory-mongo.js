@@ -1,4 +1,5 @@
 'use strict';
+const { Decimal128 } = require('mongodb');
 
 function valueAt(doc, path) {
   return String(path).split('.').reduce((value, key) => value == null ? undefined : value[key], doc);
@@ -17,6 +18,7 @@ function same(a, b) {
   if (a instanceof Date || b instanceof Date) return new Date(a).getTime() === new Date(b).getTime();
   return a === b;
 }
+function numberValue(value){if(value&&value.bytes instanceof Uint8Array&&value.bytes.length===16){try{return Number(new Decimal128(value.bytes).toString());}catch{}}return Number(value||0);}
 function matchesValue(value, expected) {
   if (expected instanceof RegExp) return expected.test(String(value ?? ''));
   if (!expected || typeof expected !== 'object' || Array.isArray(expected) || expected instanceof Date) return same(value, expected);
@@ -63,6 +65,8 @@ class MemoryCollection {
     return rows.length ? structuredClone(rows[0]) : null;
   }
   async insertOne(doc) { const value=structuredClone(doc); if(value._id==null)value._id=`${this.name}-${this.rows.length+1}`; this.rows.push(value); return {acknowledged:true,insertedId:value._id}; }
+  async insertMany(docs) { for(const doc of docs)await this.insertOne(doc); return {acknowledged:true,insertedCount:docs.length}; }
+  async countDocuments(query={}) { return this.rows.filter(row=>matches(row,query)).length; }
   async updateOne(filter, update, options={}) {
     const index=this.rows.findIndex(row=>matches(row,filter));
     if(index>=0) {
@@ -86,6 +90,8 @@ class MemoryCollection {
     return {acknowledged:true,matchedCount:0,modifiedCount:0,upsertedCount:1,upsertedId:doc._id};
   }
   async deleteMany(query={}) { const before=this.rows.length; this.rows=this.rows.filter(row=>!matches(row,query)); return {acknowledged:true,deletedCount:before-this.rows.length}; }
+  async updateMany(filter,update,options={}) { let matchedCount=0,modifiedCount=0;for(const row of this.rows.filter(item=>matches(item,filter))){matchedCount++;if(update.$set)for(const [path,value] of Object.entries(structuredClone(update.$set)))setAt(row,path,value);if(update.$unset)for(const path of Object.keys(update.$unset))unsetAt(row,path);modifiedCount++;}if(!matchedCount&&options.upsert){await this.updateOne(filter,update,{upsert:true});return{acknowledged:true,matchedCount:0,modifiedCount:0,upsertedCount:1};}return{acknowledged:true,matchedCount,modifiedCount,upsertedCount:0}; }
+  async bulkWrite(operations) { let modifiedCount=0,upsertedCount=0;for(const operation of operations){if(operation.updateOne){const result=await this.updateOne(operation.updateOne.filter,operation.updateOne.update,{upsert:operation.updateOne.upsert});modifiedCount+=result.modifiedCount||0;upsertedCount+=result.upsertedCount||0;}}return{acknowledged:true,modifiedCount,upsertedCount}; }
   async createIndex(key, options={}) { const name=options.name||Object.entries(key).map(([k,v])=>`${k}_${v}`).join('_'); if(!this.indexList.some(x=>x.name===name))this.indexList.push({name,key,...options}); return name; }
   async indexes() { return structuredClone(this.indexList); }
   async dropIndex(name) { this.indexList=this.indexList.filter(index=>index.name!==name); }
@@ -97,16 +103,17 @@ class MemoryCollection {
       else if(stage.$group){
         const groups=new Map();
         for(const row of rows){
-          const resolve=value=>typeof value==='string'&&value.startsWith('$')?valueAt(row,value.slice(1)):value;
+          const resolve=value=>{if(typeof value==='string'&&value.startsWith('$'))return valueAt(row,value.slice(1));if(Array.isArray(value))return value.map(resolve);if(value&&typeof value==='object'){if(value.$size!=null)return (resolve(value.$size)||[]).length;if(value.$gt)return resolve(value.$gt[0])>resolve(value.$gt[1]);if(value.$ne)return resolve(value.$ne[0])!==resolve(value.$ne[1]);if(value.$cond)return resolve(value.$cond[0])?resolve(value.$cond[1]):resolve(value.$cond[2]);}return value;};
           const id=stage.$group._id&&typeof stage.$group._id==='object'&&!Array.isArray(stage.$group._id)
             ?Object.fromEntries(Object.entries(stage.$group._id).map(([key,value])=>[key,resolve(value)]))
             :resolve(stage.$group._id);
           const marker=JSON.stringify(id);const group=groups.get(marker)||{_id:id};
-          for(const [key,spec] of Object.entries(stage.$group)){if(key==='_id')continue;if(spec.$sum!=null)group[key]=Number(group[key]||0)+Number(resolve(spec.$sum)||0);}
+          for(const [key,spec] of Object.entries(stage.$group)){if(key==='_id')continue;if(spec.$sum!=null)group[key]=numberValue(group[key])+numberValue(resolve(spec.$sum));else if(spec.$first!=null&&group[key]===undefined)group[key]=resolve(spec.$first);else if(spec.$addToSet!=null){const value=resolve(spec.$addToSet);const list=group[key]||[];if(!list.some(item=>same(item,value)))list.push(value);group[key]=list;}}
           groups.set(marker,group);
         }
         rows=[...groups.values()];
       }else if(stage.$sort)rows.sort(compareBy(stage.$sort));
+      else if(stage.$skip)rows=rows.slice(Number(stage.$skip));
       else if(stage.$limit)rows=rows.slice(0,Number(stage.$limit));
       else if(stage.$count)rows=rows.length?[{[stage.$count]:rows.length}]:[];
     }

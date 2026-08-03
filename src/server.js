@@ -18,6 +18,7 @@ const accountingFinalAcceptance = require('./lib/accounting-final-acceptance');
 const profitCommissionLedger = require('./lib/profit-commission-ledger');
 const commissionPolicyGovernance = require('./lib/commission-policy-governance');
 const accountingGovernance = require('./lib/accounting-governance');
+const sellerFinancialPerformance = require('./lib/seller-financial-performance');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -36,6 +37,7 @@ const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
 const { PurchaseLayerDatasetJob } = require('../dist/jobs/PurchaseLayerDatasetJob');
 const { FifoShadowJob } = require('../dist/jobs/FifoShadowJob');
+const { SellerFinancialPerformanceJob } = require('../dist/jobs/SellerFinancialPerformanceJob');
 const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
 const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
@@ -54,6 +56,9 @@ const purchaseLayerJobManager = new JobManager(purchaseLayerJobRegistry);
 const fifoShadowJobRegistry = new JobRegistry();
 fifoShadowJobRegistry.register({ name:'fifo-shadow', version:1, factory:input=>new FifoShadowJob(input) });
 const fifoShadowJobManager = new JobManager(fifoShadowJobRegistry);
+const sellerFinancialJobRegistry = new JobRegistry();
+sellerFinancialJobRegistry.register({ name:'seller-financial-performance', version:1, factory:input=>new SellerFinancialPerformanceJob(input) });
+const sellerFinancialJobManager = new JobManager(sellerFinancialJobRegistry);
 const inventorySyncJobRegistry=new JobRegistry();
 inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
 const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
@@ -274,6 +279,19 @@ function startFifoShadowBackgroundJob({db,jobId,request,requestedBy}){
     if(serviceResult)update.result=serviceResult;
     return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
   }).catch(()=>clearInterval(timer));
+  return handle;
+}
+
+function startSellerFinancialBackgroundJob({db,jobId,request,requestedBy}){
+  let serviceResult=null;
+  const handle=sellerFinancialJobManager.start('seller-financial-performance',{
+    db,request,requestedBy,service:sellerFinancialPerformance,onResult:result=>{serviceResult=result;}
+  });
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress}}).catch(()=>{});},15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{clearInterval(timer);await runningUpdate;const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;const cancelled=snapshot.status===JobStatus.Cancelled;const update={status:completed?'completed':cancelled?'cancelled':'failed',phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||''};if(serviceResult)update.result=serviceResult;return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});}).catch(()=>clearInterval(timer));
   return handle;
 }
 
@@ -3245,6 +3263,8 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/accounting/profit-ledger/categories': 'profit-ledger.categories.create',
     'POST /api/accounting/governance/group-catalog/refresh': 'accounting-governance.group-catalog.refresh',
     'POST /api/accounting/governance/opening-balances': 'accounting-governance.opening-balances.create',
+    'POST /api/accounting/seller-financial-performance/rebuild': 'seller-financial-performance.rebuild',
+    'POST /api/accounting/seller-financial-performance/resume': 'seller-financial-performance.resume',
     'POST /api/accounting/profit-ledger/rates': 'profit-ledger.rates.create',
     'POST /api/accounting/profit-ledger/rates/seed-tir': 'profit-ledger.rates.seed-tir',
     'POST /api/accounting/profit-ledger/discounts/extract': 'profit-ledger.discounts.extract',
@@ -3309,14 +3329,15 @@ async function releaseRuntimeMetadata() {
   const empty={activeSaleSnapshotId:null,activePurchaseDatasetId:null,activePurchaseLayerDatasetId:null,activeFifoDatasetId:null,policyVersionId:null,sellerReadModelRunId:null,supplierReadModelRunId:null,sellerFinancialReadModelId:null,supplierSleepReadModelId:null};
   try {
     const db=await connectMongo();
-    const [saleState,purchaseState,fifoState,policyVersionId]=await Promise.all([
+    const [saleState,purchaseState,fifoState,policyVersionId,sellerFinancialState]=await Promise.all([
       db.collection('saleSnapshotState').findOne({activeSnapshotId:{$exists:true,$ne:''}},{sort:{activatedAt:-1,updatedAt:-1}}).catch(()=>null),
       db.collection(purchaseLayerDataset.STATE).findOne({activeDatasetId:{$exists:true,$ne:''}}).catch(()=>null),
       db.collection(fifoShadowEngine.STATE).findOne({scopeKey:fifoShadowEngine.SCOPE_KEY}).catch(()=>null),
-      commissionPolicyGovernance.activePolicyId(db).catch(()=>null)
+      commissionPolicyGovernance.activePolicyId(db).catch(()=>null),
+      db.collection(sellerFinancialPerformance.STATE).findOne({scopeKey:sellerFinancialPerformance.SCOPE_KEY}).catch(()=>null)
     ]);
     const activePurchaseDatasetId=purchaseState?.activeDatasetId||null;
-    return {...empty,activeSaleSnapshotId:saleState?.activeSnapshotId||null,activePurchaseDatasetId,activePurchaseLayerDatasetId:activePurchaseDatasetId,activeFifoDatasetId:fifoState?.activeDatasetId||null,policyVersionId};
+    return {...empty,activeSaleSnapshotId:saleState?.activeSnapshotId||null,activePurchaseDatasetId,activePurchaseLayerDatasetId:activePurchaseDatasetId,activeFifoDatasetId:fifoState?.activeDatasetId||null,policyVersionId,sellerReadModelRunId:sellerFinancialState?.activeRunId||null,sellerFinancialReadModelId:sellerFinancialState?.activeRunId||null};
   } catch (_) { return empty; }
 }
 
@@ -3745,6 +3766,74 @@ async function handleApi(req, res, pathname, query) {
     if(policyWorkflowMatch&&req.method==='POST'&&policyWorkflowMatch[2]){
       if(!requireRole(req,res,policyWorkflowMatch[2]==='submit'?['admin','accounting']:['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
       try{return sendJson(res,200,await commissionPolicyGovernance.transitionPolicy(db,decodeURIComponent(policyWorkflowMatch[1]),policyWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICY_WORKFLOW_FAILED');}
+    }
+    // Phase C — materialized Seller Financial Performance projection. These
+    // routes never calculate FIFO and never mutate any accounting source.
+    const sellerFinancialPrefix='/api/accounting/seller-financial-performance';
+    if(pathname===`${sellerFinancialPrefix}/status`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.status(db,config.sellerFinancialReadModelEnabled,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_STATUS_FAILED');}
+    }
+    if(pathname.startsWith(sellerFinancialPrefix)&&!config.sellerFinancialReadModelEnabled){
+      return sendJson(res,503,{ok:false,code:'SELLER_FINANCIAL_READ_MODEL_DISABLED',error:'Seller Financial Performance Read Model is disabled by feature flag.'});
+    }
+    if(pathname===`${sellerFinancialPrefix}/runs`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.listRuns(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_RUNS_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/filters`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.filterOptions(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FILTERS_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/freshness`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.freshness(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FRESHNESS_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/summaries`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.listSummaries(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_SUMMARIES_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/totals`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.totals(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_TOTALS_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/invoices`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.listInvoices(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_INVOICES_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/lines`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.listLines(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_LINES_FAILED');}
+    }
+    const sellerFinancialInvoiceLines=pathname.match(/^\/api\/accounting\/seller-financial-performance\/invoices\/(.+)\/lines$/);
+    if(sellerFinancialInvoiceLines&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.listInvoiceLines(db,decodeURIComponent(sellerFinancialInvoiceLines[1]),query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_INVOICE_LINES_FAILED');}
+    }
+    const sellerFinancialDrilldown=pathname.match(/^\/api\/accounting\/seller-financial-performance\/lines\/(.+)\/drilldown$/);
+    if(sellerFinancialDrilldown&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.lineDrilldown(db,decodeURIComponent(sellerFinancialDrilldown[1]),currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_DRILLDOWN_FAILED');}
+    }
+    const sellerFinancialFifo=pathname.match(/^\/api\/accounting\/seller-financial-performance\/lines\/(.+)\/fifo$/);
+    if(sellerFinancialFifo&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{const report=await sellerFinancialPerformance.lineDrilldown(db,decodeURIComponent(sellerFinancialFifo[1]),currentUser(req));return sendJson(res,200,{ok:true,runId:report.runId,line:report.line,allocations:report.source.allocations,immutableFifo:true});}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FIFO_DRILLDOWN_FAILED');}
+    }
+    const sellerFinancialGovernance=pathname.match(/^\/api\/accounting\/seller-financial-performance\/lines\/(.+)\/governance$/);
+    if(sellerFinancialGovernance&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{const report=await sellerFinancialPerformance.lineDrilldown(db,decodeURIComponent(sellerFinancialGovernance[1]),currentUser(req));return sendJson(res,200,{ok:true,runId:report.runId,policyVersionId:report.line.policyVersionId,categoryMappingId:report.line.categoryMappingId,rateVersionId:report.line.rateVersionId,adjustments:report.source.adjustments,savedEntries:report.source.savedEntries,discountFact:report.source.discountFact,nonPayable:true});}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_GOVERNANCE_DRILLDOWN_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/build-status`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();const jobId=String(query.jobId||'').trim();const job=await db.collection('appJobs').findOne(jobId?{jobId,type:'seller-financial-performance'}:{type:'seller-financial-performance'},{sort:{updatedAt:-1}});return sendJson(res,200,{ok:true,job:job||null});
+    }
+    if([`${sellerFinancialPrefix}/rebuild`,`${sellerFinancialPrefix}/resume`].includes(pathname)&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      if(sellerFinancialJobManager.isRunning('seller-financial-performance')){const running=sellerFinancialJobManager.getRunning('seller-financial-performance');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Seller Financial Performance job is already running',jobId:running?.id||''});}
+      const request={...body};if(pathname.endsWith('/resume')&&!request.runId)return sendJson(res,400,{ok:false,code:'SELLER_FINANCIAL_RUN_ID_REQUIRED',error:'runId is required for resume'});
+      const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request:{runId:String(request.runId||'').trim().slice(0,100),batchSize:Number(request.batchSize||500),maxAttempts:Number(request.maxAttempts||3)},createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now});
+      try{startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,status:'queued',runId:request.runId||'',nonPayable:true});}catch(error){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',error:String(error.message||error),updatedAt:new Date()}}).catch(()=>{});return sendLedgerError(error,'SELLER_FINANCIAL_BUILD_FAILED');}
     }
     if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
