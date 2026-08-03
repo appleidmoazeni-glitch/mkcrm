@@ -9,29 +9,50 @@ const { sendJson, sendText, collectBody, normalizeMobile, normalizeText } = requ
 const shaygan = require('./lib/shaygan');
 const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
+const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
+const manualCostResolution = require('./lib/manual-cost-resolution');
+const fifoShadowEngine = require('./lib/fifo-shadow-engine');
+const accountingEvidenceConfidence = require('./lib/accounting-evidence-confidence');
+const accountingOperationalReview = require('./lib/accounting-operational-review');
+const accountingFinalAcceptance = require('./lib/accounting-final-acceptance');
+const profitCommissionLedger = require('./lib/profit-commission-ledger');
+const accountingGovernance = require('./lib/accounting-governance');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
+const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
+const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
+const { emitSearchEvent } = require('./lib/search-observability');
+const { APP_NAME, APP_VERSION, versionPayload, injectAssetVersion } = require('./lib/app-version');
+const { normalizeJalaliRange, normalizeJalaliMonth } = require('./lib/jalali-date');
+const { resolveSellerScope } = require('./lib/seller-performance-access');
 const time = require('./lib/time');
 const { JobManager } = require('../dist/core/jobs/JobManager');
 const { JobRegistry } = require('../dist/core/jobs/JobRegistry');
 const { JobStatus } = require('../dist/core/jobs/JobStatus');
 const { SupplierSleepJob } = require('../dist/jobs/SupplierSleepJob');
 const { SaleSnapshotJob } = require('../dist/jobs/SaleSnapshotJob');
+const { PurchaseLayerDatasetJob } = require('../dist/jobs/PurchaseLayerDatasetJob');
+const { FifoShadowJob } = require('../dist/jobs/FifoShadowJob');
 const { InventorySyncJob } = require('../dist/jobs/InventorySyncJob');
 const { MongoBackupJob } = require('../dist/jobs/MongoBackupJob');
 // 0.9.19.17→WS: SQL read module حذف شد — همه خواندن‌ها از WebService شایگان
 // const shayganSql = require('./lib/shaygan-sql-read'); // REMOVED
 
 const publicDir = path.join(process.cwd(), 'public');
-const APP_VERSION = '0.9.19.59-supplier-sleep-operational-control';
 const supplierSleepJobRegistry = new JobRegistry();
 supplierSleepJobRegistry.register({ name:'supplier-sleep', version:1, factory:input=>new SupplierSleepJob(input) });
 const supplierSleepJobManager = new JobManager(supplierSleepJobRegistry);
 const saleSnapshotJobRegistry = new JobRegistry();
 saleSnapshotJobRegistry.register({ name:'sale-snapshot', version:1, factory:input=>new SaleSnapshotJob(input) });
 const saleSnapshotJobManager = new JobManager(saleSnapshotJobRegistry);
+const purchaseLayerJobRegistry = new JobRegistry();
+purchaseLayerJobRegistry.register({ name:'purchase-layer-dataset', version:1, factory:input=>new PurchaseLayerDatasetJob(input) });
+const purchaseLayerJobManager = new JobManager(purchaseLayerJobRegistry);
+const fifoShadowJobRegistry = new JobRegistry();
+fifoShadowJobRegistry.register({ name:'fifo-shadow', version:1, factory:input=>new FifoShadowJob(input) });
+const fifoShadowJobManager = new JobManager(fifoShadowJobRegistry);
 const inventorySyncJobRegistry=new JobRegistry();
 inventorySyncJobRegistry.register({name:'inventory-sync',version:1,factory:input=>new InventorySyncJob(input)});
 const inventorySyncJobManager=new JobManager(inventorySyncJobRegistry);
@@ -40,6 +61,135 @@ mongoBackupJobRegistry.register({name:'mongo-backup',version:1,factory:input=>ne
 const mongoBackupJobManager=new JobManager(mongoBackupJobRegistry);
 let mongoBackupLastResult=null;
 const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan.getInvoice(invNo,invType),supportedTypes:invoiceTypes.supportedTypes});
+
+function searchPerfNow() {
+  return Number(process.hrtime.bigint()) / 1e6;
+}
+const SEARCH_BACKEND_SLOW_THRESHOLD_MS = 500;
+function createSearchPerfTrace(endpoint, queryText, context = {}) {
+  const startedMs = searchPerfNow();
+  const requestStartedAt = new Date().toISOString();
+  const searchRequestId = `search-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+  const normalizationStarted = searchPerfNow();
+  const normalizedQuery = normalizeFa(queryText);
+  const tokens = tokensOf(queryText);
+  const itemCodeLike = looksLikeItemCode(queryText);
+  return {
+    searchRequestId,
+    endpoint,
+    page:String(context.page || ''),
+    searchSessionId:String(context.searchSessionId || ''),
+    normalizedQuery,
+    queryLength:String(queryText || '').length,
+    compactQueryLength:normalizedQuery.replace(/\s+/g, '').length,
+    tokenCount:tokens.length,
+    queryKind:itemCodeLike ? 'item-code-like' : (tokens.length > 1 ? 'multi-token' : 'single-token'),
+    looksLikeItemCode:itemCodeLike,
+    requestStartedAt,
+    _startedMs:startedMs,
+    normalizationMs:Number((searchPerfNow() - normalizationStarted).toFixed(3)),
+    candidateSearchMs:0,
+    candidateCount:0,
+    liveRepairUsed:false,
+    liveRepairMs:0,
+    liveRepairCandidateCount:0,
+    shayganCallCount:0,
+    shayganCalls:[],
+    localSnapshotQueryMs:0,
+    localRowsLoaded:0,
+    localRankingMs:0,
+    localResultCount:0,
+    groupingMs:0,
+    serializationMs:0,
+    negativeCacheHit:false,
+    fallbackUsed:false,
+    requestAborted:false,
+    responseCompleted:false
+  };
+}
+function emitSearchPerf(trace) {
+  if (!trace || trace._emitted) return;
+  trace._emitted = true;
+  const summary = {
+    requestId:trace.searchRequestId,
+    timestamp:trace.requestStartedAt,
+    route:trace.endpoint,
+    page:trace.page,
+    normalizedQuery:trace.normalizedQuery,
+    tokenCount:trace.tokenCount,
+    resultCount:trace.localResultCount,
+    backendTotalMs:trace.totalMs,
+    localDbMs:trace.localSnapshotQueryMs,
+    rankingMs:trace.localRankingMs,
+    serializationMs:trace.serializationMs,
+    liveRepairUsed:trace.liveRepairUsed,
+    shayganCallCount:trace.shayganCallCount,
+    aborted:trace.requestAborted,
+    searchSessionId:trace.searchSessionId
+  };
+  emitSearchEvent('SEARCH_QUERY_SUMMARY', summary);
+  if (Number(trace.totalMs || 0) > SEARCH_BACKEND_SLOW_THRESHOLD_MS) {
+    emitSearchEvent('SEARCH_SLOW_QUERY', {
+      requestId:trace.searchRequestId,
+      timestamp:new Date().toISOString(),
+      route:trace.endpoint,
+      page:trace.page,
+      normalizedQuery:trace.normalizedQuery,
+      tokenCount:trace.tokenCount,
+      resultCount:trace.localResultCount,
+      durationMs:trace.totalMs,
+      thresholdMs:SEARCH_BACKEND_SLOW_THRESHOLD_MS,
+      thresholdType:'backend-total',
+      searchSessionId:trace.searchSessionId
+    });
+  }
+  if (trace.responseCompleted && Number(trace.localResultCount || 0) === 0) {
+    emitSearchEvent('SEARCH_ZERO_RESULT', {
+      requestId:trace.searchRequestId,
+      timestamp:new Date().toISOString(),
+      route:trace.endpoint,
+      page:trace.page,
+      normalizedQuery:trace.normalizedQuery,
+      tokenCount:trace.tokenCount,
+      resultCount:0,
+      searchSessionId:trace.searchSessionId
+    }, { force:true });
+  }
+  if (trace.requestAborted && !trace._abortEventEmitted) emitSearchAborted(trace, 'client-disconnected');
+}
+function emitSearchAborted(trace, reason = 'client-disconnected') {
+  if (!trace || trace._abortEventEmitted) return;
+  trace.requestAborted = true;
+  trace._abortEventEmitted = true;
+  emitSearchEvent('SEARCH_ABORTED', {
+    requestId:trace.searchRequestId,
+    timestamp:new Date().toISOString(),
+    route:trace.endpoint,
+    page:trace.page,
+    normalizedQuery:trace.normalizedQuery,
+    tokenCount:trace.tokenCount,
+    reason,
+    searchSessionId:trace.searchSessionId
+  });
+}
+function sendSearchPerfJson(req, res, status, payload, trace) {
+  const serializationStarted = searchPerfNow();
+  let body;
+  try {
+    body = JSON.stringify(payload, null, 2);
+  } catch (error) {
+    trace.serializationMs = Number((searchPerfNow() - serializationStarted).toFixed(3));
+    trace.totalMs = Number((searchPerfNow() - trace._startedMs).toFixed(3));
+    emitSearchPerf(trace);
+    throw error;
+  }
+  trace.serializationMs = Number((searchPerfNow() - serializationStarted).toFixed(3));
+  trace.totalMs = Number((searchPerfNow() - trace._startedMs).toFixed(3));
+  res.writeHead(status, { 'Content-Type':'application/json; charset=utf-8', 'Cache-Control':'no-store' });
+  res.end(body);
+  trace.responseCompleted = true;
+  emitSearchPerf(trace);
+}
 
 async function executeInventorySyncJob(request){
   let serviceResult=null;
@@ -65,9 +215,64 @@ function startSaleSnapshotBackgroundJob({db,jobId,request}){
   const handle=saleSnapshotJobManager.start('sale-snapshot',{db,request,service:saleSnapshot,onResult:result=>{serviceResult=result;}});
   const startedAt=new Date();
   const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
-  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase}}).catch(()=>{});},15000);
+  const timer=setInterval(()=>{const snapshot=handle.snapshot();db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress}}).catch(()=>{});},15000);
   timer.unref?.();
   handle.completion.then(async snapshot=>{clearInterval(timer);await runningUpdate;const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;const cancelled=snapshot.status===JobStatus.Cancelled;const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};if(serviceResult)update.result=serviceResult;return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});}).catch(()=>clearInterval(timer));
+  return handle;
+}
+
+function startPurchaseLayerBackgroundJob({db,jobId,request}){
+  let serviceResult=null;
+  const handle=purchaseLayerJobManager.start('purchase-layer-dataset',{db,request,service:purchaseLayerDataset,onResult:result=>{serviceResult=result;}});
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt}}).catch(()=>{});
+  const timer=setInterval(()=>{
+    const snapshot=handle.snapshot();
+    db.collection('appJobs').updateOne({jobId},{$set:{heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress}}).catch(()=>{});
+  },15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{
+    clearInterval(timer);
+    await runningUpdate;
+    const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;
+    const cancelled=snapshot.status===JobStatus.Cancelled;
+    const update={status:completed?'completed':(cancelled?'cancelled':'failed'),phase:completed?'done':snapshot.progress.phase,finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,error:snapshot.error?.message||serviceResult?.error||''};
+    if(serviceResult)update.result=serviceResult;
+    return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
+  }).catch(()=>clearInterval(timer));
+  return handle;
+}
+
+function startFifoShadowBackgroundJob({db,jobId,request,requestedBy}){
+  let serviceResult=null;
+  const handle=fifoShadowJobManager.start('fifo-shadow',{
+    db,request,requestedBy,service:fifoShadowEngine,onResult:result=>{serviceResult=result;}
+  });
+  const startedAt=new Date();
+  const runningUpdate=db.collection('appJobs').updateOne({jobId},{$set:{
+    status:'running',phase:'Validating Input',startedAt,updatedAt:startedAt,heartbeatAt:startedAt
+  }}).catch(()=>{});
+  const timer=setInterval(()=>{
+    const snapshot=handle.snapshot();
+    db.collection('appJobs').updateOne({jobId},{$set:{
+      heartbeatAt:snapshot.heartbeatAt,updatedAt:new Date(),phase:snapshot.progress.phase,progress:snapshot.progress
+    }}).catch(()=>{});
+  },15000);
+  timer.unref?.();
+  handle.completion.then(async snapshot=>{
+    clearInterval(timer);
+    await runningUpdate;
+    const completed=snapshot.status===JobStatus.Completed&&serviceResult?.ok!==false;
+    const cancelled=snapshot.status===JobStatus.Cancelled;
+    const update={
+      status:completed?'completed':(cancelled?'cancelled':'failed'),
+      phase:completed?'done':snapshot.progress.phase,
+      finishedAt:new Date(),updatedAt:new Date(),heartbeatAt:snapshot.heartbeatAt,
+      error:snapshot.error?.message||serviceResult?.error||''
+    };
+    if(serviceResult)update.result=serviceResult;
+    return db.collection('appJobs').updateOne({jobId},{$set:update}).catch(()=>{});
+  }).catch(()=>clearInterval(timer));
   return handle;
 }
 
@@ -156,13 +361,6 @@ function parseMoneyInput(v, unit='rial') {
   if (/تومان|toman/i.test(raw) || unit === 'toman') return n * 10;
   return n;
 }
-function calcCommission({ fifoProfit=0, commissionRate=0.18, withoutLeadCount=0, leadPenaltyRial=0 } = {}) {
-  const raw = Math.round(Math.max(0, Number(fifoProfit||0)) * Number(commissionRate||0));
-  const leadPenalty = Math.max(0, Number(withoutLeadCount||0)) * Math.max(0, Number(leadPenaltyRial||0));
-  const final = Math.max(0, raw - leadPenalty);
-  return { rawCommission:raw, leadPenalty, finalCommission:final };
-}
-
 // 0.9.19.22: Sale invoice allowed extras/additions (Expense[]) governance.
 const SALE_ALLOWED_EXTRAS_KEY = 'sale.allowedInvoiceExtras';
 function normalizeAllowedInvoiceExtra(x = {}) {
@@ -497,11 +695,13 @@ async function getActiveWarehouseNumbersFromDb() {
 
 const ROLE_PERMISSIONS = {
   admin: 'all',
-  seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','tablo'],
-  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
+  seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
+  accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
   purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','reports','app-logs','tablo'],
-  seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','tablo']
+  seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports'],
+  supervisor: ['dashboard','seller-profit','reports']
 };
 function currentUser(req) {
   const s = getSession(req);
@@ -565,9 +765,19 @@ function canUseSupplierAging(req, res) {
 function canUseSellerPerformance(req, res) {
   if (!needLogin(req, res)) return false;
   const role = String(roleOf(req));
-  if (['admin','accounting','purchase'].includes(role)) return true;
-  deny(res, 'دسترسی عملکرد فروشنده فقط برای مدیر، حسابداری و بازرگانی مجاز است');
+  if (['admin','accounting','purchase','manager','supervisor','seller','seller_buyer'].includes(role)) return true;
+  deny(res, 'دسترسی عملکرد فروشنده برای این نقش مجاز نیست');
   return false;
+}
+
+async function authorizedSellerScope(db, req, requestedSeller='') {
+  const role=roleOf(req);
+  if(['admin','accounting','purchase','manager','supervisor'].includes(role)){
+    return resolveSellerScope({role,requestedSeller,normalize:saleSnapshot._normalizeSellerAccountNumber});
+  }
+  const username=String(currentUser(req)?.username||'').trim();
+  const mapping=await db.collection('userShayganMappings').findOne({username,isActive:{$ne:false}}).catch(()=>null);
+  return resolveSellerScope({role,requestedSeller,ownSeller:mapping?.employeeAccountNumber||'',normalize:saleSnapshot._normalizeSellerAccountNumber});
 }
 
 
@@ -867,6 +1077,17 @@ function looksLikeItemCode(q = '') {
   const x = String(q || '').trim();
   return /^[0-9A-Za-z_-]{5,}$/.test(x) && !/\s/.test(x);
 }
+function observeItemCodeClassifierV2(endpoint, queryText) {
+  try {
+    const scheduled = setImmediate(() => {
+      try {
+        const comparison = compareItemCodeClassifiers(queryText, looksLikeItemCode(queryText));
+        emitSearchEvent('ITEM_CODE_CLASSIFIER_V2_SHADOW', { timestamp:new Date().toISOString(), endpoint, ...comparison });
+      } catch {}
+    });
+    scheduled.unref?.();
+  } catch {}
+}
 
 // 0.9.19.23: Targeted repair for Shaygan GetRemain stock-list gaps.
 // Normal searches remain Mongo-first. Live fallback is only used when snapshot has no result.
@@ -893,11 +1114,18 @@ function markLiveRepairNegative(q, filters = {}) {
   if (ttl > 0) liveInventoryRepairNegativeCache.set(liveRepairCacheKey(q, filters), Date.now() + ttl);
 }
 function escapeRe(s='') { return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
-async function findCatalogItemCodesByQuery(db, q, max = 5) {
+async function findCatalogItemCodesByQuery(db, q, max = 5, searchTrace = null) {
+  const candidateStarted = searchPerfNow();
   const tokens = tokensOf(q);
-  if (!tokens.length) return [];
+  if (!tokens.length) {
+    if (searchTrace) searchTrace.candidateSearchMs += Number((searchPerfNow() - candidateStarted).toFixed(3));
+    return [];
+  }
   const first = tokens.sort((a,b)=>b.length-a.length)[0];
-  if (!first || first.length < 3) return [];
+  if (!first || first.length < 3) {
+    if (searchTrace) searchTrace.candidateSearchMs += Number((searchPerfNow() - candidateStarted).toFixed(3));
+    return [];
+  }
   const rx = new RegExp(escapeRe(first), 'i');
   const cols = ['itemCatalog', 'itemCatalogAll', 'itemInventoryCatalog'];
   const seen = new Set();
@@ -911,19 +1139,51 @@ async function findCatalogItemCodesByQuery(db, q, max = 5) {
       candidates.push({ code, score: scoreMatch(d.searchText || `${d.itemCode||d.ItemCode||''} ${d.itemDescription||d.ItemDescription||''}`, tokens, code) });
     }
   }
-  return candidates.filter(x => x.score > -Infinity).sort((a,b)=>b.score-a.score).slice(0, Number(max||5)).map(x=>x.code);
+  const selected = candidates.filter(x => x.score > -Infinity).sort((a,b)=>b.score-a.score).slice(0, Number(max||5)).map(x=>x.code);
+  if (searchTrace) {
+    searchTrace.candidateSearchMs += Number((searchPerfNow() - candidateStarted).toFixed(3));
+    searchTrace.candidateCount += selected.length;
+  }
+  return selected;
 }
-async function targetedLiveInventoryRepair(db, q, filters = {}, reason = 'targeted-live-search-repair') {
+async function targetedLiveInventoryRepair(db, q, filters = {}, reason = 'targeted-live-search-repair', searchTrace = null) {
+  const repairStarted = searchPerfNow();
   const query = String(q || '').trim();
-  if (!shouldRunLiveInventoryRepair(query, 0)) return { ok:true, skipped:true, reason:'not-eligible', rows:[], rowCount:0 };
-  if (liveRepairNegativeBlocked(query, filters)) return { ok:true, skipped:true, negativeCached:true, rows:[], rowCount:0 };
-  const codes = looksLikeItemCode(query) ? [query.toUpperCase()] : await findCatalogItemCodesByQuery(db, query, Number(config.liveSearchFallbackMaxCatalogCandidates || 5));
+  if (!shouldRunLiveInventoryRepair(query, 0)) {
+    if (searchTrace) searchTrace.liveRepairMs += Number((searchPerfNow() - repairStarted).toFixed(3));
+    return { ok:true, skipped:true, reason:'not-eligible', rows:[], rowCount:0 };
+  }
+  if (liveRepairNegativeBlocked(query, filters)) {
+    if (searchTrace) {
+      searchTrace.negativeCacheHit = true;
+      searchTrace.liveRepairMs += Number((searchPerfNow() - repairStarted).toFixed(3));
+    }
+    return { ok:true, skipped:true, negativeCached:true, rows:[], rowCount:0 };
+  }
+  const codes = looksLikeItemCode(query) ? [query.toUpperCase()] : await findCatalogItemCodesByQuery(db, query, Number(config.liveSearchFallbackMaxCatalogCandidates || 5), searchTrace);
+  if (searchTrace) {
+    searchTrace.liveRepairUsed = true;
+    searchTrace.liveRepairCandidateCount += codes.length;
+  }
   const allRows = [];
   const results = [];
   const active = await getActiveWarehouseNumbers(db).catch(()=>[]);
   const activeSet = new Set((active || []).map(String));
   for (const code of [...new Set(codes)]) {
+    const shayganStarted = searchPerfNow();
     const rr = await authoritativeLiveReconcileItem(db, code, reason).catch(e => ({ ok:false, itemCode:code, rows:[], error:String(e.message||e) }));
+    if (searchTrace) {
+      const errorText = String(rr.error || '');
+      searchTrace.shayganCalls.push({
+        itemCode:code,
+        durationMs:Number((searchPerfNow() - shayganStarted).toFixed(3)),
+        success:!!rr.ok,
+        timeout:/timeout/i.test(errorText),
+        resultCount:(rr.rows || []).length,
+        errorCategory:rr.ok ? '' : (/timeout/i.test(errorText) ? 'timeout' : 'read-failed')
+      });
+      searchTrace.shayganCallCount = searchTrace.shayganCalls.length;
+    }
     results.push({ itemCode:code, ok:!!rr.ok, rowCount:(rr.rows||[]).length, error:rr.error||'' });
     for (const row of (rr.rows || [])) {
       if (filters.stockNumber && String(row.stockNumber) !== String(filters.stockNumber)) continue;
@@ -933,6 +1193,7 @@ async function targetedLiveInventoryRepair(db, q, filters = {}, reason = 'target
   }
   if (!allRows.length) markLiveRepairNegative(query, filters);
   await db.collection('appLogs').insertOne({ type:'inventory_live_search_repair', query, filters, codes, resultCount:allRows.length, results, at:new Date() }).catch(()=>{});
+  if (searchTrace) searchTrace.liveRepairMs += Number((searchPerfNow() - repairStarted).toFixed(3));
   return { ok:true, skipped:false, rows:allRows, rowCount:allRows.length, codes, results, source:'targeted-live-getremain-repair' };
 }
 async function repairInventorySnapshotFromKardex(db, code, stockNumber, kardexResult) {
@@ -959,60 +1220,53 @@ async function buildActiveInventoryFind(db, filters = {}) {
   return { find, active, blockedStock:false };
 }
 
-async function searchActiveInventorySnapshot(q, limit = 50, filters = {}) {
+async function searchActiveInventorySnapshot(q, limit = 50, filters = {}, searchTrace = null) {
+  if (searchTrace && !searchTrace._localSearchStartedMs) searchTrace._localSearchStartedMs = searchPerfNow();
   const db = await connectMongo();
   const tokens = tokensOf(q);
   const { find, active, blockedStock } = await buildActiveInventoryFind(db, filters);
   if (blockedStock || !find) return { ok:true, list:[], groups:[], source:'active-inventory-snapshot-blocked-stock', activeWarehouseNumbers:active, cacheCount:0 };
   if (!tokens.length && !filters.stockNumber) return { ok:true, list:[], groups:[], source:'active-inventory-snapshot-empty', activeWarehouseNumbers:active, cacheCount:0 };
+  const snapshotStarted = searchPerfNow();
   const docs = await db.collection('itemInventoryCatalog').find(find).limit(120000).toArray();
+  if (searchTrace) {
+    searchTrace.localSnapshotQueryMs += Number((searchPerfNow() - snapshotStarted).toFixed(3));
+    searchTrace.localRowsLoaded += docs.length;
+  }
+  const rankingStarted = searchPerfNow();
   const ranked = docs
     .map(x => ({ ...x, _score: tokens.length ? scoreMatch(x.searchText || rowSearchText(x), tokens, x.itemCode || '') : 0 }))
     .filter(x => !tokens.length || x._score > -Infinity)
     .sort((a,b) => b._score - a._score || String(a.itemDescription||'').localeCompare(String(b.itemDescription||''),'fa') || String(a.stockNumber||'').localeCompare(String(b.stockNumber||''),'fa'));
+  if (searchTrace) searchTrace.localRankingMs += Number((searchPerfNow() - rankingStarted).toFixed(3));
   const cap = Number(limit || 50);
   const list = cap > 0 ? ranked.slice(0, Math.max(cap, 5000)) : ranked;
+  const groupingStarted = searchPerfNow();
   const groups = saleInventoryGroups(ranked, cap || 40);
+  if (searchTrace) {
+    searchTrace.groupingMs += Number((searchPerfNow() - groupingStarted).toFixed(3));
+    searchTrace.localResultCount = cap > 0 ? Math.min(ranked.length, cap) : ranked.length;
+  }
   return { ok:true, list: cap > 0 ? ranked.slice(0, cap) : ranked, groups, source:'active-inventory-snapshot-unified', activeWarehouseNumbers:active, cacheCount:docs.length };
 }
 
-async function searchInventoryCatalog(q, limit = 30, filters = {}) {
-  const r = await searchActiveInventorySnapshot(q, limit, filters);
+async function searchInventoryCatalog(q, limit = 30, filters = {}, searchTrace = null) {
+  const r = await searchActiveInventorySnapshot(q, limit, filters, searchTrace);
   return r.list || [];
 }
 
-async function searchSaleInventorySnapshot(q, limit = 40, filters = {}) {
+async function searchSaleInventorySnapshot(q, limit = 40, filters = {}, searchTrace = null) {
   // 0.9.19.21: سرچ فروش دقیقاً از همان موتور سرچ موجودی انبارها استفاده می‌کند.
   // وابستگی به maxAge باعث حذف کاذب کالاهای تازه sync شده می‌شد؛ cache فعال همیشه مرجع UI است و قبل از صدور live check انجام می‌شود.
   const db = await connectMongo();
   const tokens = tokensOf(q);
   if (!tokens.length) return { ok:true, list:[], groups:[], source:'sale-inventory-unified-empty', cacheCount:0, stale:false };
 
-  let exactRefresh = null;
-  if (looksLikeItemCode(q)) {
-    exactRefresh = await authoritativeLiveReconcileItem(db, String(q || '').trim().toUpperCase(), 'sale-search-exact-code-refresh').catch(e => ({ ok:false, error:String(e.message||e) }));
-  }
-
-  let preTextRefresh = null;
-  if (!looksLikeItemCode(q) && normalizeFa(String(q||'')).replace(/\s+/g,'').length >= 4) {
-    preTextRefresh = await targetedLiveInventoryRepair(db, q, filters, 'sale-text-search-targeted-refresh-before-filter').catch(e => ({ ok:false, rows:[], error:String(e.message||e) }));
-  }
-  let r = await searchActiveInventorySnapshot(q, Number(limit || 40), filters);
-  let groups = r.groups || [];
-  let list = groups.flatMap(g => (g.stocks || []).map(st => ({ ...st, totalQty:g.totalQty })));
-
-  // 0.9.19.23/52: اگر snapshot نتیجه نداد، repair هدفمند بزن؛ سرچ‌های مدل‌محور هم قبل از فیلتر refresh شدند.
-  if (!groups.length && shouldRunLiveInventoryRepair(q, 0)) {
-    const liveInfo = await targetedLiveInventoryRepair(db, q, filters, 'sale-search-targeted-live-repair');
-    if ((liveInfo.rows || []).length) {
-      // بعد از upsert fallback، دوباره از موتور واحد snapshot بخوان تا active warehouse و group key یکی باشد.
-      r = await searchActiveInventorySnapshot(q, Number(limit || 40), filters);
-      groups = r.groups || [];
-      list = groups.flatMap(g => (g.stocks || []).map(st => ({ ...st, totalQty:g.totalQty })));
-      if (groups.length) return { ok:true, list, groups, source:'sale-inventory-unified-targeted-live-repair', cacheCount:r.cacheCount||0, stale:false, exactRefresh, preTextRefresh, fallback:liveInfo, activeWarehouseNumbers:r.activeWarehouseNumbers||[] };
-    }
-  }
-  return { ok:true, list, groups, source: exactRefresh ? 'sale-inventory-unified-snapshot-exact-refreshed' : (preTextRefresh ? 'sale-inventory-unified-snapshot-text-refreshed' : 'sale-inventory-unified-snapshot'), cacheCount:r.cacheCount||0, stale:false, exactRefresh, preTextRefresh, activeWarehouseNumbers:r.activeWarehouseNumbers||[] };
+  if (searchTrace) searchTrace.preLocalSearchMs = Number((searchPerfNow() - searchTrace._startedMs).toFixed(3));
+  let r = await searchActiveInventorySnapshot(q, Number(limit || 40), filters, searchTrace);
+  const groups = r.groups || [];
+  const list = groups.flatMap(g => (g.stocks || []).map(st => ({ ...st, totalQty:g.totalQty })));
+  return { ok:true, list, groups, source:'sale-inventory-unified-snapshot', cacheCount:r.cacheCount||0, stale:false, exactRefresh:null, preTextRefresh:null, activeWarehouseNumbers:r.activeWarehouseNumbers||[] };
 }
 
 
@@ -1079,7 +1333,7 @@ async function liveScanInventorySearch(q, limit = 30, maxPages = config.inventor
   return { ok:true, list:dd.list, rows:dd.list, source:'inventory-live-deduped-store-item', scannedPages:scanned, rawCount:dd.rawCount, uniqueCount:dd.uniqueCount, duplicateCount:dd.duplicates.length, duplicateConflicts:dd.conflicts };
 }
 
-async function searchInventoryRows(q, limit = 50, maxPages = config.inventorySearchLivePages, filters = {}) {
+async function searchInventoryRows(q, limit = 50, maxPages = config.inventorySearchLivePages, filters = {}, searchTrace = null) {
   // 0.9.19.17→WS: SQL حذف شد؛ MongoDB snapshot استفاده می‌شود
   const tokens = tokensOf(q);
   if (tokens.length < 1 && !filters.stockNumber) return { ok:true, list:[], source:'empty' };
@@ -1088,33 +1342,10 @@ async function searchInventoryRows(q, limit = 50, maxPages = config.inventorySea
   // only positive-stock rows from the local inventory snapshot. Do NOT call Shaygan while typing.
   // Live Shaygan remains only for final sale verification and single-item inventory detail.
   const cacheLimit = limit > 0 ? Math.max(limit, 5000) : 80000;
-  let exactRefresh = null;
-  if (looksLikeItemCode(q)) {
-    const db = await connectMongo();
-    exactRefresh = await authoritativeLiveReconcileItem(db, String(q || '').trim().toUpperCase(), 'inventory-search-exact-code-refresh').catch(e => ({ ok:false, error:String(e.message||e) }));
-  }
-  let fallback = null;
   let source = 'inventory-snapshot-positive';
-  // 0.9.19.52: for strong text/model searches, identify candidate itemCodes first, refresh them, then apply stock filter.
-  // This fixes cases like q=m100a + stock=11 where snapshot is missing one stock row.
-  if (!looksLikeItemCode(q) && normalizeFa(String(q||'')).replace(/\s+/g,'').length >= 4) {
-    const db = await connectMongo();
-    fallback = await targetedLiveInventoryRepair(db, q, filters, 'inventory-text-search-targeted-refresh-before-filter').catch(e => ({ ok:false, rows:[], error:String(e.message||e) }));
-    if ((fallback.rows || []).length) source = 'inventory-snapshot-positive-text-targeted-refreshed';
-  }
-  let rows = await searchInventoryCatalog(q, cacheLimit, filters);
-  // 0.9.19.23/52: if still empty, try repair for eligible exact/long search.
-  if (!rows.length && shouldRunLiveInventoryRepair(q, 0)) {
-    const db = await connectMongo();
-    fallback = await targetedLiveInventoryRepair(db, q, filters, 'inventory-search-targeted-live-repair');
-    if ((fallback.rows || []).length) {
-      rows = await searchInventoryCatalog(q, cacheLimit, filters);
-      source = 'inventory-snapshot-positive-targeted-live-repair';
-    } else if (fallback.negativeCached) {
-      source = 'inventory-snapshot-positive-negative-cache';
-    }
-  }
-  return { ok:true, list: limit > 0 ? rows.slice(0, limit) : rows, source: exactRefresh ? source + '-exact-refreshed' : source, scannedPages:0, exactRefresh, fallback, error:'' };
+  if (searchTrace) searchTrace.preLocalSearchMs = Number((searchPerfNow() - searchTrace._startedMs).toFixed(3));
+  let rows = await searchInventoryCatalog(q, cacheLimit, filters, searchTrace);
+  return { ok:true, list: limit > 0 ? rows.slice(0, limit) : rows, source, scannedPages:0, exactRefresh:null, fallback:null, error:'' };
 }
 
 function deriveMainGroup(row) {
@@ -1209,28 +1440,8 @@ async function searchAllItems(q, limit = 50, maxPages = config.inventoryCatalogS
     found = [...byCode.values()].sort((a,b) => b._score - a._score || String(a.itemDescription || '').length - String(b.itemDescription || '').length || String(a.itemCode || '').localeCompare(String(b.itemCode || ''), 'fa'));
   }
 
-  // 3) Do NOT scan 300 pages during typing. A heavy scan made Kardex search slow.
-  // If cache is empty/incomplete, run only a small bounded live scan unless forceLive=1 is explicitly requested.
-  const forceLive = opts.forceLive === true;
-  const quickPages = forceLive ? Number(maxPages || 300) : Math.min(Number(maxPages || 20), Number(config.itemSearchQuickPages || 25));
-  let scanned = 0;
-  if (found.length < cap && quickPages > 0) {
-    const map = new Map(found.map(x => [x.itemCode, x]));
-    for (let rowStart = 0; scanned < quickPages; scanned++, rowStart += 100) {
-      const res = await shaygan.getItemsPage(rowStart, 100);
-      if (!res.ok) return { ok:false, list:[...map.values()].slice(0, cap).map(toProductNameRow), source:'all-items-live', scannedPages:scanned, error:res.error };
-      if (!res.list.length) break;
-      await upsertAllItemRows(db, res.list);
-      for (const item of res.list) {
-        const score = scoreMatch(`${item.itemCode || ''} ${item.itemDescription || ''}`, tokens, item.itemCode || '');
-        if (item.itemCode && score > -Infinity && !map.has(item.itemCode)) map.set(item.itemCode, { ...item, _score: score });
-      }
-      if (res.list.length < 100) break;
-    }
-    found = [...map.values()].sort((a,b) => b._score - a._score || String(a.itemDescription || '').length - String(b.itemDescription || '').length || String(a.itemCode || '').localeCompare(String(b.itemCode || ''), 'fa'));
-  }
-
-  const source = cached.length ? 'all-items-cache-ranked' : (scanned ? 'all-items-quick-live' : 'all-items-empty-cache');
+  const scanned = 0;
+  const source = cached.length ? 'all-items-cache-ranked' : 'all-items-empty-cache';
   const note = found.length ? '' : 'کاتالوگ کامل کالا هنوز sync نشده یا نتیجه‌ای در صفحات سریع پیدا نشد. از ابزار Sync All Items Catalog استفاده کنید.';
   return { ok:true, list:found.slice(0, cap).map(toProductNameRow), source, scannedPages:scanned, cacheCount:cached.length, note };
 }
@@ -1786,123 +1997,12 @@ async function resolveInvoiceMapping(body, user = null) {
 }
 
 
-// 0.9.19.24: Fast sale issue helpers. Shaygan Invoice/Put with InvNo=0 returns GuId and often Number=0;
-// never trust Result[0].Number when it is 0. Resolve the real InvNo before enabling print.
-function extractIssuedInvoiceMeta(issueResponse = {}) {
-  const candidates = [];
-  if (Array.isArray(issueResponse.result)) candidates.push(...issueResponse.result);
-  if (Array.isArray(issueResponse.Result)) candidates.push(...issueResponse.Result);
-  if (Array.isArray(issueResponse.raw?.Result)) candidates.push(...issueResponse.raw.Result);
-  if (Array.isArray(issueResponse.raw?.result)) candidates.push(...issueResponse.raw.result);
-  if (issueResponse.raw && typeof issueResponse.raw === 'object') candidates.push(issueResponse.raw);
-  if (issueResponse && typeof issueResponse === 'object') candidates.push(issueResponse);
-  let picked = null;
-  for (const x of candidates) {
-    if (!x || typeof x !== 'object') continue;
-    const invoiceNumber = Number(x.Number || x.InvNo || x.InvoiceNumber || x.invoiceNumber || x.No || 0);
-    const invoiceGuid = String(x.GuId || x.Guid || x.GUID || x.InvoiceGuId || x.invoiceGuid || '').trim();
-    if (invoiceNumber > 0) { picked = { result:x, invoiceNumber, invoiceGuid }; break; }
-  }
-  if (!picked) picked = { result:candidates.find(x => x && typeof x === 'object') || {}, invoiceNumber:0, invoiceGuid:'' };
-  const result = { ...(picked.result || {}) };
-  if (picked.invoiceNumber > 0) result.Number = picked.invoiceNumber;
-  if (picked.invoiceGuid && !result.GuId) result.GuId = picked.invoiceGuid;
-  return { invoiceNumber:picked.invoiceNumber, invoiceGuid:picked.invoiceGuid || String(result.GuId || ''), result };
-}
 function invoicePrintUrl(invoiceNumber) {
   const n = Number(invoiceNumber || 0);
   return n > 0 ? `/print/invoice/${encodeURIComponent(String(n))}` : '';
 }
-function normInvDate8(v='') {
-  const x = String(v || '').trim();
-  if (/^\d{4}-\d{2}-\d{2}/.test(x)) return x.slice(0,10).replace(/-/g,'');
-  const d = x.replace(/[^0-9]/g,'').slice(0,8);
-  return d.length === 8 ? d : '';
-}
-function invoiceBodyAmount(inv = {}) {
-  return (Array.isArray(inv.Body) ? inv.Body : []).reduce((s,x)=>s + Number(x.Amount || (Number(x.Quan||0) * Number(x.Price||0)) || 0), 0);
-}
-function saleRequestAmount(body = {}) {
-  const rows = Array.isArray(body.items) ? body.items : [];
-  const gross = rows.reduce((s,x)=>s + Number(x.quantity || x.Quan || 0) * Number(x.price || x.Price || 0) - Number(x.discountAmount || x.LineDiscAmount || 0), 0);
-  return gross - Number(body.discountAmount || body.DiscAmount || 0) + saleInvoiceExtrasTotal(body.invoiceExtras || []);
-}
-function saleRequestLines(body = {}) {
-  return (Array.isArray(body.items) ? body.items : []).map(x => ({
-    itemCode:String(x.itemCode || x.ItemNumber || x.itemNumber || '').trim(),
-    stockNumber:String(x.stockNumber || x.STNumber || x.stNumber || '').trim(),
-    quantity:Number(x.quantity || x.Quan || 0),
-    price:Number(x.price || x.Price || 0),
-    amount:Number(x.amount || x.Amount || 0) || (Number(x.quantity || x.Quan || 0) * Number(x.price || x.Price || 0) - Number(x.discountAmount || x.LineDiscAmount || 0))
-  })).filter(x => x.itemCode && x.stockNumber && x.quantity > 0);
-}
-function scoreIssuedInvoiceCandidate(inv = {}, body = {}, mapping = {}, putGuid = '', crmId = '') {
-  let score = 0;
-  const reasons = [];
-  const invNo = Number(inv.InvNo || inv.Number || inv.InvoiceNumber || 0);
-  if (invNo > 0) { score += 5; reasons.push('has-number'); }
-  const invGuid = String(inv.GuId || inv.Guid || inv.InvGuId || inv.InvHeaderGuId || '').trim().toLowerCase();
-  const pg = String(putGuid || '').trim().toLowerCase();
-  if (pg && invGuid && pg === invGuid) { score += 10000; reasons.push('guid'); }
-  const acc = String(inv.AccountNumber || '').trim();
-  const sacc = String(inv.SAccountNumber || '').trim();
-  if (mapping.cashboxAccountNumber && acc === String(mapping.cashboxAccountNumber)) { score += 900; reasons.push('account'); }
-  if (mapping.employeeAccountNumber && sacc === String(mapping.employeeAccountNumber)) { score += 600; reasons.push('saccount'); }
-  const reqDate = normInvDate8(body.invDate || shaygan.formatDate8(new Date()));
-  const gotDate = normInvDate8(inv.InvDate || inv.InvoiceDate || '');
-  if (reqDate && gotDate && reqDate === gotDate) { score += 400; reasons.push('date'); }
-  const reqAmount = saleRequestAmount(body);
-  const invAmount = Number(inv.SourceTotalAmount || inv.TotalAmount || 0) || invoiceBodyAmount(inv);
-  if (reqAmount > 0 && invAmount > 0 && Math.abs(reqAmount - invAmount) <= 1) { score += 1200; reasons.push('amount'); }
-  const desc = String(inv.InvDescription || inv.Description || '');
-  if (crmId && desc.includes(String(crmId))) { score += 2500; reasons.push('crmId'); }
-  const reqLines = saleRequestLines(body);
-  const gotLines = Array.isArray(inv.Body) ? inv.Body : [];
-  let lineHits = 0;
-  for (const r of reqLines) {
-    if (gotLines.some(g => String(g.ItemNumber||'').trim() === r.itemCode && String(g.STNumber||'').trim() === r.stockNumber && Math.abs(Number(g.Quan||0)-r.quantity) < 0.0001 && (!r.price || Math.abs(Number(g.Price||0)-r.price) <= 1))) lineHits++;
-  }
-  if (reqLines.length && lineHits === reqLines.length) { score += 1500; reasons.push('lines-all'); }
-  else if (lineHits > 0) { score += lineHits * 250; reasons.push(`lines-${lineHits}`); }
-  if (String(inv.FirstIssuerUsername||'') && String(mapping.fullName||'') && String(inv.FirstIssuerUsername).includes(String(mapping.fullName))) { score += 150; reasons.push('issuer'); }
-  return { score, reasons, invNo, invGuid, reqAmount, invAmount };
-}
 async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, mapping = {}, invoiceType = 2, crmId = '' } = {}) {
-  const issuedMeta = extractIssuedInvoiceMeta(issueResponse);
-  const putGuid = issuedMeta.invoiceGuid || String(issueResponse?.raw?.Result?.[0]?.GuId || issueResponse?.result?.[0]?.GuId || '').trim();
-  const out = { ok:false, invoiceNumber:issuedMeta.invoiceNumber || 0, invoiceGuid:putGuid || issuedMeta.invoiceGuid || '', result:issuedMeta.result || {}, method:'put-response', attempts:[] };
-  if (out.invoiceNumber > 0) { out.ok = true; return out; }
-  if (putGuid && typeof shaygan.getInvoiceByGuid === 'function') {
-    const gr = await shaygan.getInvoiceByGuid(putGuid, invoiceType).catch(e => ({ ok:false, list:[], error:String(e.message||e) }));
-    out.attempts.push({ method:'guid', ok:gr.ok, count:(gr.list||[]).length, error:gr.error||'' });
-    const doc = (gr.list || []).find(x => Number(x.InvNo || x.Number || 0) > 0);
-    if (doc) return { ok:true, invoiceNumber:Number(doc.InvNo || doc.Number), invoiceGuid:String(doc.GuId || putGuid || ''), result:{ ...doc, Number:Number(doc.InvNo || doc.Number), GuId:String(doc.GuId || putGuid || '') }, method:'guid', attempts:out.attempts };
-  }
-  const date = normInvDate8(body.invDate || shaygan.formatDate8(new Date())) || shaygan.formatDate8(new Date());
-  const maxPages = Math.max(1, Math.min(Number(process.env.INVOICE_RESOLVE_MAX_PAGES || 40), 100));
-  const candidates = [];
-  for (let page = 0, rowStart = 0; page < maxPages; page++, rowStart += 20) {
-    const r = await shaygan.getInvoicePageByDate(rowStart, invoiceType, date, date, 20);
-    out.attempts.push({ method:'date-page', page, rowStart, ok:r.ok, count:(r.result||[]).length, error:r.error||'' });
-    if (!r.ok) break;
-    const list = r.result || [];
-    if (!list.length) break;
-    for (const inv of list) {
-      const sc = scoreIssuedInvoiceCandidate(inv, body, mapping, putGuid, crmId);
-      if (sc.invNo > 0 && sc.score >= 1700) candidates.push({ inv, sc });
-    }
-    if (list.length < 20) break;
-  }
-  candidates.sort((a,b) => b.sc.score - a.sc.score || Number(b.inv.InvNo||0) - Number(a.inv.InvNo||0));
-  const best = candidates[0];
-  if (best) {
-    const n = Number(best.inv.InvNo || best.inv.Number || 0);
-    const g = String(best.inv.GuId || putGuid || '');
-    return { ok:true, invoiceNumber:n, invoiceGuid:g, result:{ ...best.inv, Number:n, GuId:g }, method:'date-search', matchScore:best.sc.score, matchReasons:best.sc.reasons, attempts:out.attempts };
-  }
-  out.method = 'unresolved';
-  out.error = 'فاکتور صادر شد اما شماره واقعی با GUID/جستجوی امروز پیدا نشد';
-  return out;
+  return resolvePostPutInvoice({issueResponse,body,mapping,invoiceType,crmId,shaygan,formatDate8:shaygan.formatDate8,maxPages:Number(process.env.INVOICE_RESOLVE_MAX_PAGES||40),issuedAt:Date.now()});
 }
 
 async function applyLocalSaleInventoryDeductAfterSuccess({ db, body, invoiceNumber, invoiceGuid, saleIssueKey }) {
@@ -2681,58 +2781,6 @@ async function buildSupplierAgingReport(opts = {}) {
 }
 
 
-async function estimateLineCostFromCardex(itemCode, saleDate, qty, salePrice) {
-  // 0.9.19.17→WS: shayganSql.getKardexByItemCode → shaygan.getKardexByItemCode
-  try {
-    if (!itemCode) return { cost:0, profit:null, unknown:Number(qty||0)*Number(salePrice||0), note:'no_item' };
-    const kr = await shaygan.getKardexByItemCode(String(itemCode), '', { maxRows: 300, hardMaxRows: 600 });
-    const rows = (kr.rows || []).filter(r => Number(r.inQty || r.InQty || 0) > 0 || Number(r.costPrice || r.CostPrice || r.buyPrice || r.inPrice || 0) > 0);
-    const saleTs = saleDate ? new Date(saleDate).getTime() : Date.now();
-    const candidates = rows.map(r => {
-      const dt = new Date(r.date || r.Date || r.invoiceDate || '').getTime();
-      const price = Number(r.costPrice || r.CostPrice || r.buyPrice || r.inPrice || r.price || 0);
-      return { dt: Number.isFinite(dt) ? dt : 0, price };
-    }).filter(x => x.price > 0 && (!x.dt || x.dt <= saleTs)).sort((a,b)=>b.dt-a.dt);
-    const unitCost = candidates[0]?.price || 0;
-    if (!unitCost) return { cost:0, profit:null, unknown:Number(qty||0)*Number(salePrice||0), note:'no_cost_from_ws_kardex' };
-    const cost = unitCost * Number(qty||0);
-    const sale = Number(qty||0)*Number(salePrice||0);
-    return { cost, profit:sale-cost, unknown:0, unitCost, note:'latest_ws_kardex_cost' };
-  } catch(e) { return { cost:0, profit:null, unknown:Number(qty||0)*Number(salePrice||0), note:'cost_error:'+String(e.message||e) }; }
-}
-function startOfMonthIso(month='') {
-  const m = String(month || '').trim();
-  if (/^\d{4}-\d{2}$/.test(m)) return `${m}-01`;
-  return '';
-}
-function endOfMonthIso(month='') {
-  const m = String(month || '').trim();
-  if (!/^\d{4}-\d{2}$/.test(m)) return '';
-  const d = new Date(`${m}-01T00:00:00`);
-  d.setMonth(d.getMonth() + 1);
-  d.setDate(d.getDate() - 1);
-  return d.toISOString().slice(0,10);
-}
-function normalizeDate8ForShaygan(v='', end=false) {
-  const iso = normalizeReportDate(v, end);
-  if (!iso) return '';
-  return iso.slice(0,10).replace(/-/g,'');
-}
-function extractLeadIdFromInvoiceDoc(inv={}) {
-  const txt = [inv.InvDescription, inv.GeneralRef, ...(Array.isArray(inv.Body) ? inv.Body.map(x=>x.LineItemDesc) : [])].filter(Boolean).join(' ');
-  const m = String(txt).match(/(?:Lead\s*ID|LeadID|CRM\s*Lead|لید)\s*[:=\- ]\s*([A-Za-z0-9_\-\/\.]+)/i) || String(txt).match(/\bLID[-_A-Za-z0-9]{3,}\b/i);
-  return m ? String(m[1] || m[0] || '').trim() : '';
-}
-function normalizeRepText(v='') {
-  return normalizeText(String(v||'')).replace(/نماینده/g,'').replace(/فروش/g,'').trim();
-}
-function sellerLabelFromInvoice(inv={}, mappingsByEmployee=new Map()) {
-  const emp = String(inv.SAccountNumber || inv.SAccount2Number || '').trim();
-  const repNameRaw = String(inv.SAccountName || inv.SJobName || inv.LastIssuerUsername || inv.FirstIssuerUsername || '').trim();
-  const m = emp ? mappingsByEmployee.get(emp) : null;
-  const name = m?.fullName || repNameRaw || (emp ? `نماینده ${emp}` : 'نماینده نامشخص');
-  return { employeeAccountNumber:emp, sellerKey: emp || normalizeRepText(name) || 'unknown-rep', sellerName:name, sellerStore:m?.storeName || '' };
-}
 async function fetchSaleInvoicesFromShayganWebService({ from8='', to8='', maxPages=600 }={}) {
   const list = [];
   let rowStart = 0;
@@ -2748,180 +2796,136 @@ async function fetchSaleInvoicesFromShayganWebService({ from8='', to8='', maxPag
   return { ok:true, list, source:'shaygan-webservice-invoice-get-date', pages:Math.ceil(list.length/pageSize) };
 }
 
-// 0.9.19.17→WS: موتور FIFO بدون SQL — از Kardex وب‌سرویس شایگان می‌خواند
-async function getSellerSalesProfitFifoFromSalesWS(saleRows=[], opts={}) {
-  const rows = (saleRows || []).map((x, idx) => ({
-    sellerKey: String(x.sellerKey || 'unknown').trim() || 'unknown',
-    sellerName: String(x.sellerName || x.sellerKey || 'نامشخص').trim() || 'نامشخص',
-    sellerStore: String(x.sellerStore || '').trim(),
-    invoiceNo: String(x.invoiceNo || '').trim(),
-    invoiceDate: x.invoiceDate ? new Date(x.invoiceDate) : new Date(),
-    leadId: String(x.leadId || '').trim(),
-    customerName: String(x.customerName || '').trim(),
-    itemCode: String(x.itemCode || '').trim(),
-    itemDescription: String(x.itemDescription || '').trim(),
-    qty: Number(x.qty || x.quantity || 0),
-    unitSale: Number(x.unitSale || x.price || 0),
-    saleRial: Number(x.saleRial || 0),
-    _idx: idx
-  })).filter(x => x.itemCode && x.qty > 0 && (x.unitSale > 0 || x.saleRial > 0));
-
-  if (!rows.length) return { ok:true, list:[], invoices:[], allocations:[], unmatched:[], source:'seller-profit-ws-empty' };
-  for (const r of rows) {
-    if (!r.saleRial) r.saleRial = r.qty * r.unitSale;
-    if (!r.unitSale) r.unitSale = r.saleRial / r.qty;
-  }
-
-  // خواندن kardex به ازای هر کد کالا از WebService
-  const codes = [...new Set(rows.map(x => x.itemCode))];
-  const batchesByCode = new Map();
-  await Promise.allSettled(codes.map(async (code) => {
-    try {
-      const kr = await shaygan.getKardexByItemCode(code, '', { maxRows: Number(opts.kardexMaxRows || 600), hardMaxRows: Number(opts.kardexHardMaxRows || 1200) });
-      const purchaseRows = (kr.rows || []).filter(r => Number(r.inQty || r.InQty || 0) > 0 && Number(r.costPrice || r.CostPrice || r.buyPrice || r.inPrice || r.unitCost || 0) > 0)
-        .map(r => {
-          const rawDate = r.date || r.Date || r.invoiceDate || r.InvDate || '';
-          return { invNo:String(r.invoiceNo||r.InvNo||''), invDate: rawDate ? new Date(rawDate) : null, qty:Number(r.inQty||r.InQty||0), remainingQty:Number(r.inQty||r.InQty||0), unitCost:Number(r.costPrice||r.CostPrice||r.buyPrice||r.inPrice||r.unitCost||0) };
-        })
-        .sort((a,b) => { if (!a.invDate&&!b.invDate) return 0; if (!a.invDate) return 1; if (!b.invDate) return -1; return a.invDate-b.invDate; });
-      batchesByCode.set(code, purchaseRows);
-    } catch(e) { batchesByCode.set(code, []); }
-  }));
-
-  const sellerMap = new Map(), invoicesMap = new Map(), allocations = [], unmatched = [];
-  function ensureSeller(r) {
-    const k = r.sellerKey||'unknown';
-    if (!sellerMap.has(k)) sellerMap.set(k, { sellerKey:k, sellerName:r.sellerName||k, sellerStore:r.sellerStore||'', invoiceCountSet:new Set(), saleRial:0, fifoCost:0, fifoProfit:0, totalQty:0, allocatedRows:0, unmatchedSaleRial:0, withoutLeadCount:0, withLeadCount:0 });
-    const s = sellerMap.get(k);
-    if (!s.sellerName||s.sellerName===k) s.sellerName=r.sellerName||k;
-    if (!s.sellerStore&&r.sellerStore) s.sellerStore=r.sellerStore;
-    return s;
-  }
-  function ensureInvoice(r) {
-    const k=`${r.sellerKey}|${r.invoiceNo||r._idx}`;
-    if (!invoicesMap.has(k)) invoicesMap.set(k,{sellerKey:r.sellerKey,sellerName:r.sellerName,sellerStore:r.sellerStore,invoiceNo:r.invoiceNo,invoiceDate:r.invoiceDate?r.invoiceDate.toISOString().slice(0,10):'',customerName:r.customerName||'',leadId:r.leadId||'',saleRial:0,fifoCost:0,fifoProfit:0,unmatchedSaleRial:0,itemCount:0,lines:[],itemCodes:[],hasNotebook:false});
-    return invoicesMap.get(k);
-  }
-  const saleList = [...rows].sort((a,b)=>(a.invoiceDate-b.invoiceDate)||String(a.invoiceNo).localeCompare(String(b.invoiceNo))||a._idx-b._idx);
-  for (const sale of saleList) {
-    let need=sale.qty;
-    const batches=batchesByCode.get(sale.itemCode)||[];
-    const ss=ensureSeller(sale), inv=ensureInvoice(sale);
-    ss.saleRial+=sale.saleRial; ss.totalQty+=sale.qty; if(sale.invoiceNo) ss.invoiceCountSet.add(sale.invoiceNo); if(sale.leadId) ss.withLeadCount+=1; else ss.withoutLeadCount+=1;
-    inv.saleRial+=sale.saleRial; inv.itemCount+=1;
-    if (!inv.itemCodes.includes(sale.itemCode)) inv.itemCodes.push(sale.itemCode);
-    if (String(sale.itemCode||'').startsWith('1')) inv.hasNotebook=true;
-    const invLine={itemCode:sale.itemCode,itemDescription:sale.itemDescription,qty:sale.qty,saleRial:Math.round(sale.saleRial),fifoCost:0,fifoProfit:0,unmatchedSaleRial:0,leadId:sale.leadId||'',invoiceNo:sale.invoiceNo};
-    inv.lines.push(invLine);
-    for (const b of batches) {
-      if (need<=0) break; if (b.remainingQty<=0) continue;
-      if (sale.invoiceDate&&b.invDate&&sale.invoiceDate<b.invDate) continue;
-      const qty=Math.min(need,b.remainingQty); need-=qty; b.remainingQty-=qty;
-      const saleValue=qty*sale.unitSale, cost=qty*b.unitCost, profit=saleValue-cost;
-      ss.fifoCost+=cost; ss.fifoProfit+=profit; ss.allocatedRows+=1;
-      inv.fifoCost+=cost; inv.fifoProfit+=profit; invLine.fifoCost+=cost; invLine.fifoProfit+=profit;
-      allocations.push({sellerKey:sale.sellerKey,sellerName:sale.sellerName,invoiceNo:sale.invoiceNo,itemCode:sale.itemCode,itemDescription:sale.itemDescription,saleQty:qty,saleValue:Math.round(saleValue),purchaseInvNo:b.invNo,unitCost:Math.round(b.unitCost),fifoCost:Math.round(cost),fifoProfit:Math.round(profit)});
-    }
-    if (need>0.0001) {
-      const val=need*sale.unitSale;
-      ss.unmatchedSaleRial+=val; inv.unmatchedSaleRial+=val; invLine.unmatchedSaleRial+=val;
-      unmatched.push({sellerKey:sale.sellerKey,sellerName:sale.sellerName,invoiceNo:sale.invoiceNo,itemCode:sale.itemCode,itemDescription:sale.itemDescription,unmatchedQty:need,unmatchedSaleRial:Math.round(val),reason:'opening-stock-or-missing-purchase-kardex-ws'});
-    }
-  }
-  const list=[...sellerMap.values()].map(s=>({...s,invoiceCount:s.invoiceCountSet.size,invoiceCountSet:undefined,saleRial:Math.round(s.saleRial),fifoCost:Math.round(s.fifoCost),fifoProfit:Math.round(s.fifoProfit),avgProfitPct:s.saleRial?Math.round((s.fifoProfit/s.saleRial)*10000)/100:null,unmatchedSaleRial:Math.round(s.unmatchedSaleRial),confidence:s.unmatchedSaleRial?'partial-fifo-ws-kardex':'fifo-ws-kardex'})).sort((a,b)=>b.saleRial-a.saleRial);
-  const invoiceList=[...invoicesMap.values()].map(x=>({...x,saleRial:Math.round(x.saleRial),fifoCost:Math.round(x.fifoCost),fifoProfit:Math.round(x.fifoProfit),profitPct:x.saleRial?Math.round((x.fifoProfit/x.saleRial)*10000)/100:null,unmatchedSaleRial:Math.round(x.unmatchedSaleRial),lines:(x.lines||[]).map(l=>({...l,saleRial:Math.round(l.saleRial||0),fifoCost:Math.round(l.fifoCost||0),fifoProfit:Math.round(l.fifoProfit||0),unmatchedSaleRial:Math.round(l.unmatchedSaleRial||0),profitPct:l.saleRial?Math.round(((l.fifoProfit||0)/l.saleRial)*10000)/100:null}))})).sort((a,b)=>String(b.invoiceDate).localeCompare(String(a.invoiceDate))||Number(b.invoiceNo)-Number(a.invoiceNo));
-  return { ok:true, list, invoices:invoiceList, allocations, unmatched:unmatched.slice(0,1000), source:'shaygan-webservice-kardex-seller-profit-fifo' };
+const SELLER_PERFORMANCE_SOURCE = 'mongo-active-sale-snapshot-accounting-metrics-financials-disabled';
+function normalizeSellerPerformanceQuery(query={}) {
+  const normalized={ ...query };
+  const month=normalizeJalaliMonth(query.month||'', { field:'month' });
+  const rawDateFrom=query.dateFrom??query.from??(month?`${month}01`:'');
+  const rawDateTo=query.dateTo??query.to??'';
+  const { dateFrom, dateTo }=normalizeJalaliRange({ dateFrom:rawDateFrom, dateTo:rawDateTo });
+  normalized.dateFrom=dateFrom;
+  normalized.dateTo=dateTo;
+  normalized.month=month;
+  delete normalized.from;
+  delete normalized.to;
+  return normalized;
 }
-
-async function buildSellerSalesProfitReport(query={}) {
-  const db = await connectMongo();
-  const seller = String(query.seller || query.employeeAccountNumber || '').trim();
-  const store = String(query.store || '').trim();
-  const month = String(query.month || '').trim();
-  const dateFromNorm = normalizeReportDate(query.dateFrom || query.from || '', false) || normalizeReportDate(startOfMonthIso(month), false);
-  const dateToNorm = normalizeReportDate(query.dateTo || query.to || '', true) || normalizeReportDate(endOfMonthIso(month), true);
-  const days = Math.min(Math.max(Number(query.days || 31), 1), 366);
-  const fromDate = dateFromNorm ? new Date(dateFromNorm) : new Date(Date.now() - days * 86400000);
-  const toDate = dateToNorm ? new Date(dateToNorm) : new Date();
-  const from8 = dateFromNorm ? dateFromNorm.slice(0,10).replace(/-/g,'') : '';
-  const to8 = dateToNorm ? dateToNorm.slice(0,10).replace(/-/g,'') : '';
-  const profitUnit = String(query.profitUnit || 'toman');
-  const minProfit = parseMoneyInput(query.minProfit, profitUnit);
-  const maxProfit = parseMoneyInput(query.maxProfit, profitUnit);
-  const commissionRate = query.commissionRate === undefined || query.commissionRate === '' ? 0.18 : Number(query.commissionRate);
-  const leadPenaltyRial = parseMoneyInput(query.leadPenaltyRial ?? query.leadPenalty, 'rial') || 0;
-  const itemGroup = String(query.itemGroup || query.group || '').trim().toLowerCase();
-  const isNotebookOnly = itemGroup === 'notebook' || itemGroup === 'nb' || itemGroup === '1';
-
-  const maps = await db.collection('userShayganMappings').find({ isActive:{ $ne:false } }).toArray().catch(()=>[]);
-  const mappingsByEmployee = new Map();
-  for (const m of maps) {
-    const emp = String(m.employeeAccountNumber || '').trim();
-    if (emp && !mappingsByEmployee.has(emp)) mappingsByEmployee.set(emp, m);
+function sendJalaliDateValidationError(res, error) {
+  return sendJson(res, Number(error?.statusCode||400), {
+    ok:false,
+    code:error?.code||'INVALID_JALALI_DATE',
+    field:error?.field||'date',
+    error:String(error?.message||'تاریخ شمسی نامعتبر است')
+  });
+}
+async function buildSellerSalesProfitReportFromSnapshot(db, query={}) {
+  const normalizedQuery=normalizeSellerPerformanceQuery(query);
+  const month=normalizedQuery.month;
+  const dateFrom=normalizedQuery.dateFrom;
+  const dateTo=normalizedQuery.dateTo;
+  const seller=String(query.seller||query.employeeAccountNumber||'').trim();
+  const store=String(query.store||'').trim();
+  const commissionRate=query.commissionRate==null||query.commissionRate===''?0.18:Number(query.commissionRate);
+  const leadPenaltyRial=parseMoneyInput(query.leadPenaltyRial??query.leadPenalty,'rial')||0;
+  const report=await saleSnapshot.sellerPerformance(db,{ sellerAccountNumber:seller, store, dateFrom, dateTo, limit:Number(query.limit||250000), invoiceLimit:Number(query.invoiceLimit||5000), lineLimit:Number(query.lineLimit||10000) });
+  const linesByInvoice=new Map();
+  for(const line of report.lines||[]){
+    const key=`${line.saleInvoiceType}-${line.saleInvoiceNo}`;
+    if(!linesByInvoice.has(key))linesByInvoice.set(key,[]);
+    linesByInvoice.get(key).push({ itemCode:line.itemCode, itemDescription:line.itemName, qty:line.qty, allocatedQty:line.allocatedQty, saleRial:line.saleValue, coveredSales:line.coveredSales, fifoCost:line.fifoCost, fifoProfit:line.fifoProfit, profitStatus:line.profitStatus, profitReason:line.profitReason, mainGroup:line.mainGroup, mainGroupSource:line.mainGroupSource });
   }
-
-  const invFetch = await fetchSaleInvoicesFromShayganWebService({ from8, to8, maxPages:Number(query.maxPages || config.sellerSalesInvoiceMaxPages || 800) });
-  if (!invFetch.ok) return { ok:false, error:invFetch.error, source:invFetch.source || 'shaygan-webservice-invoice-get-date' };
-  let invDocs = invFetch.list || [];
-  const saleRows = [];
-  for (const inv of invDocs) {
-    const rep = sellerLabelFromInvoice(inv, mappingsByEmployee);
-    if (seller && String(rep.employeeAccountNumber || rep.sellerKey) !== seller) continue;
-    if (store && !String(rep.sellerStore || '').includes(store)) continue;
-    const body = Array.isArray(inv.Body) ? inv.Body : [];
-    const invoiceNo = String(inv.InvNo || inv.Number || '').trim();
-    const leadId = extractLeadIdFromInvoiceDoc(inv);
-    const customerName = String(inv.InvDescription || inv.AccountName || '').trim();
-    const invDate = inv.InvDate || inv.CreatedDate || fromDate;
-    const discount = Number(inv.DiscAmount || inv.DiscountAmount || 0);
-    const rawAmounts = body.map(it => Number(it.Amount || (Number(it.Quan||0)*Number(it.Price||0)) || 0));
-    const gross = rawAmounts.reduce((a,b)=>a+b,0) || 1;
-    body.forEach((it, idx) => {
-      const qty = Number(it.Quan || it.quantity || 0);
-      const price = Number(it.Price || it.price || 0);
-      const amount = Number(it.Amount || (qty*price) || 0);
-      const itemCode = String(it.ItemNumber || it.ItemCode || '').trim();
-      if (!qty || !itemCode || (!price && !amount)) return;
-      // گروه اصلی نوت‌بوک در حسابداری مشهدکالا: هر کالایی که کد آن با 1 شروع شود.
-      // این فیلتر روی ردیف‌های فاکتور اعمال می‌شود؛ در فاکتورهای ترکیبی فقط ردیف‌های نوت‌بوک وارد فروش/سود می‌شوند.
-      if (isNotebookOnly && !itemCode.startsWith('1')) return;
-      const allocatedDiscount = discount ? (discount * (amount / gross)) : 0;
-      saleRows.push({
-        sellerKey:rep.sellerKey, sellerName:rep.sellerName, sellerStore:rep.sellerStore, employeeAccountNumber:rep.employeeAccountNumber,
-        invoiceNo, invoiceDate:invDate, leadId, customerName,
-        itemCode, itemDescription:String(it.ItemDescription || it.ItemDesc || '').trim(),
-        qty, unitSale: price || (amount/qty), saleRial: Math.max(0, amount - allocatedDiscount)
-      });
-    });
-  }
-  const fifo = await getSellerSalesProfitFifoFromSalesWS(saleRows, { kardexMaxRows: 600, kardexHardMaxRows: 1200 });
-  let invoices = fifo.invoices || [];
-  if (minProfit != null) invoices = invoices.filter(x => Number(x.fifoProfit || 0) >= minProfit);
-  if (maxProfit != null) invoices = invoices.filter(x => Number(x.fifoProfit || 0) <= maxProfit);
-  const sellerAgg = new Map();
-  for (const inv of invoices) {
-    const k = inv.sellerKey || 'unknown';
-    const emp = String(k).startsWith('NO_EMPLOYEE:') ? '' : String(k);
-    if (!sellerAgg.has(k)) sellerAgg.set(k, { sellerKey:k, sellerName:inv.sellerName||k, sellerStore:inv.sellerStore||'', employeeAccountNumber:emp, invoiceCount:0, saleRial:0, fifoCost:0, fifoProfit:0, unmatchedSaleRial:0, withLeadCount:0, withoutLeadCount:0 });
-    const s = sellerAgg.get(k);
-    s.invoiceCount += 1;
-    s.saleRial += Number(inv.saleRial||0);
-    s.fifoCost += Number(inv.fifoCost||0);
-    s.fifoProfit += Number(inv.fifoProfit||0);
-    s.unmatchedSaleRial += Number(inv.unmatchedSaleRial||0);
-    if (inv.leadId) s.withLeadCount += 1; else s.withoutLeadCount += 1;
-  }
-  const sellers = [...sellerAgg.values()].map(s => {
-    const c = calcCommission({ fifoProfit:s.fifoProfit, commissionRate, withoutLeadCount:s.withoutLeadCount, leadPenaltyRial });
-    return { ...s, saleRial:Math.round(s.saleRial), fifoCost:Math.round(s.fifoCost), fifoProfit:Math.round(s.fifoProfit), unmatchedSaleRial:Math.round(s.unmatchedSaleRial), avgProfitPct:s.saleRial ? Math.round((s.fifoProfit/s.saleRial)*10000)/100 : null, commissionRate, ...c, suggestedCommission:c.finalCommission, leadStatus:s.withoutLeadCount ? 'needs-review' : 'ok', employeeStatus:s.employeeAccountNumber ? 'ok' : 'missing' };
-  }).sort((a,b)=>b.fifoProfit-a.fifoProfit);
-  const summary = sellers.reduce((a,s)=>{ a.invoiceCount+=s.invoiceCount; a.saleRial+=s.saleRial; a.fifoCost+=s.fifoCost; a.fifoProfit+=s.fifoProfit; a.unmatchedSaleRial+=s.unmatchedSaleRial; a.rawCommission+=s.rawCommission||0; a.leadPenalty+=s.leadPenalty||0; a.suggestedCommission+=s.suggestedCommission; a.withoutLeadCount+=s.withoutLeadCount; a.missingEmployeeCount += s.employeeStatus === 'missing' ? 1 : 0; return a; }, { invoiceCount:0, saleRial:0, fifoCost:0, fifoProfit:0, unmatchedSaleRial:0, rawCommission:0, leadPenalty:0, suggestedCommission:0, withoutLeadCount:0, missingEmployeeCount:0 });
-  summary.avgProfitPct = summary.saleRial ? Math.round((summary.fifoProfit/summary.saleRial)*10000)/100 : null;
-  return { ok:true, period:{ from:fromDate.toISOString().slice(0,10), to:toDate.toISOString().slice(0,10), month:month||'' }, seller:seller||'all', store, source:'shaygan-webservice-sales-invoices+shaygan-webservice-kardex-seller-profit-fifo', summary, sellers, invoices:invoices.slice(0,1000), allocations:(fifo.allocations||[]).slice(0,1000), unmatched:(fifo.unmatched||[]).slice(0,1000), meta:{ invoiceRows:invDocs.length, saleRows:saleRows.length, itemGroup:isNotebookOnly?'notebook':'all', itemGroupRule:isNotebookOnly?'ItemCode starts with 1':'all items', minProfit, maxProfit, profitUnit, commissionRate, leadPenaltyRial, note:'عملکرد فروشنده از فاکتورهای فروش شایگان خوانده می‌شود؛ فروشنده از نماینده فاکتور/SAccountNumber استخراج می‌شود، نه صندوق و نه فقط لاگ CRM. فیلتر نوت‌بوک بر اساس شروع کد کالا با رقم 1 اعمال می‌شود.' } };
+  const invoices=(report.invoices||[]).map(inv=>{
+    const key=`${inv.saleInvoiceType}-${inv.saleInvoiceNo}`;
+    const unmatchedSaleRial=Math.max(0,Number(inv.amount||0)-Number(inv.coverage?.coveredSales||0));
+    return {
+      sellerKey:inv.sellerAccountNumber||'unmapped',
+      sellerName:inv.sellerName||'نامشخص',
+      sellerStore:inv.sellerStoreName||'',
+      employeeAccountNumber:inv.sellerAccountNumber||'',
+      invoiceNo:inv.saleInvoiceNo,
+      invoiceDate:inv.saleDate,
+      customerName:inv.accountName||'',
+      leadId:inv.generalRef||'',
+      saleRial:inv.amount,
+      qty:inv.qty,
+      lineCount:inv.lines,
+      discountAmount:inv.discountAmount||0,
+      fifoCost:null,
+      fifoProfit:null,
+      profitPct:null,
+      unmatchedSaleRial:null,
+      profitStatus:'unavailable',
+      coverage:inv.coverage,
+      lines:linesByInvoice.get(key)||[],
+      itemCodes:[...new Set((linesByInvoice.get(key)||[]).map(x=>x.itemCode).filter(Boolean))]
+    };
+  });
+  const sellers=(report.sellers||[]).map(s=>{
+    const incomplete=s.profitStatus!=='calculated'||s.coverage?.purchaseHistoryComplete!==true;
+    const rawCommission=incomplete||s.fifoProfit==null?null:Math.round(Number(s.fifoProfit)*commissionRate);
+    const leadPenalty=rawCommission==null?null:0;
+    const suggestedCommission=rawCommission==null?null:Math.max(0,rawCommission-leadPenalty);
+    return {
+      sellerKey:s.sellerAccountNumber||'unmapped',
+      sellerName:s.sellerName||'نامشخص',
+      sellerStore:s.sellerStoreName||'',
+      employeeAccountNumber:s.sellerAccountNumber||'',
+      invoiceCount:s.invoiceCount,
+      lineCount:s.lineCount,
+      saleRial:s.amount,
+      returnAmount:s.returnAmount||0,
+      returnQty:s.returnQty||0,
+      netSalesAfterReturns:s.netSalesAfterReturns,
+      fifoCost:null,
+      fifoProfit:null,
+      avgProfitPct:null,
+      unmatchedSaleRial:null,
+      commissionRate,
+      rawCommission,
+      leadPenalty,
+      finalCommission:suggestedCommission,
+      suggestedCommission,
+      commissionStatus:'disabled',
+      profitStatus:'unavailable',
+      coverage:s.coverage,
+      leadStatus:'not-evaluated-from-snapshot',
+      employeeStatus:s.sellerAccountNumber?'ok':'missing'
+    };
+  });
+  const coverage=report.coverage||{};
+  const incomplete=report.profitStatus!=='calculated'||coverage.purchaseHistoryComplete!==true;
+  const summary={
+    invoiceCount:report.invoiceCount,
+    lineCount:report.lineCount,
+    itemCount:report.itemCount,
+    qty:report.qty,
+    saleRial:report.totalSales,
+    grossSaleAmount:report.grossSaleAmount,
+    netSaleAmount:report.netSaleAmount,
+    saleReturnAmount:report.saleReturnAmount,
+    saleReturnQuantity:report.saleReturnQuantity,
+    netSalesAfterReturns:report.netSalesAfterReturns,
+    uniqueCustomerCount:report.uniqueCustomerCount,
+    averageInvoiceAmount:report.averageInvoiceAmount,
+    discountAmount:report.discountAmount,
+    discountPercent:report.discountPercent,
+    fifoCost:null,
+    fifoProfit:null,
+    avgProfitPct:null,
+    unmatchedSaleRial:null,
+    rawCommission:null,
+    leadPenalty:null,
+    suggestedCommission:null,
+    commissionStatus:'disabled',
+    profitStatus:'unavailable',
+    coverage
+  };
+  return { ok:true, period:{from:dateFrom,to:dateTo,month}, seller:seller||'all', store, source:SELLER_PERFORMANCE_SOURCE, activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', dataState:report.dataState, summary, sellers, invoices, groups:report.groups||[], stores:report.stores||[], dailyTrend:report.dailyTrend||[], previousPeriod:report.previousPeriod||null, returnLines:report.returnLines||[], sellerIdentityDiagnostics:report.sellerIdentityDiagnostics||{}, returnsPolicy:report.returnsPolicy||{}, allocations:[], unmatched:[], coverage, profitStatus:'unavailable', limitations:report.limitations, diagnostics:report.profitDiagnostics, meta:{ activeSnapshotId:report.activeSnapshotId||'', snapshotStatus:report.snapshotStatus||'', snapshotSource:report.snapshotSource||'', invoiceRows:report.invoiceCount, saleRows:report.lineCount, returnRows:report.saleReturnLineCount||0, itemGroup:'all', itemGroupRule:'mainGroup from catalog; explicit item-code fallback retained', commissionRate, leadPenaltyRial, reportScanLimit:report.reportScanLimit, reportScanLimitReached:report.reportScanLimitReached, note:'گزارش فقط از Snapshot فعال و کامل فروش در Mongo خوانده می‌شود. سود، ROI و پورسانت در این نسخه عمداً غیرفعال‌اند.' } };
 }
 
 
 function sellerPerformanceFilterKey(query={}) {
+  query=normalizeSellerPerformanceQuery(query);
   const keep = {};
   // کلید آرشیو فقط بر اساس فیلتر پایه است؛ فیلترهای سود و نوت‌بوک در UI روی گزارش کش‌شده اعمال می‌شوند.
   ['dateFrom','from','dateTo','to','month','seller','employeeAccountNumber','store','commissionRate','leadPenaltyRial','leadPenalty'].forEach(k => {
@@ -2950,7 +2954,10 @@ async function saveSellerPerformanceHistory(db, query, report, by='system') {
 }
 async function getLatestSellerPerformanceHistory(db, query={}) {
   const filterKey = sellerPerformanceFilterKey(query);
-  return await db.collection('sellerPerformanceHistory').findOne({ type:'seller-performance', filterKey }, { sort:{ generatedAt:-1 } });
+  const active=await saleSnapshot._activeDataset(db);
+  const q={ type:'seller-performance', filterKey, 'report.source':SELLER_PERFORMANCE_SOURCE };
+  q['report.meta.activeSnapshotId']=active.snapshotId||'';
+  return await db.collection('sellerPerformanceHistory').findOne(q, { sort:{ generatedAt:-1 } });
 }
 
 
@@ -3227,6 +3234,23 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/user-account-access': 'user-account-access.save',
     'POST /api/sale-snapshot/init': 'sale-snapshot.init',
     'POST /api/sale-snapshot/start': 'sale-snapshot.start',
+    'POST /api/sale-snapshot/resume': 'sale-snapshot.resume',
+    'POST /api/manual-cost-resolutions': 'manual-cost-resolutions.create',
+    'POST /api/accounting/fifo-shadow/start': 'fifo-shadow.start',
+    'POST /api/accounting/fifo-shadow/resume': 'fifo-shadow.resume',
+    'POST /api/accounting/profit-ledger/init': 'profit-ledger.init',
+    'POST /api/accounting/profit-ledger/facts/materialize': 'profit-ledger.facts.materialize',
+    'POST /api/accounting/profit-ledger/adjustments': 'profit-ledger.adjustments.create',
+    'POST /api/accounting/profit-ledger/categories': 'profit-ledger.categories.create',
+    'POST /api/accounting/governance/group-catalog/refresh': 'accounting-governance.group-catalog.refresh',
+    'POST /api/accounting/governance/opening-balances': 'accounting-governance.opening-balances.create',
+    'POST /api/accounting/profit-ledger/rates': 'profit-ledger.rates.create',
+    'POST /api/accounting/profit-ledger/rates/seed-tir': 'profit-ledger.rates.seed-tir',
+    'POST /api/accounting/profit-ledger/discounts/extract': 'profit-ledger.discounts.extract',
+    'POST /api/accounting/profit-ledger/commission-drafts': 'profit-ledger.commission-drafts.create',
+    'POST /api/accounting/profit-ledger/excel/export': 'profit-ledger.excel.export',
+    'POST /api/accounting/profit-ledger/excel/import': 'profit-ledger.excel.import',
+    'POST /api/accounting/profit-ledger/tir-reconstruction': 'profit-ledger.tir-reconstruction.create',
     'POST /api/supplier-sleep/init': 'supplier-sleep.init',
     'POST /api/supplier-sleep/sync-purchases': 'supplier-sleep.sync-purchases',
     'POST /api/supplier-sleep/supplier-index': 'supplier-sleep.supplier-index',
@@ -3273,6 +3297,9 @@ function stagingReadOnlyOperation(req, pathname) {
   if ((method === 'PUT' || method === 'PATCH') && /^\/api\/proformas\/\d+$/.test(normalizedPathname)) return 'proformas.update';
   if (method === 'POST' && /^\/api\/proformas\/\d+\/convert$/.test(normalizedPathname)) return 'proformas.convert';
   if (method === 'POST' && /^\/api\/purchase-drafts\/\d+\/issue$/.test(normalizedPathname)) return 'purchase-drafts.issue';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/manual-cost-resolutions\/[^/]+(?:\/(?:submit|approve|reject|expire))?$/.test(normalizedPathname)) return 'manual-cost-resolutions.workflow';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/profit-ledger\/(?:adjustments|categories|rates)\/[^/]+(?:\/(?:submit|approve|reject|return|cancel|expire|reverse))?$/.test(normalizedPathname)) return 'profit-ledger.workflow';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/governance\/opening-balances\/[^/]+(?:\/(?:submit|approve|reject|return|cancel))?$/.test(normalizedPathname)) return 'accounting-governance.opening-balances.workflow';
   return '';
 }
 
@@ -3280,8 +3307,8 @@ async function handleApi(req, res, pathname, query) {
   try {
     const readOnlyOperation = stagingReadOnlyOperation(req, pathname);
     if (readOnlyOperation && rejectIfStagingReadOnly(req, res, readOnlyOperation)) return;
-    if (pathname === '/health') return sendJson(res, 200, { ok: true, app: 'mkcrm', version: APP_VERSION, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
-    if (pathname === '/api/version') return sendJson(res, 200, { ok: true, app: 'mkcrm', version: APP_VERSION, node: process.version, serverTime: time.serverTimePayload() });
+    if (pathname === '/health') return sendJson(res, 200, { ...versionPayload(), app: APP_NAME, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
+    if (pathname === '/api/version') return sendJson(res, 200, { ...versionPayload(), app: APP_NAME, node: process.version, serverTime: time.serverTimePayload() });
     if (pathname === '/api/server-time') return sendJson(res, 200, time.serverTimePayload());
     if (pathname === '/api/search/status') { const db = await connectMongo(); return sendJson(res, 200, { ok:true, version:APP_VERSION, counts:{ inventory: await db.collection('itemInventoryCatalog').estimatedDocumentCount().catch(()=>0), allItems: await db.collection('itemCatalogAll').estimatedDocumentCount().catch(()=>0), accounts: await db.collection('accountCatalog').estimatedDocumentCount().catch(()=>0) } }); }
     if (pathname === '/api/jobs/status' && req.method === 'GET') { const db = await connectMongo(); const jobId=String(query.jobId||''); const q=jobId?{jobId}:{ }; const jobsRaw=await db.collection('appJobs').find(q).sort({ updatedAt:-1 }).limit(jobId?1:20).toArray().catch(()=>[]); const nowMs=Date.now(); const jobs=jobsRaw.map(j=>{ const hb=new Date(j.heartbeatAt||j.updatedAt||j.startedAt||0).getTime(); const stale=String(j.status||'')==='running' && hb && (nowMs-hb)>10*60*1000; return { ...j, heartbeatAgeMs: hb ? nowMs-hb : null, staleRunning: !!stale, statusFa: stale ? 'در حال اجرا - heartbeat قدیمی، بررسی PM2/WebService لازم است' : '' }; }); return sendJson(res, 200, { ok:true, list:jobs, job:jobs[0]||null, serverTime: time.serverTimePayload() }); }
@@ -3493,18 +3520,30 @@ async function handleApi(req, res, pathname, query) {
       const db = await connectMongo();
       return sendJson(res, 200, await saleSnapshot.init(db));
     }
-    if (pathname === '/api/sale-snapshot/start' && req.method === 'POST') {
+    if ((pathname === '/api/sale-snapshot/start' || pathname === '/api/sale-snapshot/resume') && req.method === 'POST') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
       const body = await collectBody(req);
+      const resumeSnapshotId=String(body.resumeSnapshotId||query.resumeSnapshotId||(pathname.endsWith('/resume')?body.snapshotId||query.snapshotId:'')||'').trim();
+      let snapshotDates;
+      try {
+        snapshotDates=normalizeJalaliRange({
+          dateFrom: body.dateFrom || query.dateFrom || '14050101',
+          dateTo: body.dateTo || query.dateTo || ''
+        }, { requireFrom:true });
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
       const request={
-        dateFrom: body.dateFrom || query.dateFrom || '14050101',
-        dateTo: body.dateTo || query.dateTo || '',
+        dateFrom: snapshotDates.dateFrom,
+        dateTo: snapshotDates.dateTo,
         maxPages: Number(body.maxPages || query.maxPages || 300),
         pageSize: Number(body.pageSize || query.pageSize || 20),
         maxDetailInvoices: Number(body.maxDetailInvoices || query.maxDetailInvoices || 0),
         reset: body.reset === true || body.reset === 'true' || query.reset === 'true',
-        mode: body.mode || query.mode || 'incremental'
+        mode: body.mode || query.mode || 'incremental',
+        resumeSnapshotId,
+        maxPageAttempts:Number(body.maxPageAttempts||query.maxPageAttempts||3)
       };
       if(saleSnapshotJobManager.isRunning('sale-snapshot')){const running=saleSnapshotJobManager.getRunning('sale-snapshot');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Sale Snapshot job is already running',jobId:running?.id||''});}
       const jobId=`JOB-SALE-SNAPSHOT-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
@@ -3526,30 +3565,807 @@ async function handleApi(req, res, pathname, query) {
     }
     if (pathname === '/api/sale-snapshot/lines' && req.method === 'GET') {
       if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
+      let snapshotDates;
+      try {
+        snapshotDates=normalizeJalaliRange({ dateFrom:query.dateFrom||'', dateTo:query.dateTo||'' });
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
       return sendJson(res, 200, await saleSnapshot.lines(db, {
         snapshotId: query.snapshotId || '',
         itemCode: query.itemCode || '',
         sellerAccountNumber: query.sellerAccountNumber || '',
-        dateFrom: query.dateFrom || '',
-        dateTo: query.dateTo || '',
+        dateFrom: snapshotDates.dateFrom,
+        dateTo: snapshotDates.dateTo,
         limit: Number(query.limit || 500)
       }));
     }
 
     if (pathname === '/api/sale-snapshot/seller-performance' && req.method === 'GET') {
-      if (!requireRole(req, res, ['admin','accounting','purchase'])) return;
+      if (!canUseSellerPerformance(req, res)) return;
+      let reportDates;
+      try {
+        reportDates=normalizeJalaliRange({ dateFrom:query.dateFrom||'', dateTo:query.dateTo||'' });
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
+      const sellerScope=await authorizedSellerScope(db,req,query.sellerAccountNumber||query.seller||'');
+      if(!sellerScope.ok)return sendJson(res,sellerScope.status||403,{ok:false,code:sellerScope.code,error:sellerScope.error});
       return sendJson(res, 200, await saleSnapshot.sellerPerformance(db, {
-        sellerAccountNumber: query.sellerAccountNumber || query.seller || '',
-        dateFrom: query.dateFrom || '',
-        dateTo: query.dateTo || '',
-        limit: Number(query.limit || 5000),
+        sellerAccountNumber: sellerScope.sellerAccountNumber,
+        store: query.store || '',
+        dateFrom: reportDates.dateFrom,
+        dateTo: reportDates.dateTo,
+        limit: Number(query.limit || 250000),
         invoiceLimit: Number(query.invoiceLimit || 1000),
         lineLimit: Number(query.lineLimit || 1000)
       }));
     }
 
+    // 0.9.19.65: accounting readiness and governed manual-cost evidence.
+    // This is deliberately separate from supplierPurchaseLayers and does not calculate FIFO, profit or commission.
+    if (pathname === '/api/manual-cost-resolutions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await manualCostResolution.list(db,query));
+    }
+    if (pathname === '/api/manual-cost-resolutions' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try {
+        return sendJson(res,201,await manualCostResolution.createDraft(db,body,currentUser(req)));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID',error:String(error.message||error)});
+      }
+    }
+    const manualCostMatch=pathname.match(/^\/api\/manual-cost-resolutions\/([^/]+)(?:\/(submit|approve|reject|expire))?$/);
+    if (manualCostMatch && req.method === 'GET' && !manualCostMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,{ok:true,resolution:await manualCostResolution.getById(db,decodeURIComponent(manualCostMatch[1]))});
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||404),{ok:false,code:error.code||'MANUAL_COST_NOT_FOUND',error:String(error.message||error)});
+      }
+    }
+    if (manualCostMatch && ['PUT','PATCH'].includes(req.method) && !manualCostMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,await manualCostResolution.updateDraft(db,decodeURIComponent(manualCostMatch[1]),body,currentUser(req)));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID',error:String(error.message||error)});
+      }
+    }
+    if (manualCostMatch && req.method === 'POST' && manualCostMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,await manualCostResolution.transition(db,decodeURIComponent(manualCostMatch[1]),manualCostMatch[2],currentUser(req),body));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID_TRANSITION',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/missing-purchase-costs' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        return sendJson(res,200,await manualCostResolution.missingQueue(db,query));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MISSING_COST_QUEUE_INVALID',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/missing-purchase-costs/export' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        const report=await manualCostResolution.missingQueue(db,{...query,export:true,page:1,pageSize:5000});
+        const csvCell=value=>{
+          let text=String(value??'');
+          if(/^[=+\-@]/.test(text))text=`'${text}`;
+          return `"${text.replace(/"/g,'""')}"`;
+        };
+        const headers=['ItemCode','ItemDescription','ItemGuid','CurrentInventory','SaleCount','SaleQuantity','SaleAmount','Coverage','Reason','FirstSale','LastSale','PurchaseLayerStatus','SuggestedResolution'];
+        const lines=[headers.map(csvCell).join(',')];
+        for(const row of report.list)lines.push([
+          row.itemCode,row.itemDescription,row.itemGuid,row.currentInventory,row.saleCount,row.saleQuantity,row.saleAmount,row.coverage,row.reason,row.firstSaleDate,row.lastSaleDate,row.purchaseLayerStatus,row.suggestedResolution
+        ].map(csvCell).join(','));
+        const body='\uFEFF'+lines.join('\r\n');
+        res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="missing-purchase-costs.csv"','Cache-Control':'no-store'});
+        return res.end(body);
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MISSING_COST_EXPORT_INVALID',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/fifo-readiness' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.readiness(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_READINESS_INVALID',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/cost-coverage' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.coverage(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'COST_COVERAGE_INVALID',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/data-health' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await manualCostResolution.dataHealth(db));
+    }
+
+    // 0.9.19.70: immutable FIFO profit facts, governed adjustments and
+    // preliminary commission review. This boundary owns no invoice, Shaygan,
+    // inventory, Sale Snapshot, Purchase Layer or FIFO source writes.
+    const sendLedgerError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error),...(error.blockers?{blockers:error.blockers}:{}),...(error.readiness?{readiness:error.readiness}:{}),...(error.details?{details:error.details}:{})});
+    if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.ensureIndexes(db));}catch(error){return sendLedgerError(error,'PROFIT_LEDGER_INIT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/health'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.health(db));}catch(error){return sendLedgerError(error,'PROFIT_LEDGER_HEALTH_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/facts'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listFacts(db,query));}catch(error){return sendLedgerError(error,'FIFO_PROFIT_FACTS_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/facts/materialize'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.materializeFifoProfitFacts(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'FIFO_PROFIT_FACTS_MATERIALIZE_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/adjustments'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listAdjustments(db,query));}catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENTS_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/adjustments'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createAdjustment(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENT_CREATE_FAILED');}
+    }
+    const profitAdjustmentMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/adjustments\/([^/]+)(?:\/(submit|approve|reject|expire|reverse))?$/);
+    if(profitAdjustmentMatch&&['PUT','PATCH'].includes(req.method)&&!profitAdjustmentMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.updateAdjustmentDraft(db,decodeURIComponent(profitAdjustmentMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENT_UPDATE_FAILED');}
+    }
+    if(profitAdjustmentMatch&&req.method==='POST'&&profitAdjustmentMatch[2]){
+      if(!requireRole(req,res,profitAdjustmentMatch[2]==='submit'?['admin','accounting']:['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,profitAdjustmentMatch[2]==='reverse'
+        ?await profitCommissionLedger.reverseAdjustment(db,decodeURIComponent(profitAdjustmentMatch[1]),body,currentUser(req))
+        :await profitCommissionLedger.transitionAdjustment(db,decodeURIComponent(profitAdjustmentMatch[1]),profitAdjustmentMatch[2],body,currentUser(req)));
+      }catch(error){return sendLedgerError(error,'PROFIT_ADJUSTMENT_TRANSITION_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/saved-profit'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listSavedLedger(db,query));}catch(error){return sendLedgerError(error,'SAVED_PROFIT_LEDGER_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/supplier-incentives'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listSupplierIncentives(db,query));}catch(error){return sendLedgerError(error,'SUPPLIER_INCENTIVE_LEDGER_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/categories'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listCategoryMappings(db,query));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORIES_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/categories'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createCategoryMapping(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_CREATE_FAILED');}
+    }
+    const categoryWorkflowMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/categories\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    if(categoryWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!categoryWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.updateCategoryMapping(db,decodeURIComponent(categoryWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_UPDATE_FAILED');}
+    }
+    if(categoryWorkflowMatch&&req.method==='POST'&&categoryWorkflowMatch[2]){
+      if(!requireRole(req,res,['approve','reject','return'].includes(categoryWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.transitionCategoryMapping(db,decodeURIComponent(categoryWorkflowMatch[1]),categoryWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_CATEGORY_WORKFLOW_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/rates'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listRateVersions(db,query));}catch(error){return sendLedgerError(error,'COMMISSION_RATES_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/rates'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createRateVersion(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_CREATE_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/rates/seed-tir'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.seedTirRateCandidates(db,currentUser(req)));}catch(error){return sendLedgerError(error,'TIR_RATE_SEED_FAILED');}
+    }
+    const rateWorkflowMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    if(rateWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!rateWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.updateRateVersion(db,decodeURIComponent(rateWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_UPDATE_FAILED');}
+    }
+    if(rateWorkflowMatch&&req.method==='POST'&&rateWorkflowMatch[2]){
+      if(!requireRole(req,res,['approve','reject','return'].includes(rateWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.transitionRateVersion(db,decodeURIComponent(rateWorkflowMatch[1]),rateWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_WORKFLOW_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/discounts'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listDiscountFacts(db,query));}catch(error){return sendLedgerError(error,'INVOICE_DISCOUNT_FACTS_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/discounts/extract'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.extractInvoiceDiscountFacts(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'INVOICE_DISCOUNT_EXTRACT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/commission-drafts'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.calculateDraftCommission(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_DRAFT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/commission-drafts'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.commissionReport(db,query));}catch(error){return sendLedgerError(error,'COMMISSION_DRAFT_REPORT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/excel/export'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createExcelExport(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'ACCOUNTING_EXCEL_EXPORT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/excel/import'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.importExcelEdits(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'ACCOUNTING_EXCEL_IMPORT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/excel/audit'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitCommissionLedger.listExcelAudit(db,query));}catch(error){return sendLedgerError(error,'ACCOUNTING_EXCEL_AUDIT_FAILED');}
+    }
+    if(pathname==='/api/accounting/profit-ledger/tir-reconstruction'&&['GET','POST'].includes(req.method)){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const body=req.method==='POST'?await collectBody(req):query;const db=await connectMongo();
+      try{return sendJson(res,200,req.method==='POST'
+        ?await profitCommissionLedger.buildTirReconstruction(db,body,currentUser(req))
+        :await profitCommissionLedger.readTirReconstruction(db,body,currentUser(req)));
+      }catch(error){return sendLedgerError(error,'TIR_RECONSTRUCTION_FAILED');}
+    }
+
+    // 0.9.19.71: governed accounting evidence and human approval UI. The
+    // official group refresh performs ItemGroup/GetList + Item/Get reads only; all writes below
+    // are limited to module-owned governance/audit collections.
+    if(pathname==='/api/accounting/governance/group-catalog/refresh'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.refreshOfficialGroupCatalog(db,shaygan,body,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_CATALOG_REFRESH_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/group-review'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.groupReviewMatrix(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_REVIEW_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/rate-review'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.rateReviewMatrix(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'RATE_REVIEW_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/readiness'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.readiness(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_READINESS_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/opening-balances'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.listOpeningBalances(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_LIST_FAILED');}
+    }
+    if(pathname==='/api/accounting/governance/opening-balances'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingGovernance.createOpeningBalance(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_CREATE_FAILED');}
+    }
+    const openingWorkflowMatch=pathname.match(/^\/api\/accounting\/governance\/opening-balances\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    if(openingWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!openingWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.updateOpeningBalance(db,decodeURIComponent(openingWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_UPDATE_FAILED');}
+    }
+    if(openingWorkflowMatch&&req.method==='POST'&&openingWorkflowMatch[2]){
+      if(!requireRole(req,res,['approve','reject','return'].includes(openingWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.transitionOpeningBalance(db,decodeURIComponent(openingWorkflowMatch[1]),openingWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'OPENING_BALANCE_WORKFLOW_FAILED');}
+    }
+
+    // 0.9.19.68: operational accounting review workbench.
+    // Candidate and workflow writes are restricted to module-owned audit
+    // collections. No invoice, Shaygan, Sale Snapshot, Purchase Layer,
+    // completed FIFO dataset or financial activation write is performed.
+    if (pathname === '/api/accounting/operational-review/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingOperationalReview.ensureIndexes(db));
+    }
+    if (pathname === '/api/accounting/operational-review/synchronize' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.synchronize(db,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_SYNC_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.impactReport(db));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    const operationalListMatch=pathname.match(/^\/api\/accounting\/operational-review\/(investigations|recovery|identities|returns|manualPackages|batches|samples)$/);
+    if (operationalListMatch && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.list(db,operationalListMatch[1],query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_LIST_FAILED',error:String(error.message||error)});}
+    }
+    const operationalTransitionMatch=pathname.match(/^\/api\/accounting\/operational-review\/(investigations|recovery|identities|returns)\/([^/]+)$/);
+    if (operationalTransitionMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.transitionReview(
+        db,operationalTransitionMatch[1],decodeURIComponent(operationalTransitionMatch[2]),body,currentUser(req)
+      ));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/manual-packages' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,201,await accountingOperationalReview.createManualPackage(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_EVIDENCE_PACKAGE_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/batches' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,201,await accountingOperationalReview.createBatch(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_BATCH_CREATE_FAILED',error:String(error.message||error)});}
+    }
+    const batchTransitionMatch=pathname.match(/^\/api\/accounting\/operational-review\/batches\/([^/]+)$/);
+    if (batchTransitionMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingOperationalReview.transitionBatch(db,decodeURIComponent(batchTransitionMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_BATCH_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/operational-review/export.csv' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        const report=await accountingOperationalReview.exportReview(db,query);
+        const cell=value=>{
+          let text=String(value??'').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,5000);
+          if(/^[=+\-@]/.test(text))text=`'${text}`;
+          return `"${text.replace(/"/g,'""')}"`;
+        };
+        const headers=['investigationId','evidenceId','sourceFifoDatasetId','revision','priority','itemCode','itemDescription','affectedSaleValue','affectedQuantity','systemClassification','confidence','reviewStatus','recommendedNextAction','unresolvedQuestions'];
+        const lines=[headers.map(cell).join(',')];
+        for(const row of report.rows)lines.push(headers.map(name=>cell(row[name])).join(','));
+        res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="accounting-operational-review.csv"','Cache-Control':'no-store','X-Accounting-Decision-Import':'disabled'});
+        return res.end('\uFEFF'+lines.join('\r\n'));
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_OPERATIONAL_EXPORT_FAILED',error:String(error.message||error)});
+      }
+    }
+
+    // 0.9.19.69: Human Accounting session freeze, reference comparison and
+    // versioned Final Acceptance Tests. All writes are isolated to review/FAT
+    // collections. No source snapshot, Purchase Layer, completed FIFO,
+    // invoice, Shaygan, Profit, ROI or Commission write is performed.
+    if (pathname === '/api/accounting/fat/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      try {
+        const indexes=await accountingFinalAcceptance.ensureIndexes(db);
+        const definitions=await accountingFinalAcceptance.initializeFatDefinitions(db,currentUser(req));
+        return sendJson(res,200,{ok:true,indexes,definitions,profitActivationAllowed:false});
+      } catch(error) {
+        return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_FAT_INIT_FAILED',error:String(error.message||error)});
+      }
+    }
+    if (pathname === '/api/accounting/fat/definitions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingFinalAcceptance.listFatDefinitions(db));
+    }
+    if (pathname === '/api/accounting/fat/sessions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingFinalAcceptance.listSessions(db,query));
+    }
+    if (pathname === '/api/accounting/fat/sessions' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.createSession(db,body,currentUser(req),{gitSha:process.env.GIT_COMMIT||process.env.COMMIT_SHA||''}));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_CREATE_FAILED',error:String(error.message||error)});}
+    }
+    const fatSessionMatch=pathname.match(/^\/api\/accounting\/fat\/sessions\/([^/]+)(?:\/(report|simulator|fifo-rerun-gate|export\.csv))?$/);
+    if (fatSessionMatch && req.method === 'GET' && !fatSessionMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,{ok:true,session:await accountingFinalAcceptance.getSession(db,decodeURIComponent(fatSessionMatch[1]))});}
+      catch(error){return sendJson(res,Number(error.statusCode||404),{ok:false,code:error.code||'ACCOUNTING_SESSION_NOT_FOUND',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'PATCH' && !fatSessionMatch[2]) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.transitionSession(db,decodeURIComponent(fatSessionMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'GET' && fatSessionMatch[2] === 'report') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.sessionReport(db,decodeURIComponent(fatSessionMatch[1])));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'POST' && fatSessionMatch[2] === 'simulator') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.coverageSimulator(db,decodeURIComponent(fatSessionMatch[1]),body));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SIMULATOR_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'GET' && fatSessionMatch[2] === 'fifo-rerun-gate') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.fifoRerunGate(db,decodeURIComponent(fatSessionMatch[1])));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RERUN_GATE_FAILED',error:String(error.message||error)});}
+    }
+    if (fatSessionMatch && req.method === 'GET' && fatSessionMatch[2] === 'export.csv') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try {
+        const exported=await accountingFinalAcceptance.exportSession(db,decodeURIComponent(fatSessionMatch[1]));
+        const cell=value=>{let text=String(value??'').replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,5000);if(/^[=+\-@]/.test(text))text=`'${text}`;return `"${text.replace(/"/g,'""')}"`;};
+        const headers=['sessionId','category','recordId','frozenFifoDatasetId','status','revision'];
+        const lines=[headers.map(cell).join(',')];for(const row of exported.rows)lines.push(headers.map(name=>cell(row[name])).join(','));
+        res.writeHead(200,{'Content-Type':'text/csv; charset=utf-8','Content-Disposition':'attachment; filename="accounting-fat-session.csv"','Cache-Control':'no-store','X-Accounting-Decision-Import':'disabled'});
+        return res.end('\uFEFF'+lines.join('\r\n'));
+      } catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SESSION_EXPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/comparison/imports' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();const filter=query.sessionId?{frozenSessionId:String(query.sessionId)}:{};
+      const list=await db.collection(accountingFinalAcceptance.COMPARISON_IMPORTS).find(filter).sort({createdAt:-1}).limit(50).toArray();
+      return sendJson(res,200,{ok:true,total:list.length,list});
+    }
+    if (pathname === '/api/accounting/comparison/imports' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.createComparisonImport(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_IMPORT_FAILED',error:String(error.message||error)});}
+    }
+    const comparisonImportMatch=pathname.match(/^\/api\/accounting\/comparison\/imports\/([^/]+)\/(rows|recover|cancel)$/);
+    if (comparisonImportMatch && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();const id=decodeURIComponent(comparisonImportMatch[1]);
+      try {
+        const result=comparisonImportMatch[2]==='rows'
+          ?await accountingFinalAcceptance.ingestComparisonRows(db,id,body,currentUser(req))
+          :comparisonImportMatch[2]==='recover'
+            ?await accountingFinalAcceptance.recoverComparisonImport(db,id,body,currentUser(req))
+            :await accountingFinalAcceptance.cancelComparisonImport(db,id,body,currentUser(req));
+        return sendJson(res,200,result);
+      } catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_IMPORT_ACTION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/comparison/runs' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();const filter=query.sessionId?{sessionId:String(query.sessionId)}:{};
+      const list=await db.collection(accountingFinalAcceptance.COMPARISON_RUNS).find(filter).sort({createdAt:-1}).limit(50).toArray();
+      return sendJson(res,200,{ok:true,total:list.length,list});
+    }
+    if (pathname === '/api/accounting/comparison/runs' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.prepareComparisonRun(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_RUN_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/comparison/differences' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.listComparisonDifferences(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_DIFFERENCES_FAILED',error:String(error.message||error)});}
+    }
+    const comparisonRunMatch=pathname.match(/^\/api\/accounting\/comparison\/runs\/([^/]+)\/(execute|recover)$/);
+    if (comparisonRunMatch && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();const id=decodeURIComponent(comparisonRunMatch[1]);
+      try{return sendJson(res,200,comparisonRunMatch[2]==='execute'?await accountingFinalAcceptance.executeComparisonBatch(db,id,body,currentUser(req)):await accountingFinalAcceptance.recoverComparisonRun(db,id,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_COMPARISON_RUN_ACTION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fat/runs' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();return sendJson(res,200,await accountingFinalAcceptance.listFatRuns(db,query));
+    }
+    if (pathname === '/api/accounting/fat/runs' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await accountingFinalAcceptance.prepareFatRun(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FAT_RUN_PREPARE_FAILED',error:String(error.message||error)});}
+    }
+    const fatRunReportMatch=pathname.match(/^\/api\/accounting\/fat\/runs\/([^/]+)\/report$/);
+    if (fatRunReportMatch && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingFinalAcceptance.fatRunReport(db,decodeURIComponent(fatRunReportMatch[1]),query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FAT_RUN_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    const fatRunActionMatch=pathname.match(/^\/api\/accounting\/fat\/runs\/([^/]+)\/(execute-technical|evidence|differences|approve)$/);
+    if (fatRunActionMatch && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);const db=await connectMongo();const id=decodeURIComponent(fatRunActionMatch[1]);
+      try {
+        const result=fatRunActionMatch[2]==='execute-technical'
+          ?await accountingFinalAcceptance.executeTechnicalFat(db,id,currentUser(req))
+          :fatRunActionMatch[2]==='evidence'
+            ?await accountingFinalAcceptance.recordFatEvidence(db,id,body,currentUser(req))
+            :fatRunActionMatch[2]==='differences'
+              ?await accountingFinalAcceptance.recordFatDifference(db,id,body,currentUser(req))
+            :await accountingFinalAcceptance.approveFatScenario(db,id,body,currentUser(req));
+        return sendJson(res,200,result);
+      } catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FAT_RUN_ACTION_FAILED',error:String(error.message||error)});}
+    }
+
+    // 0.9.19.67: evidence, return linkage, precision and approval-gate diagnostics.
+    // All writes are isolated to Phase-owned audit collections. Official sources,
+    // Profit, ROI, Commission and Shaygan business documents remain untouched.
+    if (pathname === '/api/accounting/fifo-readiness/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.ensureIndexes(db));
+    }
+    if (pathname === '/api/accounting/fifo-readiness/synchronize' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.synchronize(db,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_EVIDENCE_SYNC_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/evidence' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listEvidence(db,query));
+    }
+    const evidenceMatch=pathname.match(/^\/api\/accounting\/evidence\/([^/]+)$/);
+    if (evidenceMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.transitionEvidence(db,decodeURIComponent(evidenceMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_EVIDENCE_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/purchase-return-resolutions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listReturnResolutions(db,'purchase',query));
+    }
+    if (pathname === '/api/accounting/sale-return-resolutions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listReturnResolutions(db,'sale',query));
+    }
+    const returnResolutionMatch=pathname.match(/^\/api\/accounting\/(purchase|sale)-return-resolutions\/([^/]+)$/);
+    if (returnResolutionMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.transitionReturn(db,returnResolutionMatch[1],decodeURIComponent(returnResolutionMatch[2]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'RETURN_RESOLUTION_TRANSITION_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-readiness/samples' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.listSamples(db,query));
+    }
+    const sampleMatch=pathname.match(/^\/api\/accounting\/fifo-readiness\/samples\/([^/]+)$/);
+    if (sampleMatch && ['PUT','PATCH'].includes(req.method)) {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const body=await collectBody(req);
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.reviewSample(db,decodeURIComponent(sampleMatch[1]),body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_SAMPLE_REVIEW_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-readiness/comparison' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await accountingEvidenceConfidence.comparison(db,query.newDatasetId||'',query.oldDatasetId||''));
+    }
+    if (pathname === '/api/accounting/fifo-readiness/report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await accountingEvidenceConfidence.readinessReport(db,query.datasetId||''));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ACCOUNTING_READINESS_REPORT_FAILED',error:String(error.message||error)});}
+    }
+
+    // 0.9.19.66: isolated accounting FIFO ledger in SHADOW MODE only.
+    // It reads immutable Sale Snapshot, Purchase Layer and approved Manual Cost sources.
+    // It never writes those sources and never activates profit, ROI or commission.
+    if (pathname === '/api/accounting/fifo-shadow/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      await fifoShadowEngine.ensureIndexes(db);
+      return sendJson(res,200,{
+        ok:true,
+        version:APP_VERSION,
+        algorithmVersion:fifoShadowEngine.ALGORITHM_VERSION,
+        collections:[
+          fifoShadowEngine.DATASETS,
+          fifoShadowEngine.ALLOCATIONS,
+          fifoShadowEngine.DIAGNOSTICS,
+          fifoShadowEngine.EXCEPTIONS,
+          fifoShadowEngine.STATE
+        ],
+        shadowMode:true,
+        accountingApproved:false,
+        profitActivationAllowed:false
+      });
+    }
+    if ((pathname === '/api/accounting/fifo-shadow/start' || pathname === '/api/accounting/fifo-shadow/resume') && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      let dates;
+      try {
+        dates=normalizeJalaliRange({dateFrom:body.dateFrom||query.dateFrom||'',dateTo:body.dateTo||query.dateTo||''});
+      } catch(error) {
+        return sendJalaliDateValidationError(res,error);
+      }
+      const resumeDatasetId=String(
+        body.resumeDatasetId||query.resumeDatasetId||
+        (pathname.endsWith('/resume')?body.datasetId||query.datasetId:'')||''
+      ).trim();
+      const reviewSessionId=String(body.reviewSessionId||query.reviewSessionId||'').trim();
+      const request={
+        dateFrom:dates.dateFrom,
+        dateTo:dates.dateTo,
+        resumeDatasetId,
+        reviewSessionId,
+        saleSnapshotId:String(body.saleSnapshotId||query.saleSnapshotId||'').trim(),
+        purchaseDatasetId:String(body.purchaseDatasetId||query.purchaseDatasetId||'').trim(),
+        maxAttempts:Math.max(1,Math.min(Number(body.maxAttempts||query.maxAttempts||3),5))
+      };
+      const db=await connectMongo();
+      if (pathname.endsWith('/start')) {
+        if (!reviewSessionId) return sendJson(res,409,{ok:false,code:'FIFO_REVIEW_SESSION_REQUIRED',error:'شروع FIFO جدید فقط با Accounting Review Session frozen مجاز است.'});
+        let rerunGate;
+        try { rerunGate=await accountingFinalAcceptance.fifoRerunGate(db,reviewSessionId); }
+        catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RERUN_GATE_FAILED',error:String(error.message||error)});}
+        if (!rerunGate.allowed) return sendJson(res,409,{ok:false,code:'FIFO_AUTHORIZED_ACCOUNTING_DECISION_REQUIRED',error:'حداقل یک تصمیم انسانی مجاز قبل از FIFO rerun الزامی است.',gate:rerunGate});
+        request.saleSnapshotId=rerunGate.sourceSaleSnapshotId;
+        request.purchaseDatasetId=rerunGate.sourcePurchaseDatasetId;
+        request.accountingReviewContext={
+          sessionId:rerunGate.sessionId,
+          priorFifoDatasetId:rerunGate.priorFifoDatasetId,
+          approvedDecisionIds:rerunGate.approvedDecisionIds,
+          sourceSaleSnapshotId:rerunGate.sourceSaleSnapshotId,
+          sourcePurchaseDatasetId:rerunGate.sourcePurchaseDatasetId,
+          algorithmVersion:rerunGate.algorithmVersion,
+          expectedProjectedImpact:rerunGate.expectedProjectedImpact,
+          shadowOnly:true
+        };
+      }
+      if(fifoShadowJobManager.isRunning('fifo-shadow')){
+        const running=fifoShadowJobManager.getRunning('fifo-shadow');
+        return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'FIFO Shadow job is already running',jobId:running?.id||''});
+      }
+      const cutoff=new Date(Date.now()-15*60*1000);
+      const recentLock=await db.collection('appJobs').findOne({
+        type:'fifo-shadow',
+        status:{$in:['queued','running']},
+        updatedAt:{$gte:cutoff}
+      },{sort:{updatedAt:-1}});
+      if(recentLock)return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'FIFO Shadow job is already running',jobId:recentLock.jobId||''});
+      const jobId=`JOB-FIFO-SHADOW-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const now=new Date();
+      const requestedBy=currentUser(req);
+      await db.collection('appJobs').updateOne({jobId},{$set:{
+        jobId,type:'fifo-shadow',status:'queued',phase:'pending',createdAt:now,updatedAt:now,request,
+        requestedBy:{username:requestedBy.username||'',role:requestedBy.role||''}
+      }},{upsert:true});
+      try {
+        startFifoShadowBackgroundJob({db,jobId,request,requestedBy});
+      } catch(error) {
+        await db.collection('appJobs').updateOne({jobId},{$set:{
+          status:'failed',finishedAt:new Date(),updatedAt:new Date(),error:String(error.message||error)
+        }}).catch(()=>{});
+        if(error?.code==='JOB_LOCKED')return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:error.message,jobId});
+        throw error;
+      }
+      return sendJson(res,200,{
+        ok:true,jobId,status:'queued',type:'fifo-shadow',shadowMode:true,
+        accountingApproved:false,profitActivationAllowed:false
+      });
+    }
+    if (pathname === '/api/accounting/fifo-shadow/datasets' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.listDatasets(db,Number(query.limit||20)));
+    }
+    if (pathname === '/api/accounting/fifo-shadow/status' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.status(db,query.datasetId||''));
+    }
+    if (pathname === '/api/accounting/fifo-shadow/report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.validationReport(db,query.datasetId||''));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-shadow/allocations' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.listAllocations(db,query));
+    }
+    if (pathname === '/api/accounting/fifo-shadow/exceptions' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await fifoShadowEngine.listExceptions(db,query));
+    }
+
+    // 0.9.19.64: isolated, versioned purchase-layer foundation. No FIFO/profit is activated here.
+    if (pathname === '/api/purchase-layer-datasets/init' && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      await purchaseLayerDataset.ensureIndexes(db);
+      return sendJson(res,200,{ok:true,version:APP_VERSION,collections:['purchaseLayerDatasets','purchaseLayerDatasetState','supplierPurchaseLayers','purchaseLayerDiagnostics'],profitActivationAllowed:false});
+    }
+    if ((pathname === '/api/purchase-layer-datasets/start' || pathname === '/api/purchase-layer-datasets/resume') && req.method === 'POST') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const body=await collectBody(req);
+      let dates;
+      try{
+        dates=normalizeJalaliRange({
+          dateFrom:body.dateFrom||query.dateFrom||'12000101',
+          dateTo:body.dateTo||query.dateTo||''
+        },{requireFrom:true});
+      }catch(error){
+        return sendJalaliDateValidationError(res,error);
+      }
+      const resumeDatasetId=String(body.resumeDatasetId||query.resumeDatasetId||(pathname.endsWith('/resume')?body.datasetId||query.datasetId:'')||'').trim();
+      const request={
+        dateFrom:dates.dateFrom,dateTo:dates.dateTo,
+        mode:body.mode||query.mode||'incremental',
+        reset:body.reset===true||body.reset==='true'||query.reset==='true',
+        resumeDatasetId,
+        replayFromStart:body.replayFromStart===true||body.replayFromStart==='true'||query.replayFromStart==='true',
+        pageSize:Number(body.pageSize||query.pageSize||20),
+        maxPages:Number(body.maxPages||query.maxPages||1000),
+        maxPageAttempts:Number(body.maxPageAttempts||query.maxPageAttempts||3)
+      };
+      const db=await connectMongo();
+      if(purchaseLayerJobManager.isRunning('purchase-layer-dataset')){
+        const running=purchaseLayerJobManager.getRunning('purchase-layer-dataset');
+        return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Purchase Layer Dataset job is already running',jobId:running?.id||''});
+      }
+      const recentLock=await db.collection('appJobs').findOne({
+        type:'purchase-layer-dataset',status:{$in:['queued','running']},
+        updatedAt:{$gte:new Date(Date.now()-10*60*1000)}
+      },{sort:{updatedAt:-1}}).catch(()=>null);
+      if(recentLock)return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Purchase Layer Dataset job lock is active',jobId:recentLock.jobId||''});
+      const jobId=`JOB-PURCHASE-LAYER-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
+      const now=new Date();
+      await db.collection('appJobs').updateOne({jobId},{$set:{jobId,type:'purchase-layer-dataset',status:'queued',phase:'pending',createdAt:now,updatedAt:now,request}},{upsert:true});
+      try{startPurchaseLayerBackgroundJob({db,jobId,request});}
+      catch(error){
+        await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',finishedAt:new Date(),updatedAt:new Date(),error:String(error.message||error)}}).catch(()=>{});
+        if(error?.code==='JOB_LOCKED')return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:error.message,jobId});
+        throw error;
+      }
+      return sendJson(res,200,{ok:true,jobId,status:'queued',type:'purchase-layer-dataset',profitActivationAllowed:false});
+    }
+    if (pathname === '/api/purchase-layer-datasets' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.listDatasets(db,Number(query.limit||20)));
+    }
+    if (pathname === '/api/purchase-layer-datasets/status' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.status(db,query.datasetId||''));
+    }
+    if (pathname === '/api/purchase-layer-datasets/coverage' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.coverage(db,query.datasetId||''));
+    }
+    if (pathname === '/api/purchase-layer-datasets/layers' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.listLayers(db,{
+        datasetId:query.datasetId||'',itemCode:query.itemCode||'',
+        supplierAccountNumber:query.supplierAccountNumber||'',layerKind:query.layerKind||'',
+        validationStatus:query.validationStatus||'',limit:Number(query.limit||500)
+      }));
+    }
 
     // 0.9.19.27: Supplier stock sleep based on purchase invoice layers, not Kardex.
     if (pathname === '/api/supplier-sleep/init' && req.method === 'POST') {
@@ -3864,7 +4680,7 @@ async function handleApi(req, res, pathname, query) {
     }
     if (pathname === '/api/shaygan/sql-health') { // FIX-C2
       if (!requireRole(req, res, ['admin'])) return;
-      return sendJson(res, 200, { ok:false, disabled:true, message:'اتصال مستقیم SQL از نسخه 0.9.19.17-WS حذف شده؛ WebService رسمی شایگان استفاده می‌شود.' });
+      return sendJson(res, 200, { ok:false, disabled:true, message:'اتصال مستقیم SQL غیرفعال است؛ WebService رسمی شایگان استفاده می‌شود.' });
     }
     if (pathname === '/api/shaygan/health') { // FIX-C2
       if (!needLogin(req, res)) return;
@@ -3921,29 +4737,59 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok:r.ok, list, source:r.source||'', scannedPages:r.scannedPages||0, error:r.error||'' });
     }
     if (pathname === '/api/accounts/sync' && req.method === 'POST') { if (!requireRole(req, res, ['admin'])) return; return sendJson(res, 200, await syncAccountsCatalog(Number(query.pages || config.accountSearchPages || 220))); }
+    if (pathname === '/api/search/inventory-verify' && req.method === 'GET') {
+      if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      const itemCode = String(query.itemCode || '').trim();
+      const stockNumber = String(query.stockNumber || '').trim();
+      const searchSessionId = String(query.searchSessionId || '').trim();
+      const generation = Number(query.generation || 0);
+      const searchQuery = String(query.query || '').trim();
+      if (!itemCode || !searchSessionId || !Number.isFinite(generation)) return sendJson(res, 400, { ok:false, error:'itemCode, searchSessionId and generation required' });
+      const live = await shaygan.getInventoryByItemCode(itemCode).catch(e => ({ ok:false, list:[], error:String(e.message||e) }));
+      const list = (live.list || []).filter(row => !stockNumber || String(row.stockNumber || row.STNumber || '') === stockNumber);
+      return sendJson(res, 200, { ok:!!live.ok, searchSessionId, generation, query:searchQuery, itemCode, stockNumber, list, error:live.error || '', source:'shaygan-read-only-search-verify' });
+    }
     if (pathname === '/api/items/search') {
       // 0.9.19.17→WS: SQL searchItems حذف شد
-      return sendJson(res, 200, await searchItems(query.q || query.term || '', Number(query.limit || 200), Number(query.pages || config.inventorySearchLivePages)));
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      return sendJson(res, 200, await searchItems(searchQuery, Number(query.limit || 200), Number(query.pages || config.inventorySearchLivePages)));
     }
     if (pathname === '/api/items/search-all') {
       // 0.9.19.17→WS: SQL searchItems حذف شد
-      return sendJson(res, 200, await searchAllItems(query.q || query.term || '', Number(query.limit || 200), Number(query.pages || config.inventoryCatalogSyncPages), { forceLive: query.forceLive === '1' || query.forceLive === 'true' }));
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      return sendJson(res, 200, await searchAllItems(searchQuery, Number(query.limit || 200), Number(query.pages || config.inventoryCatalogSyncPages), { forceLive: query.forceLive === '1' || query.forceLive === 'true' }));
     }
     if (pathname === '/api/sale/inventory-snapshot-search') {
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      const searchTrace = createSearchPerfTrace(pathname, searchQuery, { page:'sale', searchSessionId:query.searchSessionId });
+      req.once('aborted', () => emitSearchAborted(searchTrace));
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
-      const r = await searchSaleInventorySnapshot(query.q || query.term || '', Number(query.limit || 30), filters);
-      return sendJson(res, 200, r);
+      const r = await searchSaleInventorySnapshot(searchQuery, Number(query.limit || 30), filters, searchTrace);
+      searchTrace.localResultCount = (r.groups || []).length;
+      return sendSearchPerfJson(req, res, 200, r, searchTrace);
     }
     if (pathname === '/api/inventory/search') {
+      const searchQuery = query.q || query.term || '';
+      observeItemCodeClassifierV2(pathname, searchQuery);
+      const searchTrace = createSearchPerfTrace(pathname, searchQuery, { page:'inventory', searchSessionId:query.searchSessionId });
+      req.once('aborted', () => emitSearchAborted(searchTrace));
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
-      const r = await searchInventoryRows(query.q || query.term || '', Number(query.limit || 0), Number(query.pages || config.inventoryCatalogSyncPages), filters);
+      const r = await searchInventoryRows(searchQuery, Number(query.limit || 0), Number(query.pages || config.inventoryCatalogSyncPages), filters, searchTrace);
       const dd = dedupeRemainRows(r.list || []);
-      return sendJson(res, 200, { ok:r.ok, list:dd.list, groups: inventoryGroups(dd.list), source:(r.source||'')+'-deduped-store-item', scannedPages:r.scannedPages||0, fallback:r.fallback||null, error:r.error||'', rawCount:dd.rawCount, uniqueCount:dd.uniqueCount, duplicateCount:dd.duplicates.length, duplicateConflicts:dd.conflicts });
+      const groupingStarted = searchPerfNow();
+      const payload = { ok:r.ok, list:dd.list, groups: inventoryGroups(dd.list), source:(r.source||'')+'-deduped-store-item', scannedPages:r.scannedPages||0, fallback:r.fallback||null, error:r.error||'', rawCount:dd.rawCount, uniqueCount:dd.uniqueCount, duplicateCount:dd.duplicates.length, duplicateConflicts:dd.conflicts };
+      searchTrace.groupingMs += Number((searchPerfNow() - groupingStarted).toFixed(3));
+      searchTrace.localResultCount = dd.list.length;
+      return sendSearchPerfJson(req, res, 200, payload, searchTrace);
     }
     if (pathname === '/api/inventory/by-stock') {
       // 0.9.15.9: sellers also need full selected-warehouse inventory for stocktaking/control.
       if (!requireRole(req, res, ['admin','seller','seller_buyer','accounting','warehouse','purchase'])) return;
+      observeItemCodeClassifierV2(pathname, query.q || '');
       const filters = { stockNumber: query.stockNumber || '', itemMainGroupCode: query.mainGroupCode || '', itemGroupCode: query.groupCode || '' };
       if (!filters.stockNumber) return sendJson(res, 400, { ok:false, error:'stockNumber required' });
       // 0.9.19.51: operational by-stock view must use global Mongo snapshot, not WebService stock-filter scan.
@@ -4476,49 +5322,76 @@ async function handleApi(req, res, pathname, query) {
     if (pathname === '/api/reports/seller-sales-profit/sellers') {
       if (!canUseSellerPerformance(req, res)) return;
       const db = await connectMongo();
+      const scope=await authorizedSellerScope(db,req,'');
+      if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
       const maps = await db.collection('userShayganMappings').find({ isActive:{ $ne:false } }).sort({ employeeAccountNumber:1, fullName:1 }).limit(800).toArray().catch(()=>[]);
       const by = new Map();
+      const identitiesByName=new Map();
       for (const m of maps) {
-        const emp = String(m.employeeAccountNumber || '').trim();
+        const emp = saleSnapshot._normalizeSellerAccountNumber(m.employeeAccountNumber);
         if (!emp) continue;
-        if (!by.has(emp)) by.set(emp, { username:m.username||'', fullName:m.fullName||`نماینده ${emp}`, storeName:m.storeName||'', cashboxAccountNumber:m.cashboxAccountNumber||'', employeeAccountNumber:emp, sellerKey:emp, source:'userShayganMappings.employeeAccountNumber' });
+        if(scope.scope==='own-seller-only'&&emp!==scope.sellerAccountNumber)continue;
+        const nameKey=saleSnapshot._normalizeSellerName(m.employeeAccountName||m.fullName);
+        if(nameKey){
+          if(!identitiesByName.has(nameKey))identitiesByName.set(nameKey,new Set());
+          identitiesByName.get(nameKey).add(emp);
+        }
+        if (!by.has(emp)) by.set(emp, { username:m.username||'', fullName:m.fullName||m.employeeAccountName||`نماینده ${emp}`, storeName:m.storeName||'', cashboxAccountNumber:m.cashboxAccountNumber||'', employeeAccountNumber:emp, sellerKey:emp, source:'userShayganMappings.employeeAccountNumber' });
       }
-      return sendJson(res, 200, { ok:true, source:'employeeAccountNumber-current-account-mapping', list:[...by.values()].sort((a,b)=>String(a.employeeAccountNumber).localeCompare(String(b.employeeAccountNumber),'fa')) });
+      const ambiguousMappings=[...identitiesByName.entries()].filter(([,values])=>values.size>1).map(([normalizedName,values])=>({normalizedName,accountNumbers:[...values].sort()}));
+      return sendJson(res, 200, { ok:true, source:'employeeAccountNumber-current-account-mapping', stableIdentifier:'AccountNumber', scope:scope.scope, ambiguousMappings, list:[...by.values()].sort((a,b)=>String(a.employeeAccountNumber).localeCompare(String(b.employeeAccountNumber),'fa')) });
     }
     if (pathname === '/api/reports/seller-sales-profit/history') {
       if (!canUseSellerPerformance(req, res)) return;
       const db = await connectMongo();
+      const scope=await authorizedSellerScope(db,req,query.seller||query.employeeAccountNumber||'');
+      if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
+      const ownershipQuery=scope.scope==='own-seller-only'?{$or:[{'filters.seller':scope.sellerAccountNumber},{'filters.employeeAccountNumber':scope.sellerAccountNumber}]}:{};
       if (query.id) {
         let oid = null;
         try { oid = new ObjectId(String(query.id)); } catch {}
-        const doc = oid ? await db.collection('sellerPerformanceHistory').findOne({ _id:oid, type:'seller-performance' }) : null;
+        const doc = oid ? await db.collection('sellerPerformanceHistory').findOne({ _id:oid, type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE, ...ownershipQuery }) : null;
         return sendJson(res, 200, { ok:true, found:!!doc, generatedAt:doc?.generatedAt || null, filters:doc?.filters || null, report:doc?.report || null });
       }
-      const list = await db.collection('sellerPerformanceHistory').find({ type:'seller-performance' }).sort({ generatedAt:-1 }).limit(30).project({ report:0 }).toArray().catch(()=>[]);
+      const list = await db.collection('sellerPerformanceHistory').find({ type:'seller-performance', 'report.source':SELLER_PERFORMANCE_SOURCE, ...ownershipQuery }).sort({ generatedAt:-1 }).limit(30).project({ report:0 }).toArray().catch(()=>[]);
       return sendJson(res, 200, { ok:true, list });
     }
     if (pathname === '/api/reports/seller-sales-profit/latest') {
       if (!canUseSellerPerformance(req, res)) return;
+      let reportQuery;
+      try {
+        reportQuery=normalizeSellerPerformanceQuery(query);
+      } catch (error) {
+        return sendJalaliDateValidationError(res, error);
+      }
       const db = await connectMongo();
-      const doc = await getLatestSellerPerformanceHistory(db, query);
+      const scope=await authorizedSellerScope(db,req,reportQuery.seller||reportQuery.employeeAccountNumber||'');
+      if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
+      reportQuery.seller=scope.sellerAccountNumber;
+      const doc = await getLatestSellerPerformanceHistory(db, reportQuery);
       return sendJson(res, 200, { ok:true, found:!!doc, generatedAt:doc?.generatedAt || null, filters:doc?.filters || null, report:doc?.report || null });
     }
     if (pathname === '/api/reports/seller-sales-profit') {
       if (!canUseSellerPerformance(req, res)) return;
       try {
+        const reportQuery=normalizeSellerPerformanceQuery(query);
         const db = await connectMongo();
-        const force = String(query.force || query.update || '').trim() === '1' || String(query.force || query.update || '').toLowerCase() === 'true';
+        const scope=await authorizedSellerScope(db,req,reportQuery.seller||reportQuery.employeeAccountNumber||'');
+        if(!scope.ok)return sendJson(res,scope.status||403,{ok:false,code:scope.code,error:scope.error});
+        reportQuery.seller=scope.sellerAccountNumber;
+        const force = String(reportQuery.force || reportQuery.update || '').trim() === '1' || String(reportQuery.force || reportQuery.update || '').toLowerCase() === 'true';
         if (!force) {
-          const cached = await getLatestSellerPerformanceHistory(db, query);
+          const cached = await getLatestSellerPerformanceHistory(db, reportQuery);
           if (cached?.report) return sendJson(res, 200, { ...cached.report, ok:true, cached:true, generatedAt:cached.generatedAt, cacheSource:'sellerPerformanceHistory' });
         }
-        const r = await buildSellerSalesProfitReport(query);
+        const r = await buildSellerSalesProfitReportFromSnapshot(db, reportQuery);
         if (r.ok) {
-          const doc = await saveSellerPerformanceHistory(db, query, r, currentUser(req)?.username || 'system');
+          const doc = await saveSellerPerformanceHistory(db, reportQuery, r, currentUser(req)?.username || 'system');
           return sendJson(res, 200, { ...r, cached:false, generatedAt:doc.generatedAt, historyId:String(doc._id) });
         }
         return sendJson(res, 200, r);
       } catch (e) {
+        if (Number(e?.statusCode)===400) return sendJalaliDateValidationError(res, e);
         return sendJson(res, 500, { ok:false, error:String(e.message||e), code:e.code||'' });
       }
     }
@@ -4675,7 +5548,7 @@ async function handleApi(req, res, pathname, query) {
           return sendJson(res, 200, { ok:true, result, invoiceNumber:finalInvoiceNumber, invoiceGuid:finalInvoiceGuid, printUrl:invoicePrintUrl(finalInvoiceNumber), mapping:mappingView, raw:r.raw, error:'', warning: r.warning||'', saleIssueKey, postProcessing:'queued', timing });
         }
         await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:r.error||'خطای ثبت فاکتور فروش', shayganRaw:r.raw, leadManual } });
-        return sendJson(res, 400, { ok:false, result, invoiceNumber:finalInvoiceNumber || 0, invoiceGuid:finalInvoiceGuid || issuedMeta.invoiceGuid || '', mapping: { username:mapping.username, fullName:mapping.fullName, storeName:mapping.storeName||'', cashboxAccountNumber:mapping.cashboxAccountNumber, employeeAccountNumber:mapping.employeeAccountNumber }, raw: r.raw, resolve:resolvedIssued || null, timing, error: (r.ok && !finalInvoiceNumber) ? 'فاکتور در شایگان ثبت شد اما شماره واقعی با GUID/جستجوی امروز resolve نشد؛ برای جلوگیری از چاپ اشتباه متوقف شد. invoiceAuditLogs را بررسی کنید.' : (r.error || 'خطای ثبت فاکتور فروش'), saleIssueKey });
+        return sendJson(res, 400, { ok:false, code:resolvedIssued?.code||'', result, invoiceNumber:finalInvoiceNumber || 0, invoiceGuid:finalInvoiceGuid || issuedMeta.invoiceGuid || '', mapping: { username:mapping.username, fullName:mapping.fullName, storeName:mapping.storeName||'', cashboxAccountNumber:mapping.cashboxAccountNumber, employeeAccountNumber:mapping.employeeAccountNumber }, raw: r.raw, resolve:resolvedIssued || null, timing, error: (r.ok && !finalInvoiceNumber) ? 'POST_PUT_RESOLVE_FAILED' : (r.error || 'خطای ثبت فاکتور فروش'), saleIssueKey });
       } catch (e) {
         await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:String(e.message||e), leadManual } }).catch(()=>{});
         throw e;
@@ -5066,8 +5939,8 @@ async function handleApi(req, res, pathname, query) {
       if (!draft) return sendJson(res, 404, { ok:false, error:'پیش‌نویس خرید پیدا نشد یا دسترسی ندارید' });
       return sendJson(res, 200, { ok:true, draft });
     }
-    if (pathname === '/api/legacy/productName/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; const r = await searchItems(q, 30, Number(query.pages || config.inventorySearchLivePages)); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toProductNameRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
-    if (pathname === '/api/legacy/stock/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; const r = await searchInventoryRows(q, Number(query.limit || 1000), Number(query.pages || config.inventorySearchLivePages), { stockNumber: query.stockNumber || '' }); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toOldStockRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
+    if (pathname === '/api/legacy/productName/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; observeItemCodeClassifierV2(pathname, q); const r = await searchItems(q, 30, Number(query.pages || config.inventorySearchLivePages)); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toProductNameRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
+    if (pathname === '/api/legacy/stock/search') { const body = req.method === 'POST' ? await collectBody(req) : {}; const q = query.q || body.q || body.search || body.name || body.term || body.text || ''; observeItemCodeClassifierV2(pathname, q); const r = await searchInventoryRows(q, Number(query.limit || 1000), Number(query.pages || config.inventorySearchLivePages), { stockNumber: query.stockNumber || '' }); return sendJson(res, 200, { ok:r.ok, list:(r.list||[]).map(toOldStockRow), source:r.source, scannedPages:r.scannedPages||0, error:r.error||'' }); }
     if (pathname === '/api/legacy/cardex/search') { const body = await collectBody(req); const code = body.itemCode || body.ItemCode || query.itemCode; const stockNumber = body.stockNumber || body.STNumber || query.stockNumber || query.STNumber || ''; const r = await shaygan.getKardexByItemCode(code, stockNumber, { maxRows: Number(query.maxRows || config.kardexAdminQuickMaxRows), hardMaxRows: config.kardexAdminFullMaxRows }); return sendJson(res, 200, { ok: r.ok, item: r.item, rows: r.rows || [], meta: r.meta || {}, error: r.error || '' }); }
     if (pathname === '/admin/getUserInfo') return sendJson(res, 200, { userData: { id: 'dev', name: 'تست', role: 'admin' } });
     if (pathname === '/api/template-map') return sendJson(res, 200, getTemplateMap());
@@ -5148,7 +6021,8 @@ async function serveStatic(req, res, pathname) {
   if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) filePath = path.join(publicDir, 'index.html');
   fs.readFile(filePath, (err, data) => {
     if (err) return sendJson(res, 404, { ok: false, error: 'Not found' });
-    res.writeHead(200, { 'Content-Type': mime(filePath), 'Cache-Control': 'no-store, no-cache, must-revalidate' }); res.end(data);
+    const body = path.basename(filePath) === 'index.html' ? injectAssetVersion(data.toString('utf8')) : data;
+    res.writeHead(200, { 'Content-Type': mime(filePath), 'Cache-Control': 'no-store, no-cache, must-revalidate' }); res.end(body);
   });
 }
 

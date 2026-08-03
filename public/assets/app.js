@@ -1,18 +1,35 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 const state = { user:null, selectedItem:null, selectedStock:null, selectedSerials:[], serialInfo:null, invoiceNumber:null, saleLines:[], stocks:null, mappings:null, selectedMapping:null };
+async function loadBackendVersion(){
+  const target=document.getElementById('sidebarVersion');
+  try{
+    const response=await fetch('/api/version',{headers:{Accept:'application/json'},cache:'no-store'});
+    const payload=await response.json();
+    if(!response.ok||!payload.ok||!payload.version)throw new Error('version unavailable');
+    if(target)target.textContent=`نسخه ${payload.version}`;
+    return payload;
+  }catch(_){
+    if(target)target.textContent='نسخه نامشخص';
+    return null;
+  }
+}
+window.loadBackendVersion=loadBackendVersion;
+document.addEventListener('DOMContentLoaded',loadBackendVersion,{once:true});
 const ROLE_PAGES = {
   admin: 'all',
-  seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations'],
-  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
+  seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
+  accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','fifo-profit-facts','profit-adjustment-review','saved-profit-ledger','supplier-incentive-ledger','commission-rate-versions','commission-category-governance','commission-rate-governance','saved-profit-opening-governance','commission-export-readiness','draft-commission-report','tir-1405-reconstruction','accounting-excel-audit','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
   purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
-  seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations']
+  seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
+  manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','fifo-profit-facts','profit-adjustment-review','saved-profit-ledger','supplier-incentive-ledger','commission-rate-versions','commission-category-governance','commission-rate-governance','saved-profit-opening-governance','commission-export-readiness','draft-commission-report','tir-1405-reconstruction','accounting-excel-audit','reports'],
+  supervisor: ['dashboard','seller-profit','reports']
 };
 function userRole(){return (state.user&&state.user.role)||'guest'}
 function canPage(page){const r=userRole(); if(r==='admin') return true; return (ROLE_PAGES[r]||[]).includes(page)}
 function firstAllowedPage(){const r=userRole(); if(r==='admin') return 'dashboard'; return (ROLE_PAGES[r]||['dashboard'])[0] || 'dashboard'}
-const ROLE_LABELS={admin:'مدیر سیستم',seller:'فروشنده',accounting:'حسابداری',warehouse:'انبار',purchase:'بازرگانی',seller_buyer:'فروشنده-خریدار'};
+const ROLE_LABELS={admin:'مدیر سیستم',seller:'فروشنده',accounting:'حسابداری',warehouse:'انبار',purchase:'بازرگانی',seller_buyer:'فروشنده-خریدار',manager:'مدیر',supervisor:'سرپرست'};
 function esc(v){return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}
 function fmt(n){return Number(n||0).toLocaleString('fa-IR')}
 
@@ -22,14 +39,684 @@ function toJalali8(d){if(!d)return '';let dt;if(/^\d{4}-\d{2}-\d{2}/.test(String
 function toJalaliDisplay(d){const x=toJalali8(d);return /^\d{8}$/.test(x)?`${x.slice(0,4)}/${x.slice(4,6)}/${x.slice(6,8)}`:x}
 function todayJalali8(){return toJalali8(new Date())}
 function cleanDate8(v){return String(v||'').replace(/[^0-9]/g,'').slice(0,8)}
+function normalizeSellerPerformanceJalaliDate(v,label='تاریخ'){
+  const raw=String(v??'').trim()
+    .replace(/[۰-۹]/g,d=>String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d)))
+    .replace(/[٠-٩]/g,d=>String('٠١٢٣٤٥٦٧٨٩'.indexOf(d)));
+  if(!raw)return '';
+  const compact=raw.match(/^(\d{4})(\d{2})(\d{2})$/);
+  const separated=raw.match(/^(\d{4})([/-])(\d{2})\2(\d{2})$/);
+  if(!compact&&!separated)throw new Error(`${label} باید تاریخ شمسی کامل با قالب 14050501 باشد.`);
+  const year=Number((compact||separated)[1]);
+  const month=Number(compact?compact[2]:separated[3]);
+  const day=Number(compact?compact[3]:separated[4]);
+  const maxDay=month<=6?31:30;
+  if(year<1200||year>1599||month<1||month>12||day<1||day>maxDay)throw new Error(`${label} شمسی معتبر نیست.`);
+  return `${String(year).padStart(4,'0')}${String(month).padStart(2,'0')}${String(day).padStart(2,'0')}`;
+}
+window.normalizeSellerPerformanceJalaliDate=normalizeSellerPerformanceJalaliDate;
 
 async function api(url, opts={}){const r=await fetch(url,{headers:{'Content-Type':'application/json'},...opts});const j=await r.json().catch(()=>({ok:false,error:'bad json'}));if(!r.ok) throw new Error(j.error||r.statusText);return j}
 function post(url, body){return api(url,{method:'POST',body:JSON.stringify(body||{})})}
+const searchPerfRuntime={activeRequestCount:0};
+const SEARCH_FRONTEND_SLOW_THRESHOLD_MS=700;
+function normalizeSearchTelemetryQuery(value){
+  return String(value||'').trim().toLowerCase().replace(/[ي]/g,'ی').replace(/[ك]/g,'ک').replace(/‌/g,' ').replace(/\s+/g,' ').slice(0,160);
+}
+function searchTelemetryPage(route){
+  if(route==='/api/sale/inventory-snapshot-search')return 'sale';
+  if(route==='/api/inventory/search')return 'inventory';
+  return 'autocomplete';
+}
+function emitSearchFrontendEvent(event,fields){
+  const allowed={
+    SEARCH_ABORTED:['requestId','timestamp','route','page','normalizedQuery','tokenCount','reason','inputToVisibleMs','searchSessionId','generation'],
+    SEARCH_SLOW_QUERY:['requestId','timestamp','route','page','normalizedQuery','tokenCount','resultCount','durationMs','thresholdMs','thresholdType','searchSessionId','generation'],
+    SEARCH_VERIFY_DIFF:['searchSessionId','itemCode','stockNumber','localQuantity','liveQuantity','difference','verifiedAt']
+  }[event]||[];
+  const output={event};
+  allowed.forEach(key=>{
+    if(!Object.prototype.hasOwnProperty.call(fields,key))return;
+    const value=fields[key];
+    if(typeof value==='string')output[key]=value.replace(/[\u0000-\u001f\u007f]/g,' ').slice(0,160);
+    else if(typeof value==='number')output[key]=Number.isFinite(value)?Math.max(-1e12,Math.min(1e12,value)):0;
+    else if(typeof value==='boolean')output[key]=value;
+  });
+  try{setTimeout(()=>{try{console.info(event,JSON.stringify(output))}catch{}},0)}catch{}
+}
+function logSearchPerfFrontend(fields){
+  const normalizedQuery=normalizeSearchTelemetryQuery(fields.query);
+  const tokenCount=normalizedQuery?normalizedQuery.split(/\s+/).length:0;
+  const timestamp=new Date().toISOString();
+  const route=String(fields.endpoint||'').slice(0,128);
+  const page=searchTelemetryPage(route);
+  const requestId=`client-search-${Date.now()}-${Number(fields.generation||0)}`.slice(0,96);
+  const searchSessionId=String(fields.searchSessionId||'').slice(0,128);
+  const legacy={
+    event:'SEARCH_PERF_FRONTEND',timestamp,requestId,route,page,normalizedQuery,tokenCount,
+    generation:Number(fields.generation||0),debounceConfiguredMs:Number(fields.debounceConfiguredMs||0),
+    actualDebounceMs:Number(fields.actualDebounceMs||0),requestStartedAt:String(fields.requestStartedAt||'').slice(0,40),
+    requestMs:Number(fields.requestMs||0),responseToRenderMs:Number(fields.responseToRenderMs||0),
+    inputToVisibleMs:Number(fields.inputToVisibleMs||0),resultCount:Number(fields.resultCount||0),
+    requestAborted:!!fields.requestAborted,staleResponseIgnored:!!fields.staleResponseIgnored,
+    activeRequestCount:Number(fields.activeRequestCount||0)
+  };
+  try{console.info('SEARCH_PERF_FRONTEND',JSON.stringify(legacy))}catch{}
+  if(legacy.requestAborted||legacy.staleResponseIgnored){
+    emitSearchFrontendEvent('SEARCH_ABORTED',{requestId,timestamp,route,page,normalizedQuery,tokenCount,reason:legacy.requestAborted?'abort-controller':'superseded',inputToVisibleMs:legacy.inputToVisibleMs,searchSessionId,generation:legacy.generation});
+  }else if(legacy.inputToVisibleMs>SEARCH_FRONTEND_SLOW_THRESHOLD_MS){
+    emitSearchFrontendEvent('SEARCH_SLOW_QUERY',{requestId,timestamp,route,page,normalizedQuery,tokenCount,resultCount:legacy.resultCount,durationMs:legacy.inputToVisibleMs,thresholdMs:SEARCH_FRONTEND_SLOW_THRESHOLD_MS,thresholdType:'frontend-input-to-visible',searchSessionId,generation:legacy.generation});
+  }
+}
+function logSearchVerifyDiff(fields){
+  const localQuantity=Number(fields.localQuantity||0),liveQuantity=Number(fields.liveQuantity||0);
+  emitSearchFrontendEvent('SEARCH_VERIFY_DIFF',{
+    searchSessionId:String(fields.searchSessionId||'').slice(0,128),
+    itemCode:String(fields.itemCode||'').slice(0,96),
+    stockNumber:String(fields.stockNumber||'').slice(0,48),
+    localQuantity,liveQuantity,difference:liveQuantity-localQuantity,
+    verifiedAt:new Date().toISOString()
+  });
+}
 const uiPageLifecycle=(()=>{
   let cleanups=[];
   function add(cleanup){if(typeof cleanup==='function')cleanups.push(cleanup);return cleanup}
   function cleanup(){const pending=cleanups;cleanups=[];pending.reverse().forEach(fn=>{try{fn()}catch{}})}
   return {add,cleanup};
+})();
+
+/* 0.9.19.70 Profit Adjustment & Commission Ledger.
+   Actual FIFO facts are immutable. Every commission is preliminary and
+   non-payable; sellers have no route or menu access in this phase. */
+(()=>{
+  const PAGES={
+    'fifo-profit-facts':'FIFO Profit Facts',
+    'profit-adjustment-review':'Profit Adjustment Review',
+    'saved-profit-ledger':'Saved Profit Ledger',
+    'supplier-incentive-ledger':'Supplier Incentive Ledger',
+    'commission-rate-versions':'Commission Rate Versions',
+    'draft-commission-report':'Draft Commission Report',
+    'tir-1405-reconstruction':'Tir 1405 Reconstruction',
+    'accounting-excel-audit':'Excel Export / Import Audit'
+  };
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const allowed=()=>['admin','accounting','manager'].includes(userRole());
+  const canEdit=()=>['admin','accounting'].includes(userRole());
+  async function json(url,options={}){const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});const payload=await response.json().catch(()=>({ok:false,error:'پاسخ نامعتبر'}));if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}return payload;}
+  const table=(headers,rows)=>`<div style="overflow:auto"><table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">داده‌ای موجود نیست</td></tr>`}</tbody></table></div>`;
+  const nav=active=>`<div class="actions">${Object.entries(PAGES).map(([id,title])=>`<button class="mini profit-ledger-nav" data-page="${id}" ${id===active?'disabled':''}>${safe(title)}</button>`).join('')}</div>`;
+  const banners=()=>`<div class="warn"><b>ACTUAL FIFO PROFIT — IMMUTABLE</b> &nbsp; | &nbsp; <b>UNKNOWN COST IS NOT ZERO</b></div><div class="info"><b>COMMISSIONABLE PROFIT — ADJUSTED</b> &nbsp; | &nbsp; <b>DRAFT COMMISSION — NOT PAYABLE</b></div>`;
+  function bindNav(){document.querySelectorAll('.profit-ledger-nav').forEach(button=>button.onclick=()=>{location.hash=button.dataset.page;route();});}
+  function failBox(error){return `<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  function shell(page,body,actions=''){setPage(PAGES[page],`<main class="main-content">${banners()}${nav(page)}${actions}<div id="profitLedgerBody">${body}</div></main>`);bindNav();}
+  async function facts(){shell('fifo-profit-facts','<div class="muted">در حال بارگذاری…</div>',canEdit()?'<div class="actions"><button class="btn" id="factsMaterialize">Materialize approved FIFO facts</button></div>':'');try{const r=await json('/api/accounting/profit-ledger/facts?pageSize=300');q('#profitLedgerBody').innerHTML=table(['Invoice / Line','Seller','Item','Official Product Category / Rate Pool','Qty / Sale','FIFO Cost / Actual Profit','Coverage'],(r.list||[]).map(row=>`<tr><td>${safe(row.saleInvoiceIdentity)}<br><small>${safe(row.saleLineIdentity)}</small></td><td>${safe(row.sellerIdentity)}<br>${safe(row.sellerName)}</td><td>${safe(row.itemCode)}<br>${safe(row.itemDescription)}</td><td>${safe(row.officialProductCategoryNumber)} — ${safe(row.officialProductCategoryName||row.commissionCategory)}<br><small>${safe(row.officialProductCategoryIdentity)} | pool ${safe(row.commissionRatePool||'UNRESOLVED')} | ${safe(row.categoryResolutionStatus)}</small></td><td>${safe(row.quantityExact)}<br>${safe(row.saleAmountExact)}</td><td>${safe(row.fifoCostExact??'UNKNOWN')}<br><b>${safe(row.actualFifoProfitExact??'UNAVAILABLE')}</b></td><td>${safe(row.costCoverageStatus)}</td></tr>`));}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}if(q('#factsMaterialize'))q('#factsMaterialize').onclick=async()=>{if(!confirm('فقط از FIFO validated-shadow Fact غیرقابل‌تغییر ساخته شود؟'))return;try{await json('/api/accounting/profit-ledger/facts/materialize',{method:'POST',body:'{}'});await facts();}catch(error){alert(`${error.code||''} ${error.message}`);}};}
+  async function adjustments(){shell('profit-adjustment-review','<div class="muted">در حال بارگذاری…</div>',canEdit()?'<div class="actions"><button class="btn" id="adjustmentCreate">Create Draft Adjustment</button></div>':'');try{const r=await json('/api/accounting/profit-ledger/adjustments?pageSize=300');q('#profitLedgerBody').innerHTML=table(['ID / Line','Type / Pool','Proposed / Approved','Reason','Status','Workflow'],(r.list||[]).map(row=>`<tr><td>${safe(row.adjustmentId)}<br><small>${safe(row.saleLineIdentity)}</small></td><td>${safe(row.adjustmentType)}<br>${safe(row.categoryPool)}</td><td>${safe(row.proposedAmountExact)}<br>${safe(row.approvedAmountExact??'—')}</td><td>${safe(row.reasonCode)}<br>${safe(row.reasonText)}</td><td>${safe(row.status)} r${safe(row.revision)}</td><td>${workflow(row)}</td></tr>`));q('#profitLedgerBody').querySelectorAll('.padj-action').forEach(button=>button.onclick=async()=>{const reason=prompt('دلیل مستند:')||'';try{await json(`/api/accounting/profit-ledger/adjustments/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`,{method:'POST',body:JSON.stringify({revision:Number(button.dataset.revision),reason})});await adjustments();}catch(error){alert(`${error.code||''} ${error.message}`);}});}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}if(q('#adjustmentCreate'))q('#adjustmentCreate').onclick=createAdjustment;}
+  function workflow(row){if(canEdit()&&row.status==='draft')return `<button class="mini padj-action" data-id="${safe(row.adjustmentId)}" data-action="submit" data-revision="${Number(row.revision)}">Submit</button>`;if(['admin','manager'].includes(userRole())&&row.status==='pending')return `<button class="mini padj-action" data-id="${safe(row.adjustmentId)}" data-action="approve" data-revision="${Number(row.revision)}">Approve</button> <button class="mini padj-action" data-id="${safe(row.adjustmentId)}" data-action="reject" data-revision="${Number(row.revision)}">Reject</button>`;if(['admin','manager'].includes(userRole())&&row.status==='approved')return `<button class="mini padj-action" data-id="${safe(row.adjustmentId)}" data-action="reverse" data-revision="${Number(row.revision)}">Reverse</button>`;return '—';}
+  async function createAdjustment(){const fifoDatasetId=prompt('FIFO dataset ID:')||'';const saleLineIdentity=prompt('Sale line identity:')||'';const adjustmentType=prompt('Type: saved_profit_credit / saved_profit_subsidy / invoice_discount / accounting_correction / category_correction / seller_mapping_correction / management_adjustment','saved_profit_credit')||'';const categoryPool=prompt('Pool: NOTEBOOK / COMPONENT','NOTEBOOK')||'';const proposedAmountExact=prompt('Proposed amount IRR:')||'';const effectivePeriod=prompt('Jalali period/date (مثال 140504):','140504')||'';const reasonText=prompt('Reason:')||'';if(!fifoDatasetId||!saleLineIdentity||!proposedAmountExact)return;try{await json('/api/accounting/profit-ledger/adjustments',{method:'POST',body:JSON.stringify({fifoDatasetId,saleLineIdentity,adjustmentType,categoryPool,proposedAmountExact,effectivePeriod,reasonText,reasonCode:'ACCOUNTING_REVIEW'})});await adjustments();}catch(error){alert(`${error.code||''} ${error.message}`);}}
+  async function saved(){shell('saved-profit-ledger','<div class="muted">در حال بارگذاری…</div>');try{const r=await json('/api/accounting/profit-ledger/saved-profit?pageSize=500');q('#profitLedgerBody').innerHTML=`<div class="row">${(r.balances||[]).map(row=>`<div class="info"><b>${safe(row.pool)}</b><br>Credit ${safe(row.creditAmountExact)}<br>Debit ${safe(row.debitAmountExact)}<br>Balance ${safe(row.balanceExact)}</div>`).join('')}</div>${table(['Entry','Pool / Type','Debit','Credit','Period','Source / Beneficiary','Posted'],(r.list||[]).map(row=>`<tr><td>${safe(row.ledgerEntryId)}</td><td>${safe(row.pool)}<br>${safe(row.entryType)}</td><td>${safe(row.debitAmountExact)}</td><td>${safe(row.creditAmountExact)}</td><td>${safe(row.accountingPeriod)}</td><td>${safe(row.sourceSaleLineIdentity)}<br>${safe(row.beneficiarySaleLineIdentity)}</td><td>${safe(row.postedAt)}</td></tr>`))}<div class="warn">Cross-pool transfer is forbidden. Balance is derived; entries are append-only.</div>`;}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}}
+  async function supplier(){shell('supplier-incentive-ledger','<div class="muted">در حال بارگذاری…</div>');try{const r=await json('/api/accounting/profit-ledger/supplier-incentives?pageSize=500');q('#profitLedgerBody').innerHTML=`<div class="warn">Drop / Rebate / Bonus is a separate ledger and is never automatically applied to seller commission.</div>${table(['Entry','Type','Supplier','Amount','Period','Reference'],(r.list||[]).map(row=>`<tr><td>${safe(row.ledgerEntryId)}</td><td>${safe(row.incentiveType)}</td><td>${safe(row.supplierIdentity)}</td><td>${safe(row.amountExact)}</td><td>${safe(row.accountingPeriod)}</td><td>${safe(row.sourceReference)}</td></tr>`))}`;}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}}
+  async function rates(){shell('commission-rate-versions','<div class="muted">در حال بارگذاری…</div>',canEdit()?'<div class="actions"><button class="btn" id="seedTirRates">Seed Tir Rate Pool evidence as pending</button></div>':'');try{const [r,c]=await Promise.all([json('/api/accounting/profit-ledger/rates?pageSize=300'),json('/api/accounting/profit-ledger/categories?pageSize=300')]);q('#profitLedgerBody').innerHTML=`<h4>Versioned rates</h4>${table(['Version','Seller / Scope','Product Category / Rate Pool','Period','Rate','Status'],(r.list||[]).map(row=>`<tr><td>${safe(row.rateVersionId)}</td><td>${safe(row.sellerIdentity)} / ${safe(row.rateScope)}</td><td>${safe(row.officialProductCategoryName||'—')}<br>pool ${safe(row.commissionRatePool||'—')}</td><td>${safe(row.effectiveFrom)}–${safe(row.effectiveTo||'open')}</td><td>${safe(row.rate)}</td><td>${safe(row.status)}</td></tr>`))}<h4>Product Category → Rate Pool mappings</h4>${table(['Mapping','Official Product Category','Commission Rate Pool','Period','Status'],(c.list||[]).map(row=>`<tr><td>${safe(row.mappingId)}</td><td>${safe(row.officialProductCategoryNumber)} — ${safe(row.officialProductCategoryName)}<br><small>${safe(row.officialProductCategoryIdentity||row.identityValue)}</small></td><td>${safe(row.commissionRatePool)}</td><td>${safe(row.effectiveFrom)}–${safe(row.effectiveTo||'open')}</td><td>${safe(row.status)}</td></tr>`))}`;}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}if(q('#seedTirRates'))q('#seedTirRates').onclick=async()=>{try{await json('/api/accounting/profit-ledger/rates/seed-tir',{method:'POST',body:'{}'});await rates();}catch(error){alert(`${error.code||''} ${error.message}`);}};}
+  async function commission(){shell('draft-commission-report','<div class="muted">Run یا داده‌ای انتخاب نشده است.</div>',canEdit()?'<div class="actions"><button class="btn" id="commissionRun">Calculate PRELIMINARY Draft</button></div>':'');if(q('#commissionRun'))q('#commissionRun').onclick=async()=>{const periodFrom=prompt('از تاریخ شمسی:','14050401')||'';const periodTo=prompt('تا تاریخ شمسی:','14050431')||'';try{const result=await json('/api/accounting/profit-ledger/commission-drafts',{method:'POST',body:JSON.stringify({periodFrom,periodTo})});const r=await json(`/api/accounting/profit-ledger/commission-drafts?commissionRunId=${encodeURIComponent(result.run.commissionRunId)}&pageSize=500`);q('#profitLedgerBody').innerHTML=`<div class="warn"><b>${safe(r.run.status)}</b> — NOT PAYABLE / NOT SELLER-FACING</div>${table(['Line','Seller / Product Category / Rate Pool','Actual FIFO','Adjustments','Commissionable','Applied rate version','Draft / Status'],(r.list||[]).map(row=>`<tr><td>${safe(row.saleLineIdentity)}</td><td>${safe(row.sellerIdentity)}<br>${safe(row.officialProductCategoryName||row.commissionCategory)}<br>pool ${safe(row.commissionRatePool)}</td><td>${safe(row.actualFifoProfitExact??'UNAVAILABLE')}</td><td>${safe(row.approvedAdjustmentEffectExact)}</td><td>${safe(row.commissionableProfitExact??'UNAVAILABLE')}</td><td>${safe(row.rateExact??'MISSING')}<br>${safe(row.rateVersionId)}<br>${safe(row.rateResolutionPrecedence)}</td><td>${safe(row.draftCommissionExact??'UNAVAILABLE')}<br>${safe(row.unavailableReason)}</td></tr>`))}`;}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}};}
+  async function tir(){shell('tir-1405-reconstruction','<div class="muted">در حال بارگذاری…</div>');try{const r=await json('/api/accounting/profit-ledger/tir-reconstruction');q('#profitLedgerBody').innerHTML=`<div class="info">Facts ${safe(r.crm.factCount)} | Complete ${safe(r.crm.completeProfitFactCount)} | Actual FIFO ${safe(r.crm.actualFifoProfitExact)} | Pending adjustments ${safe(r.crm.pendingAdjustmentCount)}</div>${table(['Issue','Classification','Invoice / Line','Description','Rule inference'],(r.issues||[]).map(row=>`<tr><td>${safe(row.issueId)}</td><td>${safe(row.classification)}</td><td>${safe(row.invoiceNumber)} / ${safe(row.lineNumber)}</td><td>${safe(row.description)}</td><td>${row.excludedFromRuleInference?'EXCLUDED':'REVIEW REQUIRED'}</td></tr>`))}`;}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}}
+  function parseCsv(text){const rows=[];let row=[],cell='',quoted=false;for(let i=0;i<text.length;i++){const ch=text[i];if(ch==='"'){if(quoted&&text[i+1]==='"'){cell+='"';i++;}else quoted=!quoted;}else if(ch===','&&!quoted){row.push(cell);cell='';}else if((ch==='\n'||ch==='\r')&&!quoted){if(ch==='\r'&&text[i+1]==='\n')i++;row.push(cell);cell='';if(row.some(value=>value!==''))rows.push(row);row=[];}else cell+=ch;}if(cell||row.length){row.push(cell);rows.push(row);}const headers=(rows.shift()||[]).map(value=>value.replace(/^\uFEFF/,''));return rows.map((values,index)=>Object.fromEntries(headers.map((header,column)=>[header,values[column]??'']))).map((value,index)=>({...value,originalExcelRowNumber:index+2}));}
+  function parseSpreadsheetMl(text){const doc=new DOMParser().parseFromString(text,'application/xml');if(doc.querySelector('parsererror'))throw new Error('فایل Excel XML معتبر نیست.');const tableNode=[...doc.getElementsByTagNameNS('*','Worksheet')].find(node=>(node.getAttributeNS('urn:schemas-microsoft-com:office:spreadsheet','Name')||node.getAttribute('ss:Name')||node.getAttribute('Name'))==='Accounting Review')?.getElementsByTagNameNS('*','Table')?.[0];if(!tableNode)throw new Error('Sheet حسابداری پیدا نشد.');const matrix=[...tableNode.getElementsByTagNameNS('*','Row')].map(row=>[...row.children].filter(node=>node.localName==='Cell').map(cell=>cell.getElementsByTagNameNS('*','Data')[0]?.textContent||''));const headers=matrix.shift()||[];return matrix.map((values,index)=>Object.fromEntries(headers.map((header,column)=>[header,values[column]??'']))).map((value,index)=>({...value,originalExcelRowNumber:index+2}));}
+  function parseReviewFile(text){return /^\s*<\?xml|<Workbook\b/.test(text)?parseSpreadsheetMl(text):parseCsv(text);}
+  async function excel(){shell('accounting-excel-audit','<div class="muted">در حال بارگذاری…</div>',canEdit()?`<div class="actions"><button class="btn" id="excelExport">Export editable Excel workbook</button>${userRole()==='admin'?'<button class="mini" id="excelDiagnostic">Diagnostic Export (incomplete / non-payable)</button>':''}<input type="file" id="excelImportFile" accept=".xml,.xls,.csv,application/vnd.ms-excel,text/csv"><input id="excelPeriod" placeholder="140504"><button class="btn" id="excelImport">Import edits as pending</button></div>`:'');try{const r=await json('/api/accounting/profit-ledger/excel/audit');q('#profitLedgerBody').innerHTML=`<h4>Exports</h4>${table(['Batch','Dataset','Rows','Hash','Created'],(r.exports||[]).map(row=>`<tr><td>${safe(row.exportBatchId)}</td><td>${safe(row.fifoDatasetId)}</td><td>${safe(row.rowCount)}</td><td><small>${safe(row.sourceWorkbookHash)}</small></td><td>${safe(row.createdAt)}</td></tr>`))}<h4>Imports</h4>${table(['Import','Export','Counts','Status'],(r.imports||[]).map(row=>`<tr><td>${safe(row.importBatchId)}</td><td>${safe(row.exportBatchId)}</td><td>${safe(row.acceptedCount)} accepted / ${safe(row.rejectedCount)} rejected</td><td>${safe(row.status)}<br>Auto approval: NO</td></tr>`))}`;}catch(error){q('#profitLedgerBody').innerHTML=failBox(error);}const downloadExport=async payload=>{const r=await json('/api/accounting/profit-ledger/excel/export',{method:'POST',body:JSON.stringify(payload)});localStorage.setItem(`mkcrm-excel-hash:${r.exportBatchId}`,r.sourceWorkbookHash);const link=document.createElement('a');link.href=URL.createObjectURL(new Blob([r.content],{type:r.contentType}));link.download=r.filename;link.click();setTimeout(()=>URL.revokeObjectURL(link.href),1000);await excel();};if(q('#excelExport'))q('#excelExport').onclick=async()=>{try{await downloadExport({});}catch(error){alert(`${error.code||''} ${error.message}`);}};if(q('#excelDiagnostic'))q('#excelDiagnostic').onclick=async()=>{const reason=prompt('Diagnostic reason (required):')||'';const sourceReference=prompt('Evidence/source reference (required):')||'';if(!reason||!sourceReference)return;try{await downloadExport({exportMode:'diagnostic',reason,sourceReference});}catch(error){alert(`${error.code||''} ${error.message}`);}};if(q('#excelImport'))q('#excelImport').onclick=async()=>{const file=q('#excelImportFile')?.files?.[0];if(!file)return alert('فایل Excel خروجی CRM را انتخاب کنید.');let rows;try{rows=parseReviewFile(await file.text());}catch(error){return alert(error.message);}const exportBatchId=rows[0]?.exportBatchId||'';const sourceWorkbookHash=localStorage.getItem(`mkcrm-excel-hash:${exportBatchId}`)||prompt('Source workbook hash:')||'';try{await json('/api/accounting/profit-ledger/excel/import',{method:'POST',body:JSON.stringify({exportBatchId,sourceWorkbookHash,effectivePeriod:q('#excelPeriod').value,rows})});await excel();}catch(error){alert(`${error.code||''} ${error.message}`);}};}
+  const renderers={'fifo-profit-facts':facts,'profit-adjustment-review':adjustments,'saved-profit-ledger':saved,'supplier-incentive-ledger':supplier,'commission-rate-versions':rates,'draft-commission-report':commission,'tir-1405-reconstruction':tir,'accounting-excel-audit':excel};
+  window.__profitLedgerPages=renderers;window.__profitLedgerTitles=PAGES;
+  const inheritedMenu=window.renderMenu||renderMenu;window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);if(!allowed())return;const menu=q('#menu');if(!menu)return;for(const[id,title]of Object.entries(PAGES)){if(menu.querySelector(`[data-page="${id}"]`))continue;const button=document.createElement('button');button.className='navbtn';button.dataset.page=id;button.textContent=title;button.onclick=event=>{event.preventDefault();location.hash=id;route();};menu.appendChild(button);}};
+  const inheritedRoute=window.route||route;window.route=route=async function(){const page=location.hash.slice(1)||firstAllowedPage();if(renderers[page]&&allowed())return renderers[page]();return inheritedRoute.apply(this,arguments);};
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.71 Accounting Governance UI. Product Category is the official
+   Shaygan Main Group; Commission Rate Pool is a separate governed dimension.
+   All suggestions remain human-review
+   candidates; approval is role-separated and no source accounting dataset is
+   mutated by these screens. */
+(()=>{
+  const PAGES={'commission-category-governance':'Product Category / Rate Pool Mapping','commission-rate-governance':'Commission Rate Governance','saved-profit-opening-governance':'Saved-Profit Opening Balances','commission-export-readiness':'Commission Export Readiness'};
+  const allowed=()=>['admin','accounting','manager'].includes(userRole());const canEdit=()=>['admin','accounting'].includes(userRole());const canApprove=()=>['admin','manager'].includes(userRole());const safe=value=>esc(value==null?'':String(value));const q=s=>document.querySelector(s);
+  async function api(url,options={}){const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});const body=await response.json().catch(()=>({ok:false,error:'پاسخ نامعتبر'}));if(!response.ok||body.ok===false){const error=new Error(body.error||response.statusText);Object.assign(error,body);throw error;}return body;}
+  const table=(heads,rows)=>`<div style="overflow:auto"><table class="table"><thead><tr>${heads.map(h=>`<th>${safe(h)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${heads.length}">داده‌ای موجود نیست</td></tr>`}</tbody></table></div>`;
+  const nav=active=>`<div class="actions">${Object.entries(PAGES).map(([id,title])=>`<button class="mini ag-nav" data-page="${id}" ${id===active?'disabled':''}>${safe(title)}</button>`).join('')}</div>`;
+  function shell(page,actions=''){setPage(PAGES[page],`<main class="main-content"><div class="warn"><b>HUMAN GOVERNANCE ONLY</b> — no automatic approval, no FIFO rerun, no payable commission</div>${nav(page)}${actions}<div id="agBody"><div class="muted">در حال بارگذاری…</div></div></main>`);document.querySelectorAll('.ag-nav').forEach(b=>b.onclick=()=>{location.hash=b.dataset.page;route();});}
+  function workflow(row,kind){const buttons=[];if(canEdit()&&['draft','returned'].includes(row.status)){buttons.push('edit','submit','cancel');}if(canApprove()&&row.status==='pending'){buttons.push('approve','reject','return');}const snapshot=safe(encodeURIComponent(JSON.stringify(row)));return buttons.map(action=>`<button class="mini ag-action" data-kind="${kind}" data-id="${safe(row.mappingId||row.rateVersionId||row.openingBalanceId)}" data-action="${action}" data-revision="${Number(row.revision)}" data-row="${snapshot}">${action}</button>`).join(' ')||'—';}
+  async function evidenceAction(button,reload){const reason=prompt('دلیل مستند:')||'';const sourceReference=prompt('مرجع مدرک / workbook / contract:')||'';const evidenceUnavailableReason=prompt('اگر attachment موجود نیست، دلیل نبود مدرک را ثبت کنید:')||'';if(!reason||!sourceReference||!evidenceUnavailableReason)return alert('Reason، source reference و evidence/unavailable reason الزامی است.');const base=button.dataset.kind==='mapping'?'/api/accounting/profit-ledger/categories':button.dataset.kind==='rate'?'/api/accounting/profit-ledger/rates':'/api/accounting/governance/opening-balances';try{await api(`${base}/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`,{method:'POST',body:JSON.stringify({revision:Number(button.dataset.revision),reason,sourceReference,evidenceUnavailableReason})});await reload();}catch(error){alert(`${error.code||''} ${error.message}`);}}
+  async function editRecord(button,reload){let row={};try{row=JSON.parse(decodeURIComponent(button.dataset.row||''));}catch{return alert('Draft snapshot is unavailable. Reload the page.');}const common={revision:Number(row.revision),effectiveFrom:prompt('Effective from:',row.effectiveFrom||'14050401')||row.effectiveFrom,effectiveTo:prompt('Effective to (blank = open):',row.effectiveTo||'')??row.effectiveTo,sourceReference:prompt('Evidence/source reference:',row.sourceReference||'')||row.sourceReference,reason:prompt('Reason:',row.reason||'')||row.reason,evidenceMetadata:row.evidenceMetadata||{evidenceUnavailableReason:'Human evidence retained in governed record'}};let endpoint='',payload=common;if(button.dataset.kind==='mapping'){endpoint=`/api/accounting/profit-ledger/categories/${encodeURIComponent(button.dataset.id)}`;payload={...common,commissionRatePool:prompt('Commission Rate Pool: NOTEBOOK / COMPONENT / CUSTOM / NON_COMMISSIONABLE / UNRESOLVED',row.commissionRatePool||'UNRESOLVED')||row.commissionRatePool};}else if(button.dataset.kind==='rate'){endpoint=`/api/accounting/profit-ledger/rates/${encodeURIComponent(button.dataset.id)}`;payload={...common,sellerIdentity:prompt('Seller identity or *:',row.sellerIdentity||'*')||row.sellerIdentity,rateScope:row.rateScope,officialProductCategoryIdentity:row.officialProductCategoryIdentity||'',officialProductCategoryName:row.officialProductCategoryName||'',commissionRatePool:row.commissionRatePool||'',rate:prompt('Exact decimal rate:',row.rate??'')};if(payload.rate==='')return alert('Blank rate is not zero.');}else{endpoint=`/api/accounting/governance/opening-balances/${encodeURIComponent(button.dataset.id)}`;payload={revision:Number(row.revision),pool:prompt('Pool:',row.pool||'NOTEBOOK')||row.pool,accountingPeriod:prompt('Accounting period:',row.accountingPeriod||'140504')||row.accountingPeriod,openingAmountExact:prompt('Human-entered source amount:',row.openingAmountExact||'')||row.openingAmountExact,sourceDocumentType:prompt('Source document type:',row.sourceDocumentType||'')||row.sourceDocumentType,sourceReference:prompt('Source reference:',row.sourceReference||'')||row.sourceReference,reason:prompt('Audit reason:',row.reason||'')||row.reason,evidenceUnavailableReason:prompt('Evidence unavailable reason:',row.evidenceUnavailableReason||'')||row.evidenceUnavailableReason};}try{await api(endpoint,{method:'PUT',body:JSON.stringify(payload)});await reload();}catch(error){alert(`${error.code||''} ${error.message}`);}}
+  function bindActions(reload){document.querySelectorAll('.ag-action').forEach(button=>button.onclick=()=>button.dataset.action==='edit'?editRecord(button,reload):evidenceAction(button,reload));}
+  let groupFilters={search:'',minSaleValue:''};
+  async function categories(){shell('commission-category-governance',`<div class="actions"><input id="agGroupSearch" placeholder="Product Category, item or invoice" value="${safe(groupFilters.search)}"><input id="agGroupMinValue" placeholder="Minimum Tir sale value" value="${safe(groupFilters.minSaleValue)}"><button class="mini" id="agGroupFilter">Filter</button>${canEdit()?'<button class="btn" id="agRefresh">Refresh official ItemGroup/GetList + Item/Get</button>':''}</div>`);try{const reviewUrl=`/api/accounting/governance/group-review?periodFrom=14050401&periodTo=14050431&pageSize=500&search=${encodeURIComponent(groupFilters.search)}&minSaleValue=${encodeURIComponent(groupFilters.minSaleValue)}`;const [review,mappings]=await Promise.all([api(reviewUrl),api('/api/accounting/profit-ledger/categories?pageSize=500')]);q('#agBody').innerHTML=`<div class="info">Official Product Category = exact Shaygan Main Group. Commission Rate Pool is separate. Official rows ${safe(review.total)} | resolved sale value ${safe(review.coverage?.officialResolvedSaleValuePercent)}% | no suggestion is auto-approved.</div>${table(['Official Product Category → inherited child groups','Affected items / invoices','Tir metrics / projected gain','Suggested Commission Rate Pool','Current pool mapping','Action'],(review.list||[]).map(row=>`<tr><td>${safe(row.officialProductCategoryNumber)} — <b>${safe(row.officialProductCategoryName)}</b><br><small>GUID ${safe(row.officialProductCategoryGuid)}<br>${safe(row.officialProductCategoryIdentity)} | ${safe(row.hierarchyStatus)}</small><details><summary>${safe(row.childGroupCount)} inherited child groups</summary>${safe((row.childGroups||[]).map(x=>`${x.groupNumber} ${x.groupName}`).join(' | '))}</details></td><td>${safe(row.itemCount)} items<details><summary>Samples</summary>Items: ${safe((row.representativeItems||[]).join(', '))}<br>Invoices: ${safe((row.representativeInvoices||[]).join(', '))}</details></td><td>${safe(row.saleLineCount)} lines / ${safe(row.saleQuantity)} qty<br>${safe(row.saleValue)} IRR<br>profit ${safe(row.knownFifoProfit)} / unknown ${safe(row.unknownCostValue)}<br><b>Projected +${safe(row.projectedCoverageGainPercent)}%</b></td><td>${safe(row.suggestedCommissionRatePool)}<br><small>${safe(row.suggestionEvidence)}</small></td><td>${safe(row.currentMappingStatus)} / ${safe(row.currentCommissionRatePool)}</td><td>${canEdit()&&row.officialEvidence?`<button class="mini ag-map-create" data-identity="${safe(row.officialProductCategoryIdentity)}" data-guid="${safe(row.officialProductCategoryGuid)}" data-number="${safe(row.officialProductCategoryNumber)}" data-name="${safe(row.officialProductCategoryName)}" data-suggestion="${safe(row.suggestedCommissionRatePool)}">Create draft</button>`:'—'}</td></tr>`))}<h4>Governed Product Category → Rate Pool history</h4>${table(['Mapping','Official Product Category','Commission Rate Pool','Period','Evidence','Status / revision','Workflow / audit'],(mappings.list||[]).map(row=>`<tr><td>${safe(row.mappingId)}</td><td>${safe(row.officialProductCategoryNumber)} — ${safe(row.officialProductCategoryName||'LEGACY')}<br><small>${safe(row.officialProductCategoryIdentity||row.identityValue)}</small></td><td><b>${safe(row.commissionRatePool)}</b>${row.legacyCompatibility?'<br><small>legacy adapter</small>':''}</td><td>${safe(row.effectiveFrom)}–${safe(row.effectiveTo||'open')}</td><td>${safe(row.sourceReference)}<br>${safe(row.reason)}</td><td>${safe(row.status)} r${safe(row.revision)}</td><td>${workflow(row,'mapping')}<details><summary>Audit</summary><pre>${safe(JSON.stringify(row.auditLog||[],null,2))}</pre></details></td></tr>`))}`;bindActions(categories);document.querySelectorAll('.ag-map-create').forEach(button=>button.onclick=async()=>{const commissionRatePool=prompt('Commission Rate Pool: NOTEBOOK / COMPONENT / CUSTOM / NON_COMMISSIONABLE / UNRESOLVED',button.dataset.suggestion||'UNRESOLVED')||'';const sourceReference=prompt('Evidence reference:')||'';const reason=prompt('Reason:')||'';const evidenceUnavailableReason=prompt('Evidence unavailable reason (if no attachment):')||'';if(!commissionRatePool||!sourceReference||!reason||!evidenceUnavailableReason)return;try{await api('/api/accounting/profit-ledger/categories',{method:'POST',body:JSON.stringify({groupPathIdentity:button.dataset.identity,officialProductCategoryIdentity:button.dataset.identity,officialProductCategoryGuid:button.dataset.guid,officialProductCategoryNumber:button.dataset.number,officialProductCategoryName:button.dataset.name,commissionRatePool,effectiveFrom:'14050401',effectiveTo:'14050431',source:'official-main-group-human-review',sourceReference,reason,evidenceMetadata:{evidenceUnavailableReason}})});await categories();}catch(error){alert(`${error.code||''} ${error.message}`);}});if(q('#agGroupFilter'))q('#agGroupFilter').onclick=()=>{groupFilters={search:q('#agGroupSearch').value,minSaleValue:q('#agGroupMinValue').value};categories();};if(q('#agRefresh'))q('#agRefresh').onclick=async()=>{if(!confirm('فقط ItemGroup/GetList و Item/Get رسمی به‌صورت read-only خوانده شوند؟'))return;try{await api('/api/accounting/governance/group-catalog/refresh',{method:'POST',body:JSON.stringify({pageSize:100,maxGroupPages:100,maxPages:1000})});await categories();}catch(error){alert(`${error.code||''} ${error.message}`);}};}catch(error){q('#agBody').innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}}
+  async function rates(){shell('commission-rate-governance',canEdit()?'<div class="actions"><button class="btn" id="agRateCreate">Create scoped rate draft</button><button class="mini" id="agSeed">Prepare Tir 14% / 20% Rate Pool evidence</button></div>':'');try{const [r,matrix]=await Promise.all([api('/api/accounting/profit-ledger/rates?pageSize=500'),api('/api/accounting/governance/rate-review?periodFrom=14050401&periodTo=14050431&pageSize=500')]);q('#agBody').innerHTML=`<div class="info">Deterministic precedence: seller/category → seller/rate-pool → category default → rate-pool default. Applied rate version is preserved. Missing rate is never zero.</div><h4>Tir seller / Product Category / Rate Pool matrix</h4>${table(['Seller','Official Product Category','Commission Rate Pool','Tir scope','Proposed rate / precedence','Status'],(matrix.list||[]).map(row=>`<tr><td>${safe(row.sellerIdentity)}<br>${safe(row.sellerName)}</td><td>${safe(row.officialProductCategoryNumber)} — ${safe(row.officialProductCategoryName)}<br><small>${safe(row.officialProductCategoryIdentity)}</small></td><td>${safe(row.commissionRatePool)}</td><td>${safe(row.saleLineCount)} lines<br>${safe(row.saleValue)} IRR<br>${safe(row.mappingStatus)}</td><td>${safe(row.proposedRate??'MISSING')}<br>${safe(row.rateClassification)}<br><small>${safe(row.rateVersionId)}</small></td><td>${safe(row.rateStatus)}<br>${safe(row.ambiguityNotes)}</td></tr>`))}<h4>Versioned rate history</h4>${table(['Version','Seller / Rate scope','Product Category / Rate Pool','Period / rate','Evidence','Status','Workflow / audit'],(r.list||[]).map(row=>`<tr><td>${safe(row.rateVersionId)}</td><td>${safe(row.sellerIdentity)} / ${safe(row.rateScope)}</td><td>${safe(row.officialProductCategoryName||'—')}<br>pool ${safe(row.commissionRatePool||'—')}</td><td>${safe(row.effectiveFrom)}–${safe(row.effectiveTo||'open')}<br><b>${safe(row.rate)}</b></td><td>${safe(row.sourceReference)}<br>${safe(row.reason)}</td><td>${safe(row.status)} r${safe(row.revision)}</td><td>${workflow(row,'rate')}<details><summary>Audit</summary><pre>${safe(JSON.stringify(row.auditLog||[],null,2))}</pre></details></td></tr>`))}`;bindActions(rates);if(q('#agRateCreate'))q('#agRateCreate').onclick=async()=>{const sellerIdentity=prompt('Seller identity or * for default:','*')||'';const rateScope=prompt('Rate scope: product_category / rate_pool','rate_pool')||'';let officialProductCategoryIdentity='',officialProductCategoryName='',commissionRatePool='';if(rateScope==='product_category'){officialProductCategoryIdentity=prompt('Exact official Product Category identity (guid:...):')||'';officialProductCategoryName=prompt('Exact official Product Category name:')||'';}else{commissionRatePool=prompt('Commission Rate Pool: NOTEBOOK / COMPONENT / CUSTOM / NON_COMMISSIONABLE','COMPONENT')||'';}const rate=prompt('Exact decimal rate (e.g. 0.20):')||'';const sourceReference=prompt('Contract/workbook evidence reference:')||'';const reason=prompt('Reason:')||'';const evidenceUnavailableReason=prompt('Evidence unavailable reason (if no attachment):')||'';if(!sellerIdentity||!rateScope||rate===''||!sourceReference||!reason||!evidenceUnavailableReason)return;try{await api('/api/accounting/profit-ledger/rates',{method:'POST',body:JSON.stringify({sellerIdentity,rateScope,officialProductCategoryIdentity,officialProductCategoryName,commissionRatePool,rate,effectiveFrom:'14050401',effectiveTo:'14050431',contractType:'human-review-candidate',sourceDocumentType:'accounting evidence',sourceReference,reason,evidenceMetadata:{evidenceUnavailableReason}})});await rates();}catch(error){alert(`${error.code||''} ${error.message}`);}};if(q('#agSeed'))q('#agSeed').onclick=async()=>{try{await api('/api/accounting/profit-ledger/rates/seed-tir',{method:'POST',body:'{}'});await rates();}catch(error){alert(`${error.code||''} ${error.message}`);}};}catch(error){q('#agBody').innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}}
+  async function openings(){shell('saved-profit-opening-governance',canEdit()?'<div class="actions"><button class="btn" id="agOpeningCreate">Create opening-balance draft</button></div>':'');try{const r=await api('/api/accounting/governance/opening-balances?pageSize=500');q('#agBody').innerHTML=`<div class="warn">NOTEBOOK and COMPONENT are isolated. Component amount is never inferred. Ledger posting occurs once, only after independent approval.</div><div class="info">Workbook evidence candidate only: NOTEBOOK 64,970,642,000 IRR. This value is not prefilled, posted or approved. Component has no inferred candidate.</div>${table(['Record','Pool / period','Amount / kind','Evidence','Status','Workflow / audit'],(r.list||[]).map(row=>`<tr><td>${safe(row.openingBalanceId)}</td><td>${safe(row.pool)} / ${safe(row.accountingPeriod)}</td><td>${safe(row.openingAmountExact)} / ${safe(row.entryKind)}</td><td>${safe(row.sourceDocumentType)}<br>${safe(row.sourceReference)}<br>${safe(row.reason)}</td><td>${safe(row.status)} r${safe(row.revision)}</td><td>${workflow(row,'opening')}<details><summary>Audit</summary><pre>${safe(JSON.stringify(row.auditLog||[],null,2))}</pre></details></td></tr>`))}`;bindActions(openings);if(q('#agOpeningCreate'))q('#agOpeningCreate').onclick=async()=>{const pool=prompt('Pool: NOTEBOOK / COMPONENT','NOTEBOOK')||'';const openingAmountExact=prompt('Human-entered source amount (IRR):')||'';const sourceDocumentType=prompt('Source document type:','Tir 1405 workbook')||'';const sourceReference=prompt('Source reference / sheet / cell:')||'';const reason=prompt('Audit reason:')||'';const evidenceUnavailableReason=prompt('Evidence unavailable reason (if no attachment):')||'';if(!pool||!openingAmountExact||!sourceDocumentType||!sourceReference||!reason||!evidenceUnavailableReason)return;try{await api('/api/accounting/governance/opening-balances',{method:'POST',body:JSON.stringify({pool,accountingPeriod:'140504',openingAmountExact,sourceDocumentType,sourceReference,reason,evidenceUnavailableReason})});await openings();}catch(error){alert(`${error.code||''} ${error.message}`);}};}catch(error){q('#agBody').innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}}
+  async function readiness(){shell('commission-export-readiness');try{const r=await api('/api/accounting/governance/readiness?periodFrom=14050401&periodTo=14050431');const m=r.metrics;q('#agBody').innerHTML=`<div class="${r.normalExportReady?'info':'warn'}"><b>Normal export: ${r.normalExportReady?'READY':'BLOCKED (HTTP 409)'}</b> — Profit / ROI / Commission remain disabled.</div><div class="row"><div class="info">Official Product Category coverage<br><b>${safe(m.officialGroupSaleValuePercent)}% value</b><br>${safe(m.officialGroupLinePercent)}% lines</div><div class="info">Approved Rate Pool mapped value<br><b>${safe(m.mappedSaleValuePercent)}%</b><br>Pending ${safe(m.pendingMappedSaleValue)} IRR<br>Projected ${safe(m.projectedMappedSaleValuePercent)}%</div><div class="info">Approved Rate Pool mapped lines<br><b>${safe(m.mappedLinePercent)}%</b><br>Pending ${safe(m.pendingMappedLineCount)}<br>Projected ${safe(m.projectedMappedLinePercent)}%</div><div class="info">Unresolved Product Category<br><b>${safe(m.unresolvedProductCategoryValuePercent)}% value</b><br>${safe(m.unresolvedProductCategoryLinePercent)}% lines</div><div class="info">Unresolved Rate Pool<br><b>${safe(m.unresolvedRatePoolValuePercent)}% value</b><br>${safe(m.unresolvedRatePoolLinePercent)}% lines</div><div class="info">Approved rate coverage<br><b>${safe(m.approvedRateCoveragePercent)}%</b></div><div class="info">Cost coverage<br>Complete ${safe(m.completeCostValuePercent)}%<br>Partial ${safe(m.partialCostValuePercent)}%<br>Unknown ${safe(m.unknownCostValuePercent)}%</div><div class="info">Unresolved controls<br>Discount ${safe(m.unresolvedDiscountLineCount)}<br>Seller ${safe(m.unresolvedSellerLineCount)}</div></div><h4>Rate precedence</h4><pre>${safe(JSON.stringify(r.rateResolutionPrecedence,null,2))}</pre><h4>Missing-rate seller/category/pool</h4><pre>${safe(JSON.stringify(r.missingRateSellers,null,2))}</pre><h4>Exceptional-rate candidates</h4><pre>${safe(JSON.stringify(r.exceptionalRateCandidates,null,2))}</pre><h4>Opening balances</h4><pre>${safe(JSON.stringify(r.openingReadiness,null,2))}</pre><h4>Machine-readable blockers</h4><pre>${safe(JSON.stringify(r.blockers,null,2))}</pre>`;}catch(error){q('#agBody').innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}}
+  window.__commissionCategoryGovernancePage=categories;
+  const renderers={'commission-category-governance':categories,'commission-rate-governance':rates,'saved-profit-opening-governance':openings,'commission-export-readiness':readiness};const inheritedMenu=window.renderMenu||renderMenu;window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);if(!allowed())return;const menu=q('#menu');if(!menu)return;for(const[id,title]of Object.entries(PAGES)){if(menu.querySelector(`[data-page="${id}"]`))continue;const b=document.createElement('button');b.className='navbtn';b.dataset.page=id;b.textContent=title;b.onclick=e=>{e.preventDefault();location.hash=id;route();};menu.appendChild(b);}};const inheritedRoute=window.route||route;window.route=route=async function(){const page=location.hash.slice(1)||firstAllowedPage();if(renderers[page]&&allowed())return renderers[page]();return inheritedRoute.apply(this,arguments);};try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.68 Operational Accounting Review Workbench.
+   This UI prepares evidence and human review tasks only. It cannot issue
+   invoices, write Shaygan, approve accounting automatically or activate
+   Profit, ROI or Commission. */
+(()=>{
+  const PAGE='accounting-review-workbench';
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const num=value=>Number.isFinite(Number(value))?Number(value).toLocaleString('fa-IR',{maximumFractionDigits:6}):'—';
+  const pct=value=>`${num(value||0)}٪`;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}
+    return payload;
+  }
+  function table(headers,rows,empty='داده‌ای موجود نیست'){
+    return `<div style="overflow:auto"><table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">${safe(empty)}</td></tr>`}</tbody></table></div>`;
+  }
+  function section(id,title){
+    return `<div class="card"><div class="card-header"><h5>${safe(title)}</h5></div><div class="card-body"><div id="${safe(id)}"><div class="muted">در حال بارگذاری…</div></div></div></div>`;
+  }
+  async function loadReport(){
+    const box=q('#aowReport');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/report');
+      const actual=r.actualApproved||{},projected=r.projected||{},base=r.baseline||{};
+      box.innerHTML=`<div class="row four">
+        <div class="info"><b>Gate</b><br>${safe(base.gateStatus)}<br>Accounting approved: NO</div>
+        <div class="info"><b>Confidence</b><br>${num(base.confidenceIndex)} / 100<br>Review coverage ${pct(base.accountingReviewCoverage)}</div>
+        <div class="info"><b>Unknown Sale Value</b><br>${num(base.actualUnknownSaleValue)} IRR<br>Actual only</div>
+        <div class="info"><b>P0 Under Review</b><br>${num(projected.p0ValueUnderReview)} IRR<br>Recoverable: ${num(projected.recoverableUnknownValue)} IRR</div>
+      </div>
+      ${table(['Metric','Actual approved','Projected / candidate'],[
+        ['Official/Manual coverage',`${pct(base.saleValueCostCoverage)} / ${pct(base.approvedManualCoverage)}`,pct(projected.saleValueCoverageAfterApprovedCandidateRecovery)],
+        ['Return linkage',pct(base.returnLinkageCoverage),`${num(projected.returnLinkageCandidateCount)} cases / ${pct(projected.returnLinkagePotentialPercent)}`],
+        ['Recovery candidates',num(actual.recoveryCandidates),num(projected.recoveryCandidates)],
+        ['Identity resolutions',num(actual.identityResolutions),num(projected.identityCandidates)],
+        ['Manual packages',num(actual.manualPackages),num(projected.manualEvidencePackages)],
+        ['Reviewed samples',num(actual.accountingReviewedSamples),num(r.counts?.validationSamples)]
+      ].map(row=>`<tr>${row.map(cell=>`<td>${safe(cell)}</td>`).join('')}</tr>`))}
+      <div class="warn"><b>Actual and projected values are intentionally separate.</b><br>
+      No candidate, package or batch is an accounting approval. Decision import is disabled.</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function reviewAction(type,row){
+    const id=row.investigationId||row.caseId||row.candidateId||row.resolutionId;
+    if(!id)return'';
+    return `<button class="mini aow-review" data-type="${safe(type)}" data-id="${safe(id)}" data-revision="${Number(row.revision||0)}">بررسی موردی</button>`;
+  }
+  async function loadInvestigations(){
+    const box=q('#aowP0');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/investigations?pageSize=200&priority=P0');
+      box.innerHTML=`<div class="info">همهٔ ${num(r.total)} مورد P0 دارای classification، source reference، سؤال باز و اقدام بعدی هستند.</div>`+
+      table(['Item','Impact','Classification','Evidence','Questions / next action','Review'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
+        <td>${num(row.affectedSaleValue)} IRR<br>${num(row.affectedQuantity)} qty</td>
+        <td>${safe(row.systemClassification)}<br><small>${pct(row.confidence)}</small></td>
+        <td><small>Invoices: ${safe((row.diagnostic?.invoiceReferences||[]).join(', ')||'—')}<br>Suppliers: ${safe((row.diagnostic?.supplierEvidence||[]).join(', ')||'—')}</small></td>
+        <td><small>${safe((row.diagnostic?.unresolvedQuestions||[]).join(' | '))}<br><b>${safe(row.diagnostic?.recommendedNextAction)}</b></small></td>
+        <td>${safe(row.reviewStatus)}<br>${reviewAction('investigations',row)}</td>
+      </tr>`));
+      bindReview(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadSimple(type,boxId,titleFields){
+    const box=q(boxId);if(!box)return;
+    try{
+      const r=await json(`/api/accounting/operational-review/${type}?pageSize=200`);
+      box.innerHTML=table(titleFields.headers,(r.list||[]).map(row=>titleFields.row(row)+`<td>${reviewAction(type,row)}</td></tr>`));
+      bindReview(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadReturns(){
+    const box=q('#aowReturns');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/returns?pageSize=500');
+      const groups=(r.list||[]).reduce((map,row)=>{map[row.confidenceBand]=(map[row.confidenceBand]||0)+1;return map;},{});
+      box.innerHTML=`<div class="info">Deterministic ${num(groups.deterministic)} | High ${num(groups.high_confidence)} | Medium ${num(groups.medium_confidence)} | Low ${num(groups.low_confidence)} | No candidate ${num(groups.no_candidate)}</div>`+
+      table(['Type/Return','Item','Confidence','Candidate comparison','Expected impact','Human review'],(r.list||[]).map(row=>{
+        const proposal=row.reversalProposal||{};
+        const candidate=(row.candidates||[])[0]||{};
+        return `<tr><td>${safe(row.kind)}<br>${safe(row.returnInvoiceIdentity)}</td><td>${safe(row.itemCode)}<br>${num(row.returnQuantity)}</td>
+          <td>${safe(row.confidenceBand)}<br>${pct(row.confidence)}<br><small>${safe((row.confidenceReasons||[]).join(', '))}</small></td>
+          <td><small>${safe(row.proposedLink||'—')}<br>score ${num(candidate.score)}<br>${safe((candidate.reasons||[]).join(', '))}</small></td>
+          <td><small>Cost ${safe(proposal.proposedReversedCostExact||candidate.remainingLayerImpact||'—')}<br>Qty ${safe(proposal.proposedReversedQuantityExact||'—')}<br>Remaining ${safe(proposal.remainingOriginalQuantityExact||'—')}<br>Over-allocation prevented: ${proposal.overAllocationPrevented?'YES':'NO'}</small></td>
+          <td>${safe(row.reviewStatus)}<br>${reviewAction('returns',row)}</td></tr>`;
+      }));
+      bindReview(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadSamples(){
+    const box=q('#aowSamples');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/samples?pageSize=200');
+      box.innerHTML=table(['Category','Invoice/Line','Item','Quantity/value','Cost/return','Review'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.category)}</td><td>${safe(row.sourceSaleInvoice||'—')}<br><small>${safe(row.saleLine||'')}</small></td>
+        <td>${safe(row.itemCode||'—')}<br><small>${safe(row.itemGuid||'')}</small></td>
+        <td>${num(row.saleQuantity)} / ${safe(row.saleValueExact||'—')}<br>allocated ${num(row.allocatedQuantity)} / unknown ${num(row.unknownQuantity)}</td>
+        <td>${safe(row.unitCostExact||'—')} / ${safe(row.allocationCostExact||'—')}<br><small>${safe(JSON.stringify(row.returnEffect||{}))}</small></td>
+        <td>${safe(row.reviewStatus)}<br><small>${safe(row.reviewedBy?.username||'—')}</small></td></tr>`));
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadBatches(){
+    const box=q('#aowBatches');if(!box)return;
+    try{
+      const r=await json('/api/accounting/operational-review/batches?pageSize=50');
+      box.innerHTML=table(['Batch','Assignments','Counts','Impact','Status','Audit'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.title)}<br><small>${safe(row.batchId)}</small></td>
+        <td>Accounting: ${safe(row.assignedAccountingUser||'—')}<br>Manager: ${safe(row.assignedManagerUser||'—')}</td>
+        <td><small>${safe(JSON.stringify(row.itemCounts||{}))}</small></td><td>${num(row.financialImpact)} IRR</td>
+        <td>${safe(row.status)}</td><td>${num(row.auditLog?.length)} events<br><small>Batch completion never approves items.</small></td></tr>`));
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function bindReview(container){
+    container.querySelectorAll('.aow-review').forEach(button=>button.onclick=async()=>{
+      const type=button.dataset.type;
+      const allowed=type==='recovery'?'detected / evidence_verified / pending_accounting_review / approved_for_dataset_rebuild / rejected / deferred'
+        :type==='identities'?'detected / pending_accounting_review / approved / rejected / deferred'
+          :'prepared / in_review / needs_evidence / ready_for_human_decision / deferred';
+      const status=prompt(`وضعیت جدید (${allowed})`)||'';
+      if(!status)return;
+      const assignedTo=prompt('Assigned user (اختیاری):')||'';
+      const reason=prompt('یادداشت و دلیل مستند:')||'';
+      const evidenceReference=prompt('مرجع Evidence (برای approval الزامی):')||'';
+      try{
+        await json(`/api/accounting/operational-review/${type}/${encodeURIComponent(button.dataset.id)}`,{
+          method:'PATCH',body:JSON.stringify({status,assignedTo,reason,accountingNotes:reason,evidenceReference,revision:Number(button.dataset.revision)})
+        });
+        await refresh();
+      }catch(error){alert(`${error.code||''} ${error.message}`);}
+    });
+  }
+  async function synchronize(){
+    const box=q('#aowSyncStatus');
+    try{
+      box.innerHTML='<div class="info">در حال تحلیل read-only منابع و ایجاد candidateهای audit شده…</div>';
+      const r=await json('/api/accounting/operational-review/synchronize',{method:'POST',body:'{}'});
+      box.innerHTML=`<div class="success">P0 ${num(r.investigations?.total)} | Purchase Returns ${num(r.returns?.purchase?.total)} | Sale Returns ${num(r.returns?.sale?.total)} | Samples ${num(r.samples?.total)} | ${num(r.durationMs)} ms<br>Automatic approvals: ${num(r.automaticApprovals)} | Business writes: ${num(r.businessDocumentWrites)}</div>`;
+      await refresh();
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function refresh(){
+    await Promise.all([
+      loadReport(),loadInvestigations(),
+      loadSimple('recovery','#aowRecovery',{headers:['Invoice/line','Item','Supplier/date','Quantity/cost','Status','Review'],row:row=>`<tr><td>${safe(row.purchaseInvoiceIdentity)}<br><small>${safe(row.purchaseLineIdentity)}</small></td><td>${safe(row.itemCode)}<br><small>${safe(row.itemGuid)}</small></td><td>${safe(row.supplierIdentity)}<br>${safe(row.purchaseDate)}</td><td>${num(row.purchaseQuantity)} / ${safe(row.unitCostExact)}</td><td>${safe(row.status)}<br>${pct(row.confidence)}</td>`}),
+      loadSimple('identities','#aowIdentity',{headers:['Source','Target','Reason','Evidence','Status','Review'],row:row=>`<tr><td>${safe(row.sourceItemCode)}<br><small>${safe(row.sourceItemGuid)}</small></td><td>${safe(row.targetItemCode)}<br><small>${safe(row.targetItemGuid)}</small></td><td>${safe(row.reason)}<br>${pct(row.confidence)}</td><td><small>${safe(JSON.stringify(row.evidence||{}))}</small></td><td>${safe(row.status)}</td>`}),
+      loadReturns(),
+      loadSimple('manualPackages','#aowManual',{headers:['Item','Source','Amount','Period','Projected impact','Status'],row:row=>`<tr><td>${safe(row.itemCode)}<br><small>${safe(row.packageId)}</small></td><td>${safe(row.documentedSource)}<br><small>${safe(row.evidenceReference)}</small></td><td>${safe(row.sourceAmountExact)} ${safe(row.sourceCurrency)}</td><td>${safe(row.proposedEffectiveFrom)}..${safe(row.proposedEffectiveTo)}</td><td>${pct(row.projectedCoverageImprovement)} / index +${num(row.projectedConfidenceImprovement)}</td><td>${safe(row.status)}</td>`}),
+      loadSamples(),loadBatches()
+    ]);
+  }
+  window.pageAccountingReviewWorkbench=async function(){
+    setPage('Accounting Review Workbench',`<main class="main-content">
+      <div class="warn"><b>HUMAN ACCOUNTING REVIEW REQUIRED</b><br><b>NO AUTOMATIC APPROVAL — NO PROFIT / ROI / COMMISSION</b><br>این صفحه هیچ سند شایگان یا فاکتور تجاری ایجاد یا ویرایش نمی‌کند.</div>
+      <div class="actions">${['admin','accounting'].includes(userRole())?'<button class="btn" id="aowSync">Prepare / Refresh Review Package</button>':''}<button class="btn" id="aowRefresh">Refresh</button><button class="btn" id="aowExport">Export CSV</button><button class="btn" id="aowPrint">Printable Review Packet</button><button class="btn" id="aowNext">Next P0 Review</button></div>
+      <div id="aowSyncStatus"></div>
+      ${section('aowReport','Gate Progress, Actual vs Projected Impact and FIFO Dataset')}
+      ${section('aowP0','1. P0 Evidence Review')}
+      ${section('aowRecovery','2. Official Layer Recovery Candidates')}
+      ${section('aowIdentity','3. Item Identity Candidates')}
+      ${section('aowReturns','4–5. Purchase and Sale Return Review')}
+      ${section('aowManual','6. Manual Cost Evidence Packages')}
+      ${section('aowSamples','7. Validation Samples')}
+      ${section('aowBatches','8–10. Review Batches and Audit Activity')}
+    </main>`);
+    if(q('#aowSync'))q('#aowSync').onclick=synchronize;
+    q('#aowRefresh').onclick=refresh;
+    q('#aowExport').onclick=()=>{location.href='/api/accounting/operational-review/export.csv?priority=P0';};
+    q('#aowPrint').onclick=()=>window.print();
+    q('#aowNext').onclick=()=>q('#aowP0')?.scrollIntoView({behavior:'smooth',block:'start'});
+    await refresh();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='میزکار بررسی حسابداری';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="accounting-fifo-readiness"]')||menu.querySelector('[data-page="seller-profit"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingReviewWorkbench();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.67 Accounting FIFO Readiness.
+   Evidence and review writes remain isolated and audited. The page never
+   activates Profit, ROI, Commission, inventory writes or Shaygan writes. */
+(()=>{
+  const PAGE='accounting-fifo-readiness';
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const num=value=>Number.isFinite(Number(value))?Number(value).toLocaleString('fa-IR',{maximumFractionDigits:6}):'—';
+  const pct=value=>`${num(value||0)}٪`;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}
+    return payload;
+  }
+  function table(headers,rows,empty='داده‌ای موجود نیست'){
+    return `<table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">${safe(empty)}</td></tr>`}</tbody></table>`;
+  }
+  function check(value){return value?'<span class="success">PASS</span>':'<span class="error">BLOCKED</span>';}
+  async function loadReport(){
+    const box=q('#afrSummary');if(!box)return;
+    try{
+      const r=await json('/api/accounting/fifo-readiness/report');
+      if(!r.available){box.innerHTML='<div class="warn">Dataset آماده برای گزارش وجود ندارد.</div>';return;}
+      const c=r.confidence||{},g=r.gate||{},comparison=r.comparison||{};
+      const components=c.components||{};
+      box.innerHTML=`
+        <div class="row four">
+          <div class="info"><b>Accounting Confidence Index</b><br>${num(c.index)} / 100<br><small>${safe(c.version)}</small></div>
+          <div class="info"><b>Approval Gate</b><br>${safe(g.status)}<br>Auto approval: NO</div>
+          <div class="info"><b>Evidence Queue</b><br>${num(r.evidence?.total)} item<br>${num(r.evidence?.affectedSaleValue)} IRR</div>
+          <div class="info"><b>Dataset</b><br><small>${safe(r.dataset?.datasetId)}</small><br>${safe(r.dataset?.algorithmVersion)}</div>
+        </div>
+        ${table(['Metric','Coverage'],[
+          ['Quantity Cost Coverage',pct(components.quantityCostCoverage)],
+          ['Sale Value Cost Coverage',pct(components.saleValueCostCoverage)],
+          ['Line Coverage',pct(components.lineCoverage)],
+          ['Official Evidence Coverage',pct(components.officialEvidenceCoverage)],
+          ['Manual Evidence Coverage',pct(components.manualEvidenceCoverage)],
+          ['Return Linkage Coverage',pct(components.returnLinkageCoverage)],
+          ['Accounting Review Coverage',pct(components.accountingReviewCoverage)]
+        ].map(row=>`<tr><td>${safe(row[0])}</td><td>${safe(row[1])}</td></tr>`))}
+        <div class="small muted">${safe(c.formula)} — ${safe(c.interpretation)}</div>
+        <h5>Accounting Approval Gate</h5>
+        ${table(['Check','Result'],[
+          ...Object.entries(g.technicalChecks||{}),
+          ...Object.entries(g.accountingChecks||{})
+        ].map(([name,value])=>`<tr><td>${safe(name)}</td><td>${check(value)}</td></tr>`))}
+        <h5>Precision Diagnostics</h5>
+        <div class="info">Model: ${safe(r.precision?.model)} | Quantity scale: ${num(r.precision?.quantityScale)} | Unit cost scale: ${num(r.precision?.unitCostScale)} | Value scale: ${num(r.precision?.allocationValueScale)} | Rounding: ${safe(r.precision?.roundingMode)}<br>Historical datasets mutated: NO</div>
+        <h5>Dataset Comparison</h5>
+        <div class="info">Old: ${safe(comparison.oldDatasetId||'—')}<br>New: ${safe(comparison.newDatasetId||'—')}<br>Changed allocations: ${num(comparison.counts?.changedAllocations)} | Source changes: ${num(comparison.counts?.changedSourceSelections)} | Precision differences: ${num(comparison.counts?.precisionOnlyDifferences)} | Return corrections: ${num(comparison.counts?.returnCorrections)}<br>Unknown quantity: ${num(comparison.unknownQuantity?.before)} → ${num(comparison.unknownQuantity?.after)}</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadEvidence(){
+    const box=q('#afrEvidence');if(!box)return;
+    try{
+      const r=await json('/api/accounting/evidence?pageSize=100');
+      box.innerHTML=`<div class="info">P0: ${num(r.impact?.byPriority?.P0)} | P1: ${num(r.impact?.byPriority?.P1)} | P2: ${num(r.impact?.byPriority?.P2)} | P3: ${num(r.impact?.byPriority?.P3)} | Impact: ${num(r.impact?.affectedSaleValue)} IRR</div>`+
+        table(['Priority','Item','Impact','Coverage gain','Status','Assigned','Action'],(r.list||[]).map(row=>`<tr>
+          <td>${safe(row.priority)}<br><small>${num(row.priorityScore)}</small></td>
+          <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
+          <td>${num(row.affectedSaleValue)} IRR<br>${num(row.affectedQuantity)} qty / ${num(row.affectedSaleCount)} invoices</td>
+          <td>${pct(row.cumulativeCoverageGainPercent)}<br>Index +${num(row.projectedConfidenceImprovement)}</td>
+          <td>${safe(row.status)}<br><small>${safe(row.reasonCode)}</small></td>
+          <td>${safe(row.assignedTo||'—')}</td>
+          <td><button class="mini afr-evidence" data-id="${safe(row.evidenceId)}" data-revision="${Number(row.revision||0)}">بررسی</button></td>
+        </tr>`));
+      document.querySelectorAll('.afr-evidence').forEach(button=>button.onclick=async()=>{
+        const status=prompt('وضعیت جدید: accounting_investigation / evidence_requested / evidence_found / manual_cost_draft / pending_approval / approved_manual / official_layer_resolved / return_dependency / manager_decision / confirmed_unknown / deferred');
+        if(!status)return;
+        const reason=prompt('دلیل/یادداشت حسابداری:')||'';
+        const evidenceReference=prompt('مرجع Evidence (در صورت وجود):')||'';
+        try{
+          await json(`/api/accounting/evidence/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify({status,reason,accountingNotes:reason,evidenceReference,revision:Number(button.dataset.revision)})});
+          await refresh();
+        }catch(error){alert(error.message);}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadReturns(kind){
+    const box=q(kind==='purchase'?'#afrPurchaseReturns':'#afrSaleReturns');if(!box)return;
+    try{
+      const r=await json(`/api/accounting/${kind}-return-resolutions?pageSize=500`);
+      box.innerHTML=table(['Return','Item','Qty','Candidates','Confidence','Status','Action'],(r.list||[]).map(row=>{
+        const candidates=kind==='purchase'?row.candidatePurchaseLayers:row.candidateSaleLines;
+        const selected=kind==='purchase'?row.selectedPurchaseLayer:row.selectedOriginalSaleLineId;
+        return `<tr><td>${safe(row.returnInvoiceIdentity)}<br><small>${safe(row.returnLineIdentity)}</small></td><td>${safe(row.itemCode)}</td><td>${num(row.returnQuantity)}</td><td>${num(candidates?.length)}<br><small>${safe(selected||candidates?.[0]?.purchaseLineIdentity||candidates?.[0]?.originalSaleLineId||'')}</small></td><td>${pct(row.confidence)}</td><td>${safe(row.status)}<br><small>${safe(row.reason)}</small></td><td>${row.status==='confirmed_linked'?'—':`<button class="mini afr-return" data-kind="${kind}" data-id="${safe(row.resolutionId)}" data-revision="${Number(row.revision||0)}" data-candidate="${safe(candidates?.[0]?.purchaseLineIdentity||candidates?.[0]?.originalSaleLineId||'')}">Review</button>`}</td></tr>`;
+      }));
+      box.querySelectorAll('.afr-return').forEach(button=>button.onclick=async()=>{
+        const status=prompt('وضعیت: pending_review / confirmed_linked / confirmed_unmatched / deferred')||'';
+        if(!status)return;
+        const selected=prompt('شناسه ردیف اصلی (فقط برای confirmed_linked):',button.dataset.candidate)||'';
+        const reason=prompt('دلیل و Evidence:')||'';
+        const body={status,reason,revision:Number(button.dataset.revision),confidence:status==='confirmed_linked'?100:0};
+        if(button.dataset.kind==='purchase')body.selectedPurchaseLayer=selected;else body.selectedOriginalSaleLineId=selected;
+        try{await json(`/api/accounting/${button.dataset.kind}-return-resolutions/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify(body)});await refresh();}
+        catch(error){alert(error.message);}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadSamples(){
+    const box=q('#afrSamples');if(!box)return;
+    try{
+      const r=await json('/api/accounting/fifo-readiness/samples');
+      box.innerHTML=table(['Category','Sale','Purchase/Manual','Cost','Classification','Review'],(r.list||[]).map(row=>`<tr>
+        <td>${safe(row.category)}</td><td>${safe(row.sourceSaleInvoice||'—')}<br><small>${safe(row.saleLine)}</small></td>
+        <td><small>${safe(row.sourcePurchaseLayer||row.manualEvidence||'—')}</small></td><td>${safe(row.unitCostExact||'—')} / ${safe(row.allocationCostExact||'—')}</td>
+        <td>${safe(row.confidenceClassification)}<br><small>${safe(row.unresolvedReason)}</small></td>
+        <td>${safe(row.reviewStatus)}${row.reviewStatus==='not_reviewed'?`<br><button class="mini afr-sample" data-id="${safe(row.sampleId)}" data-revision="${Number(row.revision||0)}">ثبت بررسی</button>`:''}</td>
+      </tr>`));
+      box.querySelectorAll('.afr-sample').forEach(button=>button.onclick=async()=>{
+        const reviewStatus=prompt('accounting_confirmed / accounting_disputed / needs_evidence')||'';
+        if(!reviewStatus)return;
+        const reviewNotes=prompt('یادداشت بررسی:')||'';
+        try{await json(`/api/accounting/fifo-readiness/samples/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify({reviewStatus,reviewNotes,revision:Number(button.dataset.revision)})});await refresh();}
+        catch(error){alert(error.message);}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function synchronize(){
+    const box=q('#afrSyncStatus');
+    try{
+      box.innerHTML='<div class="info">در حال همگام‌سازی Evidence از Datasetهای immutable…</div>';
+      const r=await json('/api/accounting/fifo-readiness/synchronize',{method:'POST',body:'{}'});
+      box.innerHTML=`<div class="success">Evidence ${num(r.evidence?.total)} | Purchase Returns ${num(r.purchaseReturns?.total)} | Sale Returns ${num(r.saleReturns?.total)} | Samples ${num(r.samples?.total)} | ${num(r.durationMs)} ms</div>`;
+      await refresh();
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function refresh(){await Promise.all([loadReport(),loadEvidence(),loadReturns('purchase'),loadReturns('sale'),loadSamples()]);}
+  window.pageAccountingFifoReadiness=async function(){
+    setPage('Accounting FIFO Readiness',`<main class="main-content">
+      <div class="warn"><b>SHADOW MODE</b><br><b>NOT APPROVED FOR PROFIT OR COMMISSION</b><br><b>Unknown Cost Is Not Zero</b></div>
+      <div class="actions">${['admin','accounting'].includes(userRole())?'<button class="btn" id="afrSync">Synchronize Evidence Queues</button>':''}<button class="btn" id="afrRefresh">Refresh</button></div><div id="afrSyncStatus"></div>
+      <div class="card"><div class="card-header"><h5>Financial Impact, Confidence, Precision and Approval Gate</h5></div><div class="card-body"><div id="afrSummary"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Accounting Evidence Queue</h5></div><div class="card-body"><div id="afrEvidence"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Manual Cost Approvals</h5></div><div class="card-body"><div class="info">Workflow مستقل Manual Cost در صفحه «رفع هزینه خرید نامشخص» باقی مانده است. فقط رکورد Approved با دو کاربر و Evidence معتبر در FIFO آینده مصرف می‌شود.</div></div></div>
+      <div class="card"><div class="card-header"><h5>Purchase Return Queue</h5></div><div class="card-body"><div id="afrPurchaseReturns"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Sale Return Queue</h5></div><div class="card-body"><div id="afrSaleReturns"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Accounting Validation Samples</h5></div><div class="card-body"><div id="afrSamples"></div></div></div>
+    </main>`);
+    if(q('#afrSync'))q('#afrSync').onclick=synchronize;
+    q('#afrRefresh').onclick=refresh;
+    await refresh();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='آمادگی حسابداری FIFO';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFifoReadiness();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.66 FIFO Shadow Validation.
+   This page reads and writes only isolated FIFO shadow collections.
+   Profit, ROI, commission and accounting approval remain disabled. */
+(()=>{
+  const PAGE='fifo-shadow-validation';
+  const q=selector=>document.querySelector(selector);
+  let selectedDatasetId='';
+  function safe(value){return esc(value==null?'':String(value));}
+  function number(value){
+    const n=Number(value);
+    return Number.isFinite(n)?n.toLocaleString('fa-IR',{maximumFractionDigits:2}):'—';
+  }
+  function pct(value){return `${number(value||0)}٪`;}
+  function query(parameters={}){
+    return new URLSearchParams(Object.entries(parameters).filter(([,value])=>value!==''&&value!=null)).toString();
+  }
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){
+      const error=new Error(payload.error||response.statusText);
+      error.code=payload.code||'';
+      throw error;
+    }
+    return payload;
+  }
+  async function waitForJob(jobId){
+    const deadline=Date.now()+30*60*1000;
+    while(Date.now()<deadline){
+      const response=await json('/api/jobs/status?'+query({jobId}));
+      const job=response.job;
+      q('#fifoJob').innerHTML=`<div class="info">Job: ${safe(jobId)} | ${safe(job?.status||'queued')} | ${safe(job?.phase||'')} ${job?.progress?.percent!=null?`| ${number(job.progress.percent)}٪`:''}</div>`;
+      if(['completed','failed','cancelled'].includes(job?.status)){
+        if(job.status!=='completed')throw new Error(job.error||`FIFO Shadow ${job.status}`);
+        return job;
+      }
+      await new Promise(resolve=>setTimeout(resolve,1500));
+    }
+    throw new Error('مهلت انتظار FIFO Shadow به پایان رسید؛ وضعیت Job را بررسی کنید.');
+  }
+  function coverageCards(summary={}){
+    return [
+      ['Official',summary.official?.quantityPercent,summary.official?.quantity],
+      ['Manual',summary.manual?.quantityPercent,summary.manual?.quantity],
+      ['Unknown',summary.unknown?.quantityPercent,summary.unknown?.quantity]
+    ].map(([label,percent,quantity])=>`<div class="info"><b>${safe(label)}</b><br>${pct(percent)}<br>${number(quantity)} واحد</div>`).join('');
+  }
+  function reconciliationTable(validation={}){
+    const checks=[
+      ['Allocated + Unknown = Sold',validation.allocatedPlusUnknownEqualsSold],
+      ['Duplicate Allocation',Number(validation.duplicateAllocationCount||0)===0],
+      ['Layer Over-consumption',Number(validation.layerOverConsumptionCount||0)===0],
+      ['Orphan Layer',Number(validation.orphanLayerCount||0)===0],
+      ['Negative Remaining',Number(validation.negativeRemainingCount||0)===0],
+      ['Inactive Source',Number(validation.inactiveSourceCount||0)===0]
+    ];
+    return `<table class="table"><thead><tr><th>کنترل</th><th>نتیجه</th></tr></thead><tbody>${checks.map(([label,ok])=>`<tr><td>${safe(label)}</td><td>${ok?'<span class="success">PASS</span>':'<span class="error">FAIL</span>'}</td></tr>`).join('')}</tbody></table>`;
+  }
+  async function loadDatasets(){
+    const response=await json('/api/accounting/fifo-shadow/datasets?limit=30');
+    const list=response.list||[];
+    if(!selectedDatasetId)selectedDatasetId=response.activeDatasetId||list[0]?.datasetId||'';
+    q('#fifoDatasets').innerHTML=`<table class="table"><thead><tr><th>Dataset</th><th>Status</th><th>Sources</th><th>Allocation</th><th>Confidence</th><th>Build</th><th></th></tr></thead><tbody>${list.map(row=>`<tr>
+      <td><small>${safe(row.datasetId)}</small>${row.isActive?'<br><span class="success">ACTIVE SHADOW</span>':''}</td>
+      <td>${safe(row.status)} / ${safe(row.activationStatus)}</td>
+      <td><small>Sale: ${safe(row.sourceSaleSnapshotId)}<br>Purchase: ${safe(row.sourcePurchaseDatasetId)}</small></td>
+      <td>${number(row.allocationCount)}</td><td>${number(row.summary?.confidenceScore)} — ${safe(row.summary?.confidence)}</td>
+      <td>${number(row.performance?.durationMs)} ms</td>
+      <td><button class="mini fifo-select" data-id="${safe(row.datasetId)}">مشاهده</button>${['failed','cancelled','completed_with_errors'].includes(row.status)&&['admin','accounting'].includes(userRole())?` <button class="mini fifo-resume" data-id="${safe(row.datasetId)}">Resume</button>`:''}</td>
+    </tr>`).join('')||'<tr><td colspan="7">Dataset ساخته نشده است.</td></tr>'}</tbody></table>`;
+    document.querySelectorAll('.fifo-select').forEach(button=>button.onclick=async()=>{selectedDatasetId=button.dataset.id;await loadReport();});
+    document.querySelectorAll('.fifo-resume').forEach(button=>button.onclick=()=>startBuild(button.dataset.id));
+  }
+  async function loadReport(){
+    const box=q('#fifoReport');if(!box)return;
+    if(!selectedDatasetId){box.innerHTML='<div class="info">FIFO Shadow Dataset موجود نیست.</div>';return;}
+    try{
+      const report=await json('/api/accounting/fifo-shadow/report?'+query({datasetId:selectedDatasetId}));
+      const dataset=report.dataset||{}, summary=dataset.summary||{}, business=report.businessValidation||{};
+      box.innerHTML=`
+        <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>هیچ سود، ROI یا پورسانتی از این Dataset فعال نیست.</div>
+        <div class="row four">
+          <div class="info"><b>Dataset</b><br><small>${safe(dataset.datasetId)}</small><br>${safe(dataset.status)} / ${safe(dataset.activationStatus)}</div>
+          <div class="info"><b>Coverage</b><br>${coverageCards(summary)}</div>
+          <div class="info"><b>Confidence</b><br>${number(report.confidence?.score)} / 100<br>${safe(report.confidence?.classification)}</div>
+          <div class="info"><b>Unknown Value</b><br>${number(summary.unknown?.saleValue)} ریال<br>${number(summary.unknown?.quantity)} واحد</div>
+        </div>
+        <div class="card"><div class="card-header"><h5>Reconciliation</h5></div><div class="card-body">${reconciliationTable(report.reconciliation)}</div></div>
+        <div class="card"><div class="card-header"><h5>Top Exceptions</h5></div><div class="card-body"><table class="table"><thead><tr><th>Code</th><th>Status</th><th>Item</th><th>Sale / Layer</th><th>Reason</th></tr></thead><tbody>${(report.topExceptions||[]).map(row=>`<tr><td>${safe(row.code)}</td><td>${safe(row.status)}</td><td>${safe(row.itemCode)}</td><td><small>${safe(row.saleLineId||row.purchaseLineIdentity||row.saleReturnLineId)}</small></td><td>${safe(row.reason)}</td></tr>`).join('')||'<tr><td colspan="5">Exception unresolved وجود ندارد.</td></tr>'}</tbody></table></div></div>
+        <div class="card"><div class="card-header"><h5>Business Validation Samples</h5></div><div class="card-body">
+          <h5>Top 10 Invoice by Value</h5><table class="table"><thead><tr><th>Invoice</th><th>Date</th><th>Lines</th><th>Sale Value</th><th>Allocated</th><th>Unknown</th></tr></thead><tbody>${(business.topInvoicesByValue||[]).map(row=>`<tr><td>${safe(row.saleInvoiceNo)}</td><td>${safe(row.saleDate)}</td><td>${number(row.lineCount)}</td><td>${number(row.saleValue)}</td><td>${number(row.allocatedQuantity)}</td><td>${number(row.unknownQuantity)}</td></tr>`).join('')}</tbody></table>
+          <h5>Top Unresolved Items</h5><table class="table"><thead><tr><th>Item</th><th>Description</th><th>Sold</th><th>Unknown</th><th>Sale Value</th></tr></thead><tbody>${(business.topUnresolvedItems||[]).map(row=>`<tr><td>${safe(row.itemCode)}</td><td>${safe(row.itemDescription)}</td><td>${number(row.soldQuantity)}</td><td>${number(row.unknownQuantity)}</td><td>${number(row.saleValue)}</td></tr>`).join('')}</tbody></table>
+          <h5>Purchase Returns</h5><div class="info">کل: ${number(summary.purchaseReturns?.total)} | unresolved: ${number(summary.purchaseReturns?.unresolved)}</div>
+        </div></div>
+        <div class="card"><div class="card-header"><h5>Allocation Drill-down</h5></div><div class="card-body">
+          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Official</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
+          <div id="fifoAllocations"></div>
+        </div></div>
+        <div class="info">Build: ${number(dataset.performance?.durationMs)} ms | Mongo read: ${number(dataset.performance?.mongoReadMs)} ms | Allocate: ${number(dataset.performance?.allocationMs)} ms | Mongo write: ${number(dataset.performance?.mongoWriteMs)} ms | Peak observed heap: ${number((dataset.performance?.peakObservedHeapBytes||0)/1024/1024)} MiB</div>`;
+      q('#fifoDrill').onclick=loadAllocations;
+      await loadAllocations();
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadAllocations(){
+    const box=q('#fifoAllocations');if(!box)return;
+    const response=await json('/api/accounting/fifo-shadow/allocations?'+query({
+      datasetId:selectedDatasetId,
+      invoiceNo:q('#fifoInvoice')?.value||'',
+      itemCode:q('#fifoItem')?.value||'',
+      sourceType:q('#fifoSource')?.value||'',
+      pageSize:200
+    }));
+    box.innerHTML=`<div class="small">Rows: ${number(response.total)}</div><table class="table"><thead><tr><th>Sale</th><th>Item</th><th>Qty</th><th>Source</th><th>Purchase / Manual</th><th>Unit Cost</th><th>Layer Remaining</th><th>Reason</th></tr></thead><tbody>${(response.list||[]).map(row=>`<tr>
+      <td>${safe(row.saleInvoiceNo)} / ${safe(row.saleDate)}<br><small>${safe(row.saleLineId)}</small></td>
+      <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
+      <td>${number(row.allocatedQty||row.unknownQty)}</td><td>${safe(row.sourceType)}</td>
+      <td><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small></td>
+      <td>${row.unitCost==null?'UNKNOWN':number(row.unitCost)}</td><td>${row.layerRemainingQuantity==null?'—':number(row.layerRemainingQuantity)}</td><td>${safe(row.unknownReason)}</td>
+    </tr>`).join('')||'<tr><td colspan="8">رکوردی وجود ندارد.</td></tr>'}</tbody></table>`;
+  }
+  async function startBuild(resumeDatasetId=''){
+    const message=q('#fifoJob');message.innerHTML='<div class="info">در حال ثبت Job...</div>';
+    try{
+      const body={
+        dateFrom:q('#fifoFrom').value.trim(),
+        dateTo:q('#fifoTo').value.trim(),
+        resumeDatasetId
+      };
+      const endpoint=resumeDatasetId?'/api/accounting/fifo-shadow/resume':'/api/accounting/fifo-shadow/start';
+      const response=await json(endpoint,{method:'POST',body:JSON.stringify(body)});
+      await waitForJob(response.jobId);
+      message.innerHTML='<div class="success">FIFO Shadow با موفقیت کامل شد.</div>';
+      selectedDatasetId='';
+      await loadDatasets();
+      await loadReport();
+    }catch(error){message.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  window.pageFifoShadowValidation=async function(){
+    setPage('FIFO Shadow Validation',`<main class="main-content">
+      <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>این ماژول فقط Ledger ایزوله می‌سازد. Profit، ROI و Commission غیرفعال‌اند.</div>
+      ${['admin','accounting'].includes(userRole())?`<div class="card"><div class="card-header"><h5>Build Shadow Dataset</h5></div><div class="card-body"><div class="row four"><div class="form-group"><label>از تاریخ شمسی</label><input id="fifoFrom" placeholder="14050101"></div><div class="form-group"><label>تا تاریخ شمسی</label><input id="fifoTo" placeholder="14051229"></div><div class="form-group"><label>&nbsp;</label><button class="btn green" id="fifoStart">ساخت FIFO Shadow</button></div><div class="form-group"><label>&nbsp;</label><span class="small">Official → Approved Manual → Unknown</span></div></div><div id="fifoJob"></div></div></div>`:'<div id="fifoJob"></div>'}
+      <div class="card"><div class="card-header"><h5>Datasets</h5></div><div class="card-body"><div id="fifoDatasets"></div></div></div>
+      <div id="fifoReport"></div>
+    </main>`);
+    if(q('#fifoStart'))q('#fifoStart').onclick=()=>startBuild('');
+    await loadDatasets();
+    await loadReport();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='FIFO Shadow Validation';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageFifoShadowValidation();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
 })();
 
 /* Admin backup + deterministic turnover/document/Kardex workflows. */
@@ -200,7 +887,8 @@ function checkBelowCost(){if(!state.selectedStock)return;const p=Number($('#Pric
 async function loadSerialsForSelected(){const box=$('#serialBox');if(!box||!state.selectedItem||!state.selectedStock)return;state.selectedSerials=[];state.serialInfo=null;box.innerHTML='<div class="small muted">در حال بررسی سریال‌های کالا در انبار انتخاب‌شده...</div>';try{const url=`/api/items/${encodeURIComponent(state.selectedItem.itemCode)}/serials?stockNumber=${encodeURIComponent(state.selectedStock.stockNumber)}&stockGuid=${encodeURIComponent(state.selectedStock.stockGuid||'')}&itemGuid=${encodeURIComponent(state.selectedItem.itemGuid||'')}`;const r=await api(url);state.serialInfo=r;const list=r.list||[];if(list.length){box.innerHTML=`<div class="form-group"><label>سریال کالا در ${esc(state.selectedStock.stockNumber)} - ${esc(state.selectedStock.stockName)}</label><div class="serial-list">${list.map((x,i)=>`<label class="serial-option"><input type="checkbox" class="serial-check" data-i="${i}"> <span>${esc(x.serialNumber)}</span></label>`).join('')}</div><div class="small muted">اگر تعداد بیش از یک است، به تعداد فروش سریال انتخاب کن.</div></div>`;$$('.serial-check').forEach(ch=>ch.onchange=()=>{state.selectedSerials=$$('.serial-check').filter(x=>x.checked).map(x=>list[Number(x.dataset.i)])});}else{box.innerHTML=`<div class="form-group"><label>سریال کالا</label><input id="manualSerials" placeholder="اگر کالا سریال‌دار است، سریال‌ها را با کاما جدا وارد کن"><div class="small muted">${esc(r.note||'برای این کالا/انبار سریالی از شایگان برنگشت. در صورت نیاز سریال را دستی وارد کن تا در فاکتور شایگان داخل فیلد Serials ارسال شود.')}</div></div>`;}}catch(e){box.innerHTML=`<div class="form-group"><label>سریال کالا</label><input id="manualSerials" placeholder="خطا در خواندن سریال؛ در صورت نیاز دستی وارد کن"><div class="small error">${esc(e.message)}</div></div>`}}
 function getLineSerials(){const manual=$('#manualSerials')?.value||'';const manualList=manual.split(/[،,\n]/).map(x=>x.trim()).filter(Boolean);return [...(state.selectedSerials||[]),...manualList.map(serialNumber=>({serialNumber}))]}
 
-function selectSaleStock(item,stock){state.selectedItem=item;state.selectedStock=stock;state.selectedSerials=[];state.serialInfo=null;$('#STNumber').value=`${stock.stockNumber} - ${stock.stockName} (${stock.quantity})`;$('#saleInventory').innerHTML=`<div class="success">کالا و انبار انتخاب شد: ${esc(item.itemDescription)} | ${esc(stock.stockName)}</div>`;checkBelowCost();loadSerialsForSelected()}
+function applyVerifiedSaleStockSelection(item,stock){state.selectedItem=item;state.selectedStock=stock;state.selectedSerials=[];state.serialInfo=null;$('#STNumber').value=`${stock.stockNumber} - ${stock.stockName} (${stock.quantity})`;$('#saleInventory').innerHTML=`<div class="success">کالا و انبار انتخاب شد: ${esc(item.itemDescription)} | ${esc(stock.stockName)}</div>`;checkBelowCost();loadSerialsForSelected()}
+function selectSaleStock(item,stock){return applyVerifiedSaleStockSelection(item,stock)}
 function renderSaleLines(){const box=$('#saleLines');if(!box)return;if(!state.saleLines.length){box.innerHTML='<div class="small muted">هنوز ردیفی به فاکتور اضافه نشده است.</div>';return}let h='<table class="table"><thead><tr><th>ردیف</th><th>کالا</th><th>انبار</th><th>تعداد</th><th>سریال</th><th>قیمت</th><th>مبلغ</th><th>حذف</th></tr></thead><tbody>';h+=state.saleLines.map((x,i)=>`<tr><td>${i+1}</td><td>${esc(x.itemCode)}<br>${esc(x.itemDescription)}</td><td>${esc(x.stockNumber)} - ${esc(x.stockName)}</td><td>${fmt(x.quantity)}</td><td>${(x.serials||[]).map(s=>esc(s.serialNumber||s)).join('<br>')||'<span class="muted">-</span>'}</td><td>${fmt(x.price)}</td><td>${fmt(x.quantity*x.price)}</td><td><button class="mini remove-line" data-i="${i}">حذف</button></td></tr>`).join('');box.innerHTML=h+'</tbody></table>';$$('.remove-line').forEach(b=>b.onclick=()=>{state.saleLines.splice(Number(b.dataset.i),1);renderSaleLines()})}
 function clearSaleLineInputs(){state.selectedItem=null;state.selectedStock=null;state.selectedSerials=[];state.serialInfo=null;['saleQ','saleSelected','STNumber','Quan','Price','manualSerials'].forEach(id=>{const el=$('#'+id);if(el)el.value=id==='Quan'?'1':''});$('#saleInventory').innerHTML='';$('#priceWarn').innerHTML='';const sb=$('#serialBox');if(sb)sb.innerHTML='';setTimeout(()=>$('#saleQ')?.focus(),50)}
 function addSaleLine(){if(!state.selectedItem||!state.selectedStock)return alert('اول کالا و انبار را از لیست انتخاب کنید');const quantity=Number($('#Quan').value||0);const price=Number($('#Price').value||0);if(quantity<=0)return alert('تعداد معتبر وارد کنید');if(price<=0)return alert('مبلغ فروش را وارد کنید');if(quantity>Number(state.selectedStock.quantity||0))return alert('تعداد از موجودی انبار بیشتر است');const serials=getLineSerials();if(serials.length && serials.length!==quantity){if(!confirm(`تعداد سریال انتخاب/وارد شده (${serials.length}) با تعداد فروش (${quantity}) برابر نیست. ادامه می‌دهی؟`))return;}state.saleLines.push({itemCode:state.selectedItem.itemCode,itemDescription:state.selectedItem.itemDescription,itemGuid:state.selectedItem.itemGuid,stockNumber:state.selectedStock.stockNumber,stockName:state.selectedStock.stockName,stockGuid:state.selectedStock.stockGuid,quantity,price,averageCost:state.selectedStock.averageCost,serials});renderSaleLines();clearSaleLineInputs()}
@@ -898,7 +1586,7 @@ if(typeof window!=='undefined'){
     $('#menu').innerHTML=h;
     $$('.navbtn').forEach(b=>b.onclick=()=>{location.hash=b.dataset.page; route();});
     const chip=document.querySelector('.user-chip');
-    if(chip) chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small><br><small>${OP_VERSION}</small>`;
+    if(chip) chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small>`;
   };
 
   function purchaseLineHtml(){return `<div id="purchaseLines" class="mt"></div>`}
@@ -1002,7 +1690,7 @@ if(typeof window!=='undefined'){
     menuEl.innerHTML=h;
     $$('.navbtn').forEach(b=>b.onclick=(ev)=>{ev.preventDefault(); history.pushState(null,'','#'+b.dataset.page); route();});
     const chip=document.querySelector('.user-chip');
-    if(chip) chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small><br><small>${FINAL_VERSION}</small>`;
+    if(chip) chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small>`;
   };
 
   async function supplierSearch(q, limit=80){
@@ -1098,7 +1786,7 @@ if(typeof window!=='undefined'){
   function bindSupplierPicker(inputId,listId,onPick){const input=$('#'+inputId),box=$('#'+listId);if(!input||!box)return;let last=[],seq=0;function render(list){box.style.display='block';box.innerHTML=(list||[]).map((a,i)=>`<div class="account-result" data-i="${i}"><b>${esc(a.supplierName||a.accountName||'')}</b><span>${esc(a.supplierNumber||a.accountNumber||'')}</span><small>${esc(a.supplierGuid||a.accountGuid||'')}</small></div>`).join('')||'<div class="floating-empty">تأمین‌کننده‌ای پیدا نشد.</div>';box.querySelectorAll('.account-result').forEach(el=>el.onclick=()=>{const a=list[Number(el.dataset.i)];const acc={supplierNumber:a.supplierNumber||a.accountNumber||'',supplierName:a.supplierName||a.accountName||'',supplierGuid:a.supplierGuid||a.accountGuid||'',accountNumber:a.supplierNumber||a.accountNumber||'',accountName:a.supplierName||a.accountName||'',accountGuid:a.supplierGuid||a.accountGuid||''};input.value=`${acc.supplierNumber} - ${acc.supplierName}`;box.style.display='none';onPick(acc);});}
     const run=debounce(async()=>{const q=input.value.trim(); if(q.length<2){box.style.display='none';return;} const my=++seq;box.style.display='block';box.innerHTML='<div class="floating-empty">در حال جستجو در شایگان...</div>';const r=await supplierSearch(q,80);if(my!==seq)return;last=r.list||[];render(last);},250);input.addEventListener('input',run);input.addEventListener('keydown',e=>{if(e.key==='Enter'&&last.length===1){e.preventDefault();const a=last[0];const acc={supplierNumber:a.supplierNumber||a.accountNumber||'',supplierName:a.supplierName||a.accountName||'',supplierGuid:a.supplierGuid||a.accountGuid||''};input.value=`${acc.supplierNumber} - ${acc.supplierName}`;box.style.display='none';onPick(acc);}});document.addEventListener('click',e=>{if(!box.contains(e.target)&&e.target!==input)box.style.display='none'});}
   window.canPage = (function(base){return function(page){const r=userRole(); if(r==='admin')return true; if((page==='buy'||page==='purchase-drafts')&&state.user&&state.user.canPurchase===true)return true; return base(page);};})(canPage);
-  window.renderMenu = renderMenu = function(){const newMenu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا-تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات']]]];let h='';const role=userRole();newMenu.forEach(([g,items])=>{const allowed=items.filter(([id])=>canPage(id));if(!allowed.length)return;h+=`<div class="menu-group">${g}</div>`;allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`)});const m=$('#menu');if(!m)return;m.innerHTML=h;$$('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});const chip=document.querySelector('.user-chip');if(chip)chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small><br><small>${V}</small>`};
+  window.renderMenu = renderMenu = function(){const newMenu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا-تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات']]]];let h='';const role=userRole();newMenu.forEach(([g,items])=>{const allowed=items.filter(([id])=>canPage(id));if(!allowed.length)return;h+=`<div class="menu-group">${g}</div>`;allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`)});const m=$('#menu');if(!m)return;m.innerHTML=h;$$('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});const chip=document.querySelector('.user-chip');if(chip)chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc(ROLE_LABELS[role]||role)}</small>`};
   function renderPurchaseLines(){const box=$('#purchaseLines');if(!box)return;const lines=state.purchaseLines||[];if(!lines.length){box.innerHTML='<div class="muted">هنوز ردیفی اضافه نشده است.</div>';return;}let totalQty=0,totalAmount=0;const rows=lines.map((x,i)=>{const amount=lineAmount(x.quantity,x.price);totalQty+=Number(x.quantity||0);totalAmount+=amount;return `<tr><td>${i+1}</td><td>${esc(x.itemCode)}</td><td>${esc(x.itemDescription)}</td><td>${fmt(x.quantity)}</td><td>${fmt(x.lastPurchasePrice||0)}</td><td>${fmt(x.price)}</td><td>${fmt(amount)}</td><td><button class="btn small" data-edit="${i}">ویرایش</button> <button class="btn small danger" data-del="${i}">حذف</button></td></tr>`}).join('');box.innerHTML=`<table class="table"><thead><tr><th>#</th><th>کد</th><th>کالا</th><th>تعداد</th><th>آخرین خرید</th><th>قیمت واحد</th><th>مبلغ</th><th></th></tr></thead><tbody>${rows}</tbody><tfoot><tr><th colspan="3">جمع</th><th>${fmt(totalQty)}</th><th></th><th></th><th>${fmt(totalAmount)}</th><th></th></tr></tfoot></table><div class="total">جمع کل: ${fmt(totalAmount)} ریال</div>`;box.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{state.purchaseLines.splice(Number(b.dataset.del),1);renderPurchaseLines();});box.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editPurchaseLine(Number(b.dataset.edit)));}
   function updatePriceText(){const p=Number($('#buyPrice')?.value||0),q=Number($('#buyQty')?.value||0);const el=$('#buyPriceWords');if(el)el.innerHTML=`قیمت واحد: <b>${fmt(p)} ریال</b> - ${esc(rialWords(p))}<br>مبلغ ردیف: <b>${fmt(lineAmount(q,p))} ریال</b> - ${esc(rialWords(lineAmount(q,p)))}`;}
   function resetPurchaseLineForm(){state.purchaseItem=null;state.purchaseEditIndex=null;['buySelected','buyQ','buyPrice'].forEach(id=>{const e=$('#'+id);if(e)e.value=''});if($('#buyQty'))$('#buyQty').value='1';if($('#buyAdd'))$('#buyAdd').textContent='افزودن ردیف';if($('#buyCancelEdit'))$('#buyCancelEdit').style.display='none';if($('#buyLastPurchase'))$('#buyLastPurchase').innerHTML='';updatePriceText();}
@@ -1115,7 +1803,6 @@ if(typeof window!=='undefined'){
 /* FINAL PATCH 0.9.1: issue purchase draft to Shaygan InvTyp=3 with stock selection. Turnover remains frozen from 0.8.4. */
 (function(){
   const V='0.9.6-purchase-guard-customer-bank';
-  window.MKCRM_VERSION = V;
   async function loadStocks(){ if(state._stocks&&state._stocks.length)return state._stocks; const r=await api('/api/stocks'); state._stocks=r.list||[]; return state._stocks; }
   function stockOptions(selected=''){ const list=state._stocks||[]; return '<option value="">انتخاب انبار ورودی</option>'+list.map(s=>`<option value="${esc(s.stockNumber)}" ${String(selected)===String(s.stockNumber)?'selected':''}>${esc(s.stockNumber)} - ${esc(s.stockName||'')}</option>`).join(''); }
   function renderPurchaseLines091(){const box=$('#purchaseLines');if(!box)return;const lines=state.purchaseLines||[];if(!lines.length){box.innerHTML='<div class="muted">هنوز ردیفی اضافه نشده است.</div>';return;}let totalQty=0,totalAmount=0;const rows=lines.map((x,i)=>{const amount=Number(x.quantity||0)*Number(x.price||0);totalQty+=Number(x.quantity||0);totalAmount+=amount;return `<tr><td>${i+1}</td><td>${esc(x.itemCode)}</td><td>${esc(x.itemDescription)}</td><td>${esc(x.stockNumber||'')} - ${esc(x.stockName||'')}</td><td>${fmt(x.quantity)}</td><td>${fmt(x.lastPurchasePrice||0)}</td><td>${fmt(x.price)}</td><td>${fmt(amount)}</td><td><button class="btn small" data-edit="${i}">ویرایش</button> <button class="btn small danger" data-del="${i}">حذف</button></td></tr>`}).join('');box.innerHTML=`<table class="table"><thead><tr><th>#</th><th>کد</th><th>کالا</th><th>انبار ورودی</th><th>تعداد</th><th>آخرین خرید</th><th>قیمت</th><th>مبلغ</th><th></th></tr></thead><tbody>${rows}</tbody><tfoot><tr><th colspan="4">جمع</th><th>${fmt(totalQty)}</th><th></th><th></th><th>${fmt(totalAmount)}</th><th></th></tr></tfoot></table><div class="total">جمع کل: ${fmt(totalAmount)} ریال</div>`;box.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>{state.purchaseLines.splice(Number(b.dataset.del),1);renderPurchaseLines091();});box.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>editPurchaseLine091(Number(b.dataset.edit)));}
@@ -1188,10 +1875,9 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* FINAL PATCH 0.9.6: purchase archive issue guard with full frontend finally cleanup */
 (function(){
   const V='0.9.6-purchase-guard-customer-bank';
-  window.MKCRM_VERSION = V;
   function localStatusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ثبت',issued:'ثبت‌شده',failed:'خطای ثبت',pending_verify:'در انتظار بررسی',cancelled:'لغوشده'}[String(s||'draft')]||String(s||'draft'));}
   window.pagePurchaseDraftArchive = pagePurchaseDraftArchive = async function(){
-    setPage('آرشیو پیش‌نویس خرید',`<main class="main-content"><div class="card"><div class="card-header"><h5>آرشیو پیش‌نویس خرید</h5></div><div class="card-body"><div class="info">نسخه 0.9.6: ثبت خرید دارای قفل ضد کلیک تکراری است.</div><div class="row three"><div class="form-group"><label>جستجو</label><input id="pdQ" placeholder="شماره، تأمین‌کننده، توضیحات"></div><div class="form-group"><label>وضعیت</label><select id="pdStatus"><option value="">همه</option><option value="draft">پیش‌نویس</option><option value="issuing">در حال ثبت</option><option value="issued">ثبت‌شده در شایگان</option><option value="pending_verify">در انتظار بررسی</option><option value="failed">خطای ثبت</option><option value="cancelled">لغوشده</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="pdLoad">نمایش</button></div></div><div id="pdList">در حال بارگذاری...</div><div id="pdOut"></div></div></div></main>`);
+    setPage('آرشیو پیش‌نویس خرید',`<main class="main-content"><div class="card"><div class="card-header"><h5>آرشیو پیش‌نویس خرید</h5></div><div class="card-body"><div class="info">ثبت خرید دارای قفل ضد کلیک تکراری است.</div><div class="row three"><div class="form-group"><label>جستجو</label><input id="pdQ" placeholder="شماره، تأمین‌کننده، توضیحات"></div><div class="form-group"><label>وضعیت</label><select id="pdStatus"><option value="">همه</option><option value="draft">پیش‌نویس</option><option value="issuing">در حال ثبت</option><option value="issued">ثبت‌شده در شایگان</option><option value="pending_verify">در انتظار بررسی</option><option value="failed">خطای ثبت</option><option value="cancelled">لغوشده</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="pdLoad">نمایش</button></div></div><div id="pdList">در حال بارگذاری...</div><div id="pdOut"></div></div></div></main>`);
     async function issue(no){
       if(state.purchaseIssueInFlight){alert('ثبت خرید در حال انجام است؛ صبر کن تا نتیجه مشخص شود.');return;}
       state.purchaseIssueInFlight=true;
@@ -1231,7 +1917,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* FINAL PATCH 0.9.6 CUSTOMER BANK: Shaygan sales customer sync + sale autofill. Purchase/turnover frozen. */
 (function(){
   const V='0.9.6-purchase-guard-customer-bank';
-  window.MKCRM_VERSION = V;
   function safeText(v){return esc(v==null?'':String(v));}
   function customerLabel(c){return `${c.fullName||'بدون نام'} ${c.mobile?' | '+c.mobile:''} ${c.nationalCode?' | کد ملی '+c.nationalCode:''} ${c.purchaseCount?` | ${c.purchaseCount} خرید`:''}`;}
   async function pickCustomerToSale(c){
@@ -1285,7 +1970,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* FINAL PATCH 0.9.7: sales readiness, sale discount, improved print expectations. Purchase/turnover frozen. */
 (function(){
   const V='0.9.8-sale-issue-idempotency-lock';
-  window.MKCRM_VERSION = V;
   function saleGross(){return (state.saleLines||[]).reduce((sum,x)=>sum+Number(x.quantity||0)*Number(x.price||0),0)}
   // FIX-C1: parse sale discount safely even when user enters formatted numbers like 100,000 or Persian digits.
   function parseSaleMoney(v){
@@ -1389,7 +2073,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* PATCH 0.9.9: sales usability - Jalali kardex dates, page draft state preservation, sale price words. */
 (function(){
   const V='0.9.9-sales-ui-state-jalali-pricewords';
-  window.MKCRM_VERSION = V;
 
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
@@ -1541,7 +2224,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* PATCH 0.9.10: inventory inline kardex modal; keep inventory search context. */
 (function(){
   const V='0.9.12-inventory-live-source-cardex-unified';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
   function ensureCardexModal(){
@@ -1597,7 +2279,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* PATCH 0.9.12: authoritative live inventory + unified cardex modal from every inventory path. */
 (function(){
   const V='0.9.12-inventory-live-source-cardex-unified';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
   function qtyOf(x){ return Number(x?.quantity ?? x?.RemainQ ?? x?.Quantity1 ?? 0); }
@@ -1636,23 +2317,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
     const r=await api(url);
     return {ok:!!r.ok, rows:(r.list||[]).filter(x=>qtyOf(x)>0), error:r.error||''};
   }
-
-  const oldSelectSaleStock = window.selectSaleStock || selectSaleStock;
-  window.selectSaleStock = selectSaleStock = async function(item,stock){
-    const code=item?.itemCode||stock?.itemCode; const sn=stock?.stockNumber||'';
-    const box=$('#saleInventory'); if(box) box.innerHTML='<div class="info">در حال کنترل موجودی لحظه‌ای شایگان...</div>';
-    const live=await verifyLiveInventory(code,sn);
-    if(!live.ok){ if(box) box.innerHTML=`<div class="error">کنترل موجودی زنده ناموفق بود: ${safe(live.error)}</div>`; return; }
-    const row=live.rows.find(x=>stockNoOfLocal(x)===String(sn)) || live.rows[0];
-    if(!row){
-      state.selectedItem=null; state.selectedStock=null;
-      if($('#STNumber')) $('#STNumber').value='';
-      if(box) box.innerHTML='<div class="warn">این کالا در این لحظه در شایگان موجودی قابل فروش ندارد. انتخاب برای فاکتور فروش مجاز نیست.</div>';
-      return;
-    }
-    const is=rawToItemStock(row);
-    return oldSelectSaleStock(is.item,is.stock);
-  };
 
   window.renderInventory = renderInventory = async function(itemCode,target,selectable=false,stockNumber=''){
     const el=$(target); if(el) el.innerHTML='در حال خواندن موجودی لحظه‌ای شایگان...';
@@ -1710,7 +2374,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.13.1-cardex-modal-stock-selector-full';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
   function qtyOf(x){ return Number(x?.quantity ?? x?.RemainQ ?? x?.Quantity1 ?? 0); }
@@ -1825,17 +2488,24 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
   // Fast autocomplete: product catalog only. No live inventory scan while typing.
   window.bindItemSearch = bindItemSearch = function(prefix,onPick,opts={}){
     const q=$(`#${prefix}Q`), box=$(`#${prefix}List`), msg=$(`#${prefix}Msg`); if(!q||!box) return;
-    const limit=Number(opts.limit||80); let seq=0,requestController=null;
+    const limit=Number(opts.limit||80); let seq=0,requestController=null,lastInputAt=0;
     const managedPopup=true;
     uiPageLifecycle.add(()=>{seq++;if(requestController)requestController.abort();requestController=null;});
     async function fastSearch(showBox=true){
       const val=q.value.trim();
       if(val.length<2){box.innerHTML='';if(managedPopup)popupSuggestionController.close({restoreFocus:false});else box.style.display='none';if(msg)msg.textContent='';return []}
       const my=++seq;if(requestController)requestController.abort();requestController=new AbortController();
+      const requestStarted=performance.now(),inputStarted=lastInputAt||requestStarted;searchPerfRuntime.activeRequestCount++;
+      let requestAborted=false,staleResponseIgnored=false,resultCount=0,responseAt=requestStarted;
       if(showBox){box.style.display='block';box.innerHTML='<div class="floating-empty">در حال جستجوی سریع کالا...</div>';if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});}
       if(msg) msg.textContent='جستجوی سریع کالا؛ موجودی بعد از انتخاب کنترل می‌شود.';
-      let r;try{r=await searchAllItemsRows(val,limit,false,{signal:requestController.signal});}catch(e){if(e.name==='AbortError')return [];throw e;} if(my!==seq) return [];
+      let r;try{r=await searchAllItemsRows(val,limit,false,{signal:requestController.signal});responseAt=performance.now();}catch(e){if(e.name==='AbortError'){requestAborted=true;return [];}throw e;} finally {
+        searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1);
+        if(requestAborted)logSearchPerfFrontend({endpoint:'/api/items/search-all',query:val,generation:my,debounceConfiguredMs:250,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((performance.now()-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:true,staleResponseIgnored,activeRequestCount:searchPerfRuntime.activeRequestCount});
+      } if(my!==seq){staleResponseIgnored=true;logSearchPerfFrontend({endpoint:'/api/items/search-all',query:val,generation:my,debounceConfiguredMs:250,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted,staleResponseIgnored:true,activeRequestCount:searchPerfRuntime.activeRequestCount});return [];
+      }
       const list=(r.list||[]).map(productFromRow).filter(x=>x.itemCode);
+      resultCount=list.length;
       if(msg) msg.textContent=`${list.length} کالا | ${r.source||''}${r.cacheCount?' | کش: '+r.cacheCount:''}${r.scannedPages?' | '+r.scannedPages+' صفحه سریع':''}${r.note?' | '+r.note:''}`;
       if(showBox){
         box.style.display='block';
@@ -1843,10 +2513,11 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
         box.querySelectorAll('.product-row').forEach(el=>el.onclick=()=>{const item={itemCode:el.dataset.code,itemDescription:el.dataset.desc,itemGuid:el.dataset.guid};$(`#${prefix}Selected`).value=`${item.itemCode} - ${item.itemDescription}`;if(managedPopup)popupSuggestionController.close();else box.style.display='none';onPick(item,list)});
         if(managedPopup)popupSuggestionController.open({popup:box,trigger:q,optionSelector:'.product-row'});
       }
+      logSearchPerfFrontend({endpoint:'/api/items/search-all',query:val,generation:my,debounceConfiguredMs:250,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted,staleResponseIgnored,activeRequestCount:searchPerfRuntime.activeRequestCount});
       return list;
     }
     const deb=debounce(()=>fastSearch(true),250);
-    q.addEventListener('input',deb);
+    q.addEventListener('input',()=>{lastInputAt=performance.now();deb()});
     q.addEventListener('keydown',async e=>{if(e.key==='Enter'){e.preventDefault();const list=await fastSearch(false);box.style.display='none';if(opts.onEnter) opts.onEnter(q.value.trim(),list);else if(list.length===1) onPick(list[0],list)}});
     if(opts.filterElement){opts.filterElement.addEventListener('change',()=>{const val=q.value.trim(); if(val.length>=2 && opts.onEnter) opts.onEnter(val,[]);});}
   };
@@ -1878,7 +2549,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.13.2-bulk-live-inventory-search-results';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
   function qtyOf(x){return Number(x?.quantity ?? x?.RemainQ ?? x?.Quantity1 ?? 0)}
@@ -1960,7 +2630,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.17.7-customer-search-js-guard';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
   function qtyOf(x){return Number(x?.quantity ?? x?.RemainQ ?? x?.Quantity1 ?? 0)}
@@ -1994,7 +2663,7 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
         return;
       }
       const liveStock={...stock, stockNumber:live.stockNumber||stock.stockNumber, stockName:live.stockName||stock.stockName, stockGuid:live.stockGuid||stock.stockGuid, quantity:qtyOf(live), averageCost:Number(live.averageCost||stock.averageCost||0), remainCost:Number(live.remainCost||stock.remainCost||0)};
-      selectSaleStock(item, liveStock);
+      applyVerifiedSaleStockSelection(item, liveStock);
       if(box) box.innerHTML=`<div class="success">موجودی زنده تأیید شد: ${safe(item.itemDescription)} | ${safe(liveStock.stockNumber)} - ${safe(liveStock.stockName)} | موجودی ${nfmt(liveStock.quantity)}</div>`;
     }catch(e){
       state.selectedItem=null; state.selectedStock=null;
@@ -2005,20 +2674,56 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
   function bindSaleSnapshotSearch(){
     const q=$('#saleQ'), list=$('#saleList'), msg=$('#saleMsg');
     if(!q||!list) return;
-    let seq=0, lastGroups=[];
+    const searchSessionId=`search-session-${Date.now()}-${Math.random().toString(36).slice(2,8)}`;
+    let seq=0, lastGroups=[],lastInputAt=0,requestController=null,verifyController=null,disposed=false;
+    function invalidateSearch(){
+      seq++;
+      requestController?.abort();
+      verifyController?.abort();
+      requestController=null;
+      verifyController=null;
+    }
+    async function verifyVisibleResult(itemCode,generation,queryText){
+      if(!itemCode||disposed||generation!==seq||q.value.trim()!==queryText)return;
+      verifyController?.abort();
+      verifyController=new AbortController();
+      try{
+        const r=await api(`/api/search/inventory-verify?itemCode=${encodeURIComponent(itemCode)}&searchSessionId=${encodeURIComponent(searchSessionId)}&generation=${generation}&query=${encodeURIComponent(queryText)}`,{signal:verifyController.signal});
+        if(disposed||generation!==seq||q.value.trim()!==queryText||r.searchSessionId!==searchSessionId||Number(r.generation)!==generation||r.query!==queryText)return;
+        const liveByStock=new Map((r.list||[]).map(row=>[String(row.stockNumber||row.STNumber||''),row]));
+        list.querySelectorAll('.choose-sale-snapshot-stock').forEach(btn=>{
+          const local=JSON.parse(btn.dataset.row||'{}');
+          if(String(local.itemCode||'')!==String(itemCode))return;
+          if(!btn.isConnected||!list.contains(btn))return;
+          const live=liveByStock.get(String(local.stockNumber||''));
+          if(!live){if(r.ok)logSearchVerifyDiff({searchSessionId,itemCode,stockNumber:String(local.stockNumber||''),localQuantity:Number(local.quantity||0),liveQuantity:0});return;}
+          const quantity=Number(live.quantity??live.RemainQ??live.Quantity1??local.quantity??0);
+          logSearchVerifyDiff({searchSessionId,itemCode,stockNumber:String(local.stockNumber||''),localQuantity:Number(local.quantity||0),liveQuantity:quantity});
+          btn.dataset.row=JSON.stringify({...local,quantity,searchVerify:{status:'verified',verifiedAt:new Date().toISOString()}});
+          let badge=btn.nextElementSibling;
+          if(!badge||!badge.classList.contains('sale-search-verify-status')){badge=document.createElement('span');badge.className='pill sale-search-verify-status';btn.insertAdjacentElement('afterend',badge);}
+          badge.textContent=`تأیید زنده: موجودی ${nfmt(quantity)}`;
+        });
+      }catch(e){if(e.name!=='AbortError'&&generation===seq&&!disposed&&msg)msg.textContent+=' | کنترل پس‌زمینه در دسترس نبود';}
+    }
     const search=debounceLocal(async()=>{
+      if(disposed)return;
       const val=q.value.trim();
       state.selectedItem=null; state.selectedStock=null;
       if($('#STNumber')) $('#STNumber').value='';
       if($('#saleInventory')) $('#saleInventory').innerHTML='';
       if(val.length<2){list.style.display='none';list.innerHTML='';if(msg)msg.textContent='';return;}
       const my=++seq;
+      const requestStarted=performance.now(),inputStarted=lastInputAt||requestStarted;searchPerfRuntime.activeRequestCount++;
+      let responseAt=requestStarted,staleResponseIgnored=false,resultCount=0;
+      requestController=new AbortController();
       list.style.display='block'; list.innerHTML='<div class="floating-empty">در حال جستجوی موجودی فعال CRM...</div>';
       if(msg) msg.textContent='سرچ فروش و موجودی از موتور یکپارچه موجودی فعال CRM.';
       try{
-        const r=await api(`/api/sale/inventory-snapshot-search?q=${encodeURIComponent(val)}&limit=30`);
-        if(my!==seq) return;
+        const r=await api(`/api/sale/inventory-snapshot-search?q=${encodeURIComponent(val)}&limit=30&searchSessionId=${encodeURIComponent(searchSessionId)}&generation=${my}`,{signal:requestController.signal});responseAt=performance.now();
+        if(my!==seq){staleResponseIgnored=true;logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored:true,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1),searchSessionId});return;}
         lastGroups=r.groups||[];
+        resultCount=lastGroups.length;
         if(msg) msg.innerHTML=`${nfmt(lastGroups.length)} کالا دارای موجودی فعال | ${safe(r.source||'snapshot')}${r.stale?' | <span class="warn-inline">snapshot موجودی فعال است؛ در صورت خطا Sync موجودی را بررسی کنید</span>':''}`;
         renderSaleSnapshotGroups(list,lastGroups);
         list.querySelectorAll('.choose-sale-snapshot-stock').forEach(btn=>btn.onclick=async(ev)=>{
@@ -2030,13 +2735,16 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
           list.style.display='none';
           await verifyAndSelectSaleStock(item,stock);
         });
+        logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1),searchSessionId});
+        verifyVisibleResult(lastGroups[0]?.itemCode,my,val);
       }catch(e){
+        if(e.name==='AbortError'){logSearchPerfFrontend({endpoint:'/api/sale/inventory-snapshot-search',query:val,generation:my,debounceConfiguredMs:220,actualDebounceMs:Number((requestStarted-inputStarted).toFixed(3)),requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((performance.now()-requestStarted).toFixed(3)),responseToRenderMs:0,inputToVisibleMs:Number((performance.now()-inputStarted).toFixed(3)),resultCount,requestAborted:true,staleResponseIgnored:false,activeRequestCount:Math.max(0,searchPerfRuntime.activeRequestCount-1),searchSessionId});return;}
         if(my!==seq) return;
         list.innerHTML=`<div class="floating-empty">${safe(e.message||e)}</div>`;
         if(msg) msg.textContent='خطا در جستجوی snapshot موجودی';
-      }
+      }finally{searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1)}
     },220);
-    q.addEventListener('input',search);
+    q.addEventListener('input',()=>{lastInputAt=performance.now();invalidateSearch();search()});
     q.addEventListener('keydown',async e=>{
       if(e.key==='Enter'){
         e.preventDefault();
@@ -2045,6 +2753,7 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
       }
     });
     document.addEventListener('click',e=>{if(list&&!list.contains(e.target)&&e.target!==q)list.style.display='none'});
+    uiPageLifecycle.add(()=>{disposed=true;invalidateSearch()});
   }
   window.bindSaleSnapshotSearch = bindSaleSnapshotSearch;
   const oldAddSaleLine = window.addSaleLine || addSaleLine;
@@ -2074,7 +2783,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.19.21-inventory-sale-search-unified';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function nfmt(v){try{return fmt(v);}catch{return Number(v||0).toLocaleString('fa-IR')}}
   function qsel(x){return document.querySelector(x)}
@@ -2156,7 +2864,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.19.21-inventory-sale-search-unified';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function fmtDate(v){if(!v)return '';try{return new Date(v).toLocaleString('fa-IR');}catch{return String(v)}}
   async function pageSettingsFiscal(){
@@ -2264,7 +2971,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.14.2-sql-fiscal-customer-bank-restore';
-  window.MKCRM_VERSION = V;
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function labelCustomer(c){
     return `${c.fullName||c.customerName||'بدون نام'} ${c.mobile?' | '+c.mobile:''} ${c.nationalCode?' | کد ملی '+c.nationalCode:''} ${c.purchaseCount?` | ${c.purchaseCount} خرید`:''}`;
@@ -2539,7 +3245,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.16.3-lead-control-reports-logo';
-  window.MKCRM_VERSION=V;
   function $(s){return document.querySelector(s)}
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'')}}
   function normLead(v){return String(v||'').trim().replace(/[\u200c\u200f\u202a-\u202e]/g,'').replace(/[\r\n\t]+/g,' ').replace(/\s+/g,' ').slice(0,80)}
@@ -2589,7 +3294,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 */
 (function(){
   const V='0.9.16.3-lead-control-reports-logo';
-  window.MKCRM_VERSION=V;
   function $q(s){return document.querySelector(s)}
   function $qa(s){return Array.from(document.querySelectorAll(s))}
   function html(v){try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}}
@@ -2642,7 +3346,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 /* 0.9.16.3 Lead Control - CRM-only pilot, no direct Lead ID database/API dependency */
 (function(){
   const V='0.9.16.3-lead-control-reports-logo';
-  window.MKCRM_VERSION=V;
   function q(s){return document.querySelector(s)}
   function qa(s){return Array.from(document.querySelectorAll(s))}
   function h(v){try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}}
@@ -2691,7 +3394,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 
 /* 0.9.16.4: sale form reset after successful issue + persistent logo safeguard */
 (function(){
-  window.MKCRM_VERSION='0.9.16.8-proforma-live-total-persian-search';
   const st=document.createElement('style');
   st.textContent='.brand.brand-with-logo{padding:14px 18px 7px!important;display:flex!important;flex-direction:column!important;align-items:center!important;gap:6px!important}.brand-logo-img{width:210px!important;max-width:100%!important;height:auto!important;background:#fff!important;border-radius:10px!important;padding:6px!important;box-shadow:0 3px 10px rgba(0,0,0,.20)!important;display:block!important}.brand-system{font-size:12px!important;letter-spacing:.4px!important;color:#e5e7eb!important}';
   document.head.appendChild(st);
@@ -2699,7 +3401,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 
 /* 0.9.17.0 Customer Bank + Data Quality */
 (function(){
-  window.MKCRM_VERSION='0.9.17.5-customer-search-money-format-purchase-sql';
   function q(s){return document.querySelector(s)}
   function h(v){try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}}
   function n(v){try{return Number(v||0).toLocaleString('fa-IR')}catch{return String(v||0)}}
@@ -2743,7 +3444,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 
 /* 0.9.17.1 Customer Intelligence Reports */
 (function(){
-  window.MKCRM_VERSION='0.9.17.1-customer-intelligence-reports';
   function q(s){return document.querySelector(s)}
   function h(v){try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}}
   function n(v){try{return Number(v||0).toLocaleString('fa-IR')}catch{return String(v||0)}}
@@ -2806,7 +3506,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 
 /* 0.9.17.5: regression guard - sale customer search restore, money input comma formatting, purchase item SQL search */
 (function(){
-  window.MKCRM_VERSION='0.9.17.5-customer-search-money-format-purchase-sql';
   function qs(s){return document.querySelector(s)}
   function qsa(s){return Array.from(document.querySelectorAll(s))}
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}}
@@ -2892,7 +3591,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
    - Keeps final invoice number guard, Lead soft sync, money formatting, Persian search, and all previous fixes.
 */
 (function(){
-  window.MKCRM_VERSION='0.9.17.6-customer-search-hard-restore';
   function qs(s){return document.querySelector(s)}
   function safe(v){try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}}
   function faToEnDigits(v){return String(v??'').replace(/[۰-۹]/g,d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d)).replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d));}
@@ -2977,7 +3675,6 @@ function statusFa(s){return ({draft:'پیش‌نویس',issuing:'در حال ث�
 
 /* 0.9.18.1: Shaygan invoice view from account ledger - supports historical Shaygan invoices and CRM-issued invoices */
 (function(){
-  window.MKCRM_VERSION='0.9.19.6-supplier-aging-origin-summary';
   const qs=s=>document.querySelector(s);
   const qsa=s=>Array.from(document.querySelectorAll(s));
   const safe=v=>{try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}};
@@ -3099,7 +3796,6 @@ async function pageSellerProfit(){
 
 /* PATCH 0.9.19.7: Supplier aging inventory-first UI + stability cleanup */
 (function(){
-  window.MKCRM_VERSION='0.9.19.44-stability-sync-sale-reset-background-jobs';
   const qsa=(s)=>Array.from(document.querySelectorAll(s));
   const qs=(s)=>document.querySelector(s);
   const safe=(v)=>{try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}};
@@ -3252,7 +3948,6 @@ async function pageSellerProfit(){
 
 /* PATCH 0.9.19.9: Seller profit fixes + persistent supplier aging last report */
 (function(){
-  window.MKCRM_VERSION='0.9.19.9-seller-profit-jalali-last-aging-report';
   const $ = (s)=>document.querySelector(s);
   const $$ = (s)=>Array.from(document.querySelectorAll(s));
   const safe = (v)=>{ try { return esc(v==null?'':String(v)); } catch { return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m])); } };
@@ -3265,7 +3960,7 @@ async function pageSellerProfit(){
       t.parentNode.insertBefore(w,t); w.appendChild(t);
     });
   };
-  function normJalaliInput(v){ return toEn(v).replace(/[^0-9]/g,'').slice(0,8); }
+  function normJalaliInput(v){ return normalizeSellerPerformanceJalaliDate(v); }
   function moneyTomanToRial(v){ const x=toEn(v).replace(/[^0-9.-]/g,''); return x===''?'':String(Number(x)*10); }
   function payFa(x){ return ({cash:'نقدی',check:'چکی',mixed:'ترکیبی',manual:'دستی/نامشخص'}[String(x||'mixed')]||x||'ترکیبی'); }
   function riskFa(r){ return ({high:'بالا',medium:'متوسط',low:'پایین'}[String(r||'')]||r||''); }
@@ -3332,13 +4027,12 @@ async function pageSellerProfit(){
 
 /* PATCH 0.9.19.13 FINAL: seller performance filters from cached report only */
 (function(){
-  window.MKCRM_VERSION='0.9.19.14-final-seller-jalali-date-shaygan';
   const hesc = (v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   const toEnNum = (v)=>String(v??'').replace(/[۰-۹]/g,d=>'۰۱۲۳۴۵۶۷۸۹'.indexOf(d)).replace(/[٠-٩]/g,d=>'٠١٢٣٤٥٦٧٨٩'.indexOf(d));
   const moneyClean = (v)=>toEnNum(v).replace(/[^0-9.-]/g,'');
   const moneyTomanToRial = (v)=>{ const n=Number(moneyClean(v)); return Number.isFinite(n) && n!==0 ? n*10 : null; };
   const dfltMonthRange = ()=>{
-    // UI date input is Jalali. Server normalizes 13/14xx Jalali dates to Shaygan-compatible YYYYMMDD Gregorian before WebService calls.
+    // Seller Performance uses canonical Jalali YYYYMMDD end-to-end. No Jalali-to-Gregorian conversion is performed.
     try {
       const t = (typeof todayJalali8 === 'function' ? todayJalali8() : '');
       if (/^\d{8}$/.test(String(t))) return { from: t.slice(0,6)+'01', to: t };
@@ -3346,10 +4040,19 @@ async function pageSellerProfit(){
     return { from: '14050101', to: '14050131' };
   };
   let sellerPerfBaseReport = null;
+  function formatSellerReportTimestamp(value){
+    if(!value)return '';
+    const date=new Date(value);
+    if(Number.isNaN(date.getTime()))return String(value);
+    return new Intl.DateTimeFormat('fa-IR',{dateStyle:'short',timeStyle:'medium',timeZone:'Asia/Tehran'}).format(date);
+  }
   function spBaseQuery(force=false){
     const qs = new URLSearchParams();
     const set=(k,v)=>{ if(v!==undefined && v!==null && String(v).trim()!=='') qs.set(k,String(v).trim()); };
-    set('dateFrom',$('#spFrom')?.value||''); set('dateTo',$('#spTo')?.value||''); set('seller',$('#spSeller')?.value||''); set('store',$('#spStore')?.value||'');
+    const dateFrom=normalizeSellerPerformanceJalaliDate($('#spFrom')?.value||'','از تاریخ');
+    const dateTo=normalizeSellerPerformanceJalaliDate($('#spTo')?.value||'','تا تاریخ');
+    if(dateFrom&&dateTo&&dateFrom>dateTo)throw new Error('از تاریخ نباید بعد از تا تاریخ باشد.');
+    set('dateFrom',dateFrom); set('dateTo',dateTo); set('seller',$('#spSeller')?.value||''); set('store',$('#spStore')?.value||'');
     set('commissionRate',$('#spCommissionRate')?.value||'0.18'); set('leadPenaltyRial',moneyClean($('#spLeadPenalty')?.value||''));
     // فیلترهای سود و نوت‌بوک عمداً به API ارسال نمی‌شوند؛ فقط روی گزارش کش‌شده اعمال می‌شوند.
     if(force) qs.set('force','1');
@@ -3369,9 +4072,11 @@ async function pageSellerProfit(){
     if (!lines.length) return null;
     const saleRial = lines.reduce((a,l)=>a+Number(l.saleRial||0),0);
     const fifoCost = lines.reduce((a,l)=>a+Number(l.fifoCost||0),0);
-    const fifoProfit = lines.reduce((a,l)=>a+Number(l.fifoProfit||0),0);
-    const unmatchedSaleRial = lines.reduce((a,l)=>a+Number(l.unmatchedSaleRial||0),0);
-    return { ...inv, lines, itemCodes:[...new Set(lines.map(l=>String(l.itemCode||l.ItemCode||'').trim()).filter(Boolean))], hasNotebook:true, saleRial:Math.round(saleRial), fifoCost:Math.round(fifoCost), fifoProfit:Math.round(fifoProfit), unmatchedSaleRial:Math.round(unmatchedSaleRial), profitPct:saleRial?Math.round((fifoProfit/saleRial)*10000)/100:null };
+    const coveredLines=lines.filter(l=>l.fifoProfit!=null);
+    const fifoProfit = coveredLines.reduce((a,l)=>a+Number(l.fifoProfit||0),0);
+    const coveredSales=lines.reduce((a,l)=>a+Number(l.coveredSales||0),0),totalQty=lines.reduce((a,l)=>a+Number(l.qty||0),0),coveredQty=lines.reduce((a,l)=>a+Number(l.allocatedQty||0),0);
+    const coverage={totalLines:lines.length,calculatedLines:lines.filter(l=>l.profitStatus==='calculated').length,partialLines:lines.filter(l=>l.profitStatus==='partial').length,unknownLines:lines.filter(l=>l.profitStatus==='unknown').length,totalQty,coveredQty,coveredQtyPercent:totalQty?Math.round(coveredQty*10000/totalQty)/100:0,totalSales:Math.round(saleRial),coveredSales:Math.round(coveredSales),coveredSalesPercent:saleRial?Math.round(coveredSales*10000/saleRial)/100:0,purchaseHistoryComplete:false};
+    return { ...inv, lines, itemCodes:[...new Set(lines.map(l=>String(l.itemCode||l.ItemCode||'').trim()).filter(Boolean))], hasNotebook:true, saleRial:Math.round(saleRial), fifoCost:coveredLines.length?Math.round(fifoCost):null, fifoProfit:coveredLines.length?Math.round(fifoProfit):null, unmatchedSaleRial:Math.round(saleRial-coveredSales), profitPct:coveredLines.length&&fifoCost?Math.round((fifoProfit/fifoCost)*10000)/100:null, profitStatus:coveredLines.length?'partial':'unknown', coverage };
   }
   function rebuildSellerPerfFromInvoices(base, invoices){
     const commissionRate = Number(base?.meta?.commissionRate ?? $('#spCommissionRate')?.value ?? 0.18) || 0.18;
@@ -3379,12 +4084,12 @@ async function pageSellerProfit(){
     const by = new Map();
     for(const inv of invoices){
       const k=inv.sellerKey||'unknown';
-      if(!by.has(k)) by.set(k,{sellerKey:k,sellerName:inv.sellerName||k,sellerStore:inv.sellerStore||'',employeeAccountNumber:inv.employeeAccountNumber||(!String(k).startsWith('NO_EMPLOYEE:')?k:''),invoiceCount:0,saleRial:0,fifoCost:0,fifoProfit:0,unmatchedSaleRial:0,withLeadCount:0,withoutLeadCount:0});
-      const s=by.get(k); s.invoiceCount++; s.saleRial+=Number(inv.saleRial||0); s.fifoCost+=Number(inv.fifoCost||0); s.fifoProfit+=Number(inv.fifoProfit||0); s.unmatchedSaleRial+=Number(inv.unmatchedSaleRial||0); if(inv.leadId) s.withLeadCount++; else s.withoutLeadCount++;
+      if(!by.has(k)) by.set(k,{sellerKey:k,sellerName:inv.sellerName||k,sellerStore:inv.sellerStore||'',employeeAccountNumber:inv.employeeAccountNumber||(!String(k).startsWith('NO_EMPLOYEE:')?k:''),invoiceCount:0,saleRial:0,fifoCost:0,fifoProfit:0,hasCoveredProfit:false,unmatchedSaleRial:0,withLeadCount:0,withoutLeadCount:0,totalLines:0,calculatedLines:0,partialLines:0,unknownLines:0,totalQty:0,coveredQty:0,coveredSales:0});
+      const s=by.get(k); s.invoiceCount++; s.saleRial+=Number(inv.saleRial||0); if(inv.fifoCost!=null)s.fifoCost+=Number(inv.fifoCost||0); if(inv.fifoProfit!=null){s.fifoProfit+=Number(inv.fifoProfit||0);s.hasCoveredProfit=true;} s.unmatchedSaleRial+=Number(inv.unmatchedSaleRial||0); if(inv.leadId) s.withLeadCount++; else s.withoutLeadCount++; const c=inv.coverage||{};s.totalLines+=Number(c.totalLines||0);s.calculatedLines+=Number(c.calculatedLines||0);s.partialLines+=Number(c.partialLines||0);s.unknownLines+=Number(c.unknownLines||0);s.totalQty+=Number(c.totalQty||0);s.coveredQty+=Number(c.coveredQty||0);s.coveredSales+=Number(c.coveredSales||0);
     }
-    const sellers=[...by.values()].map(s=>{ const raw=Math.round(Number(s.fifoProfit||0)*commissionRate); const lp=Math.round(Number(s.withoutLeadCount||0)*leadPenaltyRial); return {...s,saleRial:Math.round(s.saleRial),fifoCost:Math.round(s.fifoCost),fifoProfit:Math.round(s.fifoProfit),unmatchedSaleRial:Math.round(s.unmatchedSaleRial),avgProfitPct:s.saleRial?Math.round((s.fifoProfit/s.saleRial)*10000)/100:null,commissionRate,rawCommission:raw,leadPenalty:lp,finalCommission:Math.max(0,raw-lp),suggestedCommission:Math.max(0,raw-lp),leadStatus:s.withoutLeadCount?'needs-review':'ok',employeeStatus:s.employeeAccountNumber?'ok':'missing'}; }).sort((a,b)=>b.fifoProfit-a.fifoProfit);
-    const summary=sellers.reduce((a,s)=>{ a.invoiceCount+=s.invoiceCount; a.saleRial+=s.saleRial; a.fifoCost+=s.fifoCost; a.fifoProfit+=s.fifoProfit; a.unmatchedSaleRial+=s.unmatchedSaleRial; a.rawCommission+=s.rawCommission||0; a.leadPenalty+=s.leadPenalty||0; a.suggestedCommission+=s.suggestedCommission||0; a.withoutLeadCount+=s.withoutLeadCount||0; a.missingEmployeeCount+=s.employeeStatus==='missing'?1:0; return a; },{invoiceCount:0,saleRial:0,fifoCost:0,fifoProfit:0,unmatchedSaleRial:0,rawCommission:0,leadPenalty:0,suggestedCommission:0,withoutLeadCount:0,missingEmployeeCount:0});
-    summary.avgProfitPct=summary.saleRial?Math.round((summary.fifoProfit/summary.saleRial)*10000)/100:null;
+    const sellers=[...by.values()].map(s=>{const coverage={totalLines:s.totalLines,calculatedLines:s.calculatedLines,partialLines:s.partialLines,unknownLines:s.unknownLines,totalQty:s.totalQty,coveredQty:s.coveredQty,coveredQtyPercent:s.totalQty?Math.round(s.coveredQty*10000/s.totalQty)/100:0,totalSales:Math.round(s.saleRial),coveredSales:Math.round(s.coveredSales),coveredSalesPercent:s.saleRial?Math.round(s.coveredSales*10000/s.saleRial)/100:0,purchaseHistoryComplete:false};return {...s,saleRial:Math.round(s.saleRial),fifoCost:s.hasCoveredProfit?Math.round(s.fifoCost):null,fifoProfit:s.hasCoveredProfit?Math.round(s.fifoProfit):null,unmatchedSaleRial:Math.round(s.saleRial-s.coveredSales),avgProfitPct:s.hasCoveredProfit&&s.fifoCost?Math.round((s.fifoProfit/s.fifoCost)*10000)/100:null,commissionRate,rawCommission:null,leadPenalty:null,finalCommission:null,suggestedCommission:null,commissionStatus:'withheld-incomplete-coverage',profitStatus:s.hasCoveredProfit?'partial':'unknown',coverage,leadStatus:'not-evaluated-from-snapshot',employeeStatus:s.employeeAccountNumber?'ok':'missing'};}).sort((a,b)=>Number(b.fifoProfit||-Infinity)-Number(a.fifoProfit||-Infinity));
+    const summary=sellers.reduce((a,s)=>{a.invoiceCount+=s.invoiceCount;a.saleRial+=s.saleRial;if(s.fifoCost!=null)a.fifoCost+=s.fifoCost;if(s.fifoProfit!=null){a.fifoProfit+=s.fifoProfit;a.hasCoveredProfit=true;}a.unmatchedSaleRial+=s.unmatchedSaleRial;const c=s.coverage||{};a.totalLines+=Number(c.totalLines||0);a.calculatedLines+=Number(c.calculatedLines||0);a.partialLines+=Number(c.partialLines||0);a.unknownLines+=Number(c.unknownLines||0);a.totalQty+=Number(c.totalQty||0);a.coveredQty+=Number(c.coveredQty||0);a.coveredSales+=Number(c.coveredSales||0);return a;},{invoiceCount:0,saleRial:0,fifoCost:0,fifoProfit:0,hasCoveredProfit:false,unmatchedSaleRial:0,totalLines:0,calculatedLines:0,partialLines:0,unknownLines:0,totalQty:0,coveredQty:0,coveredSales:0});
+    summary.fifoCost=summary.hasCoveredProfit?summary.fifoCost:null;summary.fifoProfit=summary.hasCoveredProfit?summary.fifoProfit:null;summary.avgProfitPct=summary.hasCoveredProfit&&summary.fifoCost?Math.round((summary.fifoProfit/summary.fifoCost)*10000)/100:null;summary.profitStatus=summary.hasCoveredProfit?'partial':'unknown';summary.rawCommission=null;summary.leadPenalty=null;summary.suggestedCommission=null;summary.commissionStatus='withheld-incomplete-coverage';summary.coverage={totalLines:summary.totalLines,calculatedLines:summary.calculatedLines,partialLines:summary.partialLines,unknownLines:summary.unknownLines,totalQty:summary.totalQty,coveredQty:summary.coveredQty,coveredQtyPercent:summary.totalQty?Math.round(summary.coveredQty*10000/summary.totalQty)/100:0,totalSales:summary.saleRial,coveredSales:summary.coveredSales,coveredSalesPercent:summary.saleRial?Math.round(summary.coveredSales*10000/summary.saleRial)/100:0,purchaseHistoryComplete:false};
     return {summary,sellers};
   }
   function applySellerPerfClientFilters(base){
@@ -3393,6 +4098,7 @@ async function pageSellerProfit(){
     const min=moneyTomanToRial($('#spMinProfit')?.value||'');
     const max=moneyTomanToRial($('#spMaxProfit')?.value||'');
     let invoices=Array.isArray(r.invoices)?r.invoices.slice():[];
+    if(!group&&min==null&&max==null)return r;
     if(group==='notebook') invoices=invoices.map(notebookPartialInvoice).filter(Boolean);
     if(min!=null) invoices=invoices.filter(x=>Number(x.fifoProfit||0)>=min);
     if(max!=null) invoices=invoices.filter(x=>Number(x.fifoProfit||0)<=max);
@@ -3406,30 +4112,37 @@ async function pageSellerProfit(){
     const r = applySellerPerfClientFilters(sellerPerfBaseReport || base);
     if(!r || !r.ok){ out.innerHTML=`<div class="error">${hesc(r?.error||'گزارش موجود نیست')}</div>`; return; }
     const sm=r.summary||{};
-    const generated=r.generatedAt?`<div class="success">تاریخ گزارش: ${hesc(window.normDate?normDate(r.generatedAt):String(r.generatedAt).slice(0,19))}${r.cached?' | از آرشیو':''}</div>`:'';
+    const valueOrUnknown=(value,status)=>status==='unknown'||value==null?'<span class="muted">نامشخص</span>':fmt(value);
+    const statusBadge=status=>status==='unavailable'?'<span class="muted">در این نسخه غیرفعال</span>':status==='calculated'?'<span class="success">قطعی</span>':status==='partial'?'<span class="warn">ناقص</span>':'<span class="muted">نامشخص</span>';
+    const coverage=sm.coverage||r.coverage||{};
+    const coverageWarning='<div class="warn"><b>سود، ROI و پورسانت در نسخه جاری عمداً غیرفعال است.</b><br>این صفحه فقط معیارهای فروش و مرجوعی را از Sale Snapshot فعال نمایش می‌دهد.</div>';
+    const generated=r.generatedAt?`<div class="success">تاریخ گزارش: ${hesc(formatSellerReportTimestamp(r.generatedAt))}${r.cached?' | از آرشیو':''}</div>`:'';
     let html=generated;
-    html+=`<div class="info">منبع: ${hesc(r.source||'')} | فیلترها از کش آخرین گزارش اعمال شده‌اند؛ محاسبه مجدد فقط با دکمه بروزرسانی انجام می‌شود. | گروه کالا: ${r.meta?.itemGroup==='notebook'?'فقط نوت‌بوک؛ کد کالا با ۱':'همه کالاها'}</div>`;
-    html+=`<div class="kpis"><div class="kpi"><b>${fmt(sm.invoiceCount)}</b><span>تعداد فاکتور</span></div><div class="kpi"><b>${fmt(sm.saleRial)}</b><span>جمع فروش</span></div><div class="kpi"><b>${fmt(sm.fifoProfit)}</b><span>سود FIFO</span></div><div class="kpi"><b>${sm.avgProfitPct==null?'-':fmt(sm.avgProfitPct)+'%'}</b><span>درصد سود</span></div><div class="kpi"><b>${fmt(sm.suggestedCommission||sm.finalCommission||0)}</b><span>پورسانت نهایی</span></div><div class="kpi warn"><b>${fmt(sm.unmatchedSaleRial)}</b><span>فروش با قیمت تمام‌شده نامشخص</span></div></div>`;
-    html+=`<h5>جدول خلاصه فروشندگان</h5><table class="table"><thead><tr><th>نام</th><th>جاری کارکنان</th><th>فروشگاه</th><th>تعداد فاکتور</th><th>جمع فروش</th><th>سود</th><th>درصد سود</th><th>نامشخص</th><th>Lead ندارد</th><th>وضعیت</th></tr></thead><tbody>${(r.sellers||[]).map(x=>`<tr><td>${hesc(x.sellerName||x.sellerKey)}</td><td>${hesc(x.employeeAccountNumber||'ندارد')}</td><td>${hesc(x.sellerStore||'')}</td><td>${fmt(x.invoiceCount)}</td><td>${fmt(x.saleRial)}</td><td>${fmt(x.fifoProfit)}</td><td>${x.avgProfitPct==null?'-':fmt(x.avgProfitPct)+'%'}</td><td>${fmt(x.unmatchedSaleRial)}</td><td>${fmt(x.withoutLeadCount||0)}</td><td>${x.employeeStatus==='missing'?'<span class="error">جاری کارکنان ندارد</span>':(x.leadStatus==='ok'?'<span class="success">اوکی</span>':'<span class="warn">Lead ناقص</span>')}</td></tr>`).join('')}</tbody></table>`;
-    html+=`<h5>ریز فاکتورها</h5><table class="table"><thead><tr><th>شماره فاکتور</th><th>تاریخ</th><th>فروشنده</th><th>مشتری</th><th>فروش</th><th>سود</th><th>درصد سود</th><th>Lead</th><th>نامشخص</th></tr></thead><tbody>${(r.invoices||[]).slice(0,1000).map(x=>`<tr><td>${invLink(x.invoiceNo)}</td><td>${hesc(window.normDate?normDate(x.invoiceDate):x.invoiceDate||'')}</td><td>${hesc(x.sellerName||x.sellerKey)}</td><td>${hesc(x.customerName||'')}</td><td>${fmt(x.saleRial)}</td><td>${fmt(x.fifoProfit)}</td><td>${x.profitPct==null?'-':fmt(x.profitPct)+'%'}</td><td>${hesc(x.leadId||'')}</td><td>${fmt(x.unmatchedSaleRial)}</td></tr>`).join('')}</tbody></table>`;
-    html+=`<h5>جدول پورسانت پیشنهادی</h5><table class="table"><thead><tr><th>نام فروشنده</th><th>جمع فروش</th><th>سود محاسبه‌شده</th><th>نرخ</th><th>پورسانت خام</th><th>کسر Lead</th><th>پورسانت نهایی پیشنهادی</th><th>وضعیت Lead</th></tr></thead><tbody>${(r.sellers||[]).map(x=>`<tr><td>${hesc(x.sellerName||x.sellerKey)}</td><td>${fmt(x.saleRial)}</td><td>${fmt(x.fifoProfit)}</td><td>${hesc(String(x.commissionRate??''))}</td><td>${fmt(x.rawCommission)}</td><td>${fmt(x.leadPenalty)}</td><td>${fmt(x.suggestedCommission)}</td><td>${x.leadStatus==='ok'?'اوکی':'نیازمند بررسی'}</td></tr>`).join('')}</tbody></table>`;
-    html+=`<div class="card mt"><div class="card-header"><h5>فیلترهای تکمیلی روی گزارش ذخیره‌شده</h5></div><div class="card-body"><div class="row four"><input id="spMinProfit" value="${hesc($('#spMinProfit')?.value||'')}" placeholder="سود بالای X تومان"><input id="spMaxProfit" value="${hesc($('#spMaxProfit')?.value||'')}" placeholder="سود زیر Y تومان"><select id="spItemGroup"><option value="">همه کالاها</option><option value="notebook" ${r.meta?.itemGroup==='notebook'?'selected':''}>فقط نوت‌بوک؛ کد کالا با ۱</option></select><button class="btn" id="spApplyFilters">اعمال فیلترها روی کش</button></div></div></div>`;
+    html+=`<div class="info">فروشنده: ${hesc($('#spSeller')?.selectedOptions?.[0]?.textContent||r.seller||'همه')} | بازه: ${hesc(r.period?.from||'')} تا ${hesc(r.period?.to||'')}<br>Snapshot فعال: ${hesc(r.activeSnapshotId||r.meta?.activeSnapshotId||'legacy fallback')} | وضعیت: ${hesc(r.snapshotStatus||r.meta?.snapshotStatus||'')} | منبع: ${hesc(r.source||'')}</div>`;
+    if(Number(sm.invoiceCount||0)===0){
+      out.innerHTML=html+'<div class="success">درخواست با موفقیت انجام شد، اما برای فروشنده و بازه انتخاب‌شده داده‌ای وجود ندارد.</div>';
+      return;
+    }
+    html+=`<div class="info">گزارش پایه از Snapshot فعال و کامل Mongo خوانده می‌شود. | گروه کالا: ${r.meta?.itemGroup==='notebook'?'فقط نوت‌بوک؛ کد کالا با ۱':'همه کالاها'}</div>${coverageWarning}`;
+    html+=`<div class="kpis"><div class="kpi"><b>${fmt(sm.invoiceCount)}</b><span>تعداد فاکتور</span></div><div class="kpi"><b>${valueOrUnknown(sm.grossSaleAmount,'')}</b><span>فروش ناخالص</span></div><div class="kpi"><b>${valueOrUnknown(sm.discountAmount,'')}</b><span>تخفیف</span></div><div class="kpi"><b>${fmt(sm.saleReturnAmount)}</b><span>مرجوعی فروش</span></div><div class="kpi"><b>${fmt(sm.netSalesAfterReturns)}</b><span>فروش خالص پس از مرجوعی</span></div><div class="kpi"><b>${valueOrUnknown(sm.uniqueCustomerCount,'')}</b><span>مشتری یکتا</span></div></div>`;
+    html+=`<h5>جدول خلاصه فروشندگان</h5><table class="table"><thead><tr><th>نام</th><th>جاری کارکنان</th><th>فروشگاه</th><th>تعداد فاکتور</th><th>فروش</th><th>مرجوعی</th><th>خالص</th></tr></thead><tbody>${(r.sellers||[]).map(x=>`<tr><td>${hesc(x.sellerName||x.sellerKey)}</td><td>${hesc(x.employeeAccountNumber||'ندارد')}</td><td>${hesc(x.sellerStore||'')}</td><td>${fmt(x.invoiceCount)}</td><td>${fmt(x.saleRial)}</td><td>${fmt(x.returnAmount)}</td><td>${fmt(x.netSalesAfterReturns)}</td></tr>`).join('')}</tbody></table>`;
+    html+=`<h5>ریز فاکتورها</h5><table class="table"><thead><tr><th>شماره فاکتور</th><th>تاریخ</th><th>فروشنده</th><th>مشتری</th><th>فروش</th><th>تعداد</th><th>ردیف</th></tr></thead><tbody>${(r.invoices||[]).slice(0,1000).map(x=>`<tr><td>${invLink(x.invoiceNo)}</td><td>${hesc(window.normDate?normDate(x.invoiceDate):x.invoiceDate||'')}</td><td>${hesc(x.sellerName||x.sellerKey)}</td><td>${hesc(x.customerName||'')}</td><td>${fmt(x.saleRial)}</td><td>${fmt(x.qty)}</td><td>${fmt((x.lines||[]).length||x.lineCount||0)}</td></tr>`).join('')}</tbody></table>`;
     out.innerHTML=html;
     if(window.wrapTables) window.wrapTables(out); bindInvoiceLinks(out);
     const ap=$('#spApplyFilters'); if(ap) ap.onclick=()=>renderSellerPerfReport(sellerPerfBaseReport, out);
   }
   async function loadSellerHistory(){
     const box=$('#spHistory'); if(!box)return;
-    try{ const h=await api('/api/reports/seller-sales-profit/history'); const list=h.list||[]; box.innerHTML=list.length?`<table class="table"><thead><tr><th>تاریخ</th><th>فیلتر پایه</th><th>نمایش</th></tr></thead><tbody>${list.map(x=>`<tr><td>${hesc(window.normDate?normDate(x.generatedAt):String(x.generatedAt||'').slice(0,19))}</td><td><small>${hesc(JSON.stringify(x.filters||{}))}</small></td><td><button class="mini sp-hist" data-id="${hesc(x._id)}">نمایش</button></td></tr>`).join('')}</tbody></table>`:'<div class="muted">آرشیوی وجود ندارد.</div>'; if(window.wrapTables) window.wrapTables(box); box.querySelectorAll('.sp-hist').forEach(b=>b.onclick=async()=>{ const r=await api('/api/reports/seller-sales-profit/history?id='+encodeURIComponent(b.dataset.id)); if(r?.report) renderSellerPerfReport({...r.report,cached:true,generatedAt:r.generatedAt}, $('#spOut')); }); }catch(e){box.innerHTML=`<div class="warn">آرشیو خوانده نشد: ${hesc(e.message||e)}</div>`;}
+    try{ const h=await api('/api/reports/seller-sales-profit/history'); const list=h.list||[]; box.innerHTML=list.length?`<table class="table"><thead><tr><th>تاریخ</th><th>فیلتر پایه</th><th>نمایش</th></tr></thead><tbody>${list.map(x=>`<tr><td>${hesc(formatSellerReportTimestamp(x.generatedAt))}</td><td><small>${hesc(JSON.stringify(x.filters||{}))}</small></td><td><button class="mini sp-hist" data-id="${hesc(x._id)}">نمایش</button></td></tr>`).join('')}</tbody></table>`:'<div class="muted">آرشیوی وجود ندارد.</div>'; if(window.wrapTables) window.wrapTables(box); box.querySelectorAll('.sp-hist').forEach(b=>b.onclick=async()=>{ const r=await api('/api/reports/seller-sales-profit/history?id='+encodeURIComponent(b.dataset.id)); if(r?.report) renderSellerPerfReport({...r.report,cached:true,generatedAt:r.generatedAt}, $('#spOut')); }); }catch(e){box.innerHTML=`<div class="warn">آرشیو خوانده نشد: ${hesc(e.message||e)}</div>`;}
   }
   async function loadSellerPerf(force=false){
-    const out=$('#spOut'); if(!out)return; out.innerHTML=force?'<div class="info">در حال محاسبه دستی و ذخیره گزارش پایه...</div>':'<div class="info">در حال خواندن آخرین گزارش ذخیره‌شده...</div>';
-    try{ const r=await api('/api/reports/seller-sales-profit?'+spBaseQuery(force).toString()); renderSellerPerfReport(r,out); await loadSellerHistory(); }catch(e){out.innerHTML=`<div class="error">${hesc(e.message||e)}</div>`;}
+    const out=$('#spOut'); if(!out)return; const selected=$('#spSeller')?.selectedOptions?.[0]?.textContent||'همه فروشنده‌ها'; const from=$('#spFrom')?.value||'',to=$('#spTo')?.value||''; out.innerHTML=`<div class="info">${force?'در حال محاسبه دستی و ذخیره گزارش پایه':'در حال خواندن آخرین گزارش ذخیره‌شده'}<br>فروشنده: ${hesc(selected)} | بازه: ${hesc(from)} تا ${hesc(to)}</div>`;
+    try{ const r=await api('/api/reports/seller-sales-profit?'+spBaseQuery(force).toString()); renderSellerPerfReport(r,out); await loadSellerHistory(); }catch(e){out.innerHTML=`<div class="error">گزارش عملکرد فروشنده دریافت نشد.<br>فروشنده: ${hesc(selected)} | بازه: ${hesc(from)} تا ${hesc(to)}<br>جزئیات: ${hesc(e.message||e)}</div>`;}
   }
   window.pageSellerProfit = pageSellerProfit = async function(){
     const rg=dfltMonthRange();
-    setPage('عملکرد فروشنده', `<main class="main-content"><div class="card"><div class="card-header"><h5>عملکرد فروشنده و پورسانت پیشنهادی</h5></div><div class="card-body"><div class="info">مسیر B: گزارش پایه از آرشیو Mongo خوانده می‌شود؛ تاریخ ورودی شمسی است و سرور قبل از خواندن WebService شایگان آن را به فرمت قابل قبول شایگان تبدیل می‌کند. فیلترهای سود و نوت‌بوک بعد از گزارش فقط روی کش اعمال می‌شوند.</div><div class="row four"><input id="spFrom" placeholder="از تاریخ شمسی مثل 14050301" value="${rg.from}"><input id="spTo" placeholder="تا تاریخ شمسی مثل 14050331" value="${rg.to}"><select id="spSeller"><option value="">همه فروشنده‌ها</option></select><button class="btn primary" id="spUpdate">محاسبه دستی / بروزرسانی گزارش پایه</button></div><div class="row three"><input id="spStore" placeholder="فروشگاه اختیاری"><input id="spCommissionRate" value="0.18" placeholder="نرخ پورسانت"><input id="spLeadPenalty" placeholder="جریمه هر فاکتور بدون Lead - ریال"></div><div class="actions"><button class="btn" id="spLoadLatest">نمایش آخرین گزارش همین فیلتر پایه</button><button class="btn gray" id="spClearFilters">پاک کردن فیلتر سود/گروه</button></div><div id="spOut" class="mt"><div class="muted">برای مشاهده گزارش، آخرین گزارش را بخوان یا بروزرسانی را بزن.</div></div></div></div><div class="card"><div class="card-header"><h5>آرشیو ۳۰ گزارش آخر عملکرد فروشنده</h5></div><div class="card-body"><div id="spHistory">در حال بارگذاری...</div></div></div></main>`);
-    try{ const sellers=await api('/api/reports/seller-sales-profit/sellers'); const sel=$('#spSeller'); (sellers.list||[]).forEach(x=>sel.add(new Option(`${x.fullName||x.employeeAccountName||x.sellerKey} - ${x.employeeAccountNumber}`, x.sellerKey||x.employeeAccountNumber))); }catch{}
+    setPage('عملکرد فروشنده', `<main class="main-content"><div class="card"><div class="card-header"><h5>عملکرد فروشنده</h5></div><div class="card-body"><div class="info">گزارش فقط از Sale Snapshot فعال و کامل در Mongo خوانده می‌شود. تاریخ ورودی شمسی است. سود، ROI و پورسانت در این نسخه غیرفعال‌اند.</div><div class="row four"><input id="spFrom" placeholder="از تاریخ شمسی مثل 14050301" value="${rg.from}"><input id="spTo" placeholder="تا تاریخ شمسی مثل 14050331" value="${rg.to}"><select id="spSeller"><option value="">همه فروشنده‌ها</option></select><button class="btn primary" id="spUpdate">محاسبه و ذخیره گزارش</button></div><div class="row"><input id="spStore" placeholder="فروشگاه اختیاری"></div><div class="actions"><button class="btn" id="spLoadLatest">نمایش آخرین گزارش همین فیلتر</button></div><div id="spOut" class="mt"><div class="muted">برای مشاهده گزارش، آخرین گزارش را بخوان یا بروزرسانی را بزن.</div></div></div></div><div class="card"><div class="card-header"><h5>آرشیو ۳۰ گزارش آخر عملکرد فروشنده</h5></div><div class="card-body"><div id="spHistory">در حال بارگذاری...</div></div></div></main>`);
+    try{ const sellers=await api('/api/reports/seller-sales-profit/sellers'); const sel=$('#spSeller'); (sellers.list||[]).forEach(x=>{const key=String(x.sellerKey||x.employeeAccountNumber||'').trim();if(!key||Array.from(sel.options).some(option=>option.value===key))return;sel.add(new Option(`${x.fullName||x.employeeAccountName||key} - ${x.employeeAccountNumber||key}`,key));}); }catch{}
     $('#spUpdate').onclick=()=>loadSellerPerf(true); $('#spLoadLatest').onclick=()=>loadSellerPerf(false); $('#spClearFilters').onclick=()=>{ ['spMinProfit','spMaxProfit'].forEach(id=>{const el=$('#'+id); if(el)el.value='';}); const g=$('#spItemGroup'); if(g)g.value=''; if(sellerPerfBaseReport) renderSellerPerfReport(sellerPerfBaseReport,$('#spOut')); };
     await loadSellerHistory();
   };
@@ -3452,7 +4165,6 @@ async function pageSellerProfit(){
 
 /* PATCH 0.9.19.15: CRM Tablo board for stock-out and purchase entry review */
 (function(){
-  window.MKCRM_VERSION='0.9.19.17-role-access-alignment';
   try{
     ['seller','seller_buyer','accounting','warehouse','purchase'].forEach(r=>{ if(Array.isArray(ROLE_PAGES[r]) && !ROLE_PAGES[r].includes('tablo')) ROLE_PAGES[r].push('tablo'); });
   }catch{}
@@ -3509,7 +4221,6 @@ async function pageSellerProfit(){
 
 /* PATCH 0.9.19.17: role access alignment for sale/proforma/supplier aging/seller performance */
 (function(){
-  window.MKCRM_VERSION='0.9.19.17-role-access-alignment';
   const add=(role,pages)=>{try{if(Array.isArray(ROLE_PAGES[role])) pages.forEach(p=>{if(!ROLE_PAGES[role].includes(p)) ROLE_PAGES[role].push(p);});}catch{}};
   add('accounting',['sale','supplier-aging','seller-profit']);
   add('warehouse',['sale']);
@@ -3521,7 +4232,7 @@ async function pageSellerProfit(){
     if(r==='admin') return true;
     if(page==='sale' || page==='proforma' || page==='proforma-list') return ['seller','seller_buyer','accounting','warehouse','purchase'].includes(r);
     if(page==='supplier-aging') return ['accounting','purchase'].includes(r);
-    if(page==='seller-profit') return ['accounting','purchase'].includes(r);
+    if(page==='seller-profit') return ['seller','seller_buyer','accounting','purchase','manager','supervisor'].includes(r);
     return prevCanPage(page);
   };
   const prevRenderMenu = window.renderMenu || renderMenu;
@@ -3551,7 +4262,6 @@ async function pageSellerProfit(){
    Scope: Invoice UI/API only. Inventory/search/sync/tablo logic from 0.9.19.21 is preserved. */
 (function(){
   const V='0.9.19.22-invoice-ref-expense';
-  window.MKCRM_VERSION=V;
   const qs=s=>document.querySelector(s);
   const safe=v=>{try{return esc(v==null?'':String(v));}catch{return String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]))}};
   const money=v=>{try{return Number(v||0).toLocaleString('fa-IR')}catch{return String(v||0)}};
@@ -3765,7 +4475,7 @@ async function pageSellerProfit(){
     let h=''; const role=userRole();
     newMenu.forEach(([g,items])=>{const allowed=items.filter(([id])=>canPage(id)); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);});
     const m=$q('#menu'); if(m){m.innerHTML=h; $qa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});}
-    const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${htmlSafe(state.user?.fullName||state.user?.username||'')}<br><small>${htmlSafe(ROLE_LABELS[role]||role)}</small><br><small>${htmlSafe(window.V||'0.9.19.26.3')}</small>`;
+    const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${htmlSafe(state.user?.fullName||state.user?.username||'')}<br><small>${htmlSafe(ROLE_LABELS[role]||role)}</small>`;
   };
   const oldRoute = window.route;
   window.route = route = async function(){
@@ -3779,7 +4489,6 @@ async function pageSellerProfit(){
 /* 0.9.19.27: Supplier stock sleep rebuilt on purchase invoice layers. UI cleanup: remove old Kardex/stock-sleep test screens. */
 (function(){
   const V27='0.9.19.27-purchase-layer-supplier-sleep';
-  window.MKCRM_VERSION=V27;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -3827,7 +4536,7 @@ async function pageSellerProfit(){
   const oldRenderMenu27=window.renderMenu;
   window.renderMenu=renderMenu=function(){
     const menu27=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]];
-    let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu27.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V27}</small>`;
+    let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu27.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`;
   };
   const oldRoute27=window.route;
   window.route=route=async function(){ const p=location.hash.slice(1)||firstAllowedPage(); if(p==='stock-sleep'){ location.hash='supplier-aging'; return; } if(p==='supplier-aging') return window.pageSupplierAging(); if(oldRoute27) return oldRoute27.apply(this,arguments); };
@@ -3837,7 +4546,6 @@ async function pageSellerProfit(){
 /* 0.9.19.27.1: Supplier-first purchase invoice sleep UI. Removes extra stock-sleep controls; starts from supplier purchase invoices. */
 (function(){
   const V271='0.9.19.27.1-purchase-layer-supplier-index-sleep';
-  window.MKCRM_VERSION=V271;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -3899,7 +4607,7 @@ async function pageSellerProfit(){
   };
   window.renderMenu=renderMenu=function(){
     const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]];
-    let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V271}</small>`;
+    let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`;
   };
   const oldRoute=window.route; window.route=route=async function(){ let p=location.hash.slice(1)||firstAllowedPage(); if(p==='supplier-aging') return window.pageSupplierAging(); if(p==='stock-sleep'){ location.hash='supplier-aging'; return window.pageSupplierAging(); } if(oldRoute) return oldRoute.apply(this,arguments); };
   try{ renderMenu(); }catch{}
@@ -3908,7 +4616,6 @@ async function pageSellerProfit(){
 /* 0.9.19.27.2: Supplier-selected sleep. Avoids full 500 invoice scan; user searches supplier from accounts, then only selected supplier invoices are analyzed. */
 (function(){
   const V272='0.9.19.27.2-selected-supplier-purchase-sleep';
-  window.MKCRM_VERSION=V272;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -3957,7 +4664,7 @@ async function pageSellerProfit(){
     $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=()=>loadSelectedSupplierInvoices(true); $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();};
     await renderSnapshots(); await renderSnapshot('');
   };
-  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V272}</small>`; };
+  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
   const oldRoute=window.route; window.route=route=async function(){ let p=location.hash.slice(1)||firstAllowedPage(); if(p==='supplier-aging') return window.pageSupplierAging(); if(p==='stock-sleep'){location.hash='supplier-aging';return window.pageSupplierAging();} if(oldRoute) return oldRoute.apply(this,arguments); };
   try{renderMenu();}catch{}
 })();
@@ -3965,7 +4672,6 @@ async function pageSellerProfit(){
 /* 0.9.19.27.4: Supplier sleep diagnostic pipeline. Shows each stage: supplier, ledger, invoice candidates, getInvoice validation, fallback scan. */
 (function(){
   const V274='0.9.19.27.4-supplier-sleep-diagnostic-fallback';
-  window.MKCRM_VERSION=V274;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -4032,7 +4738,7 @@ async function pageSellerProfit(){
     $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();};
     await renderSnapshots(); await renderSnapshot('');
   };
-  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V274}</small>`; };
+  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
   const oldRoute=window.route; window.route=route=async function(){ let p=location.hash.slice(1)||firstAllowedPage(); if(p==='supplier-aging') return window.pageSupplierAging(); if(p==='stock-sleep'){location.hash='supplier-aging';return window.pageSupplierAging();} if(oldRoute) return oldRoute.apply(this,arguments); };
   try{renderMenu();}catch{}
 })();
@@ -4040,7 +4746,6 @@ async function pageSellerProfit(){
 /* 0.9.19.27.5: Supplier sleep reconciliation validation. Accounting invoice total is separated from goods-layer total. */
 (function(){
   const V275='0.9.19.27.5-supplier-sleep-reconciliation-validation';
-  window.MKCRM_VERSION=V275;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -4110,7 +4815,7 @@ async function pageSellerProfit(){
     $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();};
     await renderSnapshots(); await renderSnapshot('');
   };
-  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V275}</small>`; };
+  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
   const oldRoute=window.route; window.route=route=async function(){ let p=location.hash.slice(1)||firstAllowedPage(); if(p==='supplier-aging') return window.pageSupplierAging(); if(p==='stock-sleep'){location.hash='supplier-aging';return window.pageSupplierAging();} if(oldRoute) return oldRoute.apply(this,arguments); };
   try{renderMenu();}catch{}
 })();
@@ -4118,7 +4823,6 @@ async function pageSellerProfit(){
 /* 0.9.19.28: Supplier sleep LayerId + invoice/group dashboard. */
 (function(){
   const V276='0.9.19.33-supplier-profit-diagnostic-snapshot-label';
-  window.MKCRM_VERSION=V276;
   const $s=q=>document.querySelector(q); const $sa=q=>Array.from(document.querySelectorAll(q));
   const safe=v=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
   const money=v=>{try{return Number(v||0).toLocaleString('fa-IR')}catch{return String(v||0)}};
@@ -4142,7 +4846,7 @@ async function pageSellerProfit(){
   function snapshotTable(list){ if(!list||!list.length)return '<div class="muted">Snapshot قبلی وجود ندارد.</div>'; return `<table class="table"><thead><tr><th>گزارش</th><th>کد Snapshot</th><th>روش</th><th>فاکتور</th><th>جمع فاکتور</th><th>جمع لایه</th><th>اختلاف</th><th>وضعیت</th><th></th></tr></thead><tbody>${list.map(x=>`<tr><td><b>${safe(x.snapshotLabel||((x.supplierDisplayName||x.selectedSupplier?.accountName||'تأمین‌کننده')+' - '+(x.reportJalaliDate||'')))}</b></td><td><small>${safe(x.snapshotId)}</small></td><td>${safe(x.mode||'')}</td><td>${money(x.purchaseInvoicesSynced)}</td><td>${money(x.periodInvoiceTotalValue||0)}</td><td>${money(x.periodLayerGoodsValue||0)}</td><td>${money(x.periodReconciliationDiff||0)}<br><small>${safe(x.periodReconciliationDiffPercent||0)}٪</small></td><td>${statusBadge(x.reconciliationStatus||'')}</td><td><button class="mini ps-pick" data-id="${safe(x.snapshotId)}">نمایش</button></td></tr>`).join('')}</tbody></table>`; }
   async function renderSnapshots(){ const box=$s('#psSnapshots'); if(!box)return; try{ const r=await getJson('/api/supplier-sleep/snapshots?limit=10'); box.innerHTML=snapshotTable(r.list||[]); $sa('.ps-pick').forEach(b=>b.onclick=()=>renderSnapshot(b.dataset.id)); }catch(e){box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
   window.pageSupplierAging=async function(){ setPage('خواب کالا تأمین‌کننده',`<main class="main-content"><div class="card"><div class="card-header"><h5>خواب کالا تأمین‌کننده - LayerId / Dashboard</h5></div><div class="card-body"><div class="info">این نسخه فازهای ماقبل سود را نگه می‌دارد: فاکتور خرید، Reconciliation، LayerId، مانده واقعی، گروه اصلی و True Reverse FIFO. محاسبه سود تأمین‌کننده فعلاً متوقف است تا Sale Snapshot مستقل کامل و تست شود.</div><div class="row four"><div class="form-group"><label>از تاریخ خرید/فروش</label><input id="psDateFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="psDateTo" value=""></div><div class="form-group"><label>حداکثر فاکتور خرید</label><input id="psMaxInvoices" value="300" inputmode="numeric"></div><div class="form-group"><label>حداکثر اسکن خرید</label><input id="psMaxScan" value="6000" inputmode="numeric"></div></div><div class="row two"><div class="form-group"><label>جستجوی تأمین‌کننده</label><input id="psSupplierSearch" placeholder="مثلاً ماتریس، ماندگار، رایان کاوه"></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="psSearchBtn">جستجوی تأمین‌کننده</button></div></div><div class="actions"><button class="btn green" id="psInit">آماده‌سازی</button><button class="btn" id="psReadSelected">خواندن مرحله‌ای فاکتورهای خرید</button><button class="btn red" id="psBuildSelected">تحلیل و کنترل صحت</button><button class="btn" id="psRefresh">نمایش آخرین گزارش</button></div><div id="psMsg" class="mt"></div><div id="psSelectedSupplier" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>۱) انتخاب تأمین‌کننده</h5></div><div class="card-body"><div id="psSupplierResults"></div></div></div><div class="card"><div class="card-header"><h5>۲) فاکتورهای خرید و Reconciliation</h5></div><div class="card-body"><div id="psInvoices"></div></div></div><div class="card"><div class="card-header"><h5>۳) Diagnostic مراحل</h5></div><div class="card-body"><div id="psDiagnostics"></div></div></div><div class="card"><div class="card-header"><h5>۴) Snapshotهای اخیر</h5></div><div class="card-body"><div id="psSnapshots"></div></div></div><div class="card"><div class="card-header"><h5>۵) داشبورد مدیریتی تأمین‌کننده</h5></div><div class="card-body"><div id="psSummary"></div></div></div><div class="card"><div class="card-header"><h5>۶) مانده واقعی هر فاکتور خرید</h5></div><div class="card-body"><div id="psInvoiceSummary"></div></div></div><div class="card"><div class="card-header"><h5>۷) گزارش گروه اصلی کالا</h5></div><div class="card-body"><div id="psGroupSummary"></div></div></div><div class="card"><div class="card-header"><h5>۸) لایه‌های Purchase Layer</h5></div><div class="card-body"><div id="psProfitDiag"></div><div id="psLayers"></div></div></div></main>`); $s('#psInit').onclick=async()=>{const m=$s('#psMsg');m.innerHTML='در حال آماده‌سازی...';try{const r=await postJson('/api/supplier-sleep/init',{});m.innerHTML=`<div class="success">آماده شد. نسخه: ${safe(r.version||'')}</div>`;}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}}; $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();}; await renderSnapshots(); await renderSnapshot(''); };
-  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V276}</small>`; };
+  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
   const oldRoute=window.route; window.route=route=async function(){ let p=location.hash.slice(1)||(typeof firstAllowedPage==='function'?firstAllowedPage():'dashboard'); if(p==='supplier-aging') return window.pageSupplierAging(); if(p==='stock-sleep'){location.hash='supplier-aging';return window.pageSupplierAging();} if(oldRoute) return oldRoute.apply(this,arguments); };
   try{renderMenu();}catch{}
 })();
@@ -4157,43 +4861,53 @@ async function pageSellerProfit(){
   async function postJson(url,body){ const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},credentials:'include',body:JSON.stringify(body||{})}); const j=await r.json(); if(!r.ok||j.ok===false) throw new Error(j.error||'خطا'); return j; }
   function saleSnapshotTable(list){
     if(!list||!list.length) return '<div class="muted">Sale Snapshot قبلی وجود ندارد.</div>';
-    return `<table class="table"><thead><tr><th>Snapshot</th><th>وضعیت</th><th>بازه</th><th>صفحه</th><th>حالت</th><th>فاکتور فروش</th><th>Body خوانده‌شده</th><th>ردیف کالا</th><th>Body خالی</th><th>فروش نوع ۲</th><th></th></tr></thead><tbody>${list.map(x=>`<tr><td><small>${safe(x.snapshotId)}</small><br>${safe(String(x.createdAt||'').slice(0,19).replace('T',' '))}</td><td>${safe(x.status||'')}</td><td>${safe(x.dateFrom||'')} تا ${safe(x.dateTo||'')}</td><td>${money(x.pagesScanned||0)}</td><td>${safe(x.mode||(x.incremental?'new':'full'))}</td><td>${money(x.invoiceHeadersFound||0)}</td><td>${money(x.invoiceBodiesLoaded||0)}</td><td>${money(x.saleLinesParsed||0)}</td><td>${money(x.emptyBodyInvoices||0)}</td><td>${money((x.typeStats&&x.typeStats['2']&&x.typeStats['2'].invoices)||0)}</td><td><button class="mini sale-snap-pick" data-id="${safe(x.snapshotId)}">نمایش</button></td></tr>`).join('')}</tbody></table>`;
+    return `<table class="table"><thead><tr><th>Snapshot</th><th>وضعیت</th><th>فعال‌سازی</th><th>بازه</th><th>صفحه / Retry</th><th>حالت</th><th>Dataset</th><th>عملیات</th></tr></thead><tbody>${list.map(x=>{const resumable=x.candidateStorage==='isolated'&&['completed_with_errors','failed','cancelled'].includes(String(x.status||''));return `<tr><td><small>${safe(x.snapshotId)}</small><br>${safe(String(x.createdAt||'').slice(0,19).replace('T',' '))}</td><td>${safe(x.status||'')}</td><td>${x.isActive?'<span class="success">ACTIVE</span>':safe(x.activationStatus||'legacy')}</td><td>${safe(x.dateFrom||'')} تا ${safe(x.dateTo||'')}</td><td>${money(x.pagesScanned||0)} / ${money(x.retryCount||0)}<br><small>بعدی: ${money(x.nextRowStart||0)}</small></td><td>${safe(x.mode||(x.incremental?'new':'full'))}</td><td>${x.candidateStorage==='isolated'?`${money(x.datasetHeaderCount||0)} فاکتور<br>${money(x.datasetLineCount||0)} ردیف`:'legacy aggregate'}</td><td><button class="mini sale-snap-pick" data-id="${safe(x.snapshotId)}">نمایش</button>${resumable?` <button class="mini sale-snap-resume" data-id="${safe(x.snapshotId)}">ادامه امن</button>`:''}</td></tr>`}).join('')}</tbody></table>`;
   }
   async function renderSaleSnapshotStatus(snapshotId=''){
     const box=$q('#saleSnapStatus'); if(!box)return;
     try{
       const r=await getJson('/api/sale-snapshot/status'+(snapshotId?'?snapshotId='+encodeURIComponent(snapshotId):''));
       const x=r.snapshot; if(!x){box.innerHTML='<div class="muted">هنوز Snapshot فروش ساخته نشده است.</div>';return;}
-      box.innerHTML=`<h4>وضعیت Sale Snapshot</h4><table class="table"><tbody><tr><td>Snapshot</td><td><small>${safe(x.snapshotId)}</small></td><td>وضعیت</td><td>${safe(x.status||'')}</td></tr><tr><td>حالت</td><td>${x.incremental?'فقط فاکتورهای جدید':'اسکن کامل'}</td><td>روش</td><td>${safe(x.mode||'')}</td></tr><tr><td>فاکتور فروش Header</td><td>${money(x.invoiceHeadersFound||0)}</td><td>Body فروش خوانده‌شده</td><td>${money(x.invoiceBodiesLoaded||0)}</td></tr><tr><td>ردیف کالای فروش</td><td>${money(x.saleLinesParsed||0)}</td><td>Body خالی</td><td>${money(x.emptyBodyInvoices||0)}</td></tr><tr><td>صفحات اسکن‌شده</td><td>${money(x.pagesScanned||0)}</td><td>Detail Fetch</td><td>${money(x.detailFetched||0)}</td></tr><tr><td>فروش واقعی Type 2</td><td>${money((x.typeStats&&x.typeStats['2']&&x.typeStats['2'].invoices)||0)} فاکتور / ${money((x.typeStats&&x.typeStats['2']&&x.typeStats['2'].lines)||0)} ردیف</td><td>برگشت‌ها</td><td>Type 6 برگشت از فروش و Type 7 برگشت از خرید فعلاً در فروش خالص اعمال نشده‌اند.</td></tr></tbody></table><h4>اتصال فروش به نماینده / صندوق</h4><table class="table"><thead><tr><th>نام نماینده</th><th>کد نماینده</th><th>فروشگاه/صندوق</th><th>فاکتور</th><th>ردیف</th><th>مبلغ</th></tr></thead><tbody>${((x.sellerStats||[]).slice(0,20).map(s=>`<tr><td><button class="mini sale-seller-detail" data-seller="${safe(s.sellerAccountNumber||'')}">${safe(s.sellerName||s.sellerAccountName||s.key||'نامشخص')}</button></td><td>${safe(s.sellerAccountNumber||'')}</td><td>${safe(s.sellerStoreName||'')}<br>${safe(s.cashboxAccountName||'')}</td><td>${money(s.invoices||0)}</td><td>${money(s.lines||0)}</td><td>${money(s.amount||0)}</td></tr>`).join(''))||'<tr><td colspan="6" class="muted">هنوز اطلاعات نماینده ساخته نشده است.</td></tr>'}</tbody></table><details><summary>نمونه و خطاها</summary><pre class="prewrap">${safe(JSON.stringify({samples:x.samples||[], errors:x.errors||[], diagnostics:r.diagnostics||null},null,2))}</pre></details><div id="saleSellerDetailBox" class="mt"></div>`;
-      $qa('.sale-seller-detail').forEach(b=>b.onclick=async()=>{const seller=b.dataset.seller||''; const out=$q('#saleSellerDetailBox'); if(!seller){out.innerHTML='<div class="error">کد نماینده خالی است.</div>';return;} out.innerHTML='<div class="info">در حال خواندن عملکرد نماینده...</div>'; try{const r=await getJson('/api/sale-snapshot/seller-performance?sellerAccountNumber='+encodeURIComponent(seller)+'&dateFrom='+encodeURIComponent($q('#saleSnapFrom')?.value||'')+'&dateTo='+encodeURIComponent($q('#saleSnapTo')?.value||'')); out.innerHTML=`<h4>عملکرد نماینده: ${safe((r.invoices&&r.invoices[0]&&r.invoices[0].sellerName)||seller)}</h4><table class="table"><tbody><tr><td>تعداد فاکتور</td><td>${money(r.invoiceCount||0)}</td><td>ردیف فروش</td><td>${money(r.lineCount||0)}</td></tr><tr><td>عدد فروش</td><td>${money(r.totalSales||0)}</td><td>سود/ROI</td><td>${safe(r.profitStatus||'')} | سود: ${money(r.fifoProfit||r.estimatedProfit||0)} | ROI: ${r.roiPercent==null?'نامشخص':safe(r.roiPercent)+'%'}</td></tr><tr><td>بهای FIFO</td><td>${money(r.fifoCost||0)}</td><td>وضعیت ردیف‌ها</td><td>محاسبه‌شده: ${money((r.profitLineStats||{}).calculated||0)} | ناقص: ${money((r.profitLineStats||{}).partial||0)} | نامشخص: ${money((r.profitLineStats||{}).unknown||0)}</td></tr></tbody></table><h4>گروه اصلی کالا</h4><table class="table"><thead><tr><th>گروه</th><th>فاکتور</th><th>ردیف</th><th>مبلغ</th><th>بهای FIFO</th><th>سود</th><th>ROI</th><th>وضعیت</th></tr></thead><tbody>${(r.groups||[]).map(g=>`<tr><td>${safe(g.mainGroup||'نامشخص')}</td><td>${money(g.invoiceCount||0)}</td><td>${money(g.lines||0)}</td><td>${money(g.amount||0)}</td><td>${money(g.fifoCost||0)}</td><td>${money(g.fifoProfit||0)}</td><td>${g.roiPercent==null?'نامشخص':safe(g.roiPercent)+'%'}</td><td>${safe(g.profitStatus||'')}</td></tr>`).join('')}</tbody></table><details><summary>Diagnostic سود FIFO</summary><pre class="prewrap">${safe(JSON.stringify(r.profitDiagnostics||{},null,2))}</pre></details><h4>شماره فاکتورها</h4><table class="table"><thead><tr><th>تاریخ</th><th>نوع</th><th>شماره</th><th>ردیف</th><th>مبلغ</th><th>صندوق</th></tr></thead><tbody>${(r.invoices||[]).map(x=>`<tr><td>${safe(x.saleDate||'')}</td><td>${safe(x.saleInvoiceType||'')}</td><td>${safe(x.saleInvoiceNo||'')}</td><td>${money(x.lines||0)}</td><td>${money(x.amount||0)}</td><td>${safe(x.cashboxAccountName||'')}</td></tr>`).join('')}</tbody></table>`;}catch(e){out.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}});
+      box.innerHTML=`<h4>وضعیت Sale Snapshot</h4>${x.isActive?'<div class="success">این Snapshot فعال و تنها منبع گزارش عملکرد فروشنده است.</div>':`<div class="warn">این Snapshot فعال نیست. Snapshot فعال فعلی: ${safe(r.activeSnapshotId||'fallback قدیمی')}</div>`}<table class="table"><tbody><tr><td>Snapshot</td><td><small>${safe(x.snapshotId)}</small></td><td>وضعیت</td><td>${safe(x.status||'')} / ${safe(x.activationStatus||'')}</td></tr><tr><td>حالت</td><td>${x.incremental?'فقط فاکتورهای جدید':'اسکن کامل'}</td><td>روش</td><td>${safe(x.mode||'')}</td></tr><tr><td>فاکتور فروش Header</td><td>${money(x.invoiceHeadersFound||0)}</td><td>Body فروش خوانده‌شده</td><td>${money(x.invoiceBodiesLoaded||0)}</td></tr><tr><td>ردیف کالای فروش</td><td>${money(x.saleLinesParsed||0)}</td><td>Body خالی</td><td>${money(x.emptyBodyInvoices||0)}</td></tr><tr><td>صفحات اسکن‌شده</td><td>${money(x.pagesScanned||0)}</td><td>Retry / Resume</td><td>${money(x.retryCount||0)} / ${money(x.resumeCount||0)}</td></tr><tr><td>آخرین صفحه موفق</td><td>${money(x.lastSuccessfulPage??-1)}</td><td>RowStart ادامه</td><td>${money(x.nextRowStart||0)}</td></tr><tr><td>Dataset نهایی</td><td>${money(x.datasetHeaderCount||0)} فاکتور / ${money(x.datasetLineCount||0)} ردیف</td><td>Validation</td><td>${x.validation?.valid?'<span class="success">VALID</span>':'<span class="warn">NOT ACTIVATED</span>'}</td></tr><tr><td>فروش واقعی Type 2</td><td>${money((x.typeStats&&x.typeStats['2']&&x.typeStats['2'].invoices)||0)} فاکتور / ${money((x.typeStats&&x.typeStats['2']&&x.typeStats['2'].lines)||0)} ردیف</td><td>برگشت‌ها</td><td>Type 6 برگشت از فروش و Type 7 برگشت از خرید فعلاً در فروش خالص اعمال نشده‌اند.</td></tr></tbody></table><h4>اتصال فروش به نماینده / صندوق</h4><table class="table"><thead><tr><th>نام نماینده</th><th>کد نماینده</th><th>فروشگاه/صندوق</th><th>فاکتور</th><th>ردیف</th><th>مبلغ</th></tr></thead><tbody>${((x.sellerStats||[]).slice(0,20).map(s=>`<tr><td><button class="mini sale-seller-detail" data-seller="${safe(s.sellerAccountNumber||'')}">${safe(s.sellerName||s.sellerAccountName||s.key||'نامشخص')}</button></td><td>${safe(s.sellerAccountNumber||'')}</td><td>${safe(s.sellerStoreName||'')}<br>${safe(s.cashboxAccountName||'')}</td><td>${money(s.invoices||0)}</td><td>${money(s.lines||0)}</td><td>${money(s.amount||0)}</td></tr>`).join(''))||'<tr><td colspan="6" class="muted">هنوز اطلاعات نماینده ساخته نشده است.</td></tr>'}</tbody></table><details open><summary>Validation، صفحه ناموفق و خطا</summary><pre class="prewrap">${safe(JSON.stringify({validation:x.validation||null, failedPages:x.failedPages||[], lastRetry:x.lastRetry||null, samples:x.samples||[], errors:x.errors||[], diagnostics:r.diagnostics||null},null,2))}</pre></details><div id="saleSellerDetailBox" class="mt"></div>`;
+      $qa('.sale-seller-detail').forEach(b=>b.onclick=async()=>{const seller=b.dataset.seller||''; const out=$q('#saleSellerDetailBox'); if(!seller){out.innerHTML='<div class="error">کد نماینده خالی است.</div>';return;} out.innerHTML='<div class="info">در حال خواندن عملکرد نماینده...</div>'; try{const r=await getJson('/api/sale-snapshot/seller-performance?sellerAccountNumber='+encodeURIComponent(seller)+'&dateFrom='+encodeURIComponent($q('#saleSnapFrom')?.value||'')+'&dateTo='+encodeURIComponent($q('#saleSnapTo')?.value||'')); out.innerHTML=`<h4>عملکرد نماینده: ${safe((r.invoices&&r.invoices[0]&&r.invoices[0].sellerName)||seller)}</h4><table class="table"><tbody><tr><td>تعداد فاکتور</td><td>${money(r.invoiceCount||0)}</td><td>ردیف فروش</td><td>${money(r.lineCount||0)}</td></tr><tr><td>عدد فروش</td><td>${money(r.totalSales||0)}</td><td>سود/ROI</td><td>${safe(r.profitStatus||'')} | سود: ${r.fifoProfit==null?'نامشخص':money(r.fifoProfit)} | ROI: ${r.roiPercent==null?'نامشخص':safe(r.roiPercent)+'%'}</td></tr><tr><td>بهای FIFO</td><td>${r.fifoCost==null?'نامشخص':money(r.fifoCost)}</td><td>وضعیت ردیف‌ها</td><td>محاسبه‌شده: ${money((r.profitLineStats||{}).calculated||0)} | ناقص: ${money((r.profitLineStats||{}).partial||0)} | نامشخص: ${money((r.profitLineStats||{}).unknown||0)}</td></tr></tbody></table><h4>گروه اصلی کالا</h4><table class="table"><thead><tr><th>گروه</th><th>فاکتور</th><th>ردیف</th><th>مبلغ</th><th>بهای FIFO</th><th>سود</th><th>ROI</th><th>وضعیت</th></tr></thead><tbody>${(r.groups||[]).map(g=>`<tr><td>${safe(g.mainGroup||'نامشخص')}</td><td>${money(g.invoiceCount||0)}</td><td>${money(g.lines||0)}</td><td>${money(g.amount||0)}</td><td>${g.fifoCost==null?'نامشخص':money(g.fifoCost)}</td><td>${g.fifoProfit==null?'نامشخص':money(g.fifoProfit)}</td><td>${g.roiPercent==null?'نامشخص':safe(g.roiPercent)+'%'}</td><td>${safe(g.profitStatus||'')}</td></tr>`).join('')}</tbody></table><details><summary>Diagnostic سود FIFO</summary><pre class="prewrap">${safe(JSON.stringify(r.profitDiagnostics||{},null,2))}</pre></details><h4>شماره فاکتورها</h4><table class="table"><thead><tr><th>تاریخ</th><th>نوع</th><th>شماره</th><th>ردیف</th><th>مبلغ</th><th>صندوق</th></tr></thead><tbody>${(r.invoices||[]).map(x=>`<tr><td>${safe(x.saleDate||'')}</td><td>${safe(x.saleInvoiceType||'')}</td><td>${safe(x.saleInvoiceNo||'')}</td><td>${money(x.lines||0)}</td><td>${money(x.amount||0)}</td><td>${safe(x.cashboxAccountName||'')}</td></tr>`).join('')}</tbody></table>`;}catch(e){out.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}});
     }catch(e){ box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; }
   }
   async function renderSaleSnapshots(){
     const box=$q('#saleSnapList'); if(!box)return;
-    try{ const r=await getJson('/api/sale-snapshot/snapshots?limit=15'); box.innerHTML=saleSnapshotTable(r.list||[]); $qa('.sale-snap-pick').forEach(b=>b.onclick=()=>renderSaleSnapshotStatus(b.dataset.id)); }
+    try{ const r=await getJson('/api/sale-snapshot/snapshots?limit=15'); box.innerHTML=saleSnapshotTable(r.list||[]); $qa('.sale-snap-pick').forEach(b=>b.onclick=()=>renderSaleSnapshotStatus(b.dataset.id)); $qa('.sale-snap-resume').forEach(b=>b.onclick=()=>resumeSaleSnapshot(b.dataset.id)); }
     catch(e){ box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; }
   }
   async function waitForSaleSnapshotJob(jobId,m){
     for(let i=0;i<600;i++){
       await new Promise(resolve=>setTimeout(resolve,2000));
       const r=await getJson('/api/jobs/status?jobId='+encodeURIComponent(jobId)); const job=r.job||{};
-      m.innerHTML=`<div class="info">Sale Snapshot Job: ${safe(jobId)} | وضعیت: ${safe(job.status||'')} | مرحله: ${safe(job.phase||'')}</div>`;
+      m.innerHTML=`<div class="info">Sale Snapshot Job: ${safe(jobId)} | وضعیت: ${safe(job.status||'')} | مرحله: ${safe(job.phase||'')}<br>${safe(job.progress?.message||'')} ${job.progress?.current!=null?`| ${money(job.progress.current)} / ${money(job.progress.total||0)}`:''}</div>`;
       if(job.status==='completed') return job.result||{};
-      if(job.status==='failed'||job.status==='cancelled') throw new Error(job.error||job.status);
+      if(job.status==='failed'||job.status==='cancelled'){const detail=job.result?.errors?.[0]?.error||job.result?.error||job.error||job.status;throw new Error(`${detail}${job.result?.snapshotId?' | Snapshot: '+job.result.snapshotId:''}`);}
     }
     throw new Error('Sale Snapshot job is still running; use Refresh to check its status.');
   }
+  async function resumeSaleSnapshot(snapshotId){
+    const m=$q('#saleSnapMsg'); if(!m)return;
+    m.innerHTML=`<div class="info">ادامه همان Candidate از آخرین صفحه موفق: ${safe(snapshotId)}</div>`;
+    try{
+      const started=await postJson('/api/sale-snapshot/resume',{snapshotId,maxPages:Number($q('#saleSnapPages')?.value||1000),maxPageAttempts:3});
+      const r=await waitForSaleSnapshotJob(started.jobId,m);
+      m.innerHTML=`<div class="success">Snapshot پس از Resume کامل و فعال شد: ${safe(r.snapshotId)} | Retry: ${money(r.retryCount||0)}</div>`;
+      await renderSaleSnapshots(); await renderSaleSnapshotStatus(r.snapshotId);
+    }catch(e){m.innerHTML=`<div class="error">Resume ناموفق بود؛ Snapshot فعال قبلی حفظ شد.<br>${safe(e.message||e)}</div>`;await renderSaleSnapshots();await renderSaleSnapshotStatus(snapshotId);}
+  }
   window.pageSaleSnapshot=async function(){
-    setPage('Sale Snapshot', `<main class="main-content"><div class="card"><div class="card-header"><h5>Sale Snapshot - زیرساخت فروش برای سود، عملکرد فروشنده و پیش‌بینی بازار</h5></div><div class="card-body"><div class="info">این فاز فقط فروش‌ها را از شایگان می‌خواند و در Mongo ذخیره می‌کند. محاسبه سود تأمین‌کننده عمداً متوقف است. این نسخه فروش واقعی را فقط با InvoiceType=2 می‌خواند. نگاشت صحیح شایگان: 2=فروش، 3=خرید، 6=برگشت از فروش، 7=برگشت از خرید. برگشت‌ها فعلاً فقط در طراحی بعدی فروش خالص/خرید خالص لحاظ می‌شوند.</div><div class="row four"><div class="form-group"><label>از تاریخ فروش</label><input id="saleSnapFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="saleSnapTo" value=""></div><div class="form-group"><label>حداکثر صفحات فروش</label><input id="saleSnapPages" value="300" inputmode="numeric"></div><div class="form-group"><label>RowCount ثابت</label><input id="saleSnapDetails" value="20" inputmode="numeric" disabled><div class="small muted">WebService حداکثر ۲۰ ردیف در هر صفحه می‌دهد.</div></div></div><div class="form-group"><label><input type="checkbox" id="saleSnapReset"> بازسازی کامل از ابتدا (معمولاً خاموش بماند)</label></div><div class="actions"><button class="btn green" id="saleSnapInit">آماده‌سازی</button><button class="btn red" id="saleSnapStart">ساخت Sale Snapshot</button><button class="btn" id="saleSnapRefresh">Refresh</button></div><div id="saleSnapMsg" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>Snapshotهای فروش</h5></div><div class="card-body"><div id="saleSnapList"></div></div></div><div class="card"><div class="card-header"><h5>Diagnostic فروش</h5></div><div class="card-body"><div id="saleSnapStatus"></div></div></div></main>`);
+    setPage('Sale Snapshot', `<main class="main-content"><div class="card"><div class="card-header"><h5>Sale Snapshot - زیرساخت فروش برای سود، عملکرد فروشنده و پیش‌بینی بازار</h5></div><div class="card-body"><div class="info">هر اجرا ابتدا در Candidate مستقل ساخته می‌شود. فقط Snapshot کامل، بدون صفحه ناموفق و با Validation موفق به‌صورت اتمیک فعال می‌شود؛ اجرای ناقص گزارش فعال قبلی را تغییر نمی‌دهد. فروش واقعی فقط InvoiceType=2 است. نگاشت شایگان: 2=فروش، 3=خرید، 6=برگشت از فروش، 7=برگشت از خرید.</div><div class="row four"><div class="form-group"><label>از تاریخ فروش</label><input id="saleSnapFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="saleSnapTo" value=""></div><div class="form-group"><label>حداکثر صفحات فروش</label><input id="saleSnapPages" value="1000" inputmode="numeric"></div><div class="form-group"><label>RowCount ثابت</label><input id="saleSnapDetails" value="20" inputmode="numeric" disabled><div class="small muted">WebService حداکثر ۲۰ ردیف در هر صفحه می‌دهد؛ هر صفحه تا ۳ بار retry می‌شود.</div></div></div><div class="form-group"><label><input type="checkbox" id="saleSnapReset"> بازسازی کامل در Candidate مستقل</label></div><div class="actions"><button class="btn green" id="saleSnapInit">آماده‌سازی</button><button class="btn red" id="saleSnapStart">ساخت Candidate و فعال‌سازی امن</button><button class="btn" id="saleSnapRefresh">Refresh</button></div><div id="saleSnapMsg" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>Snapshotهای فروش</h5></div><div class="card-body"><div id="saleSnapList"></div></div></div><div class="card"><div class="card-header"><h5>Diagnostic فروش</h5></div><div class="card-body"><div id="saleSnapStatus"></div></div></div></main>`);
     $q('#saleSnapInit').onclick=async()=>{const m=$q('#saleSnapMsg');m.innerHTML='در حال آماده‌سازی...';try{const r=await postJson('/api/sale-snapshot/init',{});m.innerHTML=`<div class="success">آماده شد. نسخه: ${safe(r.version||'')}</div>`;}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}};
-    $q('#saleSnapStart').onclick=async()=>{const m=$q('#saleSnapMsg');m.innerHTML='<div class="info">Job ساخت Sale Snapshot در حال ثبت است...</div>';try{const started=await postJson('/api/sale-snapshot/start',{dateFrom:$q('#saleSnapFrom').value,dateTo:$q('#saleSnapTo').value,maxPages:Number($q('#saleSnapPages').value||300),maxDetailInvoices:Number($q('#saleSnapDetails').value||0),reset:!!$q('#saleSnapReset')?.checked});const r=await waitForSaleSnapshotJob(started.jobId,m);m.innerHTML=`<div class="success">Sale Snapshot ساخته شد: ${safe(r.snapshotId)} | حالت: ${safe(r.mode||'')} | فاکتور: ${money(r.invoiceHeadersFound)} | Body: ${money(r.invoiceBodiesLoaded)} | ردیف فروش: ${money(r.saleLinesParsed)}</div>`;await renderSaleSnapshots();await renderSaleSnapshotStatus(r.snapshotId);}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}};
+    $q('#saleSnapStart').onclick=async()=>{const button=$q('#saleSnapStart'),m=$q('#saleSnapMsg');button.disabled=true;m.innerHTML='<div class="info">Job ساخت Candidate مستقل در حال ثبت است...</div>';try{const started=await postJson('/api/sale-snapshot/start',{dateFrom:$q('#saleSnapFrom').value,dateTo:$q('#saleSnapTo').value,maxPages:Number($q('#saleSnapPages').value||1000),maxPageAttempts:3,maxDetailInvoices:Number($q('#saleSnapDetails').value||0),reset:!!$q('#saleSnapReset')?.checked});const r=await waitForSaleSnapshotJob(started.jobId,m);if(!r.ok||r.activationStatus!=='active')throw new Error(r.error||'Candidate کامل نشد و فعال نشد');m.innerHTML=`<div class="success">Sale Snapshot کامل و فعال شد: ${safe(r.snapshotId)} | حالت: ${safe(r.mode||'')} | Dataset: ${money(r.datasetHeaderCount)} فاکتور / ${money(r.datasetLineCount)} ردیف</div>`;await renderSaleSnapshots();await renderSaleSnapshotStatus(r.snapshotId);}catch(e){m.innerHTML=`<div class="error">Snapshot ناقص فعال نشد و Snapshot قبلی حفظ شد.<br>${safe(e.message||e)}</div>`;await renderSaleSnapshots();await renderSaleSnapshotStatus('');}finally{button.disabled=false;}};
     $q('#saleSnapRefresh').onclick=async()=>{await renderSaleSnapshots();await renderSaleSnapshotStatus('');};
     await renderSaleSnapshots(); await renderSaleSnapshotStatus('');
   };
   const prevMenu=window.renderMenu;
   window.renderMenu=renderMenu=function(){
     const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['sale-snapshot','Sale Snapshot'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]];
-    let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$q('#menu'); if(m){m.innerHTML=h; $qa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V34}</small>`;
+    let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$q('#menu'); if(m){m.innerHTML=h; $qa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`;
   };
   const prevRoute=window.route;
   window.route=route=async function(){ const p=location.hash.slice(1)||(typeof firstAllowedPage==='function'?firstAllowedPage():'dashboard'); if(p==='sale-snapshot') return window.pageSaleSnapshot(); if(prevRoute) return prevRoute.apply(this,arguments); };
@@ -4214,7 +4928,6 @@ async function pageSellerProfit(){
 */
 (function(){
   const V46='0.9.19.47-supplier-sleep-unified-stable-ui';
-  window.MKCRM_VERSION=V46;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -4279,14 +4992,14 @@ async function pageSellerProfit(){
       if(grp)grp.innerHTML=(rg.list||[]).length?`<table class="table"><thead><tr><th>گروه اصلی</th><th>تعداد کالا</th><th>لایه</th><th>خرید کالایی</th><th>مانده</th><th>ارزش مانده</th><th>درصد مانده</th><th>میانگین سن</th></tr></thead><tbody>${(rg.list||[]).map(x=>`<tr><td>${safe(x.mainGroup||x.mainGroupName||'نامشخص')}</td><td>${money(x.itemCount||0)}</td><td>${money(x.layerCount||0)}</td><td>${money(x.purchaseValue||0)}</td><td>${money(x.remainingQty||0)}</td><td>${money(x.remainingValue||0)}</td><td>${safe(x.remainingPercent??0)}٪</td><td>${x.averageAgeDays==null?'نامشخص':money(x.averageAgeDays)}</td></tr>`).join('')}</tbody></table>`:'<div class="muted">گزارش گروه اصلی وجود ندارد.</div>';
     }catch(e){ if(sum)sum.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}
   }
-  async function searchSuppliers(){ const q=($s('#psSupplierSearch')?.value||'').trim(); const box=$s('#psSupplierResults'); if(!box)return; if(q.length<2){box.innerHTML='<div class="warn">حداقل دو حرف یا کد وارد کن.</div>';return;} box.innerHTML='<div class="info">در حال جستجوی حساب...</div>'; try{ const r=await getJson('/api/accounts/search?q='+encodeURIComponent(q)+'&limit=20&pages=220'); const list=r.list||[]; box.innerHTML=list.length?`<table class="table"><thead><tr><th>کد</th><th>نام حساب</th><th>انتخاب</th></tr></thead><tbody>${list.map(x=>`<tr><td>${safe(x.accountNumber||'')}</td><td>${safe(x.accountName||'')}</td><td><button class="mini ps-select-supplier" data-no="${safe(x.accountNumber||'')}" data-name="${safe(x.accountName||'')}" data-guid="${safe(x.accountGuid||x.guId||'')}">انتخاب</button></td></tr>`).join('')}</tbody></table>`:'<div class="muted">حسابی پیدا نشد.</div>'; $sa('.ps-select-supplier').forEach(b=>b.onclick=()=>{window.__psSelectedSupplier={accountNumber:b.dataset.no,accountName:b.dataset.name,accountGuid:b.dataset.guid}; const s=$s('#psSelectedSupplier'); if(s)s.innerHTML=`<div class="success">تأمین‌کننده انتخاب شد: ${safe(b.dataset.name)} | ${safe(b.dataset.no)}</div>`; const inv=$s('#psInvoices'); if(inv)inv.innerHTML='<div class="muted">حالا «خواندن مرحله‌ای فاکتورهای خرید» را بزن. این مرحله از نسخه 46 به Job پس‌زمینه‌ای تبدیل شده است.</div>';}); } catch(e){ box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; } }
+  async function searchSuppliers(){ const q=($s('#psSupplierSearch')?.value||'').trim(); const box=$s('#psSupplierResults'); if(!box)return; if(q.length<2){box.innerHTML='<div class="warn">حداقل دو حرف یا کد وارد کن.</div>';return;} box.innerHTML='<div class="info">در حال جستجوی حساب...</div>'; try{ const r=await getJson('/api/accounts/search?q='+encodeURIComponent(q)+'&limit=20&pages=220'); const list=r.list||[]; box.innerHTML=list.length?`<table class="table"><thead><tr><th>کد</th><th>نام حساب</th><th>انتخاب</th></tr></thead><tbody>${list.map(x=>`<tr><td>${safe(x.accountNumber||'')}</td><td>${safe(x.accountName||'')}</td><td><button class="mini ps-select-supplier" data-no="${safe(x.accountNumber||'')}" data-name="${safe(x.accountName||'')}" data-guid="${safe(x.accountGuid||x.guId||'')}">انتخاب</button></td></tr>`).join('')}</tbody></table>`:'<div class="muted">حسابی پیدا نشد.</div>'; $sa('.ps-select-supplier').forEach(b=>b.onclick=()=>{window.__psSelectedSupplier={accountNumber:b.dataset.no,accountName:b.dataset.name,accountGuid:b.dataset.guid}; const s=$s('#psSelectedSupplier'); if(s)s.innerHTML=`<div class="success">تأمین‌کننده انتخاب شد: ${safe(b.dataset.name)} | ${safe(b.dataset.no)}</div>`; const inv=$s('#psInvoices'); if(inv)inv.innerHTML='<div class="muted">حالا «خواندن مرحله‌ای فاکتورهای خرید» را بزن. این مرحله به Job پس‌زمینه‌ای تبدیل شده است.</div>';}); } catch(e){ box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; } }
   async function checkReadJob(showIfMissing=false){ const msg=$s('#psMsg'), box=$s('#psInvoices'), diag=$s('#psDiagnostics'); const jobId=getJob('read'); if(!jobId){ if(showIfMissing&&msg)msg.innerHTML='<div class="muted">Job خواندن فعالی ثبت نشده است.</div>'; return null; } try{ const job=await jobStatus(jobId); if(!job){ if(msg)msg.innerHTML='<div class="warn">Job خواندن پیدا نشد.</div>'; return null; } if(msg)msg.innerHTML=`<div class="info">${jobLine(job)}</div>`; if(job.status==='completed'){ const r=job.result||{}; if(msg)msg.innerHTML=`<div class="success">خواندن فاکتورهای خرید کامل شد: گردش ${money(r.statementRows)} | کاندید ${money(r.invoiceNoCandidates)} | فاکتور معتبر ${money(r.count)} | منبع: ${safe(r.source||'')}</div>`; if(box)box.innerHTML=invoiceTable(r.list||[],null); if(diag)diag.innerHTML=stageView(r.diagnostics||{}); clearJob('read'); return job; } if(job.status==='failed'){ if(box)box.innerHTML=`<div class="error">Job خواندن ناموفق شد: ${safe(job.error||job.result?.error||'')}</div>`; clearJob('read'); return job; } if(box)box.innerHTML=`<div class="info">خواندن فاکتورهای خرید در پس‌زمینه ادامه دارد. ترک صفحه دیگر نباید آن را متوقف کند.<br>${jobLine(job)}</div>`; return job; }catch(e){ if(msg)msg.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; return null; } }
   async function readSelected(){ const sup=window.__psSelectedSupplier||{}; const box=$s('#psInvoices'), msg=$s('#psMsg'); if(!sup.accountNumber&&!sup.accountGuid&&!sup.accountName){ if(box)box.innerHTML='<div class="warn">اول تأمین‌کننده را انتخاب کن.</div>'; return;} if(box)box.innerHTML='<div class="info">Job خواندن فاکتورهای خرید در پس‌زمینه ثبت می‌شود...</div>'; try{const r=await postJson('/api/supplier-sleep/selected-supplier-invoices-job',selectedBody()); setJob('read',r.jobId||''); if(msg)msg.innerHTML=`<div class="info">Job خواندن ثبت شد: <small>${safe(r.jobId||'')}</small>. می‌توانی صفحه را ترک کنی و بعداً Refresh بزنی.</div>`; await checkReadJob(false);}catch(e){if(box)box.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
   async function checkBuildJob(showIfMissing=false){ const msg=$s('#psMsg'); const jobId=getJob('build'); if(!jobId){ if(showIfMissing&&msg)msg.innerHTML='<div class="muted">Job تحلیل فعالی ثبت نشده است.</div>'; return null; } try{ const job=await jobStatus(jobId); if(!job){ if(msg)msg.innerHTML='<div class="warn">Job تحلیل پیدا نشد.</div>'; return null; } if(msg)msg.innerHTML=`<div class="info">${jobLine(job)}</div>`; if(job.status==='completed'){ const sid=job.result?.snapshotId||''; window.__psSnapshotId=sid; if(msg)msg.innerHTML=`<div class="success">تحلیل کامل شد. Snapshot: ${safe(sid)} | فاکتور: ${money(job.result?.purchaseInvoicesSynced||0)} | لایه: ${money(job.result?.purchaseLayerCount||0)} | مانده مرتبط: ${money(job.result?.totalAllocatedValue||0)} | نامشخص: ${money(job.result?.totalUnknownValue||0)}</div>`; clearJob('build'); await renderSnapshot(sid); await renderSnapshots(); return job; } if(job.status==='failed'){ if(msg)msg.innerHTML=`<div class="error">Job تحلیل ناموفق شد: ${safe(job.error||job.result?.error||'')}</div>`; clearJob('build'); return job; } if(msg)msg.innerHTML=`<div class="info">تحلیل هنوز در حال اجراست و به صفحه وابسته نیست. بعداً Refresh/نمایش وضعیت Job را بزن.<br>${jobLine(job)}</div>`; return job; }catch(e){ if(msg)msg.innerHTML=`<div class="error">${safe(e.message||e)}</div>`; return null; } }
   async function buildSelected(){ const sup=window.__psSelectedSupplier||{}, msg=$s('#psMsg'); if(!sup.accountNumber&&!sup.accountGuid&&!sup.accountName){if(msg)msg.innerHTML='<div class="warn">اول تأمین‌کننده را انتخاب کن.</div>';return;} if(getJob('read')){ const readJob=await checkReadJob(false); if(readJob && ['queued','running'].includes(readJob.status)){ if(msg)msg.innerHTML='<div class="warn">خواندن فاکتورهای خرید هنوز تمام نشده است. تحلیل تا تکمیل مرحله خواندن شروع نمی‌شود.</div>'; return; } if(readJob && readJob.status==='failed') return; } if(msg)msg.innerHTML='<div class="info">Job تحلیل و کنترل صحت در پس‌زمینه شروع می‌شود...</div>'; try{const r=await postJson('/api/supplier-sleep/build-selected-job',selectedBody()); setJob('build',r.jobId||''); if(msg)msg.innerHTML=`<div class="info">Job تحلیل ثبت شد: <small>${safe(r.jobId||'')}</small>. وضعیت هر ۴ ثانیه خودکار بررسی می‌شود و پس از اتمام گزارش تازه می‌شود.</div>`; startSupplierSleepPolling(); await checkBuildJob(false);}catch(e){if(msg)msg.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;} }
-  window.pageSupplierAging=async function(){ setPage('خواب کالا تأمین‌کننده',`<main class="main-content"><div class="card"><div class="card-header"><h5>خواب کالا تأمین‌کننده - کنترل عملیاتی Snapshot و Job</h5></div><div class="card-body"><div class="info">نسخه 47: Jobهای پس‌زمینه نسخه 46 حفظ شده‌اند و نمایش بعد از Snapshot یکپارچه شده است: فاکتورهای معتبر، مانده واقعی هر فاکتور، گروه اصلی و Purchase Layer هر کدام جدول مستقل دارند.</div><div class="row four"><div class="form-group"><label>از تاریخ خرید/فروش</label><input id="psDateFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="psDateTo" value=""></div><div class="form-group"><label>حداکثر فاکتور خرید</label><input id="psMaxInvoices" value="300" inputmode="numeric"></div><div class="form-group"><label>حداکثر اسکن خرید</label><input id="psMaxScan" value="6000" inputmode="numeric"></div></div><div class="row two"><div class="form-group"><label>جستجوی تأمین‌کننده</label><input id="psSupplierSearch" placeholder="مثلاً ماتریس، ماندگار، رایان کاوه"></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="psSearchBtn">جستجوی تأمین‌کننده</button></div></div><div class="actions"><button class="btn green" id="psInit">آماده‌سازی</button><button class="btn" id="psReadSelected">خواندن مرحله‌ای فاکتورهای خرید</button><button class="btn red" id="psBuildSelected">تحلیل و کنترل صحت</button><button class="btn" id="psRefresh">Refresh / وضعیت Job</button></div><div id="psMsg" class="mt"></div><div id="psSelectedSupplier" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>۱) انتخاب تأمین‌کننده</h5></div><div class="card-body"><div id="psSupplierResults"></div></div></div><div class="card"><div class="card-header"><h5>۲) فاکتورهای خرید و Reconciliation</h5></div><div class="card-body"><div id="psInvoices"></div></div></div><div class="card"><div class="card-header"><h5>۳) Diagnostic مراحل</h5></div><div class="card-body"><div id="psDiagnostics"></div></div></div><div class="card"><div class="card-header"><h5>۴) Snapshotهای اخیر</h5></div><div class="card-body"><div id="psSnapshots"></div></div></div><div class="card"><div class="card-header"><h5>۵) داشبورد مدیریتی تأمین‌کننده</h5></div><div class="card-body"><div id="psSummary"></div></div></div><div class="card"><div class="card-header"><h5>۶) مانده واقعی هر فاکتور خرید</h5></div><div class="card-body"><div id="psInvoiceSummary"></div></div></div><div class="card"><div class="card-header"><h5>۷) گزارش گروه اصلی کالا</h5></div><div class="card-body"><div id="psGroupSummary"></div></div></div><div class="card"><div class="card-header"><h5>۸) لایه‌های Purchase Layer</h5></div><div class="card-body"><div id="psLayers"></div></div></div></main>`); $s('#psInit').onclick=async()=>{const m=$s('#psMsg');m.innerHTML='در حال آماده‌سازی...';try{const r=await postJson('/api/supplier-sleep/init',{});m.innerHTML=`<div class="success">آماده شد. نسخه: ${safe(r.version||'')}</div>`;}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}}; $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{ await checkReadJob(false); await checkBuildJob(false); await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();}; await renderSnapshots(); await renderSnapshot(''); await checkReadJob(false); await checkBuildJob(false); };
+  window.pageSupplierAging=async function(){ setPage('خواب کالا تأمین‌کننده',`<main class="main-content"><div class="card"><div class="card-header"><h5>خواب کالا تأمین‌کننده - کنترل عملیاتی Snapshot و Job</h5></div><div class="card-body"><div class="info">Jobهای پس‌زمینه حفظ شده‌اند و نمایش بعد از Snapshot یکپارچه شده است: فاکتورهای معتبر، مانده واقعی هر فاکتور، گروه اصلی و Purchase Layer هر کدام جدول مستقل دارند.</div><div class="row four"><div class="form-group"><label>از تاریخ خرید/فروش</label><input id="psDateFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="psDateTo" value=""></div><div class="form-group"><label>حداکثر فاکتور خرید</label><input id="psMaxInvoices" value="300" inputmode="numeric"></div><div class="form-group"><label>حداکثر اسکن خرید</label><input id="psMaxScan" value="6000" inputmode="numeric"></div></div><div class="row two"><div class="form-group"><label>جستجوی تأمین‌کننده</label><input id="psSupplierSearch" placeholder="مثلاً ماتریس، ماندگار، رایان کاوه"></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="psSearchBtn">جستجوی تأمین‌کننده</button></div></div><div class="actions"><button class="btn green" id="psInit">آماده‌سازی</button><button class="btn" id="psReadSelected">خواندن مرحله‌ای فاکتورهای خرید</button><button class="btn red" id="psBuildSelected">تحلیل و کنترل صحت</button><button class="btn" id="psRefresh">Refresh / وضعیت Job</button></div><div id="psMsg" class="mt"></div><div id="psSelectedSupplier" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>۱) انتخاب تأمین‌کننده</h5></div><div class="card-body"><div id="psSupplierResults"></div></div></div><div class="card"><div class="card-header"><h5>۲) فاکتورهای خرید و Reconciliation</h5></div><div class="card-body"><div id="psInvoices"></div></div></div><div class="card"><div class="card-header"><h5>۳) Diagnostic مراحل</h5></div><div class="card-body"><div id="psDiagnostics"></div></div></div><div class="card"><div class="card-header"><h5>۴) Snapshotهای اخیر</h5></div><div class="card-body"><div id="psSnapshots"></div></div></div><div class="card"><div class="card-header"><h5>۵) داشبورد مدیریتی تأمین‌کننده</h5></div><div class="card-body"><div id="psSummary"></div></div></div><div class="card"><div class="card-header"><h5>۶) مانده واقعی هر فاکتور خرید</h5></div><div class="card-body"><div id="psInvoiceSummary"></div></div></div><div class="card"><div class="card-header"><h5>۷) گزارش گروه اصلی کالا</h5></div><div class="card-body"><div id="psGroupSummary"></div></div></div><div class="card"><div class="card-header"><h5>۸) لایه‌های Purchase Layer</h5></div><div class="card-body"><div id="psLayers"></div></div></div></main>`); $s('#psInit').onclick=async()=>{const m=$s('#psMsg');m.innerHTML='در حال آماده‌سازی...';try{const r=await postJson('/api/supplier-sleep/init',{});m.innerHTML=`<div class="success">آماده شد. نسخه موتور: ${safe(r.version||'')}</div>`;}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}}; $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{ await checkReadJob(false); await checkBuildJob(false); await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();}; await renderSnapshots(); await renderSnapshot(''); await checkReadJob(false); await checkBuildJob(false); };
   const prevMenu=window.renderMenu;
-  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['sale-snapshot','Sale Snapshot'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V46}</small>`; };
+  window.renderMenu=renderMenu=function(){ const menu=[['حسابداری / شایگان',[['sale','فاکتور فروش جدید'],['proforma','پیش‌فاکتور'],['proforma-list','آرشیو پیش‌فاکتور'],['buy','فاکتور خرید جدید'],['purchase-drafts','آرشیو پیش‌نویس خرید'],['stocks','موجودی انبارها'],['cardex','کاردکس کالا'],['inv-sale','فاکتورهای فروش'],['inv-buy','فاکتورهای خرید'],['turnover','گردش حساب'],['account-set','تعریف صندوق/نماینده']]],['CRM',[['customers','مشتریان'],['leads','Lead ID']]],['مدیریت',[['settings','تنظیمات'],['supplier-aging','خواب کالا تأمین‌کننده'],['sale-snapshot','Sale Snapshot'],['users','کاربران'],['roles','نقش‌ها'],['seller-profit','عملکرد فروشنده'],['reports','تست‌ها'],['app-logs','لاگ عملیات'],['tablo','تابلو']]]]; let h=''; const role=typeof userRole==='function'?userRole():'admin'; menu.forEach(([g,items])=>{const allowed=items.filter(([id])=>typeof canPage==='function'?canPage(id):true); if(!allowed.length)return; h+=`<div class="menu-group">${g}</div>`; allowed.forEach(([id,t])=>h+=`<button class="navbtn" data-page="${id}">${t}</button>`);}); const m=$s('#menu'); if(m){m.innerHTML=h; $sa('.navbtn').forEach(b=>b.onclick=e=>{e.preventDefault();location.hash=b.dataset.page;route();});} const chip=document.querySelector('.user-chip'); if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
   const prevRoute=window.route; window.route=route=async function(){ const p=location.hash.slice(1)||(typeof firstAllowedPage==='function'?firstAllowedPage():'dashboard'); if(p==='supplier-aging') return window.pageSupplierAging(); if(prevRoute) return prevRoute.apply(this,arguments); };
   try{renderMenu();}catch{}
 })();
@@ -4294,7 +5007,6 @@ async function pageSellerProfit(){
 /* PATCH 0.9.19.49: core stability refactor phase 1 - server time, guarded inventory sync, job heartbeat, supplier sleep cleanup */
 (function(){
   const V48='0.9.19.49-core-stability-refactor-phase1';
-  window.MKCRM_VERSION=V48;
   const $s=(q)=>document.querySelector(q);
   const $sa=(q)=>Array.from(document.querySelectorAll(q));
   const safe=(v)=>String(v??'').replace(/[&<>"']/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
@@ -4328,7 +5040,7 @@ async function pageSellerProfit(){
   let __psPollTimer=null;
   function startSupplierSleepPolling(){ if(__psPollTimer)clearInterval(__psPollTimer); __psPollTimer=setInterval(async()=>{ if(location.hash.slice(1)!=='supplier-aging'){clearInterval(__psPollTimer);__psPollTimer=null;return;} const hasRead=!!getJob('read'),hasBuild=!!getJob('build'); if(!hasRead&&!hasBuild){clearInterval(__psPollTimer);__psPollTimer=null;return;} if(hasRead)await checkReadJob(false); if(hasBuild)await checkBuildJob(false); },4000); }
   function restoreSupplierSleepSupplier(){ if(window.__psSelectedSupplier&&Object.keys(window.__psSelectedSupplier).length)return; try{const x=JSON.parse(localStorage.getItem('mkcrm_supplier_sleep_selected_supplier')||'{}'); if(x&&(x.accountNumber||x.accountGuid||x.accountName))window.__psSelectedSupplier=x;}catch{} }
-  window.pageSupplierAging=async function(){ restoreSupplierSleepSupplier(); setPage('خواب کالا تأمین‌کننده',`<main class="main-content"><div class="card"><div class="card-header"><h5>خواب کالا تأمین‌کننده - نسخه 49 - پایداری هسته</h5></div><div class="card-body"><div class="info">Jobها مستقل از صفحه‌اند؛ نمایش فاکتورهای مصرف‌شده/مانده اصلاح شده؛ نمایش لایه‌های هر گروه اصلی فعال شده است.</div><div class="row four"><div class="form-group"><label>از تاریخ خرید/فروش</label><input id="psDateFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="psDateTo" value=""></div><div class="form-group"><label>حداکثر فاکتور خرید</label><input id="psMaxInvoices" value="300" inputmode="numeric"></div><div class="form-group"><label>حداکثر اسکن خرید</label><input id="psMaxScan" value="6000" inputmode="numeric"></div></div><div class="row two"><div class="form-group"><label>جستجوی تأمین‌کننده</label><input id="psSupplierSearch" placeholder="مثلاً ماتریس، ماندگار، رایان کاوه"></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="psSearchBtn">جستجوی تأمین‌کننده</button></div></div><div class="actions"><button class="btn green" id="psInit">آماده‌سازی</button><button class="btn" id="psReadSelected">خواندن مرحله‌ای فاکتورهای خرید</button><button class="btn red" id="psBuildSelected">تحلیل و کنترل صحت</button><button class="btn" id="psRefresh">Refresh / وضعیت Job</button></div><div id="psMsg" class="mt"></div><div id="psSelectedSupplier" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>۱) انتخاب تأمین‌کننده</h5></div><div class="card-body"><div id="psSupplierResults"></div></div></div><div class="card"><div class="card-header"><h5>۲) فاکتورهای خرید و Reconciliation</h5></div><div class="card-body"><div id="psInvoices"></div></div></div><div class="card"><div class="card-header"><h5>۳) Diagnostic مراحل</h5></div><div class="card-body"><div id="psDiagnostics"></div></div></div><div class="card"><div class="card-header"><h5>۴) Snapshotهای اخیر</h5></div><div class="card-body"><div id="psSnapshots"></div></div></div><div class="card"><div class="card-header"><h5>۵) داشبورد مدیریتی تأمین‌کننده</h5></div><div class="card-body"><div id="psSummary"></div></div></div><div class="card"><div class="card-header"><h5>۶) مانده واقعی هر فاکتور خرید</h5></div><div class="card-body"><div id="psInvoiceSummary"></div></div></div><div class="card"><div class="card-header"><h5>۷) گزارش گروه اصلی کالا</h5></div><div class="card-body"><div id="psGroupSummary"></div></div></div><div class="card"><div class="card-header"><h5>۸) لایه‌های Purchase Layer</h5></div><div class="card-body"><div id="psLayers"></div></div></div></main>`); $s('#psInit').onclick=async()=>{const m=$s('#psMsg');m.innerHTML='در حال آماده‌سازی...';try{const r=await postJson('/api/supplier-sleep/init',{});m.innerHTML=`<div class="success">آماده شد. نسخه: ${safe(r.version||'')}</div>`;}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}}; $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{ await checkReadJob(false); await checkBuildJob(false); await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();}; await renderSnapshots(); await renderSnapshot(''); const rs=window.__psSelectedSupplier||{}; if((rs.accountNumber||rs.accountName)&&$s('#psSelectedSupplier'))$s('#psSelectedSupplier').innerHTML=`<div class="success">تأمین‌کننده بازیابی شد: ${safe(rs.accountName||'')} | ${safe(rs.accountNumber||'')}</div>`; await checkReadJob(false); await checkBuildJob(false); if(getJob('read')||getJob('build'))startSupplierSleepPolling(); };
+  window.pageSupplierAging=async function(){ restoreSupplierSleepSupplier(); setPage('خواب کالا تأمین‌کننده',`<main class="main-content"><div class="card"><div class="card-header"><h5>خواب کالا تأمین‌کننده - پایداری هسته</h5></div><div class="card-body"><div class="info">Jobها مستقل از صفحه‌اند؛ نمایش فاکتورهای مصرف‌شده/مانده اصلاح شده؛ نمایش لایه‌های هر گروه اصلی فعال شده است.</div><div class="row four"><div class="form-group"><label>از تاریخ خرید/فروش</label><input id="psDateFrom" value="14050101"></div><div class="form-group"><label>تا تاریخ</label><input id="psDateTo" value=""></div><div class="form-group"><label>حداکثر فاکتور خرید</label><input id="psMaxInvoices" value="300" inputmode="numeric"></div><div class="form-group"><label>حداکثر اسکن خرید</label><input id="psMaxScan" value="6000" inputmode="numeric"></div></div><div class="row two"><div class="form-group"><label>جستجوی تأمین‌کننده</label><input id="psSupplierSearch" placeholder="مثلاً ماتریس، ماندگار، رایان کاوه"></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="psSearchBtn">جستجوی تأمین‌کننده</button></div></div><div class="actions"><button class="btn green" id="psInit">آماده‌سازی</button><button class="btn" id="psReadSelected">خواندن مرحله‌ای فاکتورهای خرید</button><button class="btn red" id="psBuildSelected">تحلیل و کنترل صحت</button><button class="btn" id="psRefresh">Refresh / وضعیت Job</button></div><div id="psMsg" class="mt"></div><div id="psSelectedSupplier" class="mt"></div></div></div><div class="card"><div class="card-header"><h5>۱) انتخاب تأمین‌کننده</h5></div><div class="card-body"><div id="psSupplierResults"></div></div></div><div class="card"><div class="card-header"><h5>۲) فاکتورهای خرید و Reconciliation</h5></div><div class="card-body"><div id="psInvoices"></div></div></div><div class="card"><div class="card-header"><h5>۳) Diagnostic مراحل</h5></div><div class="card-body"><div id="psDiagnostics"></div></div></div><div class="card"><div class="card-header"><h5>۴) Snapshotهای اخیر</h5></div><div class="card-body"><div id="psSnapshots"></div></div></div><div class="card"><div class="card-header"><h5>۵) داشبورد مدیریتی تأمین‌کننده</h5></div><div class="card-body"><div id="psSummary"></div></div></div><div class="card"><div class="card-header"><h5>۶) مانده واقعی هر فاکتور خرید</h5></div><div class="card-body"><div id="psInvoiceSummary"></div></div></div><div class="card"><div class="card-header"><h5>۷) گزارش گروه اصلی کالا</h5></div><div class="card-body"><div id="psGroupSummary"></div></div></div><div class="card"><div class="card-header"><h5>۸) لایه‌های Purchase Layer</h5></div><div class="card-body"><div id="psLayers"></div></div></div></main>`); $s('#psInit').onclick=async()=>{const m=$s('#psMsg');m.innerHTML='در حال آماده‌سازی...';try{const r=await postJson('/api/supplier-sleep/init',{});m.innerHTML=`<div class="success">آماده شد. نسخه موتور: ${safe(r.version||'')}</div>`;}catch(e){m.innerHTML=`<div class="error">${safe(e.message||e)}</div>`;}}; $s('#psSearchBtn').onclick=searchSuppliers; $s('#psReadSelected').onclick=readSelected; $s('#psBuildSelected').onclick=buildSelected; $s('#psRefresh').onclick=async()=>{ await checkReadJob(false); await checkBuildJob(false); await renderSnapshot(window.__psSnapshotId||''); await renderSnapshots();}; await renderSnapshots(); await renderSnapshot(''); const rs=window.__psSelectedSupplier||{}; if((rs.accountNumber||rs.accountName)&&$s('#psSelectedSupplier'))$s('#psSelectedSupplier').innerHTML=`<div class="success">تأمین‌کننده بازیابی شد: ${safe(rs.accountName||'')} | ${safe(rs.accountNumber||'')}</div>`; await checkReadJob(false); await checkBuildJob(false); if(getJob('read')||getJob('build'))startSupplierSleepPolling(); };
   function boardStatusFa(s){return ({new:'جدید',seen:'بررسی شد',site_updated:'سایت بروزرسانی شد',closed:'بسته شد'}[String(s||'new')]||s||'')}
   function boardTypeFa(t){return ({stock_out:'اتمام کالا',stock_in:'ورود کالا'}[String(t||'')]||t||'')}
   function canManageBoardEventsUI(){const u=state.user||{}; return u.role==='admin' || u.canManageBoardEvents===true;}
@@ -4340,10 +5052,10 @@ async function pageSellerProfit(){
   async function viewPurchaseInvoice(no){ const box=$s('#tabloPurchaseDetail'); if(!box)return; box.innerHTML='<div class="info">در حال خواندن فاکتور خرید...</div>'; const r=await getJson(`/api/board/purchase-invoices/${encodeURIComponent(no)}`); if(!r.ok){box.innerHTML=`<div class="error">${safe(r.error||'خطا')}</div>`;return;} const inv=r.invoice||{}, lines=r.lines||[]; const announceBtn=canPostPurchaseToBoardUI()?'<button class="btn green" id="announcePurchaseToBoard">اعلام ورود در تابلو</button>':'<div class="muted">دسترسی اعلام ورود کالا برای این کاربر فعال نیست.</div>'; box.innerHTML=`<div class="card mt"><div class="card-header"><h5>فاکتور خرید ${safe(inv.invNo)}</h5></div><div class="card-body"><div class="info">تاریخ: ${safe(toJalaliDisplay(inv.invDate))} | تأمین‌کننده: ${safe(inv.supplierName)} | مبلغ: ${money(inv.totalAmount)}</div><div class="table-scroll"><table class="table"><thead><tr><th>کد کالا</th><th>نام کالا</th><th>انبار</th><th>تعداد</th><th>قیمت</th><th>مبلغ</th></tr></thead><tbody>${lines.map(x=>`<tr><td>${safe(x.itemCode)}</td><td>${safe(x.itemName)}</td><td>${safe(x.stockNumber)} ${safe(x.stockName)}</td><td>${money(x.qty)}</td><td>${money(x.price)}</td><td>${money(x.amount)}</td></tr>`).join('')}</tbody></table></div>${announceBtn}<div id="announceOut" class="mt"></div></div></div>`; if($s('#announcePurchaseToBoard')) $s('#announcePurchaseToBoard').onclick=async()=>{if(!confirm('کالاهای این فاکتور خرید در تابلو به عنوان ورود کالا اعلام شود؟'))return; const r=await postJson(`/api/board/purchase-invoices/${encodeURIComponent(no)}/announce`,{}); $s('#announceOut').innerHTML=r.ok?`<div class="success">اعلام شد. جدید: ${money(r.inserted)} | تکراری/رد شده: ${money(r.skipped)}</div>`:`<div class="error">${safe(r.error||'خطا')}</div>`; await loadBoardEvents();}; }
   window.pageTablo=async function(){ const purchaseReviewCard=canViewPurchaseInvoicesUI()?`<div class="card"><div class="card-header"><h5>بررسی فاکتورهای خرید برای اعلام ورود کالا</h5></div><div class="card-body"><button class="btn" id="loadPurchaseInvoicesBtn">خواندن ۳۰ فاکتور خرید آخر</button><div id="tabloPurchases" class="mt"></div><div id="tabloPurchaseDetail" class="mt"></div></div></div>`:`<div class="card"><div class="card-header"><h5>بررسی فاکتورهای خرید</h5></div><div class="card-body"><div class="muted">دسترسی مرور فاکتورهای خرید برای این کاربر فعال نیست.</div></div></div>`; setPage('تابلو',`<main class="main-content"><div class="card"><div class="card-header"><h5>تابلو: ورود کالا و اتمام موجودی</h5></div><div class="card-body"><div class="info">اتمام کالا بعد از صدور فاکتور فروش یا تبدیل پیش‌فاکتور و صفر شدن موجودی کل در انبارهای فعال خودکار ثبت می‌شود. زمان تابلو از ساعت سرور خوانده و با تقویم تهران نمایش داده می‌شود.</div><div class="row three"><div class="form-group"><label>نوع</label><select id="tabloType"><option value="all">همه</option><option value="stock_out">اتمام کالا</option><option value="stock_in">ورود کالا</option></select></div><div class="form-group"><label>وضعیت</label><select id="tabloStatus"><option value="all">همه</option><option value="new">جدید</option><option value="seen">بررسی شد</option><option value="site_updated">سایت بروزرسانی شد</option><option value="closed">بسته شد</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="tabloReload">بروزرسانی تابلو</button></div></div><div id="tabloEvents" class="mt"></div></div></div>${purchaseReviewCard}</main>`); $s('#tabloReload').onclick=loadBoardEvents; $s('#tabloStatus').onchange=loadBoardEvents; $s('#tabloType').onchange=loadBoardEvents; if($s('#loadPurchaseInvoicesBtn')) $s('#loadPurchaseInvoicesBtn').onclick=loadPurchaseInvoices; await loadBoardEvents(); };
   const oldRenderMenu=window.renderMenu||renderMenu;
-  window.renderMenu=renderMenu=function(){ if(oldRenderMenu) oldRenderMenu(); const chip=document.querySelector('.user-chip'); const role=typeof userRole==='function'?userRole():'admin'; if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V48}</small>`; };
+  window.renderMenu=renderMenu=function(){ if(oldRenderMenu) oldRenderMenu(); const chip=document.querySelector('.user-chip'); const role=typeof userRole==='function'?userRole():'admin'; if(chip) chip.innerHTML=`${safe(state.user?.fullName||state.user?.username||'')}<br><small>${safe((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
   const oldRoute=window.route||route;
   window.route=route=async function(){ const p=location.hash.slice(1)||(typeof firstAllowedPage==='function'?firstAllowedPage():'dashboard'); if(p==='supplier-aging') return window.pageSupplierAging(); if(p==='tablo') return window.pageTablo(); return oldRoute.apply(this,arguments); };
-  async function refreshVersionText(){ try{ const r=await getJson('/api/version'); const ht=$s('#healthText'); if(ht) ht.textContent=`online | ${r.version||V48}`; }catch{} try{renderMenu();}catch{} }
+  async function refreshVersionText(){ const r=await loadBackendVersion(); const ht=$s('#healthText'); if(ht&&r?.version) ht.textContent=`online | ${r.version}`; }
   setTimeout(refreshVersionText,300);
 })();
 
@@ -4369,16 +5081,19 @@ async function pageSellerProfit(){
   };
   window.renderInventorySearch = renderInventorySearch = async function(query,target,selectable=false,stockNumber=''){
     const box=$(target); if(!box) return;
+    const requestStarted=performance.now();searchPerfRuntime.activeRequestCount++;let responseAt=requestStarted,resultCount=0;
     box.innerHTML='در حال جستجوی موجودی از snapshot یکپارچه...';
     try{
-      const r=await searchInventoryRowsFull(query,stockNumber);
+      const r=await searchInventoryRowsFull(query,stockNumber);responseAt=performance.now();
       if(!r.ok){ box.innerHTML=`<div class="error">${esc(r.error||'خطا در جستجوی موجودی')}</div>`; return; }
       const rows=r.list||[];
+      resultCount=rows.length;
       if(!rows.length){ box.innerHTML='<div class="warn">نتیجه‌ای برای این جستجو/انبار پیدا نشد.</div>'; return; }
       box.innerHTML=`<div class="small muted">${fmt(rows.length)} ردیف انبار منطبق با «${esc(query)}» | منبع: ${esc(r.source||'snapshot')} ${r.exactRefresh?`| refresh دقیق کالا: ${r.exactRefresh.ok?'موفق':'ناموفق'}`:''}</div><div id="stockGroupBox" class="form-group"></div><div id="stockRowsBox"></div>`;
       renderGroupSelect(r.groups||[],'stock','#stockRowsBox',rows,selectable);
       renderInventoryRows(rows,'#stockRowsBox',selectable);
     }catch(e){ box.innerHTML=`<div class="error">خطا در جستجوی موجودی: ${esc(invErr(e))}</div>`; }
+    finally{searchPerfRuntime.activeRequestCount=Math.max(0,searchPerfRuntime.activeRequestCount-1);logSearchPerfFrontend({endpoint:'/api/inventory/search',query,generation:0,debounceConfiguredMs:0,actualDebounceMs:0,requestStartedAt:new Date(Date.now()-(performance.now()-requestStarted)).toISOString(),requestMs:Number((responseAt-requestStarted).toFixed(3)),responseToRenderMs:Number((performance.now()-responseAt).toFixed(3)),inputToVisibleMs:Number((performance.now()-requestStarted).toFixed(3)),resultCount,requestAborted:false,staleResponseIgnored:false,activeRequestCount:searchPerfRuntime.activeRequestCount})}
   };
   window.renderKardex = renderKardex = async function(item,target,stockNumber=''){
     const box=$(target); if(!box) return;
@@ -4394,7 +5109,7 @@ async function pageSellerProfit(){
     }catch(e){ box.innerHTML=`<div class="error">کاردکس خوانده نشد: ${esc(invErr(e))}</div><div class="small muted">کد کالا: ${esc(code)} | endpoint: ${esc(cardexUrl(code,stockNumber))}</div><button class="btn" id="retryKardexSafe">تلاش مجدد</button>`; const b=$('#retryKardexSafe'); if(b)b.onclick=()=>renderKardex(item,target,stockNumber); }
   };
   const oldRenderMenu51=window.renderMenu||renderMenu;
-  window.renderMenu=renderMenu=function(){ if(oldRenderMenu51) oldRenderMenu51(); const chip=document.querySelector('.user-chip'); const role=typeof userRole==='function'?userRole():'admin'; if(chip) chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small><br><small>${V51}</small>`; };
+  window.renderMenu=renderMenu=function(){ if(oldRenderMenu51) oldRenderMenu51(); const chip=document.querySelector('.user-chip'); const role=typeof userRole==='function'?userRole():'admin'; if(chip) chip.innerHTML=`${esc(state.user?.fullName||state.user?.username||'')}<br><small>${esc((window.ROLE_LABELS&&ROLE_LABELS[role])||role)}</small>`; };
 })();
 
 /* Final activation for admin backup and deterministic turnover workflows. */
@@ -4403,5 +5118,432 @@ async function pageSellerProfit(){
   window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);if(userRole()!=='admin')return;const m=$('#menu');if(m&&!m.querySelector('[data-page="backup-management"]')){const b=document.createElement('button');b.className='navbtn';b.dataset.page='backup-management';b.textContent='مدیریت پشتیبان‌گیری';b.onclick=()=>{location.hash='backup-management';route();};m.appendChild(b);}};
   const inheritedRoute=window.route||route;
   window.route=route=async function(){const p=location.hash.slice(1)||firstAllowedPage();if(p==='turnover')return window.__stablePageTurnover();if(p==='backup-management'&&userRole()==='admin')return window.pageBackupManagement();return inheritedRoute.apply(this,arguments);};
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.65: governed Manual Purchase Cost Resolution.
+   Read models only: no FIFO allocation, profit, commission, inventory or purchase-layer mutation. */
+(function(){
+  const PAGE='manual-cost-resolution';
+  const q=(selector)=>document.querySelector(selector);
+  const safe=(value)=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+  const number=(value)=>Number(value||0).toLocaleString('fa-IR');
+  let queuePage=1;
+  let selectedResolutionId='';
+  let selectedResolutionRevision=0;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';throw error;}
+    return payload;
+  }
+  function queryString(extra={}){
+    const values={
+      dateFrom:q('#mcDateFrom')?.value||'',
+      dateTo:q('#mcDateTo')?.value||'',
+      supplier:q('#mcSupplier')?.value||'',
+      brand:q('#mcBrand')?.value||'',
+      store:q('#mcStore')?.value||'',
+      category:q('#mcCategory')?.value||'',
+      coverage:q('#mcCoverage')?.value||'unknown',
+      search:q('#mcSearch')?.value||'',
+      sort:q('#mcSort')?.value||'saleAmount',
+      direction:q('#mcDirection')?.value||'desc',
+      page:queuePage,
+      pageSize:50,
+      ...extra
+    };
+    const params=new URLSearchParams();
+    Object.entries(values).forEach(([key,value])=>{if(value!==''&&value!=null)params.set(key,value);});
+    return params.toString();
+  }
+  function coverageCard(title,row,kind){
+    return `<div class="card" style="min-width:210px;flex:1"><div class="card-body"><b>${safe(title)}</b><div class="${kind||''}" style="font-size:1.4rem;margin:.5rem 0">${safe(row.itemCoveragePercent??0)}٪ کالا</div><div class="small">تعداد فروش: ${safe(row.quantityCoveragePercent??0)}٪</div><div class="small">ارزش فروش: ${safe(row.saleValueCoveragePercent??0)}٪</div><div class="small">${number(row.saleValue||0)} ریال</div></div></div>`;
+  }
+  async function loadCoverage(){
+    const box=q('#mcCoverageCards'); if(!box)return;
+    try{
+      const report=await json('/api/accounting/cost-coverage?'+queryString({coverage:'',page:'',pageSize:'',sort:'',direction:'',supplier:'',brand:'',store:'',category:'',search:''}));
+      box.innerHTML=coverageCard('قبل از Manual (فقط رسمی)',report.beforeManual,'info')+
+        coverageCard('پوشش Manual تأییدشده',report.manual,'warn')+
+        coverageCard('بعد از Manual',report.afterManual,'success')+
+        coverageCard('هزینه نامشخص',report.unknown,'error');
+      q('#mcDatasetMeta').textContent=`Sale Snapshot: ${report.activeSnapshotId||'ندارد'} | Purchase Dataset: ${report.activePurchaseLayerDatasetId||'ندارد'} | سود و FIFO: غیرفعال`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function reasonLabel(reason){
+    return ({
+      no_purchase_found:'بدون سابقه خرید',
+      historical_purchase_outside_range:'خرید تاریخی خارج بازه',
+      item_guid_mismatch:'عدم تطابق ItemGuid',
+      item_code_changed:'تغییر ItemCode',
+      purchase_return_ambiguity:'ابهام برگشت خرید',
+      legacy_layer_only:'فقط لایه Legacy',
+      unknown_cost:'هزینه نامشخص'
+    })[reason]||reason||'—';
+  }
+  async function loadQueue(){
+    const box=q('#mcQueue'); if(!box)return;
+    box.innerHTML='<div class="info">در حال ساخت صف از Snapshot فعال...</div>';
+    try{
+      const report=await json('/api/accounting/missing-purchase-costs?'+queryString());
+      const rows=(report.list||[]).map(row=>`<tr>
+        <td><b>${safe(row.itemCode)}</b><br><small>${safe(row.itemGuid||'بدون GUID')}</small></td>
+        <td style="white-space:normal">${safe(row.itemDescription)}</td>
+        <td>${number(row.currentInventory)}</td><td>${number(row.saleCount)} / ${number(row.saleQuantity)}</td>
+        <td>${number(row.saleAmount)}</td><td>${safe(row.coverage)}</td>
+        <td>${safe(reasonLabel(row.reason))}</td><td>${safe(row.firstSaleDate)}<br>${safe(row.lastSaleDate)}</td>
+        <td>${safe(row.purchaseLayerStatus)}</td><td style="white-space:normal">${safe(row.suggestedResolution)}</td>
+        <td>${row.coverage==='unknown'?`<button class="mini mc-resolve" data-code="${safe(row.itemCode)}" data-guid="${safe(row.itemGuid)}">ثبت Resolution</button>`:'—'}</td>
+      </tr>`).join('');
+      box.innerHTML=`<div class="info">آیتم‌ها: ${number(report.total)} | صفحه ${number(report.page)} | Snapshot: ${safe(report.activeSnapshotId||'')}</div>
+        <table class="table"><thead><tr><th>کد / GUID</th><th>شرح</th><th>موجودی</th><th>فاکتور / تعداد</th><th>مبلغ فروش</th><th>پوشش</th><th>علت</th><th>اولین / آخرین فروش</th><th>وضعیت لایه</th><th>راهکار</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="11">رکوردی وجود ندارد.</td></tr>'}</tbody></table>
+        <div class="actions"><button class="btn" id="mcPrev" ${report.page<=1?'disabled':''}>قبلی</button><button class="btn" id="mcNext" ${report.page*report.pageSize>=report.total?'disabled':''}>بعدی</button></div>`;
+      q('#mcPrev').onclick=()=>{queuePage=Math.max(1,queuePage-1);loadQueue();};
+      q('#mcNext').onclick=()=>{queuePage++;loadQueue();};
+      document.querySelectorAll('.mc-resolve').forEach(button=>button.onclick=()=>{
+        selectedResolutionId='';selectedResolutionRevision=0;
+        q('#mcResolutionId').textContent='Resolution جدید';
+        q('#mcItemCode').value=button.dataset.code||'';
+        q('#mcItemGuid').value=button.dataset.guid||'';
+        q('#mcCost').focus();
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  function actionButtons(row){
+    if(row.status==='draft')return `<button class="mini mc-edit" data-id="${safe(row.resolutionId)}">ویرایش</button> <button class="mini mc-action" data-action="submit" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">ارسال تأیید</button>`;
+    if(row.status==='pending')return `<button class="mini mc-action" data-action="approve" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">تأیید</button> <button class="mini mc-action" data-action="reject" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">رد</button>`;
+    if(row.status==='approved')return `<button class="mini mc-action" data-action="expire" data-id="${safe(row.resolutionId)}" data-revision="${safe(row.revision)}">منقضی‌کردن</button>`;
+    return '—';
+  }
+  async function loadResolutions(){
+    const box=q('#mcResolutions');if(!box)return;
+    try{
+      const report=await json('/api/manual-cost-resolutions?pageSize=100');
+      box.innerHTML=`<table class="table"><thead><tr><th>Resolution</th><th>کالا</th><th>هزینه</th><th>بازه</th><th>منبع</th><th>وضعیت</th><th>ایجادکننده / تأییدکننده</th><th>Audit</th><th></th></tr></thead><tbody>${(report.list||[]).map(row=>`<tr>
+        <td><small>${safe(row.resolutionId)}</small></td><td>${safe(row.itemCode)}<br><small>${safe(row.itemGuid)}</small></td>
+        <td>${number(row.manualCost)} ${safe(row.currency)}</td><td>${safe(row.effectiveFrom)} تا ${safe(row.effectiveTo||'باز')}</td>
+        <td>${safe(row.sourceType)}</td><td>${safe(row.status)}</td>
+        <td>${safe(row.createdBy?.username||'')}<br><small>${safe(row.approvedBy?.username||'')}</small></td>
+        <td><details><summary>${number((row.auditLog||[]).length)} رویداد</summary>${(row.auditLog||[]).map(event=>`<div class="small">${safe(event.action)} | ${safe(event.by?.username)} | ${safe(event.at)}</div>`).join('')}</details></td>
+        <td>${actionButtons(row)}</td></tr>`).join('')||'<tr><td colspan="9">Resolution ثبت نشده است.</td></tr>'}</tbody></table>`;
+      document.querySelectorAll('.mc-edit').forEach(button=>button.onclick=async()=>{
+        const response=await json('/api/manual-cost-resolutions/'+encodeURIComponent(button.dataset.id));
+        const row=response.resolution;selectedResolutionId=row.resolutionId;selectedResolutionRevision=Number(row.revision||1);
+        q('#mcResolutionId').textContent=`ویرایش ${row.resolutionId}`;
+        q('#mcItemCode').value=row.itemCode||'';q('#mcItemGuid').value=row.itemGuid||'';q('#mcCost').value=row.manualCost||'';
+        q('#mcFrom').value=row.effectiveFrom||'';q('#mcTo').value=row.effectiveTo||'';q('#mcSource').value=row.sourceType||'manual';
+        q('#mcReason').value=row.reason||'';q('#mcNotes').value=row.notes||'';q('#mcAttachment').value=row.attachment?.reference||'';
+        q('#mcItemCode').focus();
+      });
+      document.querySelectorAll('.mc-action').forEach(button=>button.onclick=async()=>{
+        let reason='';
+        if(['reject','expire'].includes(button.dataset.action))reason=prompt('علت این تصمیم را ثبت کنید:')||'';
+        if(['reject','expire'].includes(button.dataset.action)&&!reason)return;
+        try{
+          await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`,{method:'POST',body:JSON.stringify({reason,revision:Number(button.dataset.revision||0)})});
+          await refreshAll();
+        }catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+      });
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function loadHealth(){
+    const box=q('#mcHealth');if(!box)return;
+    try{
+      const h=await json('/api/accounting/data-health');
+      box.innerHTML=`<div class="row four">
+        <div class="info">نسخه: ${safe(h.version)}<br>Git: ${safe(h.gitSha||'ثبت‌نشده')}<br>Build: ${safe(h.buildTime||'ثبت‌نشده')}</div>
+        <div class="info">Sale: ${number(h.saleSnapshot.headers)} فاکتور / ${number(h.saleSnapshot.lines)} ردیف<br>${safe(h.activeDataset.saleSnapshotId)}</div>
+        <div class="info">Purchase: ${number(h.purchaseLayer.officialRows)} رسمی / ${number(h.purchaseLayer.returnRows)} برگشت<br>هشدار: ${number(h.purchaseLayer.warnings)} | تکراری: ${number(h.purchaseLayer.duplicateRows)}</div>
+        <div class="info">Manual: ${number(h.manualCost.total)}<br>Pending: ${number(h.manualCost.byStatus.pending)} | Approved: ${number(h.manualCost.byStatus.approved)}</div>
+        <div class="info">Missing: ${number(h.missingQueue.itemCount)} کالا / ${number(h.missingQueue.saleValue)} ریال</div>
+        <div class="info">Retry jobs: ${number(h.retry.jobsWithRetry)} | Resume jobs: ${number(h.resume.jobsWithResume)} | Failed: ${number(h.failedJobs)}</div>
+        <div class="info">Returns unresolved: ${number(h.returns.unresolved)} / ${number(h.returns.total)}</div>
+        <div class="info">Backup: ${safe(h.latestBackup?.status||'نامشخص')}<br>${safe(h.latestBackup?.at||'')}</div>
+      </div><div class="warn">این داشبورد فقط آمادگی داده را نشان می‌دهد؛ FIFO، سود، ROI و پورسانت همچنان غیرفعال‌اند.</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+  }
+  async function refreshAll(){await Promise.all([loadCoverage(),loadQueue(),loadResolutions(),loadHealth()]);}
+  window.pageManualCostResolution=async function(){
+    setPage('رفع هزینه خرید نامشخص',`<main class="main-content">
+      <div class="card"><div class="card-header"><h5>Accounting Readiness — بدون FIFO و بدون سود</h5></div><div class="card-body"><div id="mcDatasetMeta" class="small muted"></div><div id="mcCoverageCards" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Missing Purchase Cost Queue</h5></div><div class="card-body">
+        <div class="row four"><div class="form-group"><label>از تاریخ شمسی</label><input id="mcDateFrom" placeholder="14050101"></div><div class="form-group"><label>تا تاریخ شمسی</label><input id="mcDateTo" placeholder="14051229"></div><div class="form-group"><label>جستجو</label><input id="mcSearch" placeholder="کد، شرح یا GUID"></div><div class="form-group"><label>پوشش</label><select id="mcCoverage"><option value="unknown">فقط نامشخص</option><option value="all">همه</option><option value="official">رسمی</option><option value="manual">Manual</option></select></div></div>
+        <div class="row four"><div class="form-group"><label>تأمین‌کننده</label><input id="mcSupplier"></div><div class="form-group"><label>برند</label><input id="mcBrand"></div><div class="form-group"><label>فروشگاه</label><input id="mcStore"></div><div class="form-group"><label>دسته</label><input id="mcCategory"></div></div>
+        <div class="row four"><div class="form-group"><label>مرتب‌سازی</label><select id="mcSort"><option value="saleAmount">مبلغ فروش</option><option value="saleCount">تعداد فروش</option><option value="saleQuantity">تعداد کالا</option><option value="currentInventory">موجودی</option><option value="itemCode">کد کالا</option><option value="firstSaleDate">اولین فروش</option><option value="lastSaleDate">آخرین فروش</option></select></div><div class="form-group"><label>جهت</label><select id="mcDirection"><option value="desc">نزولی</option><option value="asc">صعودی</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="mcApply">اعمال فیلتر</button></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="mcExport">Export CSV</button></div></div>
+        <div id="mcQueue"></div></div></div>
+      <div class="card"><div class="card-header"><h5 id="mcResolutionId">Resolution جدید</h5></div><div class="card-body">
+        <div class="warn">Manual Cost هرگز لایه رسمی نیست؛ فقط در نبود لایه رسمی معتبر و پس از Approval برای FIFO آینده eligible خواهد بود.</div>
+        <div class="row four"><div class="form-group"><label>ItemCode</label><input id="mcItemCode"></div><div class="form-group"><label>ItemGuid</label><input id="mcItemGuid"></div><div class="form-group"><label>هزینه دستی (ریال)</label><input id="mcCost" inputmode="decimal"></div><div class="form-group"><label>نوع منبع</label><select id="mcSource"><option value="manual">manual</option><option value="opening_inventory">opening_inventory</option><option value="historical_purchase">historical_purchase</option><option value="accounting_adjustment">accounting_adjustment</option><option value="legacy_cost">legacy_cost</option></select></div></div>
+        <div class="row four"><div class="form-group"><label>شروع اثر</label><input id="mcFrom" placeholder="14050101"></div><div class="form-group"><label>پایان اثر (اختیاری)</label><input id="mcTo"></div><div class="form-group"><label>مرجع پیوست</label><input id="mcAttachment" placeholder="شماره سند یا URL داخلی"></div><div class="form-group"><label>علت</label><input id="mcReason"></div></div>
+        <div class="form-group"><label>یادداشت</label><textarea id="mcNotes"></textarea></div><div class="actions"><button class="btn green" id="mcSave">ذخیره Draft</button><button class="btn" id="mcClear">فرم جدید</button></div><div id="mcFormMsg"></div>
+      </div></div>
+      <div class="card"><div class="card-header"><h5>Workflow و Audit</h5></div><div class="card-body"><div id="mcResolutions"></div></div></div>
+      <div class="card"><div class="card-header"><h5>Data Health</h5></div><div class="card-body"><div id="mcHealth"></div></div></div>
+    </main>`);
+    q('#mcApply').onclick=()=>{queuePage=1;refreshAll();};
+    q('#mcExport').onclick=()=>{location.href='/api/accounting/missing-purchase-costs/export?'+queryString({page:'',pageSize:''});};
+    q('#mcClear').onclick=()=>{selectedResolutionId='';selectedResolutionRevision=0;q('#mcResolutionId').textContent='Resolution جدید';['#mcItemCode','#mcItemGuid','#mcCost','#mcFrom','#mcTo','#mcAttachment','#mcReason','#mcNotes'].forEach(id=>{q(id).value='';});};
+    q('#mcSave').onclick=async()=>{
+      const body={revision:selectedResolutionRevision,itemCode:q('#mcItemCode').value,itemGuid:q('#mcItemGuid').value,manualCost:q('#mcCost').value,effectiveFrom:q('#mcFrom').value,effectiveTo:q('#mcTo').value,sourceType:q('#mcSource').value,currency:'IRR',reason:q('#mcReason').value,notes:q('#mcNotes').value,attachment:q('#mcAttachment').value?{reference:q('#mcAttachment').value}:null};
+      try{
+        const response=await json(selectedResolutionId?`/api/manual-cost-resolutions/${encodeURIComponent(selectedResolutionId)}`:'/api/manual-cost-resolutions',{method:selectedResolutionId?'PUT':'POST',body:JSON.stringify(body)});
+        selectedResolutionId=response.resolution.resolutionId;selectedResolutionRevision=Number(response.resolution.revision||1);q('#mcResolutionId').textContent=`ویرایش ${selectedResolutionId}`;
+        q('#mcFormMsg').innerHTML='<div class="success">Draft با Audit ذخیره شد.</div>';await refreshAll();
+      }catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+    };
+    await refreshAll();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='رفع هزینه خرید نامشخص';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageManualCostResolution();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* Final Phase 5.2.7 registration after the last legacy UI override. */
+(()=>{
+  const PAGE='accounting-fifo-readiness';
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=document.querySelector('#menu');
+    if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');
+    button.className='navbtn';
+    button.dataset.page=PAGE;
+    button.textContent='آمادگی حسابداری FIFO';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="seller-profit"]')||menu.querySelector('[data-page="reports"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFifoReadiness();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* Final Phase 5.2.8 registration after every legacy menu/route override. */
+(()=>{
+  const PAGE='accounting-review-workbench';
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=document.querySelector('#menu');
+    if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');
+    button.className='navbtn';
+    button.dataset.page=PAGE;
+    button.textContent='میزکار بررسی حسابداری';
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="accounting-fifo-readiness"]')||menu.querySelector('[data-page="seller-profit"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingReviewWorkbench();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* 0.9.19.69 Human Accounting Final Acceptance.
+   Every source reference is frozen. This page never creates an invoice,
+   writes Shaygan, approves a decision automatically, or enables Profit. */
+(()=>{
+  const PAGE='accounting-fat';
+  const q=selector=>document.querySelector(selector);
+  const safe=value=>esc(value==null?'':String(value));
+  const num=value=>Number.isFinite(Number(value))?Number(value).toLocaleString('fa-IR',{maximumFractionDigits:6}):'—';
+  let selectedSessionId='';
+  let selectedSession=null;
+  async function json(url,options={}){
+    const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
+    const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
+    if(!response.ok||payload.ok===false){const error=new Error(payload.error||response.statusText);error.code=payload.code||'';error.status=response.status;throw error;}
+    return payload;
+  }
+  function table(headers,rows,empty='داده‌ای موجود نیست'){
+    return `<div style="overflow:auto"><table class="table"><thead><tr>${headers.map(x=>`<th>${safe(x)}</th>`).join('')}</tr></thead><tbody>${rows.join('')||`<tr><td colspan="${headers.length}">${safe(empty)}</td></tr>`}</tbody></table></div>`;
+  }
+  function section(id,title){return `<div class="card"><div class="card-header"><h5>${safe(title)}</h5></div><div class="card-body"><div id="${id}"><div class="muted">در حال بارگذاری…</div></div></div></div>`;}
+  async function loadSessions(){
+    const box=q('#fatSessions');if(!box)return;
+    try{
+      const r=await json('/api/accounting/fat/sessions?pageSize=50');
+      if(!selectedSessionId&&r.list?.length)selectedSessionId=r.list[0].sessionId;
+      selectedSession=(r.list||[]).find(row=>row.sessionId===selectedSessionId)||r.list?.[0]||null;
+      box.innerHTML=table(['Session','Frozen datasets','Assignments','Targets','Status','Action'],(r.list||[]).map(row=>`<tr>
+        <td><button class="mini fat-select-session" data-id="${safe(row.sessionId)}">${safe(row.sessionId)}</button><br><small>${safe(row.title)}</small></td>
+        <td><small>Sale ${safe(row.frozen?.saleSnapshotId)}<br>Purchase ${safe(row.frozen?.purchaseDatasetId)}<br>FIFO ${safe(row.frozen?.fifoDatasetId)}<br>SHA ${safe(row.frozen?.gitSha)}</small></td>
+        <td>Accounting: ${safe(row.assignedAccountingUser?.username)}<br>Manager: ${safe(row.assignedManagerUser?.username)}</td>
+        <td><small>${safe(JSON.stringify(row.minimumTargets||{}))}</small></td><td>${safe(row.status)}<br>r${num(row.revision)}</td>
+        <td>${transitionButtons(row)}</td></tr>`));
+      box.querySelectorAll('.fat-select-session').forEach(button=>button.onclick=async()=>{selectedSessionId=button.dataset.id;await refreshSelected();});
+      bindTransitions(box);
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  function transitionButtons(row){
+    const role=userRole();
+    if(role==='accounting'&&row.status==='prepared')return `<button class="mini fat-transition" data-id="${safe(row.sessionId)}" data-revision="${Number(row.revision)}" data-status="in_progress">شروع جلسه</button>`;
+    if(role==='accounting'&&['in_progress','waiting_evidence'].includes(row.status))return `<button class="mini fat-transition" data-id="${safe(row.sessionId)}" data-revision="${Number(row.revision)}" data-status="ready_for_manager_review">ارسال برای مدیر</button>`;
+    if(['manager','admin'].includes(role)&&row.status==='ready_for_manager_review')return `<button class="mini fat-transition" data-id="${safe(row.sessionId)}" data-revision="${Number(row.revision)}" data-status="completed">تصمیم Manager</button>`;
+    return '<small>بدون اقدام مجاز در این وضعیت</small>';
+  }
+  function bindTransitions(container){
+    container.querySelectorAll('.fat-transition').forEach(button=>button.onclick=async()=>{
+      const reason=prompt('دلیل مستند این transition:')||'';if(!reason)return;
+      const evidenceReference=button.dataset.status==='completed'?(prompt('Evidence reference:')||''):'';
+      try{await json(`/api/accounting/fat/sessions/${encodeURIComponent(button.dataset.id)}`,{method:'PATCH',body:JSON.stringify({status:button.dataset.status,revision:Number(button.dataset.revision),reason,evidenceReference,authorizedScope:userRole()==='admin'?'manager':''})});await refresh();}
+      catch(error){alert(`${error.code||''} ${error.message}`);}
+    });
+  }
+  async function loadSessionReport(){
+    const box=q('#fatSessionReport');if(!box)return;if(!selectedSessionId){box.innerHTML='<div class="warn">Session آماده‌ای وجود ندارد.</div>';return;}
+    try{
+      const r=await json(`/api/accounting/fat/sessions/${encodeURIComponent(selectedSessionId)}/report`);const c=r.coverage||{},p=r.progress||{};
+      box.innerHTML=`<div class="row four">
+        <div class="info"><b>Frozen Session</b><br>${safe(r.session.sessionId)}<br>${safe(r.session.status)}</div>
+        <div class="info"><b>Confidence</b><br>${num(c.confidence)} / 100<br>Accounting approved: ${r.accountingApproved?'YES':'NO'}</div>
+        <div class="info"><b>Unknown Sale Value</b><br>${num(c.unknownSaleValue)} IRR<br>Profit activation: NO</div>
+        <div class="info"><b>Minimum target</b><br>${p.met?'COMPLETE':'INCOMPLETE'}<br>${safe(JSON.stringify(p.completed||{}))}</div></div>
+        ${table(['Metric','Actual'],[
+          ['Quantity coverage',`${num(c.quantity)}%`],['Sale-value coverage',`${num(c.saleValue)}%`],['Line coverage',`${num(c.line)}%`],['Return linkage',`${num(c.returnLinkage)}%`]
+        ].map(row=>`<tr><td>${safe(row[0])}</td><td>${safe(row[1])}</td></tr>`))}
+        <div class="warn"><b>Frozen means immutable references—not accounting approval.</b><br>Active Snapshot changes cannot retarget this session.</div>`;
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function loadFat(){
+    const box=q('#fatRuns');if(!box)return;
+    try{
+      const [defs,runs]=await Promise.all([json('/api/accounting/fat/definitions'),json(`/api/accounting/fat/runs?pageSize=50${selectedSessionId?`&sessionId=${encodeURIComponent(selectedSessionId)}`:''}`)]);
+      box.innerHTML=`<div class="info">FAT version ${safe(defs.fatVersion)} — ${num(defs.total)} versioned definitions. Automated technical pass never implies Accounting pass.</div>`+
+      table(['Run','Dimensions','Scenario summary','Status','Technical action'],(runs.list||[]).map(row=>`<tr><td>${safe(row.fatRunId)}</td><td><small>${safe(JSON.stringify(row.dimensions||{}))}</small></td><td><small>${safe(JSON.stringify(row.scenarioSummary||{}))}</small></td><td>${safe(row.status)}<br>Accounting pass: NO</td><td>${['admin','accounting'].includes(userRole())?`<button class="mini fat-execute" data-id="${safe(row.fatRunId)}">Execute technical checks</button>`:'—'}</td></tr>`));
+      box.querySelectorAll('.fat-execute').forEach(button=>button.onclick=async()=>{try{await json(`/api/accounting/fat/runs/${encodeURIComponent(button.dataset.id)}/execute-technical`,{method:'POST',body:'{}'});await loadFat();}catch(error){alert(`${error.code||''} ${error.message}`);}});
+    }catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function loadImports(){
+    const box=q('#fatImports');if(!box)return;
+    try{const r=await json(`/api/accounting/comparison/imports${selectedSessionId?`?sessionId=${encodeURIComponent(selectedSessionId)}`:''}`);box.innerHTML=table(['Import','File hash','Mapping/progress','Status'],(r.list||[]).map(row=>`<tr><td>${safe(row.importId)}<br>${safe(row.sourceFileName)}</td><td><small>${safe(row.sourceFileHash)}</small></td><td><small>${safe(JSON.stringify(row.mapping||{}))}<br>${safe(JSON.stringify(row.progress||{}))}</small></td><td>${safe(row.status)}<br>Reference approved: NO</td></tr>`));}
+    catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function loadSimulator(){
+    const box=q('#fatSimulator');if(!box)return;if(!selectedSessionId){box.innerHTML='<div class="muted">Session انتخاب نشده است.</div>';return;}
+    try{const r=await json(`/api/accounting/fat/sessions/${encodeURIComponent(selectedSessionId)}/simulator`,{method:'POST',body:JSON.stringify({decisions:[]})});box.innerHTML=table(['Metric','ACTUAL APPROVED','PROJECTED'],[
+      ['Quantity coverage',r.actual.quantityCoverage,r.projected.quantityCoverage],['Sale-value coverage',r.actual.saleValueCoverage,r.projected.saleValueCoverage],['Line coverage',r.actual.lineCoverage,r.projected.lineCoverage],['Return linkage',r.actual.returnLinkageCoverage,r.projected.returnLinkageCoverage],['Confidence',r.actual.accountingConfidenceIndex,r.projected.accountingConfidenceIndex],['Unknown sale value',r.actual.unknownSaleValue,r.projected.unknownSaleValue]
+    ].map(row=>`<tr>${row.map(cell=>`<td>${safe(num(cell))}</td>`).join('')}</tr>`))+`<div class="warn">PROJECTED is read-only and never changes workflow state.</div>`;}
+    catch(error){box.innerHTML=`<div class="error">${safe(error.code)} ${safe(error.message)}</div>`;}
+  }
+  async function refreshSelected(){await Promise.all([loadSessionReport(),loadFat(),loadImports(),loadSimulator()]);}
+  async function refresh(){await loadSessions();await refreshSelected();}
+  async function createSession(){
+    const reviewBatchId=prompt('Accounting Review Batch ID:','ARBATCH-50d898607288a7ac51947874')||'';if(!reviewBatchId)return;
+    const accounting=prompt('Username کاربر Accounting موجود:')||'';if(!accounting)return;
+    const manager=prompt('Username کاربر Manager یا Admin موجود:')||'';if(!manager)return;
+    try{const r=await json('/api/accounting/fat/sessions',{method:'POST',body:JSON.stringify({reviewBatchId,assignedAccountingUser:accounting,assignedManagerUser:manager})});selectedSessionId=r.session.sessionId;await refresh();}
+    catch(error){alert(`${error.code||''} ${error.message}`);}
+  }
+  async function registerReference(){
+    const file=q('#fatReferenceFile')?.files?.[0];if(!file||!selectedSessionId){alert('Session و فایل مرجع الزامی است.');return;}
+    if(file.size>3000000){alert('حد امن فایل 3MB است؛ برای فایل بزرگ مسیر batch/streaming لازم است.');return;}
+    let mapping;try{mapping=JSON.parse(q('#fatMapping').value);}catch{alert('Mapping JSON معتبر نیست.');return;}
+    const base64=await new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]||'');reader.onerror=reject;reader.readAsDataURL(file);});
+    try{await json('/api/accounting/comparison/imports',{method:'POST',body:JSON.stringify({sessionId:selectedSessionId,sourceFileName:file.name,sourceMimeType:file.type,sourceFileBase64:base64,mapping})});await loadImports();}
+    catch(error){alert(`${error.code||''} ${error.message}`);}
+  }
+  window.pageAccountingFat=async function(){
+    setPage('Human Accounting FAT',`<main class="main-content">
+      <div class="warn"><b>HUMAN ACCOUNTING AUTHORITY REQUIRED</b><br>Technical checks, candidates and imported references cannot approve Accounting, enable Profit, or write Shaygan.</div>
+      <div class="actions">${['admin','accounting'].includes(userRole())?'<button class="btn" id="fatInit">Initialize versioned FAT</button><button class="btn" id="fatCreateSession">Prepare frozen session</button><button class="btn" id="fatPrepareRun">Prepare FAT run</button>':''}<button class="btn" id="fatRefresh">Refresh</button><button class="btn" id="fatPrint">Print</button><button class="btn" id="fatExport">Export frozen packet</button></div>
+      ${section('fatSessions','1. Frozen Accounting Review Sessions')}
+      ${section('fatSessionReport','2. Human Session Progress and Accounting Report')}
+      ${section('fatRuns','3. Final Acceptance Test Scenarios')}
+      <div class="card"><div class="card-header"><h5>4. Accounting Excel/Reference Registration</h5></div><div class="card-body"><div class="warn">Reference values are not assumed correct. Binary is hashed, not stored. Row ingestion remains batched and audited.</div><input id="fatReferenceFile" type="file"><textarea id="fatMapping" rows="5" placeholder='{"invoiceType":"نوع فاکتور","invoiceNumber":"شماره فاکتور","invoiceDate":"تاریخ","itemCode":"کد کالا","quantity":"تعداد","saleAmount":"مبلغ فروش"}'></textarea>${['admin','accounting'].includes(userRole())?'<button class="btn" id="fatRegisterReference">Register hash and mapping</button>':''}<div id="fatImports"></div></div></div>
+      ${section('fatSimulator','5. Coverage Gain Simulator — Actual vs Projected')}
+    </main>`);
+    q('#fatRefresh').onclick=refresh;q('#fatPrint').onclick=()=>window.print();
+    q('#fatExport').onclick=()=>{if(selectedSessionId)location.href=`/api/accounting/fat/sessions/${encodeURIComponent(selectedSessionId)}/export.csv`;};
+    if(q('#fatInit'))q('#fatInit').onclick=async()=>{try{await json('/api/accounting/fat/init',{method:'POST',body:'{}'});await loadFat();}catch(error){alert(`${error.code||''} ${error.message}`);}};
+    if(q('#fatCreateSession'))q('#fatCreateSession').onclick=createSession;
+    if(q('#fatPrepareRun'))q('#fatPrepareRun').onclick=async()=>{if(!selectedSessionId)return;try{await json('/api/accounting/fat/runs',{method:'POST',body:JSON.stringify({sessionId:selectedSessionId})});await loadFat();}catch(error){alert(`${error.code||''} ${error.message}`);}};
+    if(q('#fatRegisterReference'))q('#fatRegisterReference').onclick=registerReference;
+    await refresh();
+  };
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);if(!['admin','accounting','manager'].includes(userRole()))return;const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='پذیرش نهایی حسابداری';button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};const before=menu.querySelector('[data-page="accounting-review-workbench"]')||menu.querySelector('[data-page="accounting-fifo-readiness"]');if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);};
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){const page=location.hash.slice(1)||firstAllowedPage();if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageAccountingFat();return inheritedRoute.apply(this,arguments);};
+  try{renderMenu();}catch{}
+})();
+
+/* Final Phase 5.3.0 registration after all legacy menu and route overrides. */
+(()=>{
+  const pages=window.__profitLedgerPages||{};
+  const titles=window.__profitLedgerTitles||{};
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!['admin','accounting','manager'].includes(userRole()))return;
+    const menu=document.querySelector('#menu');if(!menu)return;
+    for(const[id,title]of Object.entries(titles)){
+      if(menu.querySelector(`[data-page="${id}"]`))continue;
+      const button=document.createElement('button');button.className='navbtn';button.dataset.page=id;button.textContent=title;
+      button.onclick=event=>{event.preventDefault();location.hash=id;route();};menu.appendChild(button);
+    }
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(pages[page]&&['admin','accounting','manager'].includes(userRole()))return pages[page]();
+    return inheritedRoute.apply(this,arguments);
+  };
+  try{renderMenu();}catch{}
+})();
+
+/* Final Commission Category Governance registration after every legacy
+   menu/route override. This restores only the approved read-only entry point;
+   backend authorization remains the enforcement boundary. */
+(()=>{
+  const PAGE='commission-category-governance';
+  const LABEL='نگاشت دسته و نرخ پورسانت';
+  const ALLOWED_ROLES=['admin','accounting','manager'];
+  const inheritedMenu=window.renderMenu||renderMenu;
+  window.renderMenu=renderMenu=function(){
+    inheritedMenu.apply(this,arguments);
+    if(!ALLOWED_ROLES.includes(userRole()))return;
+    const menu=document.querySelector('#menu');
+    if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
+    const button=document.createElement('button');
+    button.className='navbtn';
+    button.dataset.page=PAGE;
+    button.textContent=LABEL;
+    button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
+    const before=menu.querySelector('[data-page="commission-rate-versions"]')||menu.querySelector('[data-page="draft-commission-report"]');
+    if(before)before.parentNode.insertBefore(button,before);else menu.appendChild(button);
+  };
+  const inheritedRoute=window.route||route;
+  window.route=route=async function(){
+    const page=location.hash.slice(1)||firstAllowedPage();
+    if(page===PAGE&&ALLOWED_ROLES.includes(userRole()))return window.__commissionCategoryGovernancePage();
+    return inheritedRoute.apply(this,arguments);
+  };
   try{renderMenu();}catch{}
 })();
