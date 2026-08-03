@@ -4,6 +4,7 @@ const test=require('node:test');
 const assert=require('node:assert/strict');
 const fs=require('node:fs');
 const path=require('node:path');
+const vm=require('node:vm');
 const {MemoryDb}=require('./helpers/memory-mongo');
 const governance=require('../src/lib/accounting-governance');
 const ledger=require('../src/lib/profit-commission-ledger');
@@ -150,4 +151,48 @@ test('normal export opens only after every governed prerequisite is approved',as
 
 test('seller has no access and source/UI contracts preserve accounting boundaries',async()=>{
   const db=dbSeed();await assert.rejects(governance.groupReviewMatrix(db,{},seller),e=>e.code==='ACCOUNTING_GOVERNANCE_FORBIDDEN');const source=fs.readFileSync(path.join(__dirname,'../src/lib/accounting-governance.js'),'utf8');for(const forbidden of ['Invoice/Put','PutSaleInvoice','PutBuyInvoice','saleSnapshotDatasetLines.update','fifoProfitFacts.update','supplierPurchaseLayers.update','itemInventoryCatalog.update'])assert.equal(source.includes(forbidden),false,forbidden);const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');assert.match(ui,/commission-category-governance/);assert.match(ui,/Official Product Category/);assert.match(ui,/Commission Rate Pool/);assert.match(ui,/officialProductCategoryIdentity/);assert.match(ui,/commissionRatePool/);assert.match(ui,/seller\/category.*seller\/rate-pool.*category default.*rate-pool default/);assert.match(ui,/saved-profit-opening-governance/);assert.match(ui,/COMMISSION_EXPORT_NOT_READY|Normal export/);assert.match(ui,/excelDiagnostic/);assert.match(ui,/Diagnostic Export \(incomplete \/ non-payable\)/);assert.match(ui,/data-action="\$\{action\}"/);assert.match(ui,/action==='edit'\?editRecord/);const sellerPages=ui.match(/seller:\s*\[([^\]]+)\]/)?.[1]||'';assert.equal(sellerPages.includes('commission-category-governance'),false);assert.equal(sellerPages.includes('saved-profit-opening-governance'),false);
+});
+
+test('final navigation registration survives legacy overrides and enforces role visibility',async()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  const marker='/* Final Commission Category Governance registration';
+  const start=ui.lastIndexOf(marker);
+  assert.ok(start>ui.lastIndexOf('/* Final Phase 5.3.0 registration'),'registration must be last');
+  const registration=ui.slice(start);
+  function load(role){
+    const buttons=[];
+    const menu={
+      querySelector(selector){const page=selector.match(/data-page="([^"]+)"/)?.[1];return buttons.find(button=>button.dataset.page===page)||null;},
+      appendChild(button){buttons.push(button);}
+    };
+    let rendered=0,fallback=0;
+    const context={
+      window:{renderMenu(){},async route(){fallback++;},__commissionCategoryGovernancePage:async()=>{rendered++;}},
+      document:{querySelector:selector=>selector==='#menu'?menu:null,createElement:()=>({dataset:{}})},
+      location:{hash:''},userRole:()=>role,firstAllowedPage:()=> 'dashboard'
+    };
+    context.renderMenu=context.window.renderMenu;context.route=context.window.route;
+    vm.runInNewContext(registration,context);
+    return{...context,buttons,get rendered(){return rendered;},get fallback(){return fallback;}};
+  }
+  for(const role of ['accounting','admin','manager']){
+    const state=load(role);
+    assert.equal(state.buttons.length,1,role);
+    assert.equal(state.buttons[0].dataset.page,'commission-category-governance');
+    assert.equal(state.buttons[0].textContent,'نگاشت دسته و نرخ پورسانت');
+    state.window.renderMenu();
+    assert.equal(state.buttons.length,1,'duplicate registration');
+    state.location.hash='#commission-category-governance';
+    await state.window.route();
+    assert.equal(state.rendered,1,role);
+    assert.equal(state.fallback,0,role);
+  }
+  for(const role of ['seller','seller_buyer','viewer']){
+    const state=load(role);
+    assert.equal(state.buttons.length,0,role);
+    state.location.hash='#commission-category-governance';
+    await state.window.route();
+    assert.equal(state.rendered,0,role);
+    assert.equal(state.fallback,1,role);
+  }
 });
