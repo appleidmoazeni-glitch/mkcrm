@@ -135,8 +135,10 @@ test('seller cannot create or approve and creator cannot self-approve', async ()
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
   await assert.rejects(
     service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:pending.resolution.revision}),
-    error=>error.code==='MANUAL_COST_SELF_APPROVAL'
+    error=>error.code==='MANUAL_COST_FORBIDDEN'&&error.statusCode===403
   );
+  const approved=await service.transition(db,created.resolution.resolutionId,'approve',{username:'manager',role:'manager'},{revision:pending.resolution.revision});
+  assert.equal(approved.resolution.status,'approved');
 });
 
 test('overlapping active resolutions are rejected and no physical delete API exists', async () => {

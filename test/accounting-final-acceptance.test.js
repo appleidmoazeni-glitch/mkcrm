@@ -127,7 +127,7 @@ test('review session freezes exact Sale, Purchase, FIFO, algorithm, batch, versi
   assert.deepEqual(session.frozen,{
     saleSnapshotId:'SALE-A',purchaseDatasetId:'PURCHASE-A',fifoDatasetId:'FIFO-V2',
     fifoAlgorithmVersion:'fifo-shadow-v2-precision-evidence',reviewBatchId:'BATCH-1',
-    reviewBatchRevision:1,applicationVersion:'0.9.19.71-dev.4',gitSha:SHA,
+    reviewBatchRevision:1,applicationVersion:'0.9.19.72-dev.1',gitSha:SHA,
     sourceFingerprint:'SOURCE-FP',allocationFingerprint:'ALLOC-FP'
   });
   assert.equal(session.status,'prepared');

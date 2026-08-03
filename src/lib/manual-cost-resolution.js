@@ -17,8 +17,8 @@ const SOURCE_TYPES = Object.freeze([
   'legacy_cost'
 ]);
 const STATUSES = Object.freeze(['draft', 'pending', 'approved', 'rejected', 'expired']);
-const EDIT_ROLES = Object.freeze(['admin', 'accounting', 'manager']);
-const APPROVE_ROLES = Object.freeze(['admin', 'accounting', 'manager']);
+const EDIT_ROLES = Object.freeze(['admin', 'accounting']);
+const APPROVE_ROLES = Object.freeze(['admin', 'manager']);
 let cachedGitMetadata;
 
 function clean(value, max = 500) {

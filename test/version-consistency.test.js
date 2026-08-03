@@ -13,8 +13,10 @@ test('package metadata is the single version source for API and health payloads'
   assert.equal(APP_NAME,'mkcrm');
   assert.equal(APP_VERSION,pkg.version);
   assert.match(pkg.version,/^\d+(?:\.\d+){2,}(?:-[0-9A-Za-z.-]+)?$/);
-  assert.deepEqual(versionPayload({}),{ok:true,name:'mkcrm',version:pkg.version,commit:null,environment:null});
-  assert.equal(versionPayload({GIT_COMMIT:'abcdef123456',APP_ENV:'stage'}).commit,'abcdef123456');
+  const local=versionPayload({});
+  assert.equal(local.ok,true);assert.equal(local.name,'mkcrm');assert.equal(local.applicationVersion,pkg.version);
+  assert.match(local.gitSha,/^[0-9a-f]{40}$/);assert.equal(local.releaseMetadataReady,true);assert.ok(local.sourceBranch);assert.ok(local.buildTimestamp);
+  const invalid=versionPayload({GIT_COMMIT:'abcdef123456',APP_ENV:'stage'});assert.equal(invalid.commit,'abcdef123456');assert.equal(invalid.releaseMetadataReady,false);assert.deepEqual(invalid.releaseBlockers,['GIT_SHA_MISSING_OR_INVALID']);
 });
 
 test('server endpoints use the shared package-derived payload',()=>{

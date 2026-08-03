@@ -16,6 +16,7 @@ const accountingEvidenceConfidence = require('./lib/accounting-evidence-confiden
 const accountingOperationalReview = require('./lib/accounting-operational-review');
 const accountingFinalAcceptance = require('./lib/accounting-final-acceptance');
 const profitCommissionLedger = require('./lib/profit-commission-ledger');
+const commissionPolicyGovernance = require('./lib/commission-policy-governance');
 const accountingGovernance = require('./lib/accounting-governance');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
@@ -3299,16 +3300,31 @@ function stagingReadOnlyOperation(req, pathname) {
   if (method === 'POST' && /^\/api\/purchase-drafts\/\d+\/issue$/.test(normalizedPathname)) return 'purchase-drafts.issue';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/manual-cost-resolutions\/[^/]+(?:\/(?:submit|approve|reject|expire))?$/.test(normalizedPathname)) return 'manual-cost-resolutions.workflow';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/profit-ledger\/(?:adjustments|categories|rates)\/[^/]+(?:\/(?:submit|approve|reject|return|cancel|expire|reverse))?$/.test(normalizedPathname)) return 'profit-ledger.workflow';
+  if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/commission-policies(?:\/[^/]+(?:\/(?:submit|approve|retire))?)?$/.test(normalizedPathname)) return 'commission-policies.workflow';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/governance\/opening-balances\/[^/]+(?:\/(?:submit|approve|reject|return|cancel))?$/.test(normalizedPathname)) return 'accounting-governance.opening-balances.workflow';
   return '';
+}
+
+async function releaseRuntimeMetadata() {
+  const empty={activeSaleSnapshotId:null,activePurchaseLayerDatasetId:null,activeFifoDatasetId:null,policyVersionId:null,sellerFinancialReadModelId:null,supplierSleepReadModelId:null};
+  try {
+    const db=await connectMongo();
+    const [saleState,purchaseState,fifoState,policyVersionId]=await Promise.all([
+      db.collection('saleSnapshotState').findOne({activeSnapshotId:{$exists:true,$ne:''}},{sort:{activatedAt:-1,updatedAt:-1}}).catch(()=>null),
+      db.collection(purchaseLayerDataset.STATE).findOne({activeDatasetId:{$exists:true,$ne:''}}).catch(()=>null),
+      db.collection(fifoShadowEngine.STATE).findOne({scopeKey:fifoShadowEngine.SCOPE_KEY}).catch(()=>null),
+      commissionPolicyGovernance.activePolicyId(db).catch(()=>null)
+    ]);
+    return {...empty,activeSaleSnapshotId:saleState?.activeSnapshotId||null,activePurchaseLayerDatasetId:purchaseState?.activeDatasetId||null,activeFifoDatasetId:fifoState?.activeDatasetId||null,policyVersionId};
+  } catch (_) { return empty; }
 }
 
 async function handleApi(req, res, pathname, query) {
   try {
     const readOnlyOperation = stagingReadOnlyOperation(req, pathname);
     if (readOnlyOperation && rejectIfStagingReadOnly(req, res, readOnlyOperation)) return;
-    if (pathname === '/health') return sendJson(res, 200, { ...versionPayload(), app: APP_NAME, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
-    if (pathname === '/api/version') return sendJson(res, 200, { ...versionPayload(), app: APP_NAME, node: process.version, serverTime: time.serverTimePayload() });
+    if (pathname === '/health') return sendJson(res, 200, { ...versionPayload(), ...(await releaseRuntimeMetadata()), app: APP_NAME, port: config.port, node: process.version, serverTime: time.serverTimePayload() });
+    if (pathname === '/api/version') return sendJson(res, 200, { ...versionPayload(), ...(await releaseRuntimeMetadata()), app: APP_NAME, node: process.version, serverTime: time.serverTimePayload() });
     if (pathname === '/api/server-time') return sendJson(res, 200, time.serverTimePayload());
     if (pathname === '/api/search/status') { const db = await connectMongo(); return sendJson(res, 200, { ok:true, version:APP_VERSION, counts:{ inventory: await db.collection('itemInventoryCatalog').estimatedDocumentCount().catch(()=>0), allItems: await db.collection('itemCatalogAll').estimatedDocumentCount().catch(()=>0), accounts: await db.collection('accountCatalog').estimatedDocumentCount().catch(()=>0) } }); }
     if (pathname === '/api/jobs/status' && req.method === 'GET') { const db = await connectMongo(); const jobId=String(query.jobId||''); const q=jobId?{jobId}:{ }; const jobsRaw=await db.collection('appJobs').find(q).sort({ updatedAt:-1 }).limit(jobId?1:20).toArray().catch(()=>[]); const nowMs=Date.now(); const jobs=jobsRaw.map(j=>{ const hb=new Date(j.heartbeatAt||j.updatedAt||j.startedAt||0).getTime(); const stale=String(j.status||'')==='running' && hb && (nowMs-hb)>10*60*1000; return { ...j, heartbeatAgeMs: hb ? nowMs-hb : null, staleRunning: !!stale, statusFa: stale ? 'در حال اجرا - heartbeat قدیمی، بررسی PM2/WebService لازم است' : '' }; }); return sendJson(res, 200, { ok:true, list:jobs, job:jobs[0]||null, serverTime: time.serverTimePayload() }); }
@@ -3612,7 +3628,7 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res,200,await manualCostResolution.list(db,query));
     }
     if (pathname === '/api/manual-cost-resolutions' && req.method === 'POST') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting'])) return;
       const body=await collectBody(req);
       const db=await connectMongo();
       try {
@@ -3632,7 +3648,7 @@ async function handleApi(req, res, pathname, query) {
       }
     }
     if (manualCostMatch && ['PUT','PATCH'].includes(req.method) && !manualCostMatch[2]) {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting'])) return;
       const body=await collectBody(req);
       const db=await connectMongo();
       try {
@@ -3642,7 +3658,7 @@ async function handleApi(req, res, pathname, query) {
       }
     }
     if (manualCostMatch && req.method === 'POST' && manualCostMatch[2]) {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,manualCostMatch[2]==='submit'?['admin','accounting']:['admin','manager'])) return;
       const body=await collectBody(req);
       const db=await connectMongo();
       try {
@@ -3703,7 +3719,32 @@ async function handleApi(req, res, pathname, query) {
     // 0.9.19.70: immutable FIFO profit facts, governed adjustments and
     // preliminary commission review. This boundary owns no invoice, Shaygan,
     // inventory, Sale Snapshot, Purchase Layer or FIFO source writes.
-    const sendLedgerError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error),...(error.blockers?{blockers:error.blockers}:{}),...(error.readiness?{readiness:error.readiness}:{}),...(error.details?{details:error.details}:{})});
+    const sendLedgerError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error),...(error.blockers?{blockers:error.blockers}:{}),...(error.readiness?{readiness:error.readiness}:{}),...(error.details?{details:error.details}:{}),...(error.migration?{migration:error.migration}:{})});
+    if(pathname==='/api/accounting/commission-policies'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await commissionPolicyGovernance.listPolicies(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICIES_FAILED');}
+    }
+    if(pathname==='/api/accounting/commission-policies'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await commissionPolicyGovernance.createPolicy(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICY_CREATE_FAILED');}
+    }
+    if(pathname==='/api/accounting/commission-policies/legacy-migration'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await commissionPolicyGovernance.migrateLegacyBindings(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICY_MIGRATION_FAILED');}
+    }
+    if(pathname==='/api/accounting/commission-policies/bindings'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await commissionPolicyGovernance.bindingReport(db,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICY_BINDINGS_FAILED');}
+    }
+    const policyWorkflowMatch=pathname.match(/^\/api\/accounting\/commission-policies\/([^/]+)(?:\/(submit|approve|retire))?$/);
+    if(policyWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!policyWorkflowMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await commissionPolicyGovernance.updatePolicy(db,decodeURIComponent(policyWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICY_UPDATE_FAILED');}
+    }
+    if(policyWorkflowMatch&&req.method==='POST'&&policyWorkflowMatch[2]){
+      if(!requireRole(req,res,policyWorkflowMatch[2]==='submit'?['admin','accounting']:['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,200,await commissionPolicyGovernance.transitionPolicy(db,decodeURIComponent(policyWorkflowMatch[1]),policyWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_POLICY_WORKFLOW_FAILED');}
+    }
     if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
       try{return sendJson(res,200,await profitCommissionLedger.ensureIndexes(db));}catch(error){return sendLedgerError(error,'PROFIT_LEDGER_INIT_FAILED');}
