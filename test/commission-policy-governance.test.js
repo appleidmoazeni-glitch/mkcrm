@@ -64,3 +64,12 @@ test('manual-cost roles remain separated in the exported contract',()=>{
   const manual=require('../src/lib/manual-cost-resolution');
   assert.deepEqual(manual.EDIT_ROLES,['admin','accounting']);assert.deepEqual(manual.APPROVE_ROLES,['admin','manager']);
 });
+
+test('only currently approved operational policies are selectable',async()=>{
+  const db=new MemoryDb();
+  let listed=await policy.listPolicies(db,{},admin);assert.equal(listed.selectable.length,0);
+  await policy.migrateLegacyBindings(db,{},admin);listed=await policy.listPolicies(db,{},admin);assert.equal(listed.selectable.length,0);assert.equal(listed.list.find(row=>row.policyVersionId===policy.LEGACY_POLICY_ID).selectable,false);
+  const approved=await approvedPolicy(db);listed=await policy.listPolicies(db,{},admin);assert.deepEqual(listed.selectable.map(row=>row.policyVersionId),[approved.policyVersionId]);
+  await policy.transitionPolicy(db,approved.policyVersionId,'retire',{revision:approved.revision,reason:'controlled test retirement'},manager);
+  listed=await policy.listPolicies(db,{},admin);assert.equal(listed.selectable.length,0);
+});
