@@ -10,9 +10,9 @@ const governance=require('../src/lib/accounting-governance');
 const ledger=require('../src/lib/profit-commission-ledger');
 const shaygan=require('../src/lib/shaygan');
 
-const accounting={username:'khedmati-test',role:'accounting'};
+const accounting={username:'khedmati',role:'accounting'};
 const manager={username:'manager-test',role:'manager'};
-const admin={username:'admin-test',role:'admin'};
+const admin={username:'admin',role:'admin'};
 const seller={username:'seller-test',role:'seller'};
 const evidence={policyVersionId:'POLICY-1',reason:'Verified against controlled test evidence',sourceReference:'TEST-DOC-1',evidenceMetadata:{attachmentId:'ATT-1'}};
 const governedEvidence={reason:'Verified against controlled test evidence',sourceReference:'TEST-DOC-1',attachmentMetadata:{attachmentId:'ATT-1'}};
@@ -76,6 +76,28 @@ test('prefix fallback is explicit and never treated as official accounting evide
 test('category mapping workflow keeps evidence optional while enforcing policy, role separation, revision and overlap safety',async()=>{
   const db=dbSeed();const created=await ledger.createCategoryMapping(db,{policyVersionId:'POLICY-1',itemGuid:'I1',commissionRatePool:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431'},accounting);assert.equal(created.mapping.status,'draft');const submitted=await ledger.transitionCategoryMapping(db,created.mapping.mappingId,'submit',{revision:1},accounting);await assert.rejects(ledger.transitionCategoryMapping(db,created.mapping.mappingId,'approve',{revision:2},accounting),e=>e.code==='PROFIT_LEDGER_FORBIDDEN');await assert.rejects(ledger.transitionCategoryMapping(db,created.mapping.mappingId,'approve',{revision:99},manager),e=>e.code==='CATEGORY_MAPPING_CONFLICT');const approved=await ledger.transitionCategoryMapping(db,created.mapping.mappingId,'approve',{revision:submitted.mapping.revision},manager);assert.equal(approved.mapping.status,'approved');assert.equal(approved.automaticApproval,false);
   const overlap=await ledger.createCategoryMapping(db,{itemGuid:'I1',commissionRatePool:'COMPONENT',effectiveFrom:'14050415',effectiveTo:'14050501',...evidence},accounting);const pending=await ledger.transitionCategoryMapping(db,overlap.mapping.mappingId,'submit',{revision:1,...evidence},accounting);await assert.rejects(ledger.transitionCategoryMapping(db,overlap.mapping.mappingId,'approve',{revision:pending.mapping.revision,...evidence},manager),e=>e.code==='CATEGORY_MAPPING_OVERLAP');
+});
+
+test('category mapping create is unique by approved policy, exact Main Group GUID and effective period',async()=>{
+  const db=dbSeed({accountingOfficialItemGroups:[
+    {catalogRunId:'TEST-CATALOG',groupIdentity:'guid:P1',sourceGroupGuid:'P1',groupNumber:'1',groupName:'NOTEBOOK',resolvedMainGroupIdentity:'guid:P1',resolvedMainGroupGuid:'P1',resolvedMainGroupNumber:'1',resolvedMainGroupName:'NOTEBOOK'},
+    {catalogRunId:'TEST-CATALOG',groupIdentity:'guid:P1-OTHER',sourceGroupGuid:'P1-OTHER',groupNumber:'1',groupName:'OTHER SAME NUMBER',resolvedMainGroupIdentity:'guid:P1-OTHER',resolvedMainGroupGuid:'P1-OTHER',resolvedMainGroupNumber:'1',resolvedMainGroupName:'OTHER SAME NUMBER'}
+  ]});
+  const first=await ledger.createCategoryMapping(db,{policyVersionId:'POLICY-1',groupPathIdentity:'guid:P1',officialProductCategoryIdentity:'guid:P1',officialProductCategoryGuid:'P1',officialProductCategoryNumber:'1',officialProductCategoryName:'NOTEBOOK',commissionRatePool:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431'},accounting);
+  await assert.rejects(ledger.createCategoryMapping(db,{policyVersionId:'POLICY-1',groupPathIdentity:'guid:P1',officialProductCategoryIdentity:'guid:P1',officialProductCategoryGuid:'P1',officialProductCategoryNumber:'1',officialProductCategoryName:'NOTEBOOK',commissionRatePool:'COMPONENT',effectiveFrom:'14050401',effectiveTo:'14050431'},accounting),error=>error.code==='CATEGORY_MAPPING_DUPLICATE_NON_TERMINAL'&&error.statusCode===409&&error.details.existingMappingId===first.mapping.mappingId);
+  const sameNumberDifferentGuid=await ledger.createCategoryMapping(db,{policyVersionId:'POLICY-1',groupPathIdentity:'guid:P1-OTHER',officialProductCategoryIdentity:'guid:P1-OTHER',officialProductCategoryGuid:'P1-OTHER',officialProductCategoryNumber:'1',officialProductCategoryName:'OTHER SAME NUMBER',commissionRatePool:'UNRESOLVED',effectiveFrom:'14050401',effectiveTo:'14050431'},accounting);
+  assert.notEqual(sameNumberDifferentGuid.mapping.mappingId,first.mapping.mappingId);assert.equal(sameNumberDifferentGuid.mapping.officialProductCategoryGuid,'P1-OTHER');
+});
+
+test('authenticated khedmati workflow creates one draft, submits it, and admin rejects without approval',async()=>{
+  const db=dbSeed();
+  const created=await ledger.createCategoryMapping(db,{policyVersionId:'POLICY-1',groupPathIdentity:'guid:P1',officialProductCategoryIdentity:'guid:P1',officialProductCategoryGuid:'P1',officialProductCategoryNumber:'1',officialProductCategoryName:'NOTEBOOK',commissionRatePool:'UNRESOLVED',effectiveFrom:'14050401',effectiveTo:'14050431',reason:'TEMP GOVERNANCE CONTRACT TEST',sourceReference:'GOVERNANCE-GATE-TEST'},accounting);
+  const submitted=await ledger.transitionCategoryMapping(db,created.mapping.mappingId,'submit',{revision:created.mapping.revision,reason:'TEMP GOVERNANCE CONTRACT TEST',sourceReference:'GOVERNANCE-GATE-TEST'},accounting);
+  await assert.rejects(ledger.transitionCategoryMapping(db,created.mapping.mappingId,'approve',{revision:submitted.mapping.revision,reason:'must remain human separated'},accounting),error=>error.code==='PROFIT_LEDGER_FORBIDDEN'&&error.statusCode===403);
+  const rejected=await ledger.transitionCategoryMapping(db,created.mapping.mappingId,'reject',{revision:submitted.mapping.revision,reason:'Temporary validation completed',sourceReference:'GOVERNANCE-GATE-TEST'},admin);
+  assert.equal(rejected.mapping.status,'rejected');assert.equal(rejected.mapping.revision,3);assert.equal(rejected.mapping.createdBy.username,'khedmati');assert.equal(rejected.mapping.rejectedBy.username,'admin');
+  assert.deepEqual(rejected.mapping.auditLog.map(event=>[event.action,event.by.username]),[['mapping-created','khedmati'],['mapping-submit','khedmati'],['mapping-reject','admin']]);
+  assert.equal(await db.collection(ledger.CATEGORY_MAPPINGS).countDocuments({policyVersionId:'POLICY-1',officialProductCategoryGuid:'P1',effectiveFrom:'14050401',effectiveTo:'14050431'}),1);assert.equal(await db.collection(ledger.CATEGORY_MAPPINGS).countDocuments({status:'approved'}),0);
 });
 
 test('stored canonical item identity survives draft editing',async()=>{
@@ -227,5 +249,10 @@ test('policy selectors expose bounded Persian empty, loading and retry states wi
   assert.match(phaseB,/row\.status==='approved'/);assert.match(phaseB,/row\.policyVersionId!=='LEGACY_PRE_POLICY'/);assert.match(phaseB,/!row\.historicalFrozen/);
   assert.match(phaseB,/id="fgmCreate" disabled/);assert.match(phaseB,/id="fgrCreate" disabled/);
   assert.match(phaseB,/cancelled:'لغوشده'/);assert.match(phaseB,/rate_pool:'سبد نرخ'/);assert.match(phaseB,/جزئیات حسابرسی/);assert.match(phaseB,/رکورد تاریخی/);
+  assert.match(phaseB,/function recordId\(row,type\)/);assert.match(phaseB,/type==='mapping'\?row\.mappingId/);assert.match(phaseB,/type==='rate'\?row\.rateVersionId/);
+  assert.doesNotMatch(phaseB,/row\.policyVersionId\|\|row\.mappingId\|\|row\.rateVersionId/);
+  assert.match(phaseB,/data-row-type="projection"/);assert.match(phaseB,/data-row-type="persisted"/);assert.match(phaseB,/ثبت‌نشده/);assert.match(phaseB,/ایجاد پیش‌نویس/);
+  assert.match(phaseB,/CATEGORY_MAPPING_NOT_FOUND/);assert.match(phaseB,/رکورد نگاشت پیدا نشد/);assert.match(phaseB,/data-error-code/);
+  assert.match(phaseB,/Candidate محاسباتی هرگز پیش‌نویس تلقی نمی‌شود/);assert.match(phaseB,/data-rate-version-id/);
   assert.equal(/\bprompt\s*\(/.test(phaseB),false,'primary governance pages must not use prompt');
 });
