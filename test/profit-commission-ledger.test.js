@@ -72,7 +72,7 @@ test('saved-profit credit preserves company FIFO profit and changes only commiss
   const approved=await ledger.transitionAdjustment(db,created.adjustment.adjustmentId,'approve',{revision:submitted.adjustment.revision,approvedAmountExact:'100'},manager);
   assert.equal(approved.actualFifoProfitChanged,false);assert.equal(approved.companyProfitChanged,false);assert.equal(approved.ledgerEntry.creditAmountExact,'100.00');assert.equal((await ledger.savedBalance(db,'NOTEBOOK')).balanceExact,'100.00');
   const fact=db.collection(ledger.FIFO_FACTS).rows.find(row=>row.saleLineIdentity==='SL-2-4691-001-NB');assert.equal(fact.actualFifoProfitExact,'300.00');
-  const draft=await ledger.calculateDraftCommission(db,{fifoDatasetId:'FIFO-APPROVED',periodFrom:'14050401',periodTo:'14050431'},accountant);const line=db.collection(ledger.COMMISSION_LINES).rows.find(row=>row.saleLineIdentity===fact.saleLineIdentity);assert.equal(line.actualFifoProfitExact,'300.00');assert.equal(line.commissionableProfitExact,'200.00');assert.equal(line.draftCommissionExact,'28.00');assert.equal(draft.payable,false);
+  const draft=await ledger.calculateDraftCommission(db,{fifoDatasetId:'FIFO-APPROVED',periodFrom:'14050401',periodTo:'14050431'},accountant);const line=db.collection(ledger.COMMISSION_LINES).rows.find(row=>row.saleLineIdentity===fact.saleLineIdentity);assert.equal(line.actualFifoProfitExact,'300.00');assert.equal(line.officialSellerDiscountExact,'10.00');assert.equal(line.commissionableProfitExact,'190.00');assert.equal(line.draftCommissionExact,'26.60');assert.equal(draft.payable,false);
 });
 
 test('subsidy debits only matching pool, cross-pool and insufficient reserve are rejected',async()=>{

@@ -282,7 +282,12 @@ function buildProjectedLines(bundle,runId,calculatedAt) {
     const lineAdjustments=adjustmentsByLine.get(fact.saleLineIdentity)||[];const adjustmentEffects=lineAdjustments.map(adjustmentEffect);const approvedAdjustmentAmountExact=add(adjustmentEffects);
     const savedCredits=savedSource.get(fact.saleLineIdentity)||[];const savedSubsidies=savedBeneficiary.get(fact.saleLineIdentity)||[];
     const savedProfitCreditExact=add(savedCredits.map(row=>row.creditAmountExact||0));const savedProfitSubsidyExact=add(savedSubsidies.map(row=>row.debitAmountExact||0));
-    const commissionableProfitExact=fact.actualFifoProfitExact==null?null:add([fact.actualFifoProfitExact,approvedAdjustmentAmountExact]);
+    // Commissionable profit is a governed derivative. Actual FIFO profit is
+    // immutable; approved adjustments are applied separately and both the
+    // official seller line discount and the allocated invoice discount are
+    // deducted exactly once.
+    const commissionableProfitExact=fact.actualFifoProfitExact==null||lineDiscountExact==null||allocatedInvoiceDiscountExact==null
+      ?null:subtract(add([fact.actualFifoProfitExact,approvedAdjustmentAmountExact]),add([lineDiscountExact,allocatedInvoiceDiscountExact]));
     const preliminaryCommissionExact=commissionableProfitExact!=null&&rate.status==='resolved'&&!blockers.length?ledger._multiplyMoneyRate(commissionableProfitExact,rate.rateVersion.rate):null;
     const header=headerByInvoice.get(fact.saleInvoiceIdentity)||{};const sellerActor=sellerActors.get(clean(fact.sellerIdentity,100))||{};
     const invoiceRows=invoiceFacts.get(fact.saleInvoiceIdentity)||[];const invoiceGrossSaleAmountExact=add(invoiceRows.map(row=>row.saleAmountExact||0));

@@ -19,6 +19,7 @@ const profitCommissionLedger = require('./lib/profit-commission-ledger');
 const commissionPolicyGovernance = require('./lib/commission-policy-governance');
 const accountingGovernance = require('./lib/accounting-governance');
 const sellerFinancialPerformance = require('./lib/seller-financial-performance');
+const profitAdjustmentBatches = require('./lib/profit-adjustment-batches');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -3855,6 +3856,51 @@ async function handleApi(req, res, pathname, query) {
       const request={...body};if(pathname.endsWith('/resume')&&!request.runId)return sendJson(res,400,{ok:false,code:'SELLER_FINANCIAL_RUN_ID_REQUIRED',error:'runId is required for resume'});
       const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request:{runId:String(request.runId||'').trim().slice(0,100),batchSize:Number(request.batchSize||500),maxAttempts:Number(request.maxAttempts||3)},createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now});
       try{startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,status:'queued',runId:request.runId||'',nonPayable:true});}catch(error){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',error:String(error.message||error),updatedAt:new Date()}}).catch(()=>{});return sendLedgerError(error,'SELLER_FINANCIAL_BUILD_FAILED');}
+    }
+    // Phase D — governed batch workflow. Candidate and Preview operations read
+    // only the active Seller Financial projection. Posting writes only
+    // approved adjustments, the append-only saved-profit ledger, and then
+    // schedules the existing rebuildable Seller Financial projection.
+    const adjustmentBatchPrefix='/api/accounting/profit-adjustment-batches';
+    if(pathname===`${adjustmentBatchPrefix}/health`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitAdjustmentBatches.health(db));}catch(error){return sendLedgerError(error,'PROFIT_BATCH_HEALTH_FAILED');}
+    }
+    if(pathname===`${adjustmentBatchPrefix}/candidates`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitAdjustmentBatches.candidates(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_BATCH_CANDIDATES_FAILED');}
+    }
+    if(pathname===`${adjustmentBatchPrefix}/monthly-statement`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitAdjustmentBatches.monthlyStatement(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_BATCH_STATEMENT_FAILED');}
+    }
+    if(pathname===`${adjustmentBatchPrefix}/record-classification`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitAdjustmentBatches.classificationReport(db,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_BATCH_CLASSIFICATION_FAILED');}
+    }
+    if(pathname===adjustmentBatchPrefix&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await profitAdjustmentBatches.listBatches(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_BATCH_LIST_FAILED');}
+    }
+    if(pathname===adjustmentBatchPrefix&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitAdjustmentBatches.createDraft(db,body,currentUser(req)));}catch(error){return sendLedgerError(error,'PROFIT_BATCH_CREATE_FAILED');}
+    }
+    const adjustmentBatchAction=pathname.match(/^\/api\/accounting\/profit-adjustment-batches\/([^/]+)\/(preview|submit|cancel|reject|approve|retry-post|request-reversal|approve-reversal)$/);
+    if(adjustmentBatchAction&&req.method==='POST'){
+      const action=adjustmentBatchAction[2];if(!requireRole(req,res,['approve','reject','retry-post','approve-reversal'].includes(action)?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{
+        let result;if(action==='preview')result=await profitAdjustmentBatches.preview(db,decodeURIComponent(adjustmentBatchAction[1]),body,currentUser(req));
+        else if(action==='approve'||action==='retry-post')result=action==='approve'?await profitAdjustmentBatches.approve(db,decodeURIComponent(adjustmentBatchAction[1]),body,currentUser(req)):await profitAdjustmentBatches.postApproved(db,decodeURIComponent(adjustmentBatchAction[1]));
+        else if(action==='request-reversal')result=await profitAdjustmentBatches.requestReversal(db,decodeURIComponent(adjustmentBatchAction[1]),body,currentUser(req));
+        else if(action==='approve-reversal')result=await profitAdjustmentBatches.approveReversal(db,decodeURIComponent(adjustmentBatchAction[1]),body,currentUser(req));
+        else result=await profitAdjustmentBatches.transition(db,decodeURIComponent(adjustmentBatchAction[1]),action,body,currentUser(req));
+        if(result.refreshRequired){
+          if(sellerFinancialJobManager.isRunning('seller-financial-performance'))result.readModelRefresh={queued:false,code:'JOB_LOCKED',retryRequired:true};
+          else{const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,now=new Date(),request={mode:'full',batchSize:500,maxAttempts:3},serviceActor={username:'phase-d-read-model-refresh',role:'accounting'};await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request,createdBy:currentUser(req),serviceActor,createdAt:now,updatedAt:now,heartbeatAt:now});try{startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:serviceActor});result.readModelRefresh={queued:true,jobId};}catch(error){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',error:String(error.message||error),updatedAt:new Date()}}).catch(()=>{});result.readModelRefresh={queued:false,jobId,code:'REFRESH_START_FAILED',retryRequired:true};}}
+        }
+        return sendJson(res,200,result);
+      }catch(error){return sendLedgerError(error,'PROFIT_BATCH_WORKFLOW_FAILED');}
     }
     if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
