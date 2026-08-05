@@ -254,5 +254,6 @@ test('policy selectors expose bounded Persian empty, loading and retry states wi
   assert.match(phaseB,/data-row-type="projection"/);assert.match(phaseB,/data-row-type="persisted"/);assert.match(phaseB,/ثبت‌نشده/);assert.match(phaseB,/ایجاد پیش‌نویس/);
   assert.match(phaseB,/CATEGORY_MAPPING_NOT_FOUND/);assert.match(phaseB,/رکورد نگاشت پیدا نشد/);assert.match(phaseB,/data-error-code/);
   assert.match(phaseB,/Candidate محاسباتی هرگز پیش‌نویس تلقی نمی‌شود/);assert.match(phaseB,/data-rate-version-id/);
+  assert.match(phaseB,/data-action="reject"/);assert.match(phaseB,/رد کردن/);
   assert.equal(/\bprompt\s*\(/.test(phaseB),false,'primary governance pages must not use prompt');
 });
