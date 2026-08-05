@@ -3789,6 +3789,27 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await sellerFinancialPerformance.freshness(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FRESHNESS_FAILED');}
     }
+    if(pathname===`${sellerFinancialPrefix}/fingerprints`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.fingerprintIntegrity(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FINGERPRINT_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/discount-status`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.discountStatusReport(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_DISCOUNT_STATUS_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/governance-coverage`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.governanceCoverage(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_GOVERNANCE_COVERAGE_FAILED');}
+    }
+    if(pathname===`${sellerFinancialPrefix}/verification-status`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();const jobId=String(query.jobId||'').trim();const job=await db.collection('appJobs').findOne(jobId?{jobId,type:'seller-financial-performance-verification'}:{type:'seller-financial-performance-verification'},{sort:{updatedAt:-1}});const stored=await sellerFinancialPerformance.listVerifications(db,{pageSize:20},currentUser(req));return sendJson(res,200,{ok:true,job:job||null,verifications:stored.list});
+    }
+    if(pathname===`${sellerFinancialPrefix}/verify`&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
+      if(sellerFinancialJobManager.isRunning('seller-financial-performance')){const running=sellerFinancialJobManager.getRunning('seller-financial-performance');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Seller Financial Performance job is already running',jobId:running?.id||''});}
+      const jobId=`JOB-SELLER-FINANCIAL-VERIFY-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,verificationId=`SFPV-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,now=new Date(),request={operation:'deep-verify',verificationId};await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance-verification',status:'queued',phase:'queued',request:{operation:'deep-verify',verificationId},createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now,readOnly:true});
+      try{startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,verificationId,status:'queued',readOnly:true});}catch(error){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',error:String(error.message||error),updatedAt:new Date()}}).catch(()=>{});return sendLedgerError(error,'SELLER_FINANCIAL_VERIFY_FAILED');}
+    }
     if(pathname===`${sellerFinancialPrefix}/summaries`&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await sellerFinancialPerformance.listSummaries(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_SUMMARIES_FAILED');}

@@ -17,7 +17,9 @@ class SellerFinancialPerformanceJob extends Job_js_1.BackgroundJob {
             throw new JobError_js_1.JobEngineError(JobError_js_1.JobErrorCode.Internal, 'Seller Financial Performance job input is incomplete');
         context.reportProgress({ phase: 'Validating Input', current: 0, total: 1, message: 'Preparing seller financial read model' });
         context.cancellationToken.throwIfCancellationRequested();
-        const result = await this.input.service.buildReadModel(this.input.db, {
+        const operation = String(this.input.request.operation || 'build');
+        const execute = operation === 'deep-verify' ? this.input.service.deepVerify.bind(this.input.service) : this.input.service.buildReadModel.bind(this.input.service);
+        const result = await execute(this.input.db, {
             ...this.input.request,
             jobControl: {
                 progress: (update) => context.reportProgress(this.weighted(update)),
@@ -27,6 +29,7 @@ class SellerFinancialPerformanceJob extends Job_js_1.BackgroundJob {
         }, { ...this.input.requestedBy });
         await this.input.onResult?.(result);
         context.metrics.setCounter('runCount', result.runId ? 1 : 0);
+        context.metrics.setCounter('verificationCount', result.verificationId ? 1 : 0);
         context.metrics.setCounter('lineCount', Number(result.lineCount || 0));
         context.metrics.setCounter('summaryCount', Number(result.summaryCount || 0));
         context.metrics.setCounter('retryCount', Number(result.retryCount || 0));
@@ -40,6 +43,7 @@ class SellerFinancialPerformanceJob extends Job_js_1.BackgroundJob {
         const ranges = {
             'Validating Input': [0, 2],
             'Reading Immutable Sources': [2, 18],
+            'Replaying Stored Fingerprints': [18, 90],
             'Projecting Seller Financial Lines': [18, 50],
             'Writing Seller Financial Lines': [50, 85],
             'Building Summaries': [85, 99],

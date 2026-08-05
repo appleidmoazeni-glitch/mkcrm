@@ -5,6 +5,7 @@ import type { JobProgressUpdate } from '../core/jobs/JobProgress.js';
 export interface SellerFinancialPerformanceResult extends Record<string, unknown> {
   readonly ok?: boolean;
   readonly runId?: string;
+  readonly verificationId?: string;
   readonly lineCount?: number;
   readonly summaryCount?: number;
   readonly retryCount?: number;
@@ -12,6 +13,7 @@ export interface SellerFinancialPerformanceResult extends Record<string, unknown
 }
 export interface SellerFinancialPerformanceService {
   buildReadModel(db: unknown, request: Record<string, unknown>, requestedBy: Record<string, unknown>): Promise<SellerFinancialPerformanceResult>;
+  deepVerify(db: unknown, request: Record<string, unknown>, requestedBy: Record<string, unknown>): Promise<SellerFinancialPerformanceResult>;
 }
 export interface SellerFinancialPerformanceJobInput {
   readonly db: unknown;
@@ -31,7 +33,9 @@ export class SellerFinancialPerformanceJob extends BackgroundJob {
     if (!this.input?.service) throw new JobEngineError(JobErrorCode.Internal, 'Seller Financial Performance job input is incomplete');
     context.reportProgress({ phase:'Validating Input', current:0, total:1, message:'Preparing seller financial read model' });
     context.cancellationToken.throwIfCancellationRequested();
-    const result=await this.input.service.buildReadModel(this.input.db,{
+    const operation=String(this.input.request.operation||'build');
+    const execute=operation==='deep-verify'?this.input.service.deepVerify.bind(this.input.service):this.input.service.buildReadModel.bind(this.input.service);
+    const result=await execute(this.input.db,{
       ...this.input.request,
       jobControl:{
         progress:(update:JobProgressUpdate)=>context.reportProgress(this.weighted(update)),
@@ -41,6 +45,7 @@ export class SellerFinancialPerformanceJob extends BackgroundJob {
     },{...this.input.requestedBy});
     await this.input.onResult?.(result);
     context.metrics.setCounter('runCount',result.runId?1:0);
+    context.metrics.setCounter('verificationCount',result.verificationId?1:0);
     context.metrics.setCounter('lineCount',Number(result.lineCount||0));
     context.metrics.setCounter('summaryCount',Number(result.summaryCount||0));
     context.metrics.setCounter('retryCount',Number(result.retryCount||0));
@@ -53,6 +58,7 @@ export class SellerFinancialPerformanceJob extends BackgroundJob {
     const ranges:Readonly<Record<string,readonly [number,number]>>={
       'Validating Input':[0,2],
       'Reading Immutable Sources':[2,18],
+      'Replaying Stored Fingerprints':[18,90],
       'Projecting Seller Financial Lines':[18,50],
       'Writing Seller Financial Lines':[50,85],
       'Building Summaries':[85,99],

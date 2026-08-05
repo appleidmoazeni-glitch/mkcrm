@@ -24,7 +24,7 @@
     "test:accounting-fat": "node --test test/accounting-final-acceptance.test.js",
     "test:profit-commission-ledger": "node --test test/profit-commission-ledger.test.js",
     "test:accounting-governance": "node --test test/profit-commission-ledger.test.js test/accounting-governance-ui.test.js",
-    "test:seller-financial-performance": "node --test test/seller-financial-performance.test.js",
+    "test:seller-financial-performance": "tsc -p tsconfig.jobs.json && node scripts/seller-financial-performance-job-test.js && node --test test/seller-financial-performance.test.js",
     "test:search-observability": "node --test test/search-observability.test.js",
     "report:search-observability": "node scripts/report-search-observability.js",
     "smoke": "node scripts/smoke-test.js",
