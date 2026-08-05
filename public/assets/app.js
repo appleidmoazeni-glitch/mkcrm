@@ -865,7 +865,7 @@ const uiModalController=(()=>{
 if(!window.__mkcrmSensitiveClickGuard){
   window.__mkcrmSensitiveClickGuard=true;
   document.addEventListener('click',e=>{
-    const button=e.target.closest&&e.target.closest('#issueBtn,#convertPfBtn,[data-issue],#buySave,#pfSave,#announcePurchaseToBoard,#psReadSelected,#psBuildSelected,#saleSnapStart');
+    const button=e.target.closest&&e.target.closest('#convertPfBtn,[data-issue],#buySave,#pfSave,#announcePurchaseToBoard,#psReadSelected,#psBuildSelected,#saleSnapStart');
     if(!button)return;
     if(button.dataset.uiClickLocked==='1'){e.preventDefault();e.stopImmediatePropagation();return;}
     button.dataset.uiClickLocked='1';button.setAttribute('aria-busy','true');button.disabled=true;
@@ -5790,6 +5790,14 @@ async function pageSellerProfit(){
   const safe=value=>{try{return esc(value==null?'':String(value));}catch{return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}};
   const money=value=>{try{return Number(value||0).toLocaleString('fa-IR')}catch{return String(value||0)}};
   const parseMoney=value=>{const raw=String(value??'').replace(/[۰-۹]/g,d=>String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))).replace(/[٠-٩]/g,d=>String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))).replace(/[,،\s]/g,'').replace(/[^0-9.\-]/g,'');const n=Number(raw||0);return Number.isFinite(n)?n:0;};
+  const ISSUE_DIAGNOSTIC_LIMIT=24;
+  function issueDiagnostic(stage,details={}){
+    const diagnostics=window.__saleIssueDiagnostics||{events:[]},event={stage,at:new Date().toISOString(),...details};
+    diagnostics.events=[...(diagnostics.events||[]),event].slice(-ISSUE_DIAGNOSTIC_LIMIT);window.__saleIssueDiagnostics=diagnostics;
+    const button=qs('#issueBtn');if(button){button.dataset.saleIssueDiagnostic=stage;button.dataset.saleIssueEventCount=String(diagnostics.events.length);}
+    return event;
+  }
+  function issueMessage(kind,message){const out=qs('#saleOut');if(out)out.innerHTML=`<div class="${kind}">${safe(message)}</div>`;}
   function storageKey(){return`mkcrm.activeSaleIssuance.${state.user?.username||'guest'}`;}
   function readStoredAttempt(){try{return localStorage.getItem(storageKey())||''}catch{return''}}
   function storeAttempt(id){try{if(id)localStorage.setItem(storageKey(),id);else localStorage.removeItem(storageKey())}catch{}}
@@ -5799,6 +5807,7 @@ async function pageSellerProfit(){
   function setIssueLocked(locked,label='صدور فاکتور'){
     state.saleIssueInFlight=Boolean(locked);
     const button=qs('#issueBtn');if(button){button.disabled=Boolean(locked);button.textContent=locked?'صدور قفل است':label;}
+    issueDiagnostic(locked?'button-locked':'button-unlocked',{reason:locked?'issuance-state':'idle'});
   }
   function statusActions(attemptId){return`<div class="actions"><button class="btn" id="retrySaleResolution" type="button">بررسی مجدد وضعیت</button><button class="btn" id="viewSaleResolution" type="button">مشاهده وضعیت بازیابی</button><button class="btn" id="referSaleAccounting" type="button">ارجاع به حسابداری</button></div><div id="saleResolutionActionOut" class="mt"></div><div class="small muted">شناسه پیگیری: ${safe(attemptId)}</div>`;}
   function bindStatusActions(attemptId){
@@ -5828,7 +5837,7 @@ async function pageSellerProfit(){
   }
   async function refreshIssuanceStatus(attemptId=readStoredAttempt(),showMissing=false){
     if(!attemptId)return;
-    try{const {response,payload}=await requestJson(`/api/sales/issuance/${encodeURIComponent(attemptId)}`);if(response.status===404){if(showMissing){const out=qs('#saleResolutionActionOut')||qs('#saleOut');if(out)out.innerHTML='<div class="warn">درخواست در سرور پیدا نشد؛ پیش از صدور مجدد با حسابداری بررسی کنید.</div>';}return;}if(payload.issuance?.resolved)return showResolved({ok:true,...payload,invoiceNumber:payload.issuance.invoiceNumber,invoiceGuid:payload.issuance.invoiceGuid,printUrl:payload.issuance.printUrl});if(LOCKED.has(payload.issuance?.state))showLocked(payload.issuance);else if(payload.issuance?.state==='confirmed_put_failure')handleIssuancePayload(payload);}catch(error){if(showMissing){const out=qs('#saleResolutionActionOut')||qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}}
+    try{const {response,payload}=await requestJson(`/api/sales/issuance/${encodeURIComponent(attemptId)}`);if(response.status===404){const stored=readStoredAttempt();if(stored===attemptId)storeAttempt('');if(state.saleIssueKey===attemptId)state.saleIssueKey=newAttemptId();setIssueLocked(false);issueDiagnostic('stale-attempt-cleared',{attemptId,status:404});issueMessage('warn','شناسه پیگیری قبلی در سرور پیدا نشد و فقط از این مرورگر پاک شد. اکنون می‌توانید فاکتور جدید را با کنترل‌های ایمن صادر کنید.');return;}if(payload.issuance?.resolved)return showResolved({ok:true,...payload,invoiceNumber:payload.issuance.invoiceNumber,invoiceGuid:payload.issuance.invoiceGuid,printUrl:payload.issuance.printUrl});if(LOCKED.has(payload.issuance?.state))showLocked(payload.issuance);else if(payload.issuance?.state==='confirmed_put_failure')handleIssuancePayload(payload);}catch(error){issueDiagnostic('status-check-failed',{attemptId});if(showMissing){const out=qs('#saleResolutionActionOut')||qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}}
   }
   function selectedExtras(){const rows=[];document.querySelectorAll('#saleExtrasRows .sale-extra-row').forEach(row=>{const select=row.querySelector('.sale-extra-account'),accountNumber=select?.value||'',amount=parseMoney(row.querySelector('.sale-extra-amount')?.value||0),option=select?.selectedOptions?.[0];if(accountNumber&&amount>0)rows.push({accountNumber,accountName:option?.dataset.name||option?.textContent||'',accountGuid:option?.dataset.guid||'',type:option?.dataset.type||'extra',amount});});return rows;}
   function enforceOneCostEditor(){const nodes=[...document.querySelectorAll('#saleRefExtrasBox')];nodes.slice(1).forEach(node=>node.remove());const active=nodes[0]||null;if(active)active.dataset.componentIdentity='sale-invoice-cost-editor';window.__invoiceCostEditorDiagnostics={activeEditorCount:active?1:0,duplicateNodesRemoved:(window.__invoiceCostEditorDiagnostics?.duplicateNodesRemoved||0)+Math.max(0,nodes.length-1),listenerSets:active?1:0,currentRoute:location.hash.slice(1)};}
@@ -5838,8 +5847,12 @@ async function pageSellerProfit(){
     if(typeof uiPageLifecycle!=='undefined'&&uiPageLifecycle?.add)uiPageLifecycle.add(()=>observer.disconnect());
   }
   async function safeIssueSale(){
-    const button=qs('#issueBtn');if(state.saleIssueInFlight||button?.disabled)return;
+    const button=qs('#issueBtn');
+    if(!button){issueDiagnostic('guard-no-button');issueMessage('error','دکمه صدور فاکتور در صفحه فعال پیدا نشد. صفحه را دوباره باز کنید.');return;}
+    if(state.saleIssueInFlight){issueDiagnostic('guard-in-flight');issueMessage('warn','درخواست قبلی هنوز در حال بررسی است؛ از صدور مجدد خودداری کنید.');return;}
+    if(button.disabled){issueDiagnostic('guard-disabled');issueMessage('warn','دکمه صدور اکنون قفل است. ابتدا وضعیت درخواست قبلی را بررسی کنید.');return;}
     try{
+      issueDiagnostic('preflight-started');
       if(!state.saleLines?.length&&state.selectedItem&&state.selectedStock&&typeof addSaleLine==='function')addSaleLine();
       if(!state.saleLines?.length)throw new Error('هیچ ردیف کالایی در فاکتور نیست');
       if(!state.selectedMapping?.cashboxAccountNumber||!state.selectedMapping?.employeeAccountNumber)throw new Error('اتصال صندوق و نماینده فروش کامل نیست');
@@ -5848,18 +5861,25 @@ async function pageSellerProfit(){
       const attemptId=ensureAttemptId(),invoiceExtras=selectedExtras();setIssueLocked(true);
       const out=qs('#saleOut');if(out)out.innerHTML='<div class="info">درخواست صدور ثبت شد. دکمه تا تعیین وضعیت نهایی قفل می‌ماند.</div>';
       const payload={issuanceAttemptId:attemptId,saleIssueKey:attemptId,customerName:qs('#buyerName')?.value||'',mobile:qs('#buyerMobile')?.value||'',nationalCode:qs('#buyerNational')?.value||'',leadId:qs('#leadId')?.value||'',mappingUsername:state.selectedMapping.username,sessionUsername:state.user?.username||'',username:state.user?.fullName||state.selectedMapping.fullName||'CRM',items:state.saleLines,discountAmount,generalRef:qs('#saleGeneralRef')?.value||'',invoiceExtras};
+      issueDiagnostic('request-initiated',{attemptId,endpoint:'/admin/accounting/putInvoice'});
       try{const {payload:result}=await requestJson('/admin/accounting/putInvoice',{method:'POST',body:JSON.stringify(payload)});handleIssuancePayload(result);}
       catch(error){showLocked({issuanceAttemptId:attemptId,state:'put_response_ambiguous',message:'ارتباط با CRM قطع شد و نتیجه ارسال مشخص نیست. از صدور مجدد خودداری کنید و وضعیت را بررسی کنید.'});}
     }catch(error){setIssueLocked(false);const out=qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}
+  }
+  function bindIssueButton(){
+    const button=qs('#issueBtn');if(!button){issueDiagnostic('button-missing');return null;}
+    button.dataset.componentIdentity='sale-issue-button';button.dataset.saleIssueHandler='safe-issuance-v2';
+    button.onclick=event=>{event?.preventDefault?.();issueDiagnostic('click-received',{disabled:Boolean(button.disabled)});return safeIssueSale();};
+    issueDiagnostic('handler-attached',{binding:'onclick'});return button;
   }
   window.issueSale=issueSale=safeIssueSale;
   const inheritedPageSale=window.pageSale||(typeof pageSale==='function'?pageSale:null);
   if(inheritedPageSale)window.pageSale=pageSale=async function(){
       const result=await inheritedPageSale.apply(this,arguments);
       const attemptId=ensureAttemptId();installCostEditorGuard();
-      const button=qs('#issueBtn');if(button)button.onclick=safeIssueSale;
-      setTimeout(()=>{enforceOneCostEditor();const active=qs('#issueBtn');if(active)active.onclick=safeIssueSale;refreshIssuanceStatus(attemptId);},260);
+      bindIssueButton();
+      setTimeout(()=>{enforceOneCostEditor();bindIssueButton();refreshIssuanceStatus(attemptId);},260);
       return result;
     };
-  window.__saleIssuanceHotfix={refreshStatus:refreshIssuanceStatus,enforceOneCostEditor,getAttemptId:ensureAttemptId,lockedStates:[...LOCKED]};
+  window.__saleIssuanceHotfix={refreshStatus:refreshIssuanceStatus,enforceOneCostEditor,getAttemptId:ensureAttemptId,bindIssueButton,diagnostics:()=>window.__saleIssueDiagnostics||{events:[]},lockedStates:[...LOCKED]};
 })();
