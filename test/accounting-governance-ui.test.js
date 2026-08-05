@@ -162,6 +162,7 @@ test('seller has no access and source/UI contracts preserve accounting boundarie
 
 test('final financial navigation removes duplicates, preserves redirects and enforces role visibility',async()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  assert.equal((ui.match(/addEventListener\('hashchange'/g)||[]).length,1,'only the final dynamic hash router may remain');
   const marker='/* Financial Navigation and Policy Selection cleanup.';
   const start=ui.lastIndexOf(marker);
   assert.ok(start>ui.lastIndexOf('/* Phase B final registry'),'cleanup registry must be last');
