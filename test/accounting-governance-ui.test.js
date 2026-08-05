@@ -160,46 +160,70 @@ test('seller has no access and source/UI contracts preserve accounting boundarie
   const db=dbSeed();await assert.rejects(governance.groupReviewMatrix(db,{},seller),e=>e.code==='ACCOUNTING_GOVERNANCE_FORBIDDEN');const source=fs.readFileSync(path.join(__dirname,'../src/lib/accounting-governance.js'),'utf8');for(const forbidden of ['Invoice/Put','PutSaleInvoice','PutBuyInvoice','saleSnapshotDatasetLines.update','fifoProfitFacts.update','supplierPurchaseLayers.update','itemInventoryCatalog.update'])assert.equal(source.includes(forbidden),false,forbidden);const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');assert.match(ui,/commission-category-governance/);assert.match(ui,/Official Product Category/);assert.match(ui,/Commission Rate Pool/);assert.match(ui,/officialProductCategoryIdentity/);assert.match(ui,/commissionRatePool/);assert.match(ui,/seller\/category.*seller\/rate-pool.*category default.*rate-pool default/);assert.match(ui,/saved-profit-opening-governance/);assert.match(ui,/COMMISSION_EXPORT_NOT_READY|Normal export/);assert.match(ui,/excelDiagnostic/);assert.match(ui,/Diagnostic Export \(incomplete \/ non-payable\)/);assert.match(ui,/data-action="\$\{action\}"/);assert.match(ui,/action==='edit'\?editRecord/);const sellerPages=ui.match(/seller:\s*\[([^\]]+)\]/)?.[1]||'';assert.equal(sellerPages.includes('commission-category-governance'),false);assert.equal(sellerPages.includes('saved-profit-opening-governance'),false);
 });
 
-test('final navigation registration survives legacy overrides and enforces role visibility',async()=>{
+test('final financial navigation removes duplicates, preserves redirects and enforces role visibility',async()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
-  const marker='/* Final Commission Category Governance registration';
+  const marker='/* Financial Navigation and Policy Selection cleanup.';
   const start=ui.lastIndexOf(marker);
-  assert.ok(start>ui.lastIndexOf('/* Final Phase 5.3.0 registration'),'registration must be last');
+  assert.ok(start>ui.lastIndexOf('/* Phase B final registry'),'cleanup registry must be last');
   const registration=ui.slice(start);
+  function node(tag='div'){
+    const value={tag,dataset:{},children:[],parentNode:null,open:undefined,
+      appendChild(child){child.parentNode=this;this.children.push(child);return child;},
+      remove(){if(this.parentNode)this.parentNode.children=this.parentNode.children.filter(child=>child!==this);},
+      querySelectorAll(selector){
+        const matches=[];
+        const visit=current=>{for(const child of current.children){
+          const financial=selector==='[data-financial-navigation="true"]'&&child.dataset.financialNavigation==='true';
+          const page=selector.match(/data-page="([^"]+)"/)?.[1];
+          if(financial||(page&&child.dataset.page===page))matches.push(child);
+          visit(child);
+        }};visit(this);return matches;
+      },
+      querySelector(selector){return this.querySelectorAll(selector)[0]||null;}
+    };return value;
+  }
   function load(role){
-    const buttons=[];
-    const menu={
-      querySelector(selector){const page=selector.match(/data-page="([^"]+)"/)?.[1];return buttons.find(button=>button.dataset.page===page)||null;},
-      appendChild(button){buttons.push(button);}
-    };
-    let rendered=0,fallback=0;
+    const menu=node('menu');
+    for(const id of ['commission-policy-governance','commission-category-governance','commission-rate-governance','commission-rate-versions','accounting-fifo-readiness','fifo-profit-facts','supplier-incentive-ledger']){
+      for(let copy=0;copy<2;copy++){const button=node('button');button.dataset.page=id;menu.appendChild(button);}
+    }
+    let fallback=0,health=0;
     const context={
-      window:{renderMenu(){},async route(){fallback++;},__commissionCategoryGovernancePage:async()=>{rendered++;}},
-      document:{querySelector:selector=>selector==='#menu'?menu:null,createElement:()=>({dataset:{}})},
+      window:{renderMenu(){},async route(){fallback++;},__accountingGovernanceRenderers:{'commission-export-readiness':async()=>{health++;}}},
+      document:{querySelector:selector=>selector==='#menu'?menu:null,createElement:tag=>node(tag)},
       location:{hash:''},userRole:()=>role,firstAllowedPage:()=> 'dashboard'
     };
     context.renderMenu=context.window.renderMenu;context.route=context.window.route;
     vm.runInNewContext(registration,context);
-    return{...context,buttons,get rendered(){return rendered;},get fallback(){return fallback;}};
+    const buttons=()=>menu.querySelectorAll('[data-financial-navigation="true"]').filter(item=>item.tag==='button');
+    return{...context,menu,buttons,get fallback(){return fallback;},get health(){return health;}};
   }
-  for(const role of ['accounting','admin','manager']){
-    const state=load(role);
-    assert.equal(state.buttons.length,1,role);
-    assert.equal(state.buttons[0].dataset.page,'commission-category-governance');
-    assert.equal(state.buttons[0].textContent,'نگاشت دسته و نرخ پورسانت');
-    state.window.renderMenu();
-    assert.equal(state.buttons.length,1,'duplicate registration');
-    state.location.hash='#commission-category-governance';
-    await state.window.route();
-    assert.equal(state.rendered,1,role);
-    assert.equal(state.fallback,0,role);
+  const expected={accounting:9,admin:14,manager:13,purchase:1,seller:0,seller_buyer:0,viewer:0};
+  for(const[role,count]of Object.entries(expected)){
+    const state=load(role);assert.equal(state.buttons().length,count,role);
+    assert.equal(new Set(state.buttons().map(button=>button.dataset.page)).size,count,`${role} duplicate capability`);
+    state.window.renderMenu();assert.equal(state.buttons().length,count,`${role} duplicate after rerender`);
+    const advanced=state.menu.children.find(item=>item.tag==='details');
+    if(['admin','manager'].includes(role))assert.equal(advanced.open,false,`${role} advanced collapsed`);else assert.equal(advanced,undefined,`${role} advanced hidden`);
   }
-  for(const role of ['seller','seller_buyer','viewer']){
-    const state=load(role);
-    assert.equal(state.buttons.length,0,role);
-    state.location.hash='#commission-category-governance';
-    await state.window.route();
-    assert.equal(state.rendered,0,role);
-    assert.equal(state.fallback,1,role);
-  }
+  const accountingState=load('accounting');
+  assert.deepEqual(accountingState.buttons().slice(0,3).map(button=>button.textContent),['سیاست‌های پورسانت','تعریف پورسانت گروه کالا','نرخ‌های پورسانت']);
+  accountingState.location.hash='#commission-rate-versions';await accountingState.window.route();
+  assert.equal(accountingState.location.hash,'commission-rate-governance');assert.equal(accountingState.fallback,1);
+  accountingState.location.hash='#accounting-fifo-readiness';await accountingState.window.route();
+  assert.equal(accountingState.location.hash,'financial-data-health');assert.equal(accountingState.health,1);
+  const sellerState=load('seller');sellerState.location.hash='#seller-profit';await sellerState.window.route();
+  assert.equal(sellerState.location.hash,'dashboard');assert.equal(sellerState.fallback,1);
+});
+
+test('policy selectors expose bounded Persian empty, loading and retry states without prompt',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  const phaseBStart=ui.indexOf('/* Phase B financial-governance page definitions.');
+  const phaseB=ui.slice(phaseBStart,ui.indexOf('window.__phaseBFinancialRenderers=renderers;',phaseBStart));
+  assert.match(phaseB,/هیچ سیاست پورسانت مصوبی وجود ندارد\./);
+  assert.match(phaseB,/ابتدا یک سیاست پورسانت ایجاد و پس از تأیید مدیر، آن را انتخاب کنید\./);
+  assert.match(phaseB,/ایجاد سیاست پورسانت/);assert.match(phaseB,/بازخوانی سیاست‌ها/);assert.match(phaseB,/تلاش دوباره/);
+  assert.match(phaseB,/row\.status==='approved'/);assert.match(phaseB,/row\.policyVersionId!=='LEGACY_PRE_POLICY'/);assert.match(phaseB,/!row\.historicalFrozen/);
+  assert.match(phaseB,/id="fgmCreate" disabled/);assert.match(phaseB,/id="fgrCreate" disabled/);
+  assert.equal(/\bprompt\s*\(/.test(phaseB),false,'primary governance pages must not use prompt');
 });
