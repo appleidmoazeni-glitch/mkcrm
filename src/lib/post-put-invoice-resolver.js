@@ -72,6 +72,8 @@ function scoreIssuedInvoiceCandidate(inv = {}, body = {}, mapping = {}, putGuid 
   if (reqAmount > 0 && invAmount > 0 && Math.abs(reqAmount - invAmount) <= 1) { score += 1200; reasons.push('amount'); }
   const desc = String(inv.InvDescription || inv.Description || '');
   if (crmId && desc.includes(String(crmId))) { score += 2500; reasons.push('crmId'); }
+  const customerRefs = [body.customerName,body.mobile,body.nationalCode].map(x=>String(x||'').trim()).filter(x=>x.length>=3);
+  if (customerRefs.length && customerRefs.some(value=>desc.includes(value))) { score += 500; reasons.push('customer-reference'); }
   const reqLines = saleRequestLines(body);
   const gotLines = Array.isArray(inv.Body) ? inv.Body : [];
   if (reqLines.length && reqLines.length === gotLines.length) { score += 300; reasons.push('line-count'); }
@@ -90,11 +92,20 @@ function scoreIssuedInvoiceCandidate(inv = {}, body = {}, mapping = {}, putGuid 
   return { score, reasons, invNo, invGuid, reqAmount, invAmount, lineCount:gotLines.length, createdDeltaMs };
 }
 
+function reliableCandidate(sc = {}, body = {}, putGuid = '') {
+  if (String(putGuid || '').trim() && sc.reasons.includes('guid')) return true;
+  const required = ['account','saccount','date','amount','lines-all'];
+  if (!required.every(reason=>sc.reasons.includes(reason))) return false;
+  if (sc.createdDeltaMs !== null && sc.createdDeltaMs > 30*60*1000) return false;
+  const customerRefs = [body.customerName,body.mobile,body.nationalCode].map(x=>String(x||'').trim()).filter(x=>x.length>=3);
+  return !customerRefs.length || sc.reasons.includes('customer-reference');
+}
+
 function failedResolution(out, extra = {}) {
   return { ...out, ok:false, method:'unresolved', code:'POST_PUT_RESOLVE_FAILED', error:'POST_PUT_RESOLVE_FAILED', ...extra };
 }
 function candidateAudit(candidates = []) {
-  return candidates.slice(0,10).map(x=>({invoiceNumber:x.sc.invNo,invoiceGuid:x.sc.invGuid,score:x.sc.score,reasons:x.sc.reasons,lineCount:x.sc.lineCount,createdDeltaMs:x.sc.createdDeltaMs}));
+  return candidates.slice(0,10).map(x=>({invoiceNumber:x.sc.invNo,invoiceGuid:x.sc.invGuid,score:x.sc.score,reasons:x.sc.reasons,lineCount:x.sc.lineCount,createdDeltaMs:x.sc.createdDeltaMs,reliable:Boolean(x.reliable)}));
 }
 function totalRecordsOf(response = {}) {
   const first = Array.isArray(response.result) ? response.result[0] : null;
@@ -138,16 +149,18 @@ async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, map
     const list = Array.isArray(r.result) ? r.result : [];
     for (const inv of list) {
       const sc = scoreIssuedInvoiceCandidate(inv,body,mapping,putGuid,crmId,issuedAt,formatDate8);
-      if (sc.invNo > 0 && sc.score >= 1700) candidates.push({ inv, sc });
+      if (sc.invNo > 0 && sc.score >= 1700) candidates.push({ inv, sc, reliable:reliableCandidate(sc,body,putGuid) });
     }
     if (paging.pagingMode==='total-records') {
       if (page+1>=paging.expectedPages) break;
     } else if (!list.length) break;
   }
   candidates.sort((a,b)=>b.sc.score-a.sc.score||Number(b.inv.InvNo||0)-Number(a.inv.InvNo||0));
-  const best = candidates[0];
+  const exactGuidCandidates=putGuid?candidates.filter(candidate=>candidate.sc.reasons.includes('guid')&&candidate.reliable):[];
+  const reliableCandidates=exactGuidCandidates.length?exactGuidCandidates:candidates.filter(candidate=>candidate.reliable);
+  const best = reliableCandidates.length===1?reliableCandidates[0]:null;
   const auditedCandidates = candidateAudit(candidates);
-  if (!best) return failedResolution(out,{ failureStage:'candidate-search', candidateCount:0, candidates:auditedCandidates });
+  if (!best) return failedResolution(out,{ failureStage:reliableCandidates.length>1?'multiple-candidates':'candidate-search', candidateCount:reliableCandidates.length, discoveredCandidateCount:candidates.length, candidates:auditedCandidates });
   const bestNo = Number(best.inv.InvNo || best.inv.Number || 0);
   const verify = await shaygan.getInvoice(bestNo,invoiceType);
   const verifyAttempt = { method:'final-verification', invoiceNumber:bestNo, invoiceType, ok:verify.ok, count:(verify.list||[]).length, error:verify.error||'' };
@@ -165,4 +178,4 @@ async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, map
   return { ...out, ok:true, invoiceNumber:bestNo, invoiceGuid:verifiedGuid||putGuid, result:{...verified,Number:bestNo,GuId:verifiedGuid||putGuid}, method:'date-search-verified', matchScore:best.sc.score, matchReasons:best.sc.reasons, candidateCount:candidates.length, candidates:auditedCandidates };
 }
 
-module.exports = { extractIssuedInvoiceMeta, saleRequestAmount, scoreIssuedInvoiceCandidate, resolveIssuedInvoiceAfterPut, totalRecordsOf };
+module.exports = { extractIssuedInvoiceMeta, saleRequestAmount, scoreIssuedInvoiceCandidate, reliableCandidate, resolveIssuedInvoiceAfterPut, totalRecordsOf };

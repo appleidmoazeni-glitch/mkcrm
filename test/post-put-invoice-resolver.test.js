@@ -64,6 +64,11 @@ function request(issueResponse,shaygan,extra={}){
     assert.equal(r.ok,true);assert.equal(r.invoiceNumber,102);assert(r.candidateCount>=2);assert(r.matchReasons.includes('guid'));
     assert.deepEqual(shaygan.calls.exact,[[102,2]]);
   });
+  await test('multiple equally reliable candidates require manual reconciliation',async()=>{
+    const first=candidate({InvNo:103,GuId:''}),second=candidate({InvNo:104,GuId:''}),shaygan=api({pages:[[first,second],[]],verified:first});
+    const r=await request({result:[{Number:0,GuId:''}]},shaygan);
+    assert.equal(r.ok,false);assert.equal(r.code,'POST_PUT_RESOLVE_FAILED');assert.equal(r.failureStage,'multiple-candidates');assert.equal(r.candidateCount,2);assert.equal(shaygan.calls.exact.length,0);
+  });
   await test('wrong candidate fails identity verification',async()=>{
     const best=candidate(),verified=candidate({GuId:'different-guid'}),shaygan=api({pages:[[best],[]],verified});
     const r=await request({result:[{Number:0,GuId:'guid-expected'}]},shaygan);

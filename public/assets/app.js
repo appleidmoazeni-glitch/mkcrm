@@ -4394,11 +4394,18 @@ async function pageSellerProfit(){
     try{const r=await api('/api/settings/sale-invoice-extras'); state.allowedSaleInvoiceExtras=r.list||[]; return state.allowedSaleInvoiceExtras;}catch(e){return []}
   }
   function extraOptions(list){return '<option value="">انتخاب افزودنی...</option>'+list.map(x=>`<option value="${safe(x.accountNumber)}" data-name="${safe(x.accountName||'')}" data-guid="${safe(x.accountGuid||'')}" data-type="${safe(x.type||'extra')}">${safe(x.accountNumber)} - ${safe(x.accountName||'')}</option>`).join('')}
-  async function injectSaleRefExtras(){
-    if(qs('#saleRefExtrasBox')) return;
+  let saleRefExtrasMountGeneration=0;
+  async function injectSaleRefExtras(generation){
+    if(generation!==saleRefExtrasMountGeneration || location.hash.slice(1)!=='sale') return;
+    const mounted=[...document.querySelectorAll('#saleRefExtrasBox')];
+    if(mounted.length){mounted.slice(1).forEach(node=>node.remove());return;}
     const anchor=qs('#saleDiscountBox') || qs('#saleLines'); if(!anchor) return;
     const list=await allowedExtras();
+    if(generation!==saleRefExtrasMountGeneration || location.hash.slice(1)!=='sale') return;
+    const afterAwait=[...document.querySelectorAll('#saleRefExtrasBox')];
+    if(afterAwait.length){afterAwait.slice(1).forEach(node=>node.remove());return;}
     const div=document.createElement('div'); div.id='saleRefExtrasBox'; div.className='sale-ref-extras-box';
+    div.dataset.componentIdentity='sale-invoice-cost-editor';
     div.innerHTML=`<div class="row two"><div class="form-group"><label>رفرنس فاکتور / کد پیگیری</label><input id="saleGeneralRef" maxlength="80" autocomplete="off" placeholder="مثلاً 77708"></div><div class="form-group"><label>افزودنی‌های فاکتور</label><div class="small muted">فقط حساب‌های مجاز تعریف‌شده توسط ادمین قابل انتخاب هستند.</div></div></div><div id="saleExtrasRows"></div><div class="actions"><button class="btn" id="addSaleExtraRow" type="button">+ افزودن هزینه / افزوده</button></div>`;
     anchor.after(div);
     function addRow(){
@@ -4422,7 +4429,13 @@ async function pageSellerProfit(){
     window.renderSaleLines=renderSaleLines=function(){const r=prevRenderSaleLines.apply(this,arguments); setTimeout(updateTotals922,40); return r;};
   }
   const prevPageSale=window.pageSale||pageSale;
-  window.pageSale=pageSale=async function(){const r=await prevPageSale.apply(this,arguments); setTimeout(()=>{injectSaleRefExtras(); const btn=qs('#issueBtn'); if(btn) btn.onclick=window.issueSale;},180); return r;};
+  window.pageSale=pageSale=async function(){
+    const generation=++saleRefExtrasMountGeneration;
+    const r=await prevPageSale.apply(this,arguments);
+    const timer=setTimeout(()=>{injectSaleRefExtras(generation); const btn=qs('#issueBtn'); if(btn) btn.onclick=window.issueSale;},180);
+    if(typeof uiPageLifecycle!=='undefined'&&uiPageLifecycle?.add)uiPageLifecycle.add(()=>{clearTimeout(timer);if(generation===saleRefExtrasMountGeneration)saleRefExtrasMountGeneration++;});
+    return r;
+  };
 
   window.issueSale=issueSale=async function(){
     try{ if(typeof cleanMoneyInputs==='function') cleanMoneyInputs(); }catch{}
@@ -5769,4 +5782,84 @@ async function pageSellerProfit(){
     return inheritedRoute.apply(this,arguments);
   };
   try{renderMenu();}catch{}
+})();
+/* Production-safety hotfix: durable invoice issuance UX and one invoice-cost editor. */
+(()=>{
+  const LOCKED=new Set(['put_in_progress','put_response_ambiguous','put_succeeded_resolve_pending','manual_reconciliation_required']);
+  const qs=selector=>document.querySelector(selector);
+  const safe=value=>{try{return esc(value==null?'':String(value));}catch{return String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]))}};
+  const money=value=>{try{return Number(value||0).toLocaleString('fa-IR')}catch{return String(value||0)}};
+  const parseMoney=value=>{const raw=String(value??'').replace(/[۰-۹]/g,d=>String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))).replace(/[٠-٩]/g,d=>String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))).replace(/[,،\s]/g,'').replace(/[^0-9.\-]/g,'');const n=Number(raw||0);return Number.isFinite(n)?n:0;};
+  function storageKey(){return`mkcrm.activeSaleIssuance.${state.user?.username||'guest'}`;}
+  function readStoredAttempt(){try{return localStorage.getItem(storageKey())||''}catch{return''}}
+  function storeAttempt(id){try{if(id)localStorage.setItem(storageKey(),id);else localStorage.removeItem(storageKey())}catch{}}
+  function newAttemptId(){return`sale-ui-${Date.now()}-${globalThis.crypto?.randomUUID?.()||Math.random().toString(16).slice(2)}`;}
+  function ensureAttemptId(){const stored=readStoredAttempt();if(stored){state.saleIssueKey=stored;return stored;}const id=state.saleIssueKey||newAttemptId();state.saleIssueKey=id;storeAttempt(id);return id;}
+  async function requestJson(url,options={}){const response=await fetch(url,{credentials:'include',headers:{Accept:'application/json','Content-Type':'application/json'},cache:'no-store',...options});const payload=await response.json().catch(()=>({ok:false,error:'پاسخ نامعتبر سرور'}));return{response,payload};}
+  function setIssueLocked(locked,label='صدور فاکتور'){
+    state.saleIssueInFlight=Boolean(locked);
+    const button=qs('#issueBtn');if(button){button.disabled=Boolean(locked);button.textContent=locked?'صدور قفل است':label;}
+  }
+  function statusActions(attemptId){return`<div class="actions"><button class="btn" id="retrySaleResolution" type="button">بررسی مجدد وضعیت</button><button class="btn" id="viewSaleResolution" type="button">مشاهده وضعیت بازیابی</button><button class="btn" id="referSaleAccounting" type="button">ارجاع به حسابداری</button></div><div id="saleResolutionActionOut" class="mt"></div><div class="small muted">شناسه پیگیری: ${safe(attemptId)}</div>`;}
+  function bindStatusActions(attemptId){
+    const retry=qs('#retrySaleResolution');if(retry)retry.onclick=async()=>{retry.disabled=true;const out=qs('#saleResolutionActionOut');if(out)out.innerHTML='<div class="info">فقط خواندن وضعیت فاکتور از شایگان در حال انجام است؛ Invoice/Put تکرار نمی‌شود.</div>';try{const {payload}=await requestJson(`/api/sales/issuance/${encodeURIComponent(attemptId)}/retry-resolution`,{method:'POST',body:'{}'});handleIssuancePayload(payload);}catch(error){if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}finally{retry.disabled=false;}};
+    const view=qs('#viewSaleResolution');if(view)view.onclick=()=>refreshIssuanceStatus(attemptId,true);
+    const refer=qs('#referSaleAccounting');if(refer)refer.onclick=()=>{const out=qs('#saleResolutionActionOut');if(out)out.innerHTML=`<div class="warn">این شناسه را برای بررسی به حسابداری/مدیر بدهید: <b>${safe(attemptId)}</b>. تا تأیید قطعی عدم وجود فاکتور، صدور مجدد مجاز نیست.</div>`;};
+  }
+  function showLocked(issuance={}){
+    const attemptId=issuance.issuanceAttemptId||issuance.saleIssueKey||ensureAttemptId();storeAttempt(attemptId);state.saleIssueKey=attemptId;setIssueLocked(true);
+    const out=qs('#saleOut');if(out)out.innerHTML=`<div class="warn"><b>از صدور مجدد خودداری کنید.</b><br>${safe(issuance.message||'فاکتور احتمالاً در شایگان ثبت شده است، اما شماره نهایی آن بازیابی نشد. سیستم در حال بازیابی یا بررسی فاکتور است.')}</div>${statusActions(attemptId)}`;
+    bindStatusActions(attemptId);
+  }
+  function showResolved(payload={}){
+    const issuance=payload.issuance||{},number=payload.invoiceNumber||issuance.invoiceNumber||payload.result?.Number||'';
+    setIssueLocked(true);state.saleIssued=true;
+    const out=qs('#saleOut');if(out)out.innerHTML=`<div class="success">فاکتور ${safe(number)} با موفقیت بازیابی و ثبت شد.${payload.duplicate?' درخواست تکراری به Invoice/Put ارسال نشد.':''}</div><div class="actions">${number?`<a class="btn" target="_blank" href="${safe(payload.printUrl||issuance.printUrl||('/print/invoice/'+encodeURIComponent(number)))}">چاپ فاکتور</a>`:''}<button class="btn green" id="newSaleAfterSafeIssue" type="button">فاکتور جدید</button></div>`;
+    const next=qs('#newSaleAfterSafeIssue');if(next)next.onclick=async()=>{storeAttempt('');state.saleIssueKey=newAttemptId();state.saleIssued=false;state.saleIssueInFlight=false;await pageSale();};
+  }
+  function handleIssuancePayload(payload={}){
+    const issuance=payload.issuance||{};
+    if(payload.ok||issuance.resolved)return showResolved(payload);
+    if(payload.issuanceLocked||payload.ambiguous||LOCKED.has(issuance.state))return showLocked(issuance);
+    if(issuance.state==='confirmed_put_failure'){
+      storeAttempt('');state.saleIssueKey=newAttemptId();storeAttempt(state.saleIssueKey);setIssueLocked(false);const out=qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(payload.error||issuance.message||'عدم ثبت فاکتور به‌صورت قطعی تأیید شد.')}</div>`;return;
+    }
+    setIssueLocked(false);const out=qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(payload.error||'خطای ثبت فاکتور')}</div>`;
+  }
+  async function refreshIssuanceStatus(attemptId=readStoredAttempt(),showMissing=false){
+    if(!attemptId)return;
+    try{const {response,payload}=await requestJson(`/api/sales/issuance/${encodeURIComponent(attemptId)}`);if(response.status===404){if(showMissing){const out=qs('#saleResolutionActionOut')||qs('#saleOut');if(out)out.innerHTML='<div class="warn">درخواست در سرور پیدا نشد؛ پیش از صدور مجدد با حسابداری بررسی کنید.</div>';}return;}if(payload.issuance?.resolved)return showResolved({ok:true,...payload,invoiceNumber:payload.issuance.invoiceNumber,invoiceGuid:payload.issuance.invoiceGuid,printUrl:payload.issuance.printUrl});if(LOCKED.has(payload.issuance?.state))showLocked(payload.issuance);else if(payload.issuance?.state==='confirmed_put_failure')handleIssuancePayload(payload);}catch(error){if(showMissing){const out=qs('#saleResolutionActionOut')||qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}}
+  }
+  function selectedExtras(){const rows=[];document.querySelectorAll('#saleExtrasRows .sale-extra-row').forEach(row=>{const select=row.querySelector('.sale-extra-account'),accountNumber=select?.value||'',amount=parseMoney(row.querySelector('.sale-extra-amount')?.value||0),option=select?.selectedOptions?.[0];if(accountNumber&&amount>0)rows.push({accountNumber,accountName:option?.dataset.name||option?.textContent||'',accountGuid:option?.dataset.guid||'',type:option?.dataset.type||'extra',amount});});return rows;}
+  function enforceOneCostEditor(){const nodes=[...document.querySelectorAll('#saleRefExtrasBox')];nodes.slice(1).forEach(node=>node.remove());const active=nodes[0]||null;if(active)active.dataset.componentIdentity='sale-invoice-cost-editor';window.__invoiceCostEditorDiagnostics={activeEditorCount:active?1:0,duplicateNodesRemoved:(window.__invoiceCostEditorDiagnostics?.duplicateNodesRemoved||0)+Math.max(0,nodes.length-1),listenerSets:active?1:0,currentRoute:location.hash.slice(1)};}
+  function installCostEditorGuard(){
+    enforceOneCostEditor();const root=qs('#content');if(!root)return;
+    const observer=new MutationObserver(enforceOneCostEditor);observer.observe(root,{childList:true,subtree:true});
+    if(typeof uiPageLifecycle!=='undefined'&&uiPageLifecycle?.add)uiPageLifecycle.add(()=>observer.disconnect());
+  }
+  async function safeIssueSale(){
+    const button=qs('#issueBtn');if(state.saleIssueInFlight||button?.disabled)return;
+    try{
+      if(!state.saleLines?.length&&state.selectedItem&&state.selectedStock&&typeof addSaleLine==='function')addSaleLine();
+      if(!state.saleLines?.length)throw new Error('هیچ ردیف کالایی در فاکتور نیست');
+      if(!state.selectedMapping?.cashboxAccountNumber||!state.selectedMapping?.employeeAccountNumber)throw new Error('اتصال صندوق و نماینده فروش کامل نیست');
+      const gross=state.saleLines.reduce((sum,line)=>sum+Number(line.quantity||0)*Number(line.price||0),0),discountAmount=Math.max(0,parseMoney(qs('#saleDiscount')?.value||0));
+      if(discountAmount>gross)throw new Error('تخفیف نمی‌تواند بیشتر از جمع ردیف‌ها باشد');
+      const attemptId=ensureAttemptId(),invoiceExtras=selectedExtras();setIssueLocked(true);
+      const out=qs('#saleOut');if(out)out.innerHTML='<div class="info">درخواست صدور ثبت شد. دکمه تا تعیین وضعیت نهایی قفل می‌ماند.</div>';
+      const payload={issuanceAttemptId:attemptId,saleIssueKey:attemptId,customerName:qs('#buyerName')?.value||'',mobile:qs('#buyerMobile')?.value||'',nationalCode:qs('#buyerNational')?.value||'',leadId:qs('#leadId')?.value||'',mappingUsername:state.selectedMapping.username,sessionUsername:state.user?.username||'',username:state.user?.fullName||state.selectedMapping.fullName||'CRM',items:state.saleLines,discountAmount,generalRef:qs('#saleGeneralRef')?.value||'',invoiceExtras};
+      try{const {payload:result}=await requestJson('/admin/accounting/putInvoice',{method:'POST',body:JSON.stringify(payload)});handleIssuancePayload(result);}
+      catch(error){showLocked({issuanceAttemptId:attemptId,state:'put_response_ambiguous',message:'ارتباط با CRM قطع شد و نتیجه ارسال مشخص نیست. از صدور مجدد خودداری کنید و وضعیت را بررسی کنید.'});}
+    }catch(error){setIssueLocked(false);const out=qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}
+  }
+  window.issueSale=issueSale=safeIssueSale;
+  const inheritedPageSale=window.pageSale||(typeof pageSale==='function'?pageSale:null);
+  if(inheritedPageSale)window.pageSale=pageSale=async function(){
+      const result=await inheritedPageSale.apply(this,arguments);
+      const attemptId=ensureAttemptId();installCostEditorGuard();
+      const button=qs('#issueBtn');if(button)button.onclick=safeIssueSale;
+      setTimeout(()=>{enforceOneCostEditor();const active=qs('#issueBtn');if(active)active.onclick=safeIssueSale;refreshIssuanceStatus(attemptId);},260);
+      return result;
+    };
+  window.__saleIssuanceHotfix={refreshStatus:refreshIssuanceStatus,enforceOneCostEditor,getAttemptId:ensureAttemptId,lockedStates:[...LOCKED]};
 })();

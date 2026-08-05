@@ -24,6 +24,7 @@ const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
 const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
+const saleIssuance=require('./lib/sale-invoice-issuance');
 const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
 const { emitSearchEvent } = require('./lib/search-observability');
 const { APP_NAME, APP_VERSION, versionPayload, injectAssetVersion } = require('./lib/app-version');
@@ -2020,8 +2021,72 @@ function invoicePrintUrl(invoiceNumber) {
   const n = Number(invoiceNumber || 0);
   return n > 0 ? `/print/invoice/${encodeURIComponent(String(n))}` : '';
 }
-async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, mapping = {}, invoiceType = 2, crmId = '' } = {}) {
-  return resolvePostPutInvoice({issueResponse,body,mapping,invoiceType,crmId,shaygan,formatDate8:shaygan.formatDate8,maxPages:Number(process.env.INVOICE_RESOLVE_MAX_PAGES||40),issuedAt:Date.now()});
+async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, mapping = {}, invoiceType = 2, crmId = '', issuedAt=Date.now() } = {}) {
+  return resolvePostPutInvoice({issueResponse,body,mapping,invoiceType,crmId,shaygan,formatDate8:shaygan.formatDate8,maxPages:Number(process.env.INVOICE_RESOLVE_MAX_PAGES||40),issuedAt});
+}
+
+function issuedResponseIdentifiers(response={}){
+  const meta=extractIssuedInvoiceMeta(response);
+  return{
+    invoiceNumber:Number(meta.invoiceNumber||0),
+    invoiceGuid:String(meta.invoiceGuid||''),
+    resultIdentifiers:(Array.isArray(response.result)?response.result:[]).slice(0,5).map(row=>({
+      Number:Number(row?.Number||row?.InvNo||row?.InvoiceNumber||0),
+      GuId:String(row?.GuId||row?.Guid||row?.InvoiceGuId||'')
+    }))
+  };
+}
+
+function lockedIssuancePayload(attempt,extra={}){
+  const status=saleIssuance.publicAttempt(attempt);
+  return{
+    ok:false,code:'INVOICE_ISSUANCE_LOCKED',ambiguous:true,issuanceLocked:true,
+    error:status.message,issuance:status,saleIssueKey:status.saleIssueKey,
+    actions:{retryResolution:true,viewStatus:true,referAccounting:true},
+    ...extra
+  };
+}
+
+async function finalizeResolvedSaleIssue({db,attemptId,body,result,invoiceNumber,invoiceGuid,mapping,leadManual,user,resolution}){
+  const printUrl=invoicePrintUrl(invoiceNumber);
+  let attempt=await saleIssuance.markResolved(db,attemptId,{...resolution,result,invoiceNumber,invoiceGuid,printUrl},user);
+  const mappingView={username:mapping.username,fullName:mapping.fullName,storeName:mapping.storeName||'',cashboxAccountNumber:mapping.cashboxAccountNumber,employeeAccountNumber:mapping.employeeAccountNumber};
+  await db.collection('invoiceReservations').updateOne({invType:2,invoiceNumber:Number(invoiceNumber)},{$set:{status:'used',shayganGuid:invoiceGuid||'',usedAt:new Date(),mappingUsername:mapping.username}}).catch(()=>{});
+  await db.collection(saleIssuance.ATTEMPTS).updateOne({_id:attemptId,issuanceState:saleIssuance.STATES.RESOLVED},{$set:{mapping:mappingView,result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),printUrl,leadManual:{...leadManual,shayganInvoiceNo:String(invoiceNumber||''),shayganGuid:String(invoiceGuid||'')},postProcessingStatus:'queued',updatedAt:new Date()}});
+  attempt={...attempt,mapping:mappingView,result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),printUrl,leadManual:{...leadManual,shayganInvoiceNo:String(invoiceNumber||''),shayganGuid:String(invoiceGuid||'')},postProcessingStatus:'queued'};
+  setImmediate(()=>runSaleIssuePostProcessing({db,body:{...body},result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),saleIssueKey:attemptId,leadManual, mappingView,user:user||{}}).catch(error=>console.error('sale issue post-processing warning:',error.message)));
+  return attempt;
+}
+
+async function retrySaleIssueResolution({db,attemptId,user}){
+  const started=await saleIssuance.startResolutionRetry(db,attemptId,user);
+  if(started.alreadyResolved)return{ok:true,duplicate:true,attempt:started.attempt,resolution:started.attempt.lastResolution||null};
+  const attempt=started.attempt,body={...(attempt.requestSnapshot||{}),crmId:attemptId,invoiceNumber:0},mapping=attempt.mapping||{};
+  const envelope=attempt.resolveEnvelope||{ok:true,status:attempt.putHttpStatus||0,result:attempt.putResponseIdentifiers?.resultIdentifiers||[]};
+  let resolution;
+  try{
+    resolution=await resolveIssuedInvoiceAfterPut({
+      issueResponse:envelope,
+      body,
+      mapping,
+      invoiceType:2,
+      crmId:attemptId,
+      issuedAt:new Date(attempt.putStartedAt||attempt.putSentAt||attempt.requestTimestamp||Date.now()).getTime()
+    });
+  }catch(error){
+    resolution={ok:false,code:'POST_PUT_RESOLVE_FAILED',error:String(error.message||error),failureStage:'resolution-read-error',attempts:[]};
+  }
+  if(!resolution.ok){
+    const manual=await saleIssuance.markManualReconciliation(db,attemptId,resolution,user);
+    await saleIssuance.technicalAudit(db,{attemptId,stage:'retry-resolution',state:manual.issuanceState,response:{status:attempt.putHttpStatus,error:resolution.error},resolution,user});
+    return{ok:false,attempt:manual,resolution};
+  }
+  const result={...(resolution.result||{}),Number:Number(resolution.invoiceNumber)};
+  if(resolution.invoiceGuid&&!result.GuId)result.GuId=resolution.invoiceGuid;
+  const leadManual=attempt.leadManual||manualLeadMeta(body,mapping,user||{});
+  const resolved=await finalizeResolvedSaleIssue({db,attemptId,body,result,invoiceNumber:resolution.invoiceNumber,invoiceGuid:resolution.invoiceGuid,mapping,leadManual,user,resolution});
+  await saleIssuance.technicalAudit(db,{attemptId,stage:'retry-resolution',state:saleIssuance.STATES.RESOLVED,response:{status:attempt.putHttpStatus,identifiers:{invoiceNumber:resolution.invoiceNumber,invoiceGuid:resolution.invoiceGuid}},resolution,user});
+  return{ok:true,attempt:resolved,resolution};
 }
 
 async function applyLocalSaleInventoryDeductAfterSuccess({ db, body, invoiceNumber, invoiceGuid, saleIssueKey }) {
@@ -2115,45 +2180,6 @@ async function runSaleIssuePostProcessing({ db, body, result, invoiceNumber, inv
     await db.collection('appLogs').insertOne({ type:'sale_issue_post_processing_error', saleIssueKey, error:String(e.message||e), at:new Date() }).catch(()=>{});
   }
 }
-
-function stableSaleIssueKey(body, mapping) {
-  const explicit = String(body.saleIssueKey || body.issueKey || '').trim();
-  if (explicit) return `sale:${explicit}`;
-  const items = Array.isArray(body.items) ? body.items.map(x => ({
-    itemNumber: String(x.itemNumber || x.itemCode || '').trim(),
-    stNumber: String(x.stockNumber || x.STNumber || x.stNumber || '').trim(),
-    quantity: Number(x.quantity || x.Quan || 0),
-    price: Number(x.price || x.Price || 0),
-    serials: x.serials || x.Serials || []
-  })) : [];
-  const core = {
-    mappingUsername: mapping?.username || body.mappingUsername || '',
-    invoiceNumber: Number(body.invoiceNumber || 0) || null,
-    customerName: String(body.customerName || '').trim(),
-    mobile: String(body.mobile || '').trim(),
-    nationalCode: String(body.nationalCode || '').trim(),
-    discountAmount: Number(body.discountAmount || body.DiscAmount || 0),
-    items
-  };
-  return 'sale:auto:' + crypto.createHash('sha256').update(JSON.stringify(core)).digest('hex').slice(0, 32);
-}
-
-async function beginSaleIssueLock(db, issueKey, body, mapping) {
-  const now = new Date();
-  const staleBefore = new Date(Date.now() - 3 * 60 * 1000);
-  const existing = await db.collection('saleIssueLocks').findOne({ _id: issueKey });
-  if (existing) {
-    if (existing.status === 'issued') return { ok:false, duplicate:true, issued:true, existing };
-    if (existing.status === 'issuing' && existing.startedAt && new Date(existing.startedAt) > staleBefore) return { ok:false, inProgress:true, existing };
-  }
-  await db.collection('saleIssueLocks').updateOne(
-    { _id: issueKey },
-    { $set:{ status:'issuing', startedAt:now, updatedAt:now, invoiceNumber:Number(body.invoiceNumber || 0) || null, mappingUsername:mapping.username, requestPreview:{ customerName:body.customerName||'', mobile:body.mobile||'', itemsCount:Array.isArray(body.items)?body.items.length:0, discountAmount:Number(body.discountAmount||0) } }, $setOnInsert:{ createdAt:now } },
-    { upsert:true }
-  );
-  return { ok:true };
-}
-
 
 async function upsertCustomerForSale(body = {}, meta = {}) {
   const db = await connectMongo();
@@ -5623,6 +5649,38 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok:true, purchaseInvoiceNo:no, inserted:results.filter(x=>x.inserted).length, skipped:results.filter(x=>!x.inserted).length, results, inventoryRefresh });
     }
 
+    const saleIssuanceStatusMatch=pathname.match(/^\/api\/sales\/issuance\/([^/]+)$/);
+    if(saleIssuanceStatusMatch&&req.method==='GET'){
+      if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
+      const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceStatusMatch[1]);
+      const attempt=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:attemptId});
+      if(!attempt)return sendJson(res,404,{ok:false,code:'ISSUANCE_ATTEMPT_NOT_FOUND',error:'درخواست صدور پیدا نشد.'});
+      const user=currentUser(req)||{};
+      if(['seller','seller_buyer'].includes(user.role)&&String(attempt.mappingUsername)!==String(user.username))return deny(res,'این درخواست صدور متعلق به کاربر دیگری است.');
+      return sendJson(res,200,{ok:true,issuance:saleIssuance.publicAttempt(attempt)});
+    }
+    const saleIssuanceRetryMatch=pathname.match(/^\/api\/sales\/issuance\/([^/]+)\/retry-resolution$/);
+    if(saleIssuanceRetryMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
+      const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceRetryMatch[1]),user=currentUser(req)||{};
+      const existing=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:attemptId});
+      if(!existing)return sendJson(res,404,{ok:false,code:'ISSUANCE_ATTEMPT_NOT_FOUND',error:'درخواست صدور پیدا نشد.'});
+      if(['seller','seller_buyer'].includes(user.role)&&String(existing.mappingUsername)!==String(user.username))return deny(res,'این درخواست صدور متعلق به کاربر دیگری است.');
+      try{
+        const retried=await retrySaleIssueResolution({db,attemptId,user});
+        if(retried.ok){const attempt=retried.attempt;return sendJson(res,200,{ok:true,duplicate:Boolean(retried.duplicate),result:attempt.result||{},invoiceNumber:Number(attempt.invoiceNumber||0),invoiceGuid:attempt.invoiceGuid||'',printUrl:attempt.printUrl||invoicePrintUrl(attempt.invoiceNumber),mapping:attempt.mapping||{},issuance:saleIssuance.publicAttempt(attempt),postProcessing:attempt.postProcessingStatus||'queued'});}
+        return sendJson(res,202,lockedIssuancePayload(retried.attempt,{resolve:{code:retried.resolution?.code||'POST_PUT_RESOLVE_FAILED',failureStage:retried.resolution?.failureStage||'',candidateCount:Number(retried.resolution?.candidateCount||0)}}));
+      }catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'ISSUANCE_RESOLUTION_RETRY_FAILED',error:String(error.message||error),issuance:error.current||saleIssuance.publicAttempt(existing)});}
+    }
+    const saleIssuanceReconcileMatch=pathname.match(/^\/api\/sales\/issuance\/([^/]+)\/manual-reconciliation$/);
+    if(saleIssuanceReconcileMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['accounting']))return;
+      const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceReconcileMatch[1]),user=currentUser(req)||{},body=await collectBody(req);
+      if(String(body.action||'')!=='confirm_no_invoice')return sendJson(res,400,{ok:false,code:'ISSUANCE_RECONCILIATION_ACTION_INVALID',error:'فقط تأیید صریح عدم وجود فاکتور مجاز است.'});
+      try{const attempt=await saleIssuance.confirmNoInvoice(db,attemptId,body,user);return sendJson(res,200,{ok:true,issuance:saleIssuance.publicAttempt(attempt),invoiceWriteCount:0,shayganWriteCount:0});}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ISSUANCE_RECONCILIATION_FAILED',error:String(error.message||error)});}
+    }
+
     if ((pathname === '/api/sales/issue' || pathname === '/admin/accounting/putInvoice') && req.method === 'POST') {
       if (!canUseSalesFlow(req, res)) return;
       const body = await collectBody(req); const db = await connectMongo();
@@ -5639,19 +5697,18 @@ async function handleApi(req, res, pathname, query) {
       body.invoiceWithoutLead = leadManual.invoiceWithoutLead;
       body.leadPenaltyEligible = leadManual.leadPenaltyEligible;
       body.leadEntryMode = 'manual';
-      const saleIssueKey = stableSaleIssueKey(body, mapping);
-      const lock = await beginSaleIssueLock(db, saleIssueKey, body, mapping);
-      await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ leadManual } }).catch(()=>{});
-      if (!lock.ok) {
-        if (lock.issued) {
-          {
-            const dupNo = Number(lock.existing.invoiceNumber || lock.existing.result?.Number || 0);
-            return sendJson(res, 200, { ok:true, duplicate:true, message:'این فاکتور قبلاً ثبت شده و برای جلوگیری از ثبت تکراری دوباره ارسال نشد.', result:lock.existing.result||{}, invoiceNumber:dupNo, invoiceGuid:lock.existing.invoiceGuid||lock.existing.result?.GuId||'', printUrl:lock.existing.printUrl || invoicePrintUrl(dupNo), mapping:lock.existing.mapping||{}, saleIssueKey });
-          }
+      const release=versionPayload();
+      const prepared=await saleIssuance.beginAttempt(db,{attemptId:body.issuanceAttemptId||body.saleIssueKey,body,mapping,user,applicationVersion:APP_VERSION,gitSha:release.gitSha||''});
+      const saleIssueKey=prepared.attempt._id;
+      body.issuanceAttemptId=saleIssueKey;
+      await db.collection(saleIssuance.ATTEMPTS).updateOne({_id:saleIssueKey},{$set:{leadManual}}).catch(()=>{});
+      if(!prepared.mayPut){
+        const publicState=saleIssuance.publicAttempt(prepared.attempt);
+        if(publicState.resolved){
+          const duplicateResult=prepared.attempt.result||{};
+          return sendJson(res,200,{ok:true,duplicate:true,message:'این فاکتور قبلاً ثبت شده و برای جلوگیری از ثبت تکراری دوباره ارسال نشد.',result:duplicateResult,invoiceNumber:publicState.invoiceNumber,invoiceGuid:publicState.invoiceGuid,printUrl:publicState.printUrl,mapping:prepared.attempt.mapping||{},saleIssueKey,issuance:publicState});
         }
-        if (lock.inProgress) {
-          return sendJson(res, 409, { ok:false, inProgress:true, error:'صدور این فاکتور در حال انجام است؛ چند لحظه صبر کن و دوباره دکمه را نزن.', saleIssueKey });
-        }
+        return sendJson(res,202,lockedIssuancePayload(prepared.attempt,{fingerprintMatch:Boolean(prepared.fingerprintMatch)}));
       }
       try {
         // 0.9.19.24: fast issue path on 0.9.19.23 base.
@@ -5659,16 +5716,16 @@ async function handleApi(req, res, pathname, query) {
         // Shaygan assigns the real number with InvNo=0; we resolve it from GuId before print.
         const inventoryValidation = await validateSaleInventoryLines(db, body.items || [], 'before-sale-issue').catch(e => ({ ok:false, errors:[{ error:String(e.message||e) }] }));
         if (!inventoryValidation.ok) {
-          await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:'خطای کنترل موجودی قبل از صدور فاکتور', inventoryValidation, leadManual } }).catch(()=>{});
-          return sendJson(res, 409, { ok:false, error:'کنترل موجودی قبل از صدور فاکتور ناموفق بود؛ انبار/تعداد ردیف‌ها را دوباره بررسی کنید.', inventoryValidation, saleIssueKey });
+          const failed=await saleIssuance.markConfirmedFailure(db,saleIssueKey,{error:'خطای کنترل موجودی قبل از صدور فاکتور'},user);
+          await db.collection(saleIssuance.ATTEMPTS).updateOne({_id:saleIssueKey},{$set:{inventoryValidation,leadManual}}).catch(()=>{});
+          return sendJson(res,409,{ok:false,code:'INVOICE_PRE_PUT_VALIDATION_FAILED',error:'کنترل موجودی قبل از صدور فاکتور ناموفق بود؛ انبار/تعداد ردیف‌ها را دوباره بررسی کنید.',inventoryValidation,saleIssueKey,issuance:saleIssuance.publicAttempt(failed)});
         }
         body.inventoryValidation = inventoryValidation.checked;
         const issueStartedAt = Date.now();
-        const originalRequestedInvoiceNumber = Number(body.invoiceNumber || 0) || null;
         body.crmId = body.crmId || saleIssueKey;
         body.invoiceNumber = 0;
-        const finalIssueAttempts = [{ attemptNo:1, finalInvoiceNumber:0, source:'shaygan-auto-number-put' }];
         const timing = { startAt:new Date() };
+        await saleIssuance.markPutInProgress(db,saleIssueKey,user,new Date(issueStartedAt));
         const putStarted = Date.now();
         const r = await shaygan.putSaleInvoice({
           ...body,
@@ -5678,31 +5735,44 @@ async function handleApi(req, res, pathname, query) {
         });
         timing.putMs = Date.now() - putStarted;
         const issuedMeta = extractIssuedInvoiceMeta(r);
-        let resolvedIssued = null;
-        if (r.ok) {
-          const resolveStarted = Date.now();
-          resolvedIssued = await resolveIssuedInvoiceAfterPut({ issueResponse:r, body, mapping, invoiceType:2, crmId:body.crmId || saleIssueKey });
-          timing.resolveMs = Date.now() - resolveStarted;
-          finalIssueAttempts.push({ attemptNo:2, source:'resolve-after-put', method:resolvedIssued.method, invoiceNumber:resolvedIssued.invoiceNumber||0, invoiceGuid:resolvedIssued.invoiceGuid||'', matchScore:resolvedIssued.matchScore||0, matchReasons:resolvedIssued.matchReasons||[], attempts:resolvedIssued.attempts||[] });
+        const identifiers=issuedResponseIdentifiers(r);
+        if(!r.ok){
+          await saleIssuance.technicalAudit(db,{attemptId:saleIssueKey,stage:'invoice-put',state:r.status>=400&&r.status<500&&r.raw?saleIssuance.STATES.CONFIRMED_PUT_FAILURE:saleIssuance.STATES.PUT_RESPONSE_AMBIGUOUS,response:{status:r.status,raw:r.raw,error:r.error,identifiers},user});
+          if(r.status>=400&&r.status<500&&r.raw){
+            const failed=await saleIssuance.markConfirmedFailure(db,saleIssueKey,{error:r.error||'Shaygan rejected Invoice/Put',httpStatus:r.status},user);
+            return sendJson(res,400,{ok:false,code:'CONFIRMED_PUT_FAILURE',error:r.error||'شایگان ثبت فاکتور را به‌صورت قطعی رد کرد.',saleIssueKey,issuance:saleIssuance.publicAttempt(failed)});
+          }
+          const ambiguous=await saleIssuance.markAmbiguous(db,saleIssueKey,{error:r.error||'Invoice/Put response ambiguous',httpStatus:r.status},user);
+          return sendJson(res,202,lockedIssuancePayload(ambiguous));
         }
-        const finalInvoiceNumber = Number(resolvedIssued?.invoiceNumber || issuedMeta.invoiceNumber || 0);
-        const result = (resolvedIssued?.result && Object.keys(resolvedIssued.result).length ? resolvedIssued.result : (issuedMeta.result || {}));
-        if (finalInvoiceNumber > 0) result.Number = finalInvoiceNumber;
-        if ((resolvedIssued?.invoiceGuid || issuedMeta.invoiceGuid) && !result.GuId) result.GuId = resolvedIssued?.invoiceGuid || issuedMeta.invoiceGuid;
-        const finalInvoiceGuid = String(resolvedIssued?.invoiceGuid || issuedMeta.invoiceGuid || result.GuId || '');
-        timing.totalBeforeResponseMs = Date.now() - issueStartedAt;
-        await db.collection('invoiceAuditLogs').insertOne({ type: 'sale_issue', saleIssueKey, mappingUsername: mapping.username, storeName: mapping.storeName || '', cashboxAccountNumber: mapping.cashboxAccountNumber, employeeAccountNumber: mapping.employeeAccountNumber, leadManual, invoiceNumber: finalInvoiceNumber || 0, invoiceGuid: finalInvoiceGuid, printUrl: invoicePrintUrl(finalInvoiceNumber), request: { ...body, originalRequestedInvoiceNumber, finalIssueAttempts, rawBody: undefined }, response: r.raw, resolve: resolvedIssued || null, ok: Boolean(r.ok && finalInvoiceNumber > 0), timing, at: new Date() });
-        if (r.ok && finalInvoiceNumber > 0) {
-          await db.collection('invoiceReservations').updateOne({ invType: 2, invoiceNumber: finalInvoiceNumber }, { $set: { status: 'used', shayganGuid: finalInvoiceGuid || '', usedAt: new Date(), mappingUsername: mapping.username } });
-          const mappingView = { username:mapping.username, fullName:mapping.fullName, storeName:mapping.storeName||'', cashboxAccountNumber:mapping.cashboxAccountNumber, employeeAccountNumber:mapping.employeeAccountNumber };
-          await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'issued', issuedAt:new Date(), updatedAt:new Date(), invoiceNumber:finalInvoiceNumber, invoiceGuid:finalInvoiceGuid, printUrl:invoicePrintUrl(finalInvoiceNumber), result, mapping:mappingView, shayganRaw:r.raw, leadManual:{ ...leadManual, shayganInvoiceNo:String(finalInvoiceNumber||''), shayganGuid:String(finalInvoiceGuid || '') }, postProcessingStatus:'queued' } });
-          setImmediate(() => runSaleIssuePostProcessing({ db, body:{ ...body }, result, invoiceNumber:finalInvoiceNumber, invoiceGuid:finalInvoiceGuid, saleIssueKey, leadManual, mappingView, user:currentUser(req)||{} }).catch(e => console.error('sale issue post-processing warning:', e.message)));
-          return sendJson(res, 200, { ok:true, result, invoiceNumber:finalInvoiceNumber, invoiceGuid:finalInvoiceGuid, printUrl:invoicePrintUrl(finalInvoiceNumber), mapping:mappingView, raw:r.raw, error:'', warning: r.warning||'', saleIssueKey, postProcessing:'queued', timing });
+        await saleIssuance.markPutSucceededResolvePending(db,saleIssueKey,{httpStatus:r.status,error:r.error,identifiers,resolveEnvelope:{ok:r.ok,status:r.status,result:r.result||[]}},user);
+        let resolvedIssued=issuedMeta.invoiceNumber>0?{ok:true,invoiceNumber:issuedMeta.invoiceNumber,invoiceGuid:issuedMeta.invoiceGuid,result:issuedMeta.result,method:'put-response',attempts:[]} : null;
+        if(!resolvedIssued){
+          const resolveStarted=Date.now();
+          try{resolvedIssued=await resolveIssuedInvoiceAfterPut({issueResponse:r,body,mapping,invoiceType:2,crmId:body.crmId||saleIssueKey,issuedAt:issueStartedAt});}
+          catch(error){resolvedIssued={ok:false,code:'POST_PUT_RESOLVE_FAILED',error:String(error.message||error),failureStage:'resolution-read-error',attempts:[]};}
+          timing.resolveMs=Date.now()-resolveStarted;
         }
-        await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:r.error||'خطای ثبت فاکتور فروش', shayganRaw:r.raw, leadManual } });
-        return sendJson(res, 400, { ok:false, code:resolvedIssued?.code||'', result, invoiceNumber:finalInvoiceNumber || 0, invoiceGuid:finalInvoiceGuid || issuedMeta.invoiceGuid || '', mapping: { username:mapping.username, fullName:mapping.fullName, storeName:mapping.storeName||'', cashboxAccountNumber:mapping.cashboxAccountNumber, employeeAccountNumber:mapping.employeeAccountNumber }, raw: r.raw, resolve:resolvedIssued || null, timing, error: (r.ok && !finalInvoiceNumber) ? 'POST_PUT_RESOLVE_FAILED' : (r.error || 'خطای ثبت فاکتور فروش'), saleIssueKey });
+        await saleIssuance.technicalAudit(db,{attemptId:saleIssueKey,stage:'invoice-put-and-resolve',state:resolvedIssued.ok?saleIssuance.STATES.RESOLVED:saleIssuance.STATES.MANUAL_RECONCILIATION_REQUIRED,response:{status:r.status,raw:r.raw,error:r.error,identifiers},resolution:resolvedIssued,user});
+        if(!resolvedIssued.ok){
+          const manual=await saleIssuance.markManualReconciliation(db,saleIssueKey,resolvedIssued,user);
+          return sendJson(res,202,lockedIssuancePayload(manual,{resolve:{code:resolvedIssued.code||'POST_PUT_RESOLVE_FAILED',failureStage:resolvedIssued.failureStage||'',candidateCount:Number(resolvedIssued.candidateCount||0)}}));
+        }
+        const finalInvoiceNumber=Number(resolvedIssued.invoiceNumber),finalInvoiceGuid=String(resolvedIssued.invoiceGuid||issuedMeta.invoiceGuid||'');
+        const result={...(resolvedIssued.result||issuedMeta.result||{}),Number:finalInvoiceNumber};if(finalInvoiceGuid&&!result.GuId)result.GuId=finalInvoiceGuid;
+        const resolvedAttempt=await finalizeResolvedSaleIssue({db,attemptId:saleIssueKey,body,result,invoiceNumber:finalInvoiceNumber,invoiceGuid:finalInvoiceGuid,mapping,leadManual,user,resolution:resolvedIssued});
+        timing.totalBeforeResponseMs=Date.now()-issueStartedAt;
+        const mappingView=resolvedAttempt.mapping||{};
+        return sendJson(res,200,{ok:true,result,invoiceNumber:finalInvoiceNumber,invoiceGuid:finalInvoiceGuid,printUrl:invoicePrintUrl(finalInvoiceNumber),mapping:mappingView,error:'',warning:r.warning||'',saleIssueKey,issuance:saleIssuance.publicAttempt(resolvedAttempt),postProcessing:'queued',timing});
       } catch (e) {
-        await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ status:'failed', failedAt:new Date(), updatedAt:new Date(), error:String(e.message||e), leadManual } }).catch(()=>{});
+        const current=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:saleIssueKey}).catch(()=>null);
+        const currentState=current?saleIssuance.legacyState(current):'';
+        if(current&&currentState===saleIssuance.STATES.PUT_IN_PROGRESS){
+          const ambiguous=await saleIssuance.markAmbiguous(db,saleIssueKey,{error:String(e.message||e),httpStatus:0},user).catch(()=>current);
+          await saleIssuance.technicalAudit(db,{attemptId:saleIssueKey,stage:'invoice-put-exception',state:saleIssuance.STATES.PUT_RESPONSE_AMBIGUOUS,response:{status:0,error:String(e.message||e)},user}).catch(()=>{});
+          return sendJson(res,202,lockedIssuancePayload(ambiguous));
+        }
+        if(current&&saleIssuance.RESOLUTION_STATES.includes(currentState))return sendJson(res,202,lockedIssuancePayload(current));
         throw e;
       }
     }
