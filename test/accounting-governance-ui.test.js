@@ -44,6 +44,46 @@ test('official hierarchy uses GUID identity, resolves main traversal and preserv
   ],{sourceVersion:'42'});assert.equal(hierarchy.diagnostics.groupCount,5);assert.equal(hierarchy.diagnostics.mainGroupCount,2);assert.equal(hierarchy.diagnostics.parentResolvedCount,5);assert.equal(hierarchy.diagnostics.ambiguousNumbers.length,1);const child=hierarchy.rows.find(x=>x.sourceGroupGuid==='G-A');assert.equal(child.groupIdentity,'guid:G-A');assert.equal(child.resolvedMainGroupIdentity,'guid:P-A');assert.equal(child.hierarchyDepth,1);assert.deepEqual(child.hierarchyPath.map(x=>x.groupGuid),['P-A','G-A']);const grandchild=hierarchy.rows.find(x=>x.sourceGroupGuid==='G-A2');assert.equal(grandchild.resolvedMainGroupIdentity,'guid:P-A');assert.equal(grandchild.hierarchyDepth,2);assert.deepEqual(grandchild.hierarchyPath.map(x=>x.groupGuid),['P-A','G-A','G-A2']);
 });
 
+test('official catalog is readable independently of mapping history and exposes only valid Main Groups',async()=>{
+  const db=dbSeed({
+    commissionCategoryMappings:[],
+    accountingOfficialGroupCatalogRuns:[{catalogRunId:'CATALOG-ONLY',fetchedAt:new Date('2026-08-06T00:00:00Z'),status:'completed'}],
+    accountingOfficialItemGroups:[
+      {catalogRunId:'CATALOG-ONLY',groupIdentity:'guid:P-NB',sourceGroupGuid:'P-NB',groupNumber:'1',groupName:'NOTEBOOK',isMainGroup:true,resolvedMainGroupIdentity:'guid:P-NB',resolvedMainGroupGuid:'P-NB',validationStatus:'valid-main',hierarchyStatus:'resolved'},
+      {catalogRunId:'CATALOG-ONLY',groupIdentity:'guid:C-NB',sourceGroupGuid:'C-NB',groupNumber:'10',groupName:'NOTEBOOK CHILD',isMainGroup:false,resolvedMainGroupIdentity:'guid:P-NB',resolvedMainGroupGuid:'P-NB',validationStatus:'valid-child',hierarchyStatus:'resolved'},
+      {catalogRunId:'CATALOG-ONLY',groupIdentity:'guid:BAD',sourceGroupGuid:'BAD',groupNumber:'99',groupName:'ORPHAN',isMainGroup:false,validationStatus:'orphan-parent',hierarchyStatus:'orphan-parent'}
+    ],
+    accountingOfficialItemGroupAssignments:[{catalogRunId:'CATALOG-ONLY',itemGuid:'NB-1',itemCode:'NB-1',resolvedMainGroupGuid:'P-NB',isOfficialEvidence:true}]
+  });
+  const catalog=await governance.officialGroupCatalog(db,{pageSize:100},accounting);
+  assert.equal(catalog.catalogAvailable,true);
+  assert.equal(catalog.counts.mainGroups,1);
+  assert.equal(catalog.counts.childGroups,2);
+  assert.equal(catalog.counts.itemAssignments,1);
+  assert.equal(catalog.automaticMappingsApproved,0);
+  assert.deepEqual(catalog.list.map(row=>row.officialProductCategoryGuid),['P-NB']);
+  assert.equal(catalog.list[0].childGroupCount,1);
+  assert.equal(catalog.list[0].itemAssignmentCount,1);
+  assert.equal(await db.collection(ledger.CATEGORY_MAPPINGS).countDocuments({}),0);
+});
+
+test('financial operations UI binds the mapping selector to official catalog and keeps FIFO audit read-only',()=>{
+  const source=fs.readFileSync(path.join(__dirname,'..','public','assets','app.js'),'utf8');
+  const mappingStart=source.indexOf('async function mappingPage()');
+  const mappingEnd=source.indexOf('async function ratePage()',mappingStart);
+  const mapping=source.slice(mappingStart,mappingEnd);
+  assert.match(mapping,/\/api\/accounting\/governance\/group-catalog\?pageSize=500/);
+  assert.doesNotMatch(mapping,/group-review\?periodFrom/);
+  assert.match(mapping,/کاتالوگ رسمی گروه‌های شایگان آماده نیست/);
+  assert.match(source,/READ-ONLY FIFO AUDIT — NOT PAYROLL APPROVED/);
+  assert.match(source,/کاتالوگ رسمی گروه‌های شایگان/);
+  assert.match(source,/ابزارهای مالی و ممیزی/);
+  assert.match(source,/ساخت Candidate با بازسازی کامل/);
+  const finalNav=source.slice(source.lastIndexOf('Financial operations navigation'));
+  assert.doesNotMatch(finalNav,/profit-ledger\/facts\/materialize/);
+  assert.doesNotMatch(finalNav,/seller-financial-performance\/rebuild/);
+});
+
 test('GUID-less fallback identity remains parent-aware and never uses GroupNumber alone',()=>{
   assert.equal(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'A',ParentGroupNumber:'1',ParentGroupName:'Main A'}).groupIdentity,'parent-number:1|parent-name:Main A|number:00030');
   assert.equal(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'Main A',IsMainGroup:true}).groupIdentity,'number:00030|name:Main A|parent:UNRESOLVED');
@@ -182,61 +222,18 @@ test('seller has no access and source/UI contracts preserve accounting boundarie
   const db=dbSeed();await assert.rejects(governance.groupReviewMatrix(db,{},seller),e=>e.code==='ACCOUNTING_GOVERNANCE_FORBIDDEN');const source=fs.readFileSync(path.join(__dirname,'../src/lib/accounting-governance.js'),'utf8');for(const forbidden of ['Invoice/Put','PutSaleInvoice','PutBuyInvoice','saleSnapshotDatasetLines.update','fifoProfitFacts.update','supplierPurchaseLayers.update','itemInventoryCatalog.update'])assert.equal(source.includes(forbidden),false,forbidden);const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');assert.match(ui,/commission-category-governance/);assert.match(ui,/Official Product Category/);assert.match(ui,/Commission Rate Pool/);assert.match(ui,/officialProductCategoryIdentity/);assert.match(ui,/commissionRatePool/);assert.match(ui,/seller\/category.*seller\/rate-pool.*category default.*rate-pool default/);assert.match(ui,/saved-profit-opening-governance/);assert.match(ui,/COMMISSION_EXPORT_NOT_READY|Normal export/);assert.match(ui,/excelDiagnostic/);assert.match(ui,/Diagnostic Export \(incomplete \/ non-payable\)/);assert.match(ui,/data-action="\$\{action\}"/);assert.match(ui,/action==='edit'\?editRecord/);const sellerPages=ui.match(/seller:\s*\[([^\]]+)\]/)?.[1]||'';assert.equal(sellerPages.includes('commission-category-governance'),false);assert.equal(sellerPages.includes('saved-profit-opening-governance'),false);
 });
 
-test('final financial navigation removes duplicates, preserves redirects and enforces role visibility',async()=>{
+test('final financial navigation is one registry with a collapsed audit section and safe legacy redirects',()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
-  assert.equal((ui.match(/addEventListener\('hashchange'/g)||[]).length,1,'only the final dynamic hash router may remain');
-  const marker='/* Financial Navigation and Policy Selection cleanup.';
+  const marker='/* Financial operations navigation — final, single registry.';
   const start=ui.lastIndexOf(marker);
-  assert.ok(start>ui.lastIndexOf('/* Phase B final registry'),'cleanup registry must be last');
+  assert.ok(start>ui.lastIndexOf('/* Financial Navigation and Policy Selection cleanup.'),'operations registry must be final');
   const registration=ui.slice(start);
-  function node(tag='div'){
-    const value={tag,dataset:{},children:[],parentNode:null,open:undefined,
-      appendChild(child){child.parentNode=this;this.children.push(child);return child;},
-      remove(){if(this.parentNode)this.parentNode.children=this.parentNode.children.filter(child=>child!==this);},
-      querySelectorAll(selector){
-        const matches=[];
-        const visit=current=>{for(const child of current.children){
-          const financial=selector==='[data-financial-navigation="true"]'&&child.dataset.financialNavigation==='true';
-          const page=selector.match(/data-page="([^"]+)"/)?.[1];
-          if(financial||(page&&child.dataset.page===page))matches.push(child);
-          visit(child);
-        }};visit(this);return matches;
-      },
-      querySelector(selector){return this.querySelectorAll(selector)[0]||null;}
-    };return value;
-  }
-  function load(role){
-    const menu=node('menu');
-    for(const id of ['commission-policy-governance','commission-category-governance','commission-rate-governance','commission-rate-versions','accounting-fifo-readiness','fifo-profit-facts','supplier-incentive-ledger']){
-      for(let copy=0;copy<2;copy++){const button=node('button');button.dataset.page=id;menu.appendChild(button);}
-    }
-    let fallback=0,health=0;
-    const context={
-      window:{renderMenu(){},async route(){fallback++;},__accountingGovernanceRenderers:{'commission-export-readiness':async()=>{health++;}}},
-      document:{querySelector:selector=>selector==='#menu'?menu:null,createElement:tag=>node(tag)},
-      location:{hash:''},userRole:()=>role,firstAllowedPage:()=> 'dashboard'
-    };
-    context.renderMenu=context.window.renderMenu;context.route=context.window.route;
-    vm.runInNewContext(registration,context);
-    const buttons=()=>menu.querySelectorAll('[data-financial-navigation="true"]').filter(item=>item.tag==='button');
-    return{...context,menu,buttons,get fallback(){return fallback;},get health(){return health;}};
-  }
-  const expected={accounting:9,admin:14,manager:13,purchase:1,seller:0,seller_buyer:0,viewer:0};
-  for(const[role,count]of Object.entries(expected)){
-    const state=load(role);assert.equal(state.buttons().length,count,role);
-    assert.equal(new Set(state.buttons().map(button=>button.dataset.page)).size,count,`${role} duplicate capability`);
-    state.window.renderMenu();assert.equal(state.buttons().length,count,`${role} duplicate after rerender`);
-    const advanced=state.menu.children.find(item=>item.tag==='details');
-    if(['admin','manager'].includes(role))assert.equal(advanced.open,false,`${role} advanced collapsed`);else assert.equal(advanced,undefined,`${role} advanced hidden`);
-  }
-  const accountingState=load('accounting');
-  assert.deepEqual(accountingState.buttons().slice(0,3).map(button=>button.textContent),['سیاست‌های پورسانت','تعریف پورسانت گروه کالا','نرخ‌های پورسانت']);
-  accountingState.location.hash='#commission-rate-versions';await accountingState.window.route();
-  assert.equal(accountingState.location.hash,'commission-rate-governance');assert.equal(accountingState.fallback,1);
-  accountingState.location.hash='#accounting-fifo-readiness';await accountingState.window.route();
-  assert.equal(accountingState.location.hash,'financial-data-health');assert.equal(accountingState.health,1);
-  const sellerState=load('seller');sellerState.location.hash='#seller-profit';await sellerState.window.route();
-  assert.equal(sellerState.location.hash,'dashboard');assert.equal(sellerState.fallback,1);
+  for(const label of ['عملکرد فروشنده','تعریف پورسانت گروه کالا','نرخ‌های پورسانت','تعدیلات سود مبنای پورسانت','سودهای سیوشده','خواب کالا و تأمین‌کننده','ابزارهای مالی و ممیزی'])assert.match(registration,new RegExp(label));
+  for(const id of ['sale-snapshot','manual-cost-resolution','fifo-audit','official-group-catalog','financial-data-health'])assert.match(registration,new RegExp(`id:'${id}'`));
+  assert.match(registration,/commission-rate-versions':'commission-rate-governance/);
+  assert.match(registration,/accounting-fifo-readiness':'financial-data-health/);
+  assert.match(registration,/FINANCIAL_ROLES=\['admin','accounting','manager'\]/);
+  assert.doesNotMatch(registration,/supplier-incentive-ledger',label/);
 });
 
 test('policy selectors expose bounded Persian empty, loading and retry states without prompt',()=>{

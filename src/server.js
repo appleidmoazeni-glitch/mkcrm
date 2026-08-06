@@ -4007,6 +4007,10 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
       try{return sendJson(res,200,await accountingGovernance.refreshOfficialGroupCatalog(db,shaygan,body,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_CATALOG_REFRESH_FAILED');}
     }
+    if(pathname==='/api/accounting/governance/group-catalog'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await accountingGovernance.officialGroupCatalog(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_CATALOG_READ_FAILED');}
+    }
     if(pathname==='/api/accounting/governance/group-review'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
       try{return sendJson(res,200,await accountingGovernance.groupReviewMatrix(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'GROUP_REVIEW_FAILED');}

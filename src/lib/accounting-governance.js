@@ -165,6 +165,20 @@ async function refreshOfficialGroupCatalog(db, shaygan, input={}, requestedBy={}
 }
 
 async function assignmentMaps(db){const latest=await db.collection(GROUP_CATALOG_RUNS).findOne({}, {sort:{fetchedAt:-1}});const query=latest?.catalogRunId?{catalogRunId:latest.catalogRunId}:{active:true};const rows=await db.collection(ITEM_GROUP_ASSIGNMENTS).find(query).toArray();return{run:latest,rows,byGuid:new Map(rows.filter(r=>r.itemGuid).map(r=>[r.itemGuid,r])),byCode:new Map(rows.filter(r=>r.itemCode).map(r=>[r.itemCode,r]))};}
+async function officialGroupCatalog(db, filters={}, requestedBy={}) {
+  requireRole(requestedBy,READ_ROLES); await ensureIndexes(db);
+  const latest=await db.collection(GROUP_CATALOG_RUNS).findOne({}, {sort:{fetchedAt:-1}});
+  const query=latest?.catalogRunId?{catalogRunId:latest.catalogRunId}:{active:true};
+  const groups=await db.collection(GROUP_CATALOG).find(query).toArray();
+  const assignments=await db.collection(ITEM_GROUP_ASSIGNMENTS).find(query).toArray();
+  // Current catalog rows carry explicit main/validation flags.  The second
+  // clause keeps pre-existing, immutable catalog runs readable during the
+  // schema transition without inferring a category from mapping history.
+  const mainGroups=groups.filter(row=>Boolean(row.sourceGroupGuid)&&(row.isMainGroup===true||row.sourceGroupGuid===row.resolvedMainGroupGuid)&&(row.validationStatus==='valid-main'||!row.validationStatus))
+    .sort((a,b)=>String(a.groupName||'').localeCompare(String(b.groupName||''),'fa')||String(a.groupNumber||'').localeCompare(String(b.groupNumber||'')))
+    .map(row=>({officialProductCategoryIdentity:row.resolvedMainGroupIdentity||row.groupIdentity,officialProductCategoryGuid:row.sourceGroupGuid,officialProductCategoryNumber:row.groupNumber,officialProductCategoryName:row.groupName,childGroupCount:groups.filter(x=>x.resolvedMainGroupGuid===row.sourceGroupGuid&&!x.isMainGroup).length,itemAssignmentCount:assignments.filter(x=>x.resolvedMainGroupGuid===row.sourceGroupGuid).length,hierarchyStatus:row.hierarchyStatus,validationStatus:row.validationStatus}));
+  return {ok:true,catalogAvailable:Boolean(latest&&mainGroups.length),latestRun:latest||null,counts:{mainGroups:mainGroups.length,childGroups:groups.filter(row=>!row.isMainGroup).length,itemAssignments:assignments.length,officialItemAssignments:assignments.filter(row=>row.isOfficialEvidence).length,orphans:groups.filter(row=>String(row.hierarchyStatus||'').includes('orphan')).length,ambiguous:groups.filter(row=>String(row.hierarchyStatus||'').includes('ambiguous')).length},...pageRows(mainGroups,filters),readOnlySource:true,automaticMappingsApproved:0};
+}
 function assignmentFor(maps,fact){return maps.byGuid.get(clean(fact.itemGuid))||maps.byCode.get(clean(fact.itemCode))||null;}
 function enrichFact(fact,assignment){return assignment?.isOfficialEvidence?{...fact,groupGuid:assignment.resolvedMainGroupGuid,groupPathIdentity:assignment.resolvedMainGroupIdentity,mainGroupCode:assignment.resolvedMainGroupNumber||'',officialProductCategoryIdentity:assignment.resolvedMainGroupIdentity,officialProductCategoryGuid:assignment.resolvedMainGroupGuid,officialProductCategoryNumber:assignment.resolvedMainGroupNumber||'',officialProductCategoryName:assignment.resolvedMainGroupName||''}:fact;}
 
@@ -245,4 +259,4 @@ async function readiness(db,input={},requestedBy={}) {
 }
 async function authorizeDiagnosticExport(db,input={},requestedBy={}){const current=requireRole(requestedBy,['admin']);const ev=evidence(input);requireEvidence(ev,'DIAGNOSTIC_EXPORT_EVIDENCE_REQUIRED');const override={overrideId:newId('XOVR'),schemaVersion:1,exportMode:'diagnostic',reason:ev.reason,sourceReference:ev.sourceReference,attachmentMetadata:ev.attachmentMetadata,evidenceUnavailableReason:ev.evidenceUnavailableReason,createdBy:current,createdAt:new Date(),audited:true,payable:false};await db.collection(EXPORT_OVERRIDES).insertOne(override);return override;}
 
-module.exports={GROUP_CATALOG,ITEM_GROUP_ASSIGNMENTS,GROUP_CATALOG_RUNS,OPENING_BALANCES,OPENING_LOCKS,EXPORT_OVERRIDES,COLLECTIONS,ensureIndexes,normalizeOfficialGroup,resolveGroupHierarchy,normalizeOfficialItem,resolveItemGroup,refreshOfficialGroupCatalog,groupReviewMatrix,rateReviewMatrix,createOpeningBalance,listOpeningBalances,updateOpeningBalance,transitionOpeningBalance,readiness,authorizeDiagnosticExport,enrichFact,_assignmentMaps:assignmentMaps};
+module.exports={GROUP_CATALOG,ITEM_GROUP_ASSIGNMENTS,GROUP_CATALOG_RUNS,OPENING_BALANCES,OPENING_LOCKS,EXPORT_OVERRIDES,COLLECTIONS,ensureIndexes,normalizeOfficialGroup,resolveGroupHierarchy,normalizeOfficialItem,resolveItemGroup,refreshOfficialGroupCatalog,officialGroupCatalog,groupReviewMatrix,rateReviewMatrix,createOpeningBalance,listOpeningBalances,updateOpeningBalance,transitionOpeningBalance,readiness,authorizeDiagnosticExport,enrichFact,_assignmentMaps:assignmentMaps};
