@@ -5898,6 +5898,7 @@ window.__saleIssuanceHotfix={refreshStatus:refreshIssuanceStatus,enforceOneCostE
   const FINANCIAL_ROLES=['admin','accounting','manager'];
   const MAIN=[
     {id:'seller-profit',label:'عملکرد فروشنده'},
+    {id:'commission-policy-governance',label:'سیاست‌های پورسانت'},
     {id:'commission-category-governance',label:'تعریف پورسانت گروه کالا'},
     {id:'commission-rate-governance',label:'نرخ‌های پورسانت'},
     {id:'profit-adjustment-review',label:'تعدیلات سود مبنای پورسانت'},
