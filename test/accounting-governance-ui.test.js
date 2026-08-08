@@ -131,6 +131,19 @@ test('category mapping workflow keeps evidence optional while enforcing policy, 
   const overlap=await ledger.createCategoryMapping(db,{itemGuid:'I1',commissionRatePool:'COMPONENT',effectiveFrom:'14050415',effectiveTo:'14050501',...evidence},accounting);const pending=await ledger.transitionCategoryMapping(db,overlap.mapping.mappingId,'submit',{revision:1,...evidence},accounting);await assert.rejects(ledger.transitionCategoryMapping(db,overlap.mapping.mappingId,'approve',{revision:pending.mapping.revision,...evidence},manager),e=>e.code==='CATEGORY_MAPPING_OVERLAP');
 });
 
+test('only approved mappings owned by operational policies block category approval overlap',async()=>{
+  const policy={policyVersionId:'POLICY-1',name:'Current',accountingPeriod:'140504',effectiveFrom:'14050401',effectiveTo:'14050431',status:'approved',revision:1};
+  const retired={policyVersionId:'POLICY-RETIRED',name:'Old',accountingPeriod:'140504',effectiveFrom:'14050401',effectiveTo:'14050431',status:'retired',revision:2};
+  const mapping=(mappingId,policyVersionId,status)=>({mappingId,policyVersionId,identityType:'groupPathIdentity',identityValue:'guid:P1',officialProductCategoryGuid:'P1',officialProductCategoryIdentity:'guid:P1',officialProductCategoryName:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431',commissionRatePool:'NOTEBOOK',status,revision:status==='pending'?2:3,createdBy:accounting});
+  const db=dbSeed({commissionPolicyVersions:[policy,retired],commissionCategoryMappings:[mapping('OLD-APPROVED','POLICY-RETIRED','approved'),mapping('CURRENT-PENDING','POLICY-1','pending'),mapping('CANCELLED','POLICY-RETIRED','cancelled'),mapping('REJECTED','POLICY-RETIRED','rejected')]});
+  const approved=await ledger.transitionCategoryMapping(db,'CURRENT-PENDING','approve',{revision:2,...evidence},manager);
+  assert.equal(approved.mapping.status,'approved');
+  assert.equal((await db.collection(ledger.CATEGORY_MAPPINGS).findOne({mappingId:'OLD-APPROVED'})).status,'approved','retired-policy audit record remains immutable');
+  const activeOther={policyVersionId:'POLICY-OTHER',name:'Other active',accountingPeriod:'140505',effectiveFrom:'14050401',effectiveTo:'14050431',status:'approved',revision:1};
+  const blockingDb=dbSeed({commissionPolicyVersions:[policy,activeOther],commissionCategoryMappings:[mapping('OTHER-APPROVED','POLICY-OTHER','approved'),mapping('CURRENT-PENDING','POLICY-1','pending')]});
+  await assert.rejects(ledger.transitionCategoryMapping(blockingDb,'CURRENT-PENDING','approve',{revision:2,...evidence},manager),error=>error.code==='CATEGORY_MAPPING_OVERLAP');
+});
+
 test('category mapping create is unique by approved policy, exact Main Group GUID and effective period',async()=>{
   const db=dbSeed({accountingOfficialItemGroups:[
     {catalogRunId:'TEST-CATALOG',groupIdentity:'guid:P1',sourceGroupGuid:'P1',groupNumber:'1',groupName:'NOTEBOOK',resolvedMainGroupIdentity:'guid:P1',resolvedMainGroupGuid:'P1',resolvedMainGroupNumber:'1',resolvedMainGroupName:'NOTEBOOK'},
