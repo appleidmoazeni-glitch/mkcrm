@@ -261,9 +261,33 @@ test('policy selectors expose bounded Persian empty, loading and retry states wi
   assert.match(phaseB,/cancelled:'لغوشده'/);assert.match(phaseB,/rate_pool:'سبد نرخ'/);assert.match(phaseB,/جزئیات حسابرسی/);assert.match(phaseB,/رکورد تاریخی/);
   assert.match(phaseB,/function recordId\(row,type\)/);assert.match(phaseB,/type==='mapping'\?row\.mappingId/);assert.match(phaseB,/type==='rate'\?row\.rateVersionId/);
   assert.doesNotMatch(phaseB,/row\.policyVersionId\|\|row\.mappingId\|\|row\.rateVersionId/);
-  assert.match(phaseB,/data-row-type="projection"/);assert.match(phaseB,/data-row-type="persisted"/);assert.match(phaseB,/ثبت‌نشده/);assert.match(phaseB,/ایجاد پیش‌نویس/);
+  assert.match(phaseB,/data-row-type="\$\{entry\.current\?'persisted':'projection'\}"/);assert.match(phaseB,/data-workflow-status=/);assert.match(phaseB,/ثبت‌نشده/);assert.match(phaseB,/ایجاد پیش‌نویس/);
   assert.match(phaseB,/CATEGORY_MAPPING_NOT_FOUND/);assert.match(phaseB,/رکورد نگاشت پیدا نشد/);assert.match(phaseB,/data-error-code/);
   assert.match(phaseB,/Candidate محاسباتی هرگز پیش‌نویس تلقی نمی‌شود/);assert.match(phaseB,/data-rate-version-id/);
   assert.match(phaseB,/data-action="reject"/);assert.match(phaseB,/رد کردن/);
   assert.equal(/\bprompt\s*\(/.test(phaseB),false,'primary governance pages must not use prompt');
+});
+
+test('mapping workflow UI separates remaining work from approved and historical records without changing governance contracts',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  const phaseBStart=ui.indexOf('/* Phase B financial-governance page definitions.');
+  const phaseB=ui.slice(phaseBStart,ui.indexOf('window.__phaseBFinancialRenderers=renderers;',phaseBStart));
+  for(const contract of [
+    "let workflowFilter='not_started',workflowSearch=''",
+    'کار باقی‌مانده:',
+    'Group Coverage:',
+    'Tir Sale Value Coverage در این UI بدون scan جدید FIFO محاسبه نمی‌شود.',
+    'id="fgmWorkflowSearch"',
+    'id="fgmWorkflowFilter"',
+    'ثبت‌های تأییدشده',
+    'تاریخچه و ممیزی / رکورد تاریخی',
+    "['rejected','cancelled','historical_frozen']",
+    'مرحله بعد:',
+    "mappings.list=[result.mapping,...(mappings.list||[])]",
+    'syncMappingDependencies()'
+  ])assert.match(phaseB,new RegExp(contract.replace(/[.*+?^${}()|[\]\\]/g,'\\$&')));
+  assert.match(phaseB,/workflowFilter==='rejected'/);
+  assert.match(phaseB,/entry\.status===workflowFilter/);
+  assert.match(phaseB,/officialProductCategoryName} \$\{entry\.group\.officialProductCategoryNumber} \$\{entry\.group\.officialProductCategoryGuid}/);
+  assert.match(phaseB,/\['draft','returned'\]\.includes\(row\.status\)/);
 });
