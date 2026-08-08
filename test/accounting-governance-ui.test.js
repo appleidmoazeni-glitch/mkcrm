@@ -84,6 +84,19 @@ test('financial operations UI binds the mapping selector to official catalog and
   assert.doesNotMatch(finalNav,/seller-financial-performance\/rebuild/);
 });
 
+test('mapping policy selection synchronizes dependencies on first selection, changes, and initial render',()=>{
+  const source=fs.readFileSync(path.join(__dirname,'..','public','assets','app.js'),'utf8');
+  const mappingStart=source.indexOf('async function mappingPage()');
+  const mappingEnd=source.indexOf('async function ratePage()',mappingStart);
+  const mapping=source.slice(mappingStart,mappingEnd);
+  assert.match(mapping,/const syncMappingDependencies=/);
+  assert.match(mapping,/policySelect\.onchange=syncMappingDependencies/);
+  assert.match(mapping,/policySelect\.oninput=syncMappingDependencies/);
+  assert.match(mapping,/syncMappingDependencies\(\);/);
+  assert.match(mapping,/create\.disabled=!selected/);
+  assert.match(mapping,/policyRender\?\.\(\);rerender\(\);/);
+});
+
 test('GUID-less fallback identity remains parent-aware and never uses GroupNumber alone',()=>{
   assert.equal(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'A',ParentGroupNumber:'1',ParentGroupName:'Main A'}).groupIdentity,'parent-number:1|parent-name:Main A|number:00030');
   assert.equal(governance.normalizeOfficialGroup({GroupNumber:'00030',GroupName:'Main A',IsMainGroup:true}).groupIdentity,'number:00030|name:Main A|parent:UNRESOLVED');
