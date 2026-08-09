@@ -3955,13 +3955,18 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting']))return;const db=await connectMongo();
       try{return sendJson(res,201,await profitCommissionLedger.seedTirRateCandidates(db,currentUser(req)));}catch(error){return sendLedgerError(error,'TIR_RATE_SEED_FAILED');}
     }
-    const rateWorkflowMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)(?:\/(submit|approve|reject|return|cancel))?$/);
+    const rateSupersedeMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)\/supersede$/);
+    if(rateSupersedeMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      try{return sendJson(res,201,await profitCommissionLedger.createSupersedingRateVersion(db,decodeURIComponent(rateSupersedeMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_SUPERSESSION_FAILED');}
+    }
+    const rateWorkflowMatch=pathname.match(/^\/api\/accounting\/profit-ledger\/rates\/([^/]+)(?:\/(submit|approve|reject|return|cancel|retire))?$/);
     if(rateWorkflowMatch&&['PUT','PATCH'].includes(req.method)&&!rateWorkflowMatch[2]){
       if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
       try{return sendJson(res,200,await profitCommissionLedger.updateRateVersion(db,decodeURIComponent(rateWorkflowMatch[1]),body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_UPDATE_FAILED');}
     }
     if(rateWorkflowMatch&&req.method==='POST'&&rateWorkflowMatch[2]){
-      if(!requireRole(req,res,['approve','reject','return'].includes(rateWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      if(!requireRole(req,res,['approve','reject','return','retire'].includes(rateWorkflowMatch[2])?['admin','manager']:['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
       try{return sendJson(res,200,await profitCommissionLedger.transitionRateVersion(db,decodeURIComponent(rateWorkflowMatch[1]),rateWorkflowMatch[2],body,currentUser(req)));}catch(error){return sendLedgerError(error,'COMMISSION_RATE_WORKFLOW_FAILED');}
     }
     if(pathname==='/api/accounting/profit-ledger/discounts'&&req.method==='GET'){

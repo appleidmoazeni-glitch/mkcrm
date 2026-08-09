@@ -55,7 +55,7 @@ test('sidecar detects source tampering and new rates require a selectable approv
   const db=new MemoryDb({commissionRateVersions:[{rateVersionId:'OLD',sellerIdentity:'*',commissionCategory:'NOTEBOOK',rate:'0.14',effectiveFrom:'14040101',status:'approved'}]});
   await policy.migrateLegacyBindings(db,{},admin);db.collection('commissionRateVersions').rows[0].rate='0.99';
   await assert.rejects(policy.migrateLegacyBindings(db,{},admin),error=>error.code==='COMMISSION_POLICY_BINDING_HASH_CONFLICT'&&error.migration.conflicts.length===1);
-  await assert.rejects(ledger.createRateVersion(db,{sellerIdentity:'*',commissionRatePool:'NOTEBOOK',rate:'0.2',effectiveFrom:'14050401'},accounting),error=>error.code==='COMMISSION_POLICY_REQUIRED');
+  await assert.rejects(ledger.createRateVersion(db,{sellerIdentity:'*',commissionRatePool:'NOTEBOOK',rate:'0.2',effectiveFrom:'14050401'},accounting),error=>error.code==='RATE_POLICY_NOT_APPROVED');
   const approved=await approvedPolicy(db);const created=await ledger.createRateVersion(db,{policyVersionId:approved.policyVersionId,sellerIdentity:'*',commissionRatePool:'NOTEBOOK',rate:'0.2',effectiveFrom:'14050401',effectiveTo:'14050431'},accounting);
   assert.equal(created.rateVersion.policyVersionId,approved.policyVersionId);assert.equal(created.rateVersion.status,'draft');
 });

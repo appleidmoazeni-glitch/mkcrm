@@ -37,8 +37,8 @@ function seedDb(){
       {mappingId:'MAP-CP',identityType:'itemGuid',identityValue:'GUID-CP',commissionCategory:'COMPONENT',effectiveFrom:'14050101',effectiveTo:'',status:'approved'}
     ],
     commissionRateVersions:[
-      {rateVersionId:'RATE-NB',sellerIdentity:'11701013',commissionCategory:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431',rate:'0.14000000',status:'approved'},
-      {rateVersionId:'RATE-CP',sellerIdentity:'11701013',commissionCategory:'COMPONENT',effectiveFrom:'14050401',effectiveTo:'14050431',rate:'0.20000000',status:'approved'}
+      {rateVersionId:'RATE-NB',policyVersionId:'POLICY-1',sellerIdentity:'11701013',commissionCategory:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431',rate:'0.14000000',status:'approved'},
+      {rateVersionId:'RATE-CP',policyVersionId:'POLICY-1',sellerIdentity:'11701013',commissionCategory:'COMPONENT',effectiveFrom:'14050401',effectiveTo:'14050431',rate:'0.20000000',status:'approved'}
     ],
     commissionPolicyVersions:[{policyVersionId:'POLICY-1',name:'Tir governed policy',accountingPeriod:'140504',effectiveFrom:'14050401',effectiveTo:'14050531',status:'approved',revision:3,createdBy:{username:'policy-owner',role:'accounting'},approvedBy:manager}],
     accountingOfficialGroupCatalogRuns:[{catalogRunId:'RUN-OFFICIAL',fetchedAt:new Date('2026-08-01T00:00:00Z')}],
@@ -94,7 +94,7 @@ test('legacy generic adjustment cannot bypass the dedicated opening-balance work
 });
 
 test('approved rate overlap is rejected and missing/exceptional resolution stays explicit',async()=>{
-  const db=seedDb();const created=await ledger.createRateVersion(db,{policyVersionId:'POLICY-1',sellerIdentity:'11701013',commissionCategory:'NOTEBOOK',effectiveFrom:'14050415',effectiveTo:'14050501',rate:'0.15',sourceReference:'contract',reason:'contract evidence',evidenceMetadata:{document:'contract'}},accountant);const submitted=await ledger.transitionRateVersion(db,created.rateVersion.rateVersionId,'submit',{revision:1,reason:'contract evidence',sourceReference:'contract',evidenceMetadata:{document:'contract'}},accountant);await assert.rejects(ledger.approveRateVersion(db,created.rateVersion.rateVersionId,{revision:submitted.rateVersion.revision,reason:'reviewed',sourceReference:'contract',evidenceMetadata:{document:'contract'}},manager),e=>e.code==='RATE_APPROVED_OVERLAP');const missing=await ledger.resolveRate(db,'OTHER','NOTEBOOK','14050410');assert.equal(missing.status,'missing');const resolved=await ledger.resolveRate(db,'11701013','NOTEBOOK','14050410');assert.equal(resolved.rateVersion.rate,'0.14000000');
+  const db=seedDb();const created=await ledger.createRateVersion(db,{policyVersionId:'POLICY-1',sellerIdentity:'11701013',commissionCategory:'NOTEBOOK',effectiveFrom:'14050415',effectiveTo:'14050501',rate:'0.15',sourceReference:'contract',reason:'contract evidence',evidenceMetadata:{document:'contract'}},accountant);const submitted=await ledger.transitionRateVersion(db,created.rateVersion.rateVersionId,'submit',{revision:1,reason:'contract evidence',sourceReference:'contract',evidenceMetadata:{document:'contract'}},accountant);await assert.rejects(ledger.approveRateVersion(db,created.rateVersion.rateVersionId,{revision:submitted.rateVersion.revision,reason:'reviewed',sourceReference:'contract',evidenceMetadata:{document:'contract'}},manager),e=>e.code==='RATE_OVERLAP');const missing=await ledger.resolveRate(db,'OTHER','NOTEBOOK','14050410');assert.equal(missing.status,'missing');const resolved=await ledger.resolveRate(db,'11701013','NOTEBOOK','14050410');assert.equal(resolved.rateVersion.rate,'0.14000000');
 });
 
 test('missing rates keep draft commission unavailable and total null rather than zero',async()=>{

@@ -81,6 +81,30 @@ function normalizeJalaliRange(input = {}, options = {}) {
   return { dateFrom, dateTo };
 }
 
+function shiftJalaliDate(value, days, options = {}) {
+  const field = options.field || 'date';
+  const amount = Number(days);
+  if (!Number.isInteger(amount)) throw dateError(field, value, 'جابجایی روز باید عدد صحیح باشد');
+  let date = normalizeJalaliDate(value, { field, required: true });
+  let year = Number(date.slice(0, 4));
+  let month = Number(date.slice(4, 6));
+  let day = Number(date.slice(6, 8));
+  const direction = amount < 0 ? -1 : 1;
+  const monthLength = currentMonth => currentMonth <= 6 ? 31 : 30;
+  for (let remaining = Math.abs(amount); remaining > 0; remaining -= 1) {
+    day += direction;
+    if (direction > 0 && day > monthLength(month)) {
+      day = 1; month += 1;
+      if (month > 12) { month = 1; year += 1; }
+    } else if (direction < 0 && day < 1) {
+      month -= 1;
+      if (month < 1) { month = 12; year -= 1; }
+      day = monthLength(month);
+    }
+  }
+  return normalizeJalaliDate(`${String(year).padStart(4, '0')}${String(month).padStart(2, '0')}${String(day).padStart(2, '0')}`, { field, required: true });
+}
+
 function isValidGregorianDate(year, month, day) {
   if (year < 1700 || year > 2299 || month < 1 || month > 12 || day < 1 || day > 31) return false;
   const date = new Date(Date.UTC(year, month - 1, day));
@@ -132,6 +156,7 @@ module.exports = {
   normalizeJalaliDate,
   normalizeJalaliMonth,
   normalizeJalaliRange,
+  shiftJalaliDate,
   canonicalSaleDate,
   gregorianToJalali
 };
