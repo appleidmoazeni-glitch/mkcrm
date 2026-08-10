@@ -21,15 +21,16 @@ function same(a, b) {
 function numberValue(value){if(value&&value.bytes instanceof Uint8Array&&value.bytes.length===16){try{return Number(new Decimal128(value.bytes).toString());}catch{}}return Number(value||0);}
 function matchesValue(value, expected) {
   if (expected instanceof RegExp) return expected.test(String(value ?? ''));
+  if (Array.isArray(value) && (!expected || typeof expected !== 'object' || Array.isArray(expected) || expected instanceof Date)) return value.some(item => same(item, expected));
   if (!expected || typeof expected !== 'object' || Array.isArray(expected) || expected instanceof Date) return same(value, expected);
   if ('$exists' in expected && (value !== undefined) !== Boolean(expected.$exists)) return false;
   if ('$ne' in expected && same(value, expected.$ne)) return false;
   if ('$in' in expected && !expected.$in.some(item => same(value, item))) return false;
   if ('$nin' in expected && expected.$nin.some(item => same(value, item))) return false;
-  if ('$gte' in expected && value < expected.$gte) return false;
-  if ('$lte' in expected && value > expected.$lte) return false;
-  if ('$gt' in expected && value <= expected.$gt) return false;
-  if ('$lt' in expected && value >= expected.$lt) return false;
+  if ('$gte' in expected && numberValue(value) < numberValue(expected.$gte)) return false;
+  if ('$lte' in expected && numberValue(value) > numberValue(expected.$lte)) return false;
+  if ('$gt' in expected && numberValue(value) <= numberValue(expected.$gt)) return false;
+  if ('$lt' in expected && numberValue(value) >= numberValue(expected.$lt)) return false;
   if ('$regex' in expected && !new RegExp(expected.$regex, expected.$options || '').test(String(value ?? ''))) return false;
   return true;
 }

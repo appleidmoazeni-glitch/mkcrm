@@ -99,6 +99,8 @@ test('draft -> pending -> approved preserves immutable audit evidence', async ()
   assert.equal(created.resolution.status,'draft');
   assert.equal(created.resolution.effectiveFrom,'14050101');
   assert.equal(created.resolution.manualCost,800.5);
+  assert.equal(created.resolution.manualCostExact,'800.500000');
+  assert.match(created.resolution.contentHash,/^[a-f0-9]{64}$/);
   assert.equal(created.resolution.currency,'IRR');
   assert.equal(created.resolution.auditLog[0].action,'created-draft');
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
@@ -111,6 +113,18 @@ test('draft -> pending -> approved preserves immutable audit evidence', async ()
   assert.equal(approved.resolution.auditLog[0].details.newValue.manualCost,800.5);
   assert.equal(approved.resolution.auditLog[2].details.oldValue.status,'pending');
   assert.equal(approved.resolution.auditLog[2].details.newValue.status,'approved');
+});
+
+test('approved manual-cost fingerprint is canonical and changes only when approved evidence changes',async()=>{
+  const db=seedDb();const empty=await service.approvedSetFingerprint(db);const created=await service.createDraft(db,{itemCode:'X',manualCost:'951860416.64',effectiveFrom:'14050101',sourceType:'manual',reason:'evidence'},accounting);const draft=await service.approvedSetFingerprint(db);assert.equal(draft.fingerprint,empty.fingerprint);await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});await service.transition(db,created.resolution.resolutionId,'approve',manager,{revision:2});const approved=await service.approvedSetFingerprint(db);assert.notEqual(approved.fingerprint,empty.fingerprint);assert.equal(approved.count,1);
+});
+
+test('impact preview is read-only and bounds affected unresolved FIFO rows before activation',async()=>{
+  const db=seedDb();db.collection('fifoDatasetState').rows.push({scopeKey:'fifo-shadow-v2-precision-evidence',activeDatasetId:'FIFO-A'});db.collection('fifoAllocations').rows.push({datasetId:'FIFO-A',allocationId:'A-U',saleLineId:'SL-3',saleInvoiceType:2,saleInvoiceNo:3,saleDate:'14050112',sourceType:'unknown_cost',itemGuid:'GUID-U',itemCode:'UNKNOWN',quantityExact:'4.000000',allocatedSaleValueExact:'4000.00',allocatedCostAmountExact:null,sellerAccountNumber:'SELLER-1'});const created=await service.createDraft(db,{itemGuid:'GUID-U',itemCode:'UNKNOWN',manualCost:'750.25',effectiveFrom:'14050101',sourceType:'manual',reason:'documented'},accounting);const before=structuredClone(db.collection('fifoAllocations').rows);const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);assert.equal(preview.affected.saleLines,1);assert.equal(preview.projectedResolvedCostExact,'3001.00');assert.equal(preview.fifoProfitDeltaExact,null);assert.equal(preview.historicalDatasetMutated,false);assert.deepEqual(db.collection('fifoAllocations').rows,before);
+});
+
+test('purchase-layer scope requires exact target identity and quantity while item scope stays backward compatible',async()=>{
+  const db=seedDb();db.collection('supplierPurchaseLayers').rows[0].originalQuantity=2;const created=await service.createDraft(db,{resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-1',targetQuantityExact:'1.250000',itemGuid:'GUID-O',itemCode:'OFFICIAL',manualCost:'700.125',effectiveFrom:'14050101',sourceType:'historical_purchase'},accounting);assert.equal(created.resolution.resolutionScope,'purchase_layer');assert.equal(created.resolution.targetQuantityExact,'1.250000');await assert.rejects(service.createDraft(db,{resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-1',targetQuantityExact:'99',itemGuid:'GUID-O',manualCost:1,effectiveFrom:'14050101'},accounting),error=>error.code==='MANUAL_COST_TARGET_QUANTITY_EXCEEDS_LAYER');
 });
 
 test('optimistic revision prevents silent overwrite', async () => {

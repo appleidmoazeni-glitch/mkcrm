@@ -116,7 +116,7 @@ function manualEffective(row, saleDate) {
   return row.status === 'approved' && row.deleted !== true &&
     validDate(row.effectiveFrom) && row.effectiveFrom <= saleDate &&
     (!row.effectiveTo || row.effectiveTo >= saleDate) &&
-    finite(row.manualCost) > 0;
+    finite(row.manualCostExact ?? row.manualCost) > 0;
 }
 function precisionFields(quantity, unitCost) {
   const precise = accountingDecimal.allocation(quantity, unitCost);
@@ -413,6 +413,15 @@ function allocateSources(datasetId, source, filters = {}) {
     confirmedReturnAdjustmentQuantity:0,
     purchaseReturnResolutionIds:[]
   }));
+  for(const manual of source.manuals.filter(row=>row.resolutionScope==='purchase_layer')){
+    const target=source.purchaseLayers.find(row=>purchaseIdentity(row)===clean(manual.purchaseLineIdentity,500)&&clean(row.datasetId,100)===clean(manual.purchaseDatasetId,100));
+    if(!target||target.layerKind!=='purchase'||eligibleOfficial(target))continue;
+    const available=finite(target.netPurchasedQuantity??target.remainingQuantity??target.originalQuantity)||0;
+    const scoped=finite(manual.targetQuantityExact)||0;
+    if(available<=EPSILON||scoped<=EPSILON||!validDate(target.purchaseInvoiceDate))continue;
+    officialRows.push({...target,validationStatus:'manual-cost-approved',netUnitCost:manual.manualCostExact??manual.manualCost,fifoRemainingQuantity:round(Math.min(available,scoped)),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],fifoSourceType:'approved_manual_purchase_layer',manualResolutionId:clean(manual.resolutionId,100)});
+  }
+  officialRows.sort(compareLayers);
   const purchaseReturns = source.purchaseLayers.filter(row => row.layerKind === 'purchase-return');
   const purchaseReturnByIdentity = new Map(purchaseReturns.map(row => [purchaseIdentity(row), row]));
   const officialByIdentity = new Map(officialRows.map(row => [purchaseIdentity(row), row]));
@@ -427,7 +436,7 @@ function allocateSources(datasetId, source, filters = {}) {
     target.purchaseReturnResolutionIds.push(clean(resolution.resolutionId, 100));
   }
   const officialIndex = indexRows(officialRows);
-  const manualIndex = indexRows(source.manuals);
+  const manualIndex = indexRows(source.manuals.filter(row=>!row.resolutionScope||row.resolutionScope==='item'));
   const allocations = [];
   const exceptions = [];
   const consumedByLayer = new Map();
@@ -481,8 +490,8 @@ function allocateSources(datasetId, source, filters = {}) {
         globalSequence:allocationSequenceGlobal,
         schemaVersion:SCHEMA_VERSION,
         algorithmVersion:ALGORITHM_VERSION,
-        sourceType:'official_purchase_layer',
-        sourceConfidence:'official',
+        sourceType:layer.fifoSourceType||'official_purchase_layer',
+        sourceConfidence:layer.fifoSourceType?'manual-approved-purchase-line':'official',
         saleSnapshotId:source.saleActive.snapshotId,
         saleLineId,
         saleInvoiceType:Number(sale.saleInvoiceType),
@@ -510,7 +519,7 @@ function allocateSources(datasetId, source, filters = {}) {
         purchaseRow:Number(layer.sourceRow || 0),
         supplierAccountNumber:clean(layer.supplierAccountNumber, 100),
         supplierName:clean(layer.supplierName, 200),
-        manualResolutionId:'',
+        manualResolutionId:clean(layer.manualResolutionId,100),
         unitCost,
         allocatedCostAmount,
         layerAvailableBefore:available,
@@ -533,7 +542,8 @@ function allocateSources(datasetId, source, filters = {}) {
         allocationSequenceGlobal++;
         const quantity = need;
         need = 0;
-        const unitCost = round(finite(manual.manualCost), VALUE_SCALE);
+        const manualUnitCost = manual.manualCostExact ?? manual.manualCost;
+        const unitCost = round(finite(manualUnitCost), VALUE_SCALE);
         allocations.push({
           datasetId,
           allocationId:`FA-${sha256(`${datasetId}|${saleLineId}|${sequence}|${manual.resolutionId}`).slice(0, 32)}`,
@@ -576,7 +586,7 @@ function allocateSources(datasetId, source, filters = {}) {
           layerAvailableBefore:null,
           layerRemainingQuantity:null,
           unknownReason:'',
-          ...precisionFields(quantity, manual.manualCost),
+          ...precisionFields(quantity, manualUnitCost),
           createdAt:new Date()
         });
       } else {
@@ -805,7 +815,7 @@ function reconcile(result) {
   let negativeRemainingCount = 0;
   let orphanLayerCount = 0;
   const officialByIdentity = new Map(result.officialRows.map(row => [purchaseIdentity(row), row]));
-  for (const row of result.allocations.filter(item => item.sourceType === 'official_purchase_layer')) {
+  for (const row of result.allocations.filter(item => ['official_purchase_layer','approved_manual_purchase_layer'].includes(item.sourceType))) {
     const source = officialByIdentity.get(row.purchaseLineIdentity);
     if (!source) orphanLayerCount++;
     if (Number(row.layerRemainingQuantity) < -EPSILON) negativeRemainingCount++;
@@ -817,7 +827,7 @@ function reconcile(result) {
     }
   }
   const inactiveSourceCount = result.allocations.filter(row =>
-    !['official_purchase_layer', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
+    !['official_purchase_layer', 'approved_manual_purchase_layer', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
   ).length;
   let monetaryReconciliationDifference = 0n;
   let monetaryPrecisionMismatchCount = 0;
@@ -876,6 +886,7 @@ function summarize(result, validation) {
   const returnReversals = { rows:0, quantity:0, saleValue:0, costValue:0 };
   const bySource = {
     official_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
+    approved_manual_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_cost:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     unknown_cost:{ quantity:0, saleValue:0, costValue:null, rows:0, items:new Set() }
   };
@@ -931,15 +942,15 @@ function summarize(result, validation) {
   }
   const confidenceScore = round(
     shaped.official_purchase_layer.quantityPercent +
-    shaped.approved_manual_cost.quantityPercent * 0.6,
+    (shaped.approved_manual_cost.quantityPercent + shaped.approved_manual_purchase_layer.quantityPercent) * 0.6,
     2
   );
   let confidence = 'Unknown';
   if (shaped.unknown_cost.quantity <= EPSILON) {
-    if (shaped.approved_manual_cost.quantity <= EPSILON) confidence = 'Official Complete';
+    if (shaped.approved_manual_cost.quantity + shaped.approved_manual_purchase_layer.quantity <= EPSILON) confidence = 'Official Complete';
     else if (shaped.official_purchase_layer.quantity <= EPSILON) confidence = 'Manual Complete';
     else confidence = 'Mixed';
-  } else if (shaped.official_purchase_layer.quantity > EPSILON || shaped.approved_manual_cost.quantity > EPSILON) {
+  } else if (shaped.official_purchase_layer.quantity > EPSILON || shaped.approved_manual_cost.quantity > EPSILON || shaped.approved_manual_purchase_layer.quantity > EPSILON) {
     confidence = 'Official Partial';
   }
   return {
@@ -950,7 +961,7 @@ function summarize(result, validation) {
     soldQuantityExact:accountingDecimal.format(totalQuantityScaled,accountingDecimal.QUANTITY_SCALE),
     saleValueExact:accountingDecimal.format(totalSaleValueScaled,accountingDecimal.MONEY_SCALE),
     official:shaped.official_purchase_layer,
-    manual:shaped.approved_manual_cost,
+    manual:{...shaped.approved_manual_cost,rows:shaped.approved_manual_cost.rows+shaped.approved_manual_purchase_layer.rows,quantity:round(shaped.approved_manual_cost.quantity+shaped.approved_manual_purchase_layer.quantity),saleValue:round(shaped.approved_manual_cost.saleValue+shaped.approved_manual_purchase_layer.saleValue,VALUE_SCALE),costValue:round(shaped.approved_manual_cost.costValue+shaped.approved_manual_purchase_layer.costValue,VALUE_SCALE),purchaseLayerScoped:shaped.approved_manual_purchase_layer},
     unknown:shaped.unknown_cost,
     confidenceScore,
     confidence,
@@ -1137,7 +1148,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       purchases:result.officialRows.map(row => [purchaseIdentity(row), row.purchaseInvoiceDate, round(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity), round(row.netUnitCost ?? row.grossUnitCost, VALUE_SCALE)]),
       manuals:[...source.manuals]
         .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
-        .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, clean(row.manualCost)]),
+        .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, clean(row.manualCostExact ?? row.manualCost), clean(row.contentHash)]),
       purchaseReturnResolutions:[...source.purchaseReturnResolutions]
         .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
         .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedPurchaseLayer,clean(row.returnQuantity)]),
@@ -1151,12 +1162,15 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
         roundingMode:accountingDecimal.ROUNDING_MODE
       }
     }));
+    const manualResolutionSet = manualCostResolution._approvedRowsFingerprint(source.manuals);
     const allocationFingerprint = sha256(stableStringify(result.allocations.map(immutableProjection)));
     const deterministicPeer = await db.collection(DATASETS).findOne({
       datasetId:{ $ne:datasetId },
       status:'completed',
       algorithmVersion:ALGORITHM_VERSION,
       sourceFingerprint,
+      manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
+      manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint
     });
     const deterministicReplayVerified = Boolean(deterministicPeer);
@@ -1196,6 +1210,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       sourceSaleSnapshotId:pinned.saleSnapshotId,
       sourcePurchaseDatasetId:pinned.purchaseDatasetId,
       sourceFingerprint,
+      manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
+      manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint,
       deterministicReplayVerified,
       deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
@@ -1237,6 +1253,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       allocationCount:persistedAllocationCount,
       exceptionCount:persistedExceptionCount,
       sourceFingerprint,
+      manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
+      manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint,
       deterministicReplayVerified,
       deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
@@ -1257,6 +1275,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       retryCount,
       resumeCount:Number(existing?.resumeCount || 0) + (existing ? 1 : 0),
       sourceFingerprint,
+      manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
+      manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint,
       deterministicReplayVerified,
       deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
@@ -1308,6 +1328,10 @@ async function status(db, datasetId = '') {
     ? await db.collection(DATASETS).findOne({ datasetId:clean(datasetId, 100) })
     : active?.dataset || await db.collection(DATASETS).findOne({}, { sort:{ createdAt:-1 } });
   const state = await db.collection(STATE).findOne({ scopeKey:SCOPE_KEY });
+  const manualResolutionSet = await manualCostResolution.approvedSetFingerprint(db);
+  const staleReasons=[];
+  if (dataset && !dataset.manualResolutionSetFingerprint) staleReasons.push('legacy-dataset-without-manual-resolution-fingerprint');
+  else if (dataset && dataset.manualResolutionSetFingerprint !== manualResolutionSet.fingerprint) staleReasons.push('approved-manual-cost-set-changed');
   return {
     ok:true,
     activeDatasetId:active?.datasetId || '',
@@ -1317,6 +1341,9 @@ async function status(db, datasetId = '') {
       buildLockExpiresAt:state?.buildLockExpiresAt || null
     },
     dataset:dataset ? { ...dataset, isActive:dataset.datasetId === active?.datasetId } : null,
+    stale:staleReasons.length>0,
+    staleReasons,
+    currentManualResolutionSetFingerprint:manualResolutionSet.fingerprint,
     shadowMode:true,
     accountingApproved:false
   };
@@ -1418,7 +1445,7 @@ async function validationReport(db, datasetId = '') {
       topHighestAllocatedValue:topValues(new Map(itemRows.map(row => [sourceKey(row), row])), 'allocatedCostAmount'),
       topUnresolvedItems:topValues(unresolvedByItem, 'unknownQuantity'),
       purchaseReturns:exceptions.filter(row => row.code === 'PURCHASE_RETURN_STATUS'),
-      manualSamples:allocations.filter(row => row.sourceType === 'approved_manual_cost').slice(0, 20),
+      manualSamples:allocations.filter(row => ['approved_manual_cost','approved_manual_purchase_layer'].includes(row.sourceType)).slice(0, 20),
       unknownSamples:allocations.filter(row => row.sourceType === 'unknown_cost').slice(0, 20)
     },
     topExceptions:exceptions.filter(row => row.status === 'unresolved').slice(0, 50),

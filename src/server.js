@@ -19,6 +19,7 @@ const profitCommissionLedger = require('./lib/profit-commission-ledger');
 const commissionPolicyGovernance = require('./lib/commission-policy-governance');
 const accountingGovernance = require('./lib/accounting-governance');
 const sellerFinancialPerformance = require('./lib/seller-financial-performance');
+const fifoReliability = require('./lib/fifo-reliability');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -3685,6 +3686,13 @@ async function handleApi(req, res, pathname, query) {
         return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_INVALID',error:String(error.message||error)});
       }
     }
+    const manualCostPreviewMatch=pathname.match(/^\/api\/manual-cost-resolutions\/([^/]+)\/impact-preview$/);
+    if (manualCostPreviewMatch && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.impactPreview(db,decodeURIComponent(manualCostPreviewMatch[1]),currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_PREVIEW_FAILED',error:String(error.message||error)});}
+    }
     const manualCostMatch=pathname.match(/^\/api\/manual-cost-resolutions\/([^/]+)(?:\/(submit|approve|reject|expire))?$/);
     if (manualCostMatch && req.method === 'GET' && !manualCostMatch[2]) {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
@@ -4466,6 +4474,12 @@ async function handleApi(req, res, pathname, query) {
       const db=await connectMongo();
       try{return sendJson(res,200,await fifoShadowEngine.validationReport(db,query.datasetId||''));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_REPORT_FAILED',error:String(error.message||error)});}
+    }
+    if (pathname === '/api/accounting/fifo-reliability' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoReliability.report(db,{datasetId:query.datasetId||''}));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RELIABILITY_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/accounting/fifo-shadow/allocations' && req.method === 'GET') {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;

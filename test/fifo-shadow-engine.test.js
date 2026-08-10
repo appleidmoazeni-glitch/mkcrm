@@ -145,6 +145,10 @@ test('approved manual follows official priority and unknown cost is explicit, ne
   assert.equal(result.summary.unknown.quantity,4);
 });
 
+test('purchase-line-scoped manual evidence costs only its targeted invalid layer',async()=>{
+  const db=seedDb();db.collection('saleSnapshotDatasetLines').rows.push(sale({saleLineId:'SL-2-5-001-D',saleInvoiceNo:5,saleDate:'14050113',itemGuid:'GUID-D',itemCode:'D',qty:2,saleValue:1000}));db.collection('supplierPurchaseLayers').rows.push(layer({purchaseLineIdentity:'P-D-1',purchaseInvoiceNo:20,purchaseInvoiceDate:'14050102',itemGuid:'GUID-D',itemCode:'D',netPurchasedQuantity:2,netUnitCost:null,validationStatus:'warning'}));db.collection('manualCostResolutions').rows.push({resolutionId:'MC-D-LAYER',revision:3,status:'approved',deleted:false,resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-D-1',targetQuantityExact:'2.000000',itemGuid:'GUID-D',itemCode:'D',manualCostExact:'125.500000',effectiveFrom:'14050101',effectiveTo:''});await engine.buildShadowDataset(db,{},accountant);const rows=db.collection(engine.ALLOCATIONS).rows.filter(row=>row.saleLineId==='SL-2-5-001-D');assert.equal(rows.length,1);assert.equal(rows[0].sourceType,'approved_manual_purchase_layer');assert.equal(rows[0].purchaseLineIdentity,'P-D-1');assert.equal(rows[0].manualResolutionId,'MC-D-LAYER');assert.equal(rows[0].allocatedCostAmountExact,'251.00');
+});
+
 test('partial official exhaustion uses approved manual only after official layers', async () => {
   const db=seedDb();
   db.collection('saleSnapshotDatasetLines').rows.push(sale({
