@@ -39,3 +39,12 @@ test('conservation mismatches and duplicate allocation identities make FIFO unre
   const db=seed();db.collection('fifoAllocations').rows[0].allocatedCostAmountExact='119.99';db.collection('fifoAllocations').rows.push(structuredClone(db.collection('fifoAllocations').rows[0]));
   const report=await reliability.report(db,{});assert.equal(report.reliable,false);assert.ok(report.counts.duplicateAllocationIds>0);assert.equal(report.moneyConservation.pass,false);
 });
+
+test('purchase source freshness compares Gregorian read-model dates as canonical Jalali dates',async()=>{
+  const db=seed();
+  db.collection('supplierPurchaseLayers').rows.push({datasetId:'BUY-R',layerKind:'purchase',purchaseInvoiceNo:1,purchaseInvoiceDate:'14050501'});
+  db.collection('supplierPurchaseInvoices').rows.push({invTyp:3,invNo:1,invDate:'2026-07-26',items:[]});
+  const report=await reliability.report(db,{});
+  assert.equal(report.sourceCompleteness.latestPurchaseDateInDataset,'14050501');
+  assert.equal(report.sourceCompleteness.latestAvailableOfficialPurchaseDate,'14050504');
+});

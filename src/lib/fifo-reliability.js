@@ -8,6 +8,7 @@ const decimal = require('./accounting-decimal');
 const fifo = require('./fifo-shadow-engine');
 const ledger = require('./profit-commission-ledger');
 const manualCost = require('./manual-cost-resolution');
+const { canonicalSaleDate } = require('./jalali-date');
 const crypto = require('crypto');
 
 function clean(value,max=500){return String(value==null?'':value).trim().slice(0,max);}
@@ -15,6 +16,7 @@ function scaled(value,scale){return decimal.parse(value==null||value===''?0:valu
 function exact(value,scale){return decimal.format(value,scale);}
 function percent(value,total){return total===0n?'0.0000':decimal.format(decimal.divideRounded(value*1000000n,total),4);}
 function add(map,key,row){if(!map.has(key))map.set(key,[]);map.get(key).push(row);}
+function canonicalSourceDate(value){try{return canonicalSaleDate(value,{field:'purchaseInvoiceDate'});}catch(_){return '';}}
 function stable(value){if(Array.isArray(value))return `[${value.map(stable).join(',')}]`;if(value&&typeof value==='object')return `{${Object.keys(value).sort().map(key=>`${JSON.stringify(key)}:${stable(value[key])}`).join(',')}}`;return JSON.stringify(value);}
 function manualFingerprint(rows){const identities=rows.filter(row=>row.status==='approved'&&row.deleted!==true).map(row=>[clean(row.resolutionId,100),Number(row.revision||0),clean(row.contentHash,64)||manualCost._contentHash({...row,manualCostExact:row.manualCostExact||manualCost._exactUnitCost(row.manualCost)})]).sort((a,b)=>a[0].localeCompare(b[0],'en'));return {count:identities.length,fingerprint:crypto.createHash('sha256').update(stable(identities)).digest('hex')};}
 function coverage(rows){
@@ -80,7 +82,7 @@ async function report(db,input={}){
   const roots=[...rootMap.values()].map(row=>({...row,products:[...row.products].filter(Boolean),sellers:[...row.sellers].filter(Boolean)})).sort((a,b)=>scaled(b.saleValueExact,2)>scaled(a.saleValueExact,2)?1:-1);
   const layerInvoiceNumbers=new Set(purchaseLayers.filter(row=>row.layerKind==='purchase').map(row=>Number(row.purchaseInvoiceNo||0)).filter(Boolean));
   const officialInvoices=officialPurchaseCache.filter(row=>Number(row.invTyp||row.invoiceType||3)===3);const missingInvoices=officialInvoices.filter(row=>!layerInvoiceNumbers.has(Number(row.invNo||row.invoiceNumber||0)));const missingItems=new Set(missingInvoices.flatMap(row=>(row.items||row.lines||row.body||[]).map(line=>clean(line.itemCode||line.ItemCode,100)).filter(Boolean)));const affectedUnknown=allocations.filter(row=>row.sourceType==='unknown_cost'&&missingItems.has(clean(row.itemCode,100)));
-  const latestLayerDate=purchaseLayers.reduce((latest,row)=>clean(row.purchaseInvoiceDate,8)>latest?clean(row.purchaseInvoiceDate,8):latest,'');const latestOfficialDate=officialInvoices.reduce((latest,row)=>clean(row.invDate||row.invoiceDate,8)>latest?clean(row.invDate||row.invoiceDate,8):latest,'');
+  const latestLayerDate=purchaseLayers.reduce((latest,row)=>canonicalSourceDate(row.purchaseInvoiceDate)>latest?canonicalSourceDate(row.purchaseInvoiceDate):latest,'');const latestOfficialDate=officialInvoices.reduce((latest,row)=>canonicalSourceDate(row.invDate||row.invoiceDate)>latest?canonicalSourceDate(row.invDate||row.invoiceDate):latest,'');
   const sourceCompleteness={purchaseDatasetId:active.dataset.sourcePurchaseDatasetId,latestPurchaseDateInDataset:latestLayerDate,latestAvailableOfficialPurchaseDate:latestOfficialDate,officialSource:'supplierPurchaseInvoices read model',officialSourceIsLiveVerified:false,missingPurchaseInvoices:missingInvoices.length,missingPurchaseLines:missingInvoices.reduce((sum,row)=>sum+(row.items||row.lines||row.body||[]).length,0),affectedUnresolvedSaleLines:new Set(affectedUnknown.map(row=>row.saleLineId)).size,affectedUnresolvedSaleValueExact:exact(affectedUnknown.reduce((sum,row)=>sum+scaled(row.allocatedSaleValueExact??row.allocatedSaleValue,2),0n),2)};
   if(saleState?.activeSnapshotId&&clean(saleState.activeSnapshotId,100)!==clean(active.dataset.sourceSaleSnapshotId,100))staleReasons.push('newer-active-sale-snapshot');
   const c=coverage(facts),reliable=!quantityErrors.length&&!moneyErrors.length&&!duplicateAllocationIds&&!staleReasons.length&&active.dataset.validation?.valid!==false;
