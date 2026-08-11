@@ -4469,6 +4469,12 @@ async function handleApi(req, res, pathname, query) {
       const db=await connectMongo();
       return sendJson(res,200,await fifoShadowEngine.status(db,query.datasetId||''));
     }
+    if (pathname === '/api/accounting/fifo-shadow/candidate-report' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.candidateQualityReport(db,query.datasetId||''));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_CANDIDATE_REPORT_FAILED',error:String(error.message||error)});}
+    }
     if (pathname === '/api/accounting/fifo-shadow/report' && req.method === 'GET') {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();

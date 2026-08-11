@@ -19,7 +19,7 @@ function stable(value){if(Array.isArray(value))return `[${value.map(stable).join
 function manualFingerprint(rows){const identities=rows.filter(row=>row.status==='approved'&&row.deleted!==true).map(row=>[clean(row.resolutionId,100),Number(row.revision||0),clean(row.contentHash,64)||manualCost._contentHash({...row,manualCostExact:row.manualCostExact||manualCost._exactUnitCost(row.manualCost)})]).sort((a,b)=>a[0].localeCompare(b[0],'en'));return {count:identities.length,fingerprint:crypto.createHash('sha256').update(stable(identities)).digest('hex')};}
 function coverage(rows){
   const sales=rows.filter(row=>Number(row.saleInvoiceType)===2);
-  const complete=sales.filter(row=>row.costCoverageStatus==='complete'&&row.actualFifoProfitExact!=null);
+  const complete=sales.filter(row=>row.costCoverageStatus==='complete'&&row.actualFifoProfitExact!=null&&(!row.profitProvenanceStatus||row.profitProvenanceStatus==='PROVEN'));
   const totalQty=sales.reduce((sum,row)=>sum+(scaled(row.quantityExact,decimal.QUANTITY_SCALE)<0n?-scaled(row.quantityExact,decimal.QUANTITY_SCALE):scaled(row.quantityExact,decimal.QUANTITY_SCALE)),0n);
   const completeQty=complete.reduce((sum,row)=>sum+(scaled(row.quantityExact,decimal.QUANTITY_SCALE)<0n?-scaled(row.quantityExact,decimal.QUANTITY_SCALE):scaled(row.quantityExact,decimal.QUANTITY_SCALE)),0n);
   const totalValue=sales.reduce((sum,row)=>sum+(scaled(row.saleAmountExact,decimal.MONEY_SCALE)<0n?-scaled(row.saleAmountExact,decimal.MONEY_SCALE):scaled(row.saleAmountExact,decimal.MONEY_SCALE)),0n);
@@ -30,11 +30,14 @@ function coverage(rows){
 function groupCoverage(rows,field){const grouped=new Map();for(const row of rows)add(grouped,clean(row[field],300)||'UNRESOLVED',row);return [...grouped].map(([identity,list])=>({identity,...coverage(list)})).sort((a,b)=>scaled(b.saleValue.totalExact,decimal.MONEY_SCALE)>scaled(a.saleValue.totalExact,decimal.MONEY_SCALE)?1:-1);}
 function classifyUnknown(row){
   const reason=clean(row.unknownReason,200);
-  if(reason==='official_layer_quantity_exhausted')return 'negative_inventory_chronology';
+  if(['official_layer_quantity_exhausted','negative_inventory_chronology','purchase_chronology_problem'].includes(reason))return 'negative_inventory_chronology';
   if(reason==='ambiguous_manual_resolution')return 'identity_or_manual_cost_ambiguity';
-  if(/return/i.test(reason))return 'purchase_return_conflict';
-  if(/opening/i.test(reason))return 'opening_inventory_cost_missing';
-  if(reason==='no_valid_cost_source')return 'purchase_source_or_layer_missing';
+  if(/return/i.test(reason))return 'purchase_return_affected';
+  if(reason==='opening_inventory_candidate')return 'opening_inventory_candidate';
+  if(reason==='purchase_identity_mismatch')return 'purchase_identity_mismatch';
+  if(reason==='purchase_exists_but_invalid_cost')return 'purchase_exists_but_invalid_cost';
+  if(reason==='purchase_history_outside_dataset_range')return 'purchase_history_outside_dataset_range';
+  if(['no_valid_cost_source','no_purchase_history_available'].includes(reason))return 'no_purchase_history_available';
   return reason||'unsupported_or_unclassified';
 }
 async function report(db,input={}){
@@ -43,11 +46,14 @@ async function report(db,input={}){
   const dataset=datasetId?await db.collection(fifo.DATASETS).findOne({datasetId}):null;
   const active=dataset?{datasetId,dataset}:null;
   if(!active?.datasetId)return {ok:false,code:'FIFO_ACTIVE_DATASET_MISSING',reliable:false,readOnly:true};
-  const [allocations,facts,exceptions,manualRows]=await Promise.all([
+  const [allocations,facts,exceptions,manualRows,purchaseLayers,officialPurchaseCache,saleState]=await Promise.all([
     db.collection(fifo.ALLOCATIONS).find({datasetId:active.datasetId}).toArray(),
     db.collection(ledger.FIFO_FACTS).find({fifoDatasetId:active.datasetId}).toArray(),
     db.collection(fifo.EXCEPTIONS).find({datasetId:active.datasetId}).toArray(),
-    db.collection(manualCost.COLLECTION).find({status:'approved'}).toArray()
+    db.collection(manualCost.COLLECTION).find({status:'approved'}).toArray(),
+    db.collection('supplierPurchaseLayers').find({datasetId:active.dataset.sourcePurchaseDatasetId}).toArray(),
+    db.collection('supplierPurchaseInvoices').find({}).toArray(),
+    db.collection('saleSnapshotState').findOne({activeSnapshotId:{$exists:true}},{sort:{activatedAt:-1}})
   ]);
   const currentManual=manualFingerprint(manualRows);const staleReasons=[];if(!active.dataset.manualResolutionSetFingerprint)staleReasons.push('legacy-dataset-without-manual-resolution-fingerprint');else if(active.dataset.manualResolutionSetFingerprint!==currentManual.fingerprint)staleReasons.push('approved-manual-cost-set-changed');
   const byLine=new Map();for(const row of allocations)add(byLine,clean(row.saleLineId,500),row);
@@ -72,8 +78,13 @@ async function report(db,input={}){
   const duplicateAllocationIds=allocations.length-new Set(allocations.map(row=>row.allocationId)).size;
   const unknownRows=allocations.filter(row=>row.sourceType==='unknown_cost');const rootMap=new Map();for(const row of unknownRows){const bucket=classifyUnknown(row),entry=rootMap.get(bucket)||{bucket,count:0,saleValueExact:'0.00',unresolvedQuantityExact:'0.000000',products:new Set(),sellers:new Set()};entry.count++;entry.saleValueExact=exact(scaled(entry.saleValueExact,2)+scaled(row.allocatedSaleValueExact??row.allocatedSaleValue,2),2);entry.unresolvedQuantityExact=exact(scaled(entry.unresolvedQuantityExact,6)+scaled(row.quantityExact??row.unknownQty,6),6);entry.products.add(clean(row.itemCode,100));entry.sellers.add(clean(row.sellerAccountNumber,100));rootMap.set(bucket,entry);}
   const roots=[...rootMap.values()].map(row=>({...row,products:[...row.products].filter(Boolean),sellers:[...row.sellers].filter(Boolean)})).sort((a,b)=>scaled(b.saleValueExact,2)>scaled(a.saleValueExact,2)?1:-1);
+  const layerInvoiceNumbers=new Set(purchaseLayers.filter(row=>row.layerKind==='purchase').map(row=>Number(row.purchaseInvoiceNo||0)).filter(Boolean));
+  const officialInvoices=officialPurchaseCache.filter(row=>Number(row.invTyp||row.invoiceType||3)===3);const missingInvoices=officialInvoices.filter(row=>!layerInvoiceNumbers.has(Number(row.invNo||row.invoiceNumber||0)));const missingItems=new Set(missingInvoices.flatMap(row=>(row.items||row.lines||row.body||[]).map(line=>clean(line.itemCode||line.ItemCode,100)).filter(Boolean)));const affectedUnknown=allocations.filter(row=>row.sourceType==='unknown_cost'&&missingItems.has(clean(row.itemCode,100)));
+  const latestLayerDate=purchaseLayers.reduce((latest,row)=>clean(row.purchaseInvoiceDate,8)>latest?clean(row.purchaseInvoiceDate,8):latest,'');const latestOfficialDate=officialInvoices.reduce((latest,row)=>clean(row.invDate||row.invoiceDate,8)>latest?clean(row.invDate||row.invoiceDate,8):latest,'');
+  const sourceCompleteness={purchaseDatasetId:active.dataset.sourcePurchaseDatasetId,latestPurchaseDateInDataset:latestLayerDate,latestAvailableOfficialPurchaseDate:latestOfficialDate,officialSource:'supplierPurchaseInvoices read model',officialSourceIsLiveVerified:false,missingPurchaseInvoices:missingInvoices.length,missingPurchaseLines:missingInvoices.reduce((sum,row)=>sum+(row.items||row.lines||row.body||[]).length,0),affectedUnresolvedSaleLines:new Set(affectedUnknown.map(row=>row.saleLineId)).size,affectedUnresolvedSaleValueExact:exact(affectedUnknown.reduce((sum,row)=>sum+scaled(row.allocatedSaleValueExact??row.allocatedSaleValue,2),0n),2)};
+  if(saleState?.activeSnapshotId&&clean(saleState.activeSnapshotId,100)!==clean(active.dataset.sourceSaleSnapshotId,100))staleReasons.push('newer-active-sale-snapshot');
   const c=coverage(facts),reliable=!quantityErrors.length&&!moneyErrors.length&&!duplicateAllocationIds&&!staleReasons.length&&active.dataset.validation?.valid!==false;
-  return {ok:true,readOnly:true,datasetId:active.datasetId,algorithmVersion:active.dataset.algorithmVersion,source:{saleSnapshotId:active.dataset.sourceSaleSnapshotId,purchaseDatasetId:active.dataset.sourcePurchaseDatasetId,sourceFingerprint:active.dataset.sourceFingerprint,allocationFingerprint:active.dataset.allocationFingerprint,manualResolutionSetFingerprint:active.dataset.manualResolutionSetFingerprint||'',currentManualResolutionSetFingerprint:currentManual.fingerprint,stale:staleReasons.length>0,staleReasons},counts:{facts:facts.length,allocations:allocations.length,exceptions:exceptions.length,duplicateAllocationIds},quantityConservation:{pass:!quantityErrors.length,errors:quantityErrors.slice(0,100)},moneyConservation:{pass:!moneyErrors.length,errors:moneyErrors.slice(0,100),roundingMode:decimal.ROUNDING_MODE,quantityScale:decimal.QUANTITY_SCALE,unitCostScale:decimal.UNIT_COST_SCALE,moneyScale:decimal.MONEY_SCALE},coverage:c,coverageBySeller:groupCoverage(facts,'sellerIdentity'),coverageByCategory:groupCoverage(facts,'officialProductCategoryName'),unknownRootCauses:roots,exceptionCounts:Object.fromEntries([...new Set(exceptions.map(row=>row.code))].sort().map(code=>[code,exceptions.filter(row=>row.code===code).length])),reliable,reliabilityDecision:reliable?(Number(c.saleValue.percent)>=95?'FIFO PROFIT RELIABLE FOR MANAGEMENT ANALYTICS':'FIFO PROFIT RELIABLE WITH EXPLICIT COVERAGE LIMITATIONS'):'FIFO PROFIT NOT RELIABLE',profitBasis:'gross-trading-profit-on-current-authoritative-sale-line-value',commissionableProfitReady:false,payableCommission:false};
+  return {ok:true,readOnly:true,datasetId:active.datasetId,algorithmVersion:active.dataset.algorithmVersion,source:{saleSnapshotId:active.dataset.sourceSaleSnapshotId,latestActiveSaleSnapshotId:clean(saleState?.activeSnapshotId,100),purchaseDatasetId:active.dataset.sourcePurchaseDatasetId,sourceFingerprint:active.dataset.sourceFingerprint,allocationFingerprint:active.dataset.allocationFingerprint,manualResolutionSetFingerprint:active.dataset.manualResolutionSetFingerprint||'',currentManualResolutionSetFingerprint:currentManual.fingerprint,stale:staleReasons.length>0,staleReasons},sourceCompleteness,counts:{facts:facts.length,allocations:allocations.length,exceptions:exceptions.length,duplicateAllocationIds},quantityConservation:{pass:!quantityErrors.length,errors:quantityErrors.slice(0,100)},moneyConservation:{pass:!moneyErrors.length,errors:moneyErrors.slice(0,100),roundingMode:decimal.ROUNDING_MODE,quantityScale:decimal.QUANTITY_SCALE,unitCostScale:decimal.UNIT_COST_SCALE,moneyScale:decimal.MONEY_SCALE},coverage:c,provenProfitCoverage:c,coverageBySeller:groupCoverage(facts,'sellerIdentity'),coverageByCategory:groupCoverage(facts,'officialProductCategoryName'),unknownRootCauses:roots,exceptionCounts:Object.fromEntries([...new Set(exceptions.map(row=>row.code))].sort().map(code=>[code,exceptions.filter(row=>row.code===code).length])),reliable,reliabilityDecision:reliable?(Number(c.saleValue.percent)>=95?'FIFO PROFIT RELIABLE FOR MANAGEMENT ANALYTICS':'FIFO PROFIT RELIABLE WITH EXPLICIT COVERAGE LIMITATIONS'):'FIFO PROFIT NOT RELIABLE',profitLabel:'سود FIFO اثبات‌شده',profitBasis:'gross-trading-profit-on-current-authoritative-sale-line-value',commissionableProfitReady:false,payableCommission:false};
 }
 
 module.exports={report,_coverage:coverage,_classifyUnknown:classifyUnknown};

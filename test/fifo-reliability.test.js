@@ -26,7 +26,7 @@ test('read-only reliability report reconciles exact quantity and money and expos
   const report=await reliability.report(db,{});
   assert.equal(report.quantityConservation.pass,true);assert.equal(report.moneyConservation.pass,true);
   assert.equal(report.coverage.line.percent,'50.0000');assert.equal(report.coverage.quantity.percent,'66.6667');assert.equal(report.coverage.saleValue.percent,'57.1429');
-  assert.equal(report.unknownRootCauses[0].bucket,'purchase_source_or_layer_missing');assert.equal(report.payableCommission,false);assert.equal(report.readOnly,true);
+  assert.equal(report.unknownRootCauses[0].bucket,'no_purchase_history_available');assert.equal(report.payableCommission,false);assert.equal(report.readOnly,true);
 });
 
 test('manual-cost set change marks active FIFO stale without mutating the historical dataset',async()=>{

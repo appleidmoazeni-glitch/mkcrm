@@ -12,6 +12,8 @@
 const crypto = require('crypto');
 const decimal = require('./accounting-decimal');
 const fifoShadow = require('./fifo-shadow-engine');
+const fifoProfitProvenance = require('./fifo-profit-provenance');
+const manualCostResolution = require('./manual-cost-resolution');
 const { canonicalSaleDate, shiftJalaliDate } = require('./jalali-date');
 const commissionPolicies = require('./commission-policy-governance');
 
@@ -237,6 +239,8 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
     return { ok:true, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint:fingerprint, duplicate:true, immutable:true };
   }
   const allocations = await db.collection(fifoShadow.ALLOCATIONS).find({ datasetId:dataset.datasetId }).sort({ globalSequence:1 }).toArray();
+  const approvedManualCosts = await db.collection(manualCostResolution.COLLECTION).find({ status:'approved', deleted:{ $ne:true } }).toArray();
+  const manualById = new Map(approvedManualCosts.map(row => [clean(row.resolutionId,100),row]));
   const saleLines = await db.collection('saleSnapshotDatasetLines').find({ snapshotId:dataset.sourceSaleSnapshotId }).toArray();
   const saleHeaders = await db.collection('saleSnapshotDatasetHeaders').find({ snapshotId:dataset.sourceSaleSnapshotId }).toArray();
   const approvedCategoryMappings = await db.collection(CATEGORY_MAPPINGS).find({ status:'approved' }).toArray();
@@ -262,11 +266,12 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
     const category = resolveCategoryFromMappings(approvedCategoryMappings, enrichedLine, clean(first.saleDate, 8));
     const quantityExact = add(rows.map(row => row.quantityExact || row.allocatedQty || row.unknownQty || 0), decimal.QUANTITY_SCALE);
     const saleAmountExact = add(rows.map(row => row.allocatedSaleValueExact || row.allocatedSaleValue || 0));
-    const unknown = rows.some(row => row.sourceType === 'unknown_cost' || row.allocatedCostAmountExact == null);
+    const provenance=fifoProfitProvenance.lineProvenance(rows,{saleQtyExact:first.soldQuantity||saleLine.qty,saleValueExact:saleAmountExact,manualById});
+    const unknown = provenance.profitProvenanceStatus !== fifoProfitProvenance.STATUSES.PROVEN;
     const knownQuantity = rows.filter(row => row.sourceType !== 'unknown_cost').map(row => row.quantityExact || row.allocatedQty || 0);
     const knownQtyExact = add(knownQuantity, decimal.QUANTITY_SCALE);
-    const fifoCostExact = unknown ? null : add(rows.map(row => row.allocatedCostAmountExact || 0));
-    const actualFifoProfitExact = fifoCostExact == null ? null : subtract(saleAmountExact, fifoCostExact);
+    const fifoCostExact = provenance.profitProvenanceStatus==='PROVEN' ? provenance.provenanceReconciliation.allocatedCostExact : null;
+    const actualFifoProfitExact = provenance.profitProvenanceStatus==='PROVEN' ? provenance.provenanceReconciliation.fifoProfitExact : null;
     const originalQuantity = exact(first.soldQuantity || saleLine.qty || quantityExact, decimal.QUANTITY_SCALE);
     const coverage = unknown
       ? (compare(knownQtyExact, '0', decimal.QUANTITY_SCALE) > 0 ? 'partial' : 'unknown')
@@ -295,6 +300,11 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
       quantityExact, saleAmountExact, invoiceDiscountExact,
       invoiceDiscountAttributionStatus:officialLineDiscount == null && Number(header.discountAmount || 0) > 0 ? 'unresolved-invoice-level' : 'official-line-or-zero',
       fifoCostExact, actualFifoProfitExact, costCoverageStatus:coverage,
+      profitProvenanceStatus:provenance.profitProvenanceStatus,
+      costSourceType:provenance.costSourceType,
+      provenanceSources:provenance.provenanceSources,
+      provenanceReconciliation:provenance.provenanceReconciliation,
+      provenanceFingerprint:provenance.provenanceFingerprint,
       sourceFingerprint:dataset.sourceFingerprint || '', allocationFingerprint:dataset.allocationFingerprint || ''
     };
     facts.push({ factId:deterministicId('PF', `${dataset.datasetId}|${saleLineIdentity}`), schemaVersion:SCHEMA_VERSION, ...immutable, factContentHash:sha256(stable(immutable)), immutable:true, createdBy:current, createdAt:now });

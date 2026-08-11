@@ -249,7 +249,6 @@ function approvedRowsFingerprint(rows = []) {
   return { count:identities.length, fingerprint:crypto.createHash('sha256').update(stable(identities)).digest('hex') };
 }
 async function approvedSetFingerprint(db) {
-  await ensureIndexes(db);
   const rows = await allRows(db.collection(COLLECTION), { status:'approved', deleted:{ $ne:true } });
   return approvedRowsFingerprint(rows);
 }
@@ -259,8 +258,14 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
   const state = await db.collection('fifoDatasetState').findOne({ scopeKey:'fifo-shadow-v2-precision-evidence' });
   const datasetId = clean(state?.activeDatasetId, 100);
   if (!datasetId) return { ok:true, resolutionId:resolution.resolutionId, datasetId:'', affected:{ purchaseLayers:0, allocations:0, saleLines:0, invoices:0, sellers:0, productCategories:0 }, blocker:'FIFO_ACTIVE_DATASET_MISSING', readOnly:true };
-  const all = await db.collection('fifoAllocations').find({ datasetId }).toArray();
-  const rows = all.filter(row => {
+  const identityQuery=clean(resolution.itemGuid,100)?{itemGuid:clean(resolution.itemGuid,100)}:{itemCode:clean(resolution.itemCode,100)};
+  const dateQuery={};
+  if(resolution.effectiveFrom)dateQuery.$gte=resolution.effectiveFrom;
+  if(resolution.effectiveTo)dateQuery.$lte=resolution.effectiveTo;
+  const query={datasetId,...identityQuery};
+  if(Object.keys(dateQuery).length)query.saleDate=dateQuery;
+  const candidates = await db.collection('fifoAllocations').find(query).toArray();
+  const rows = candidates.filter(row => {
     if (!matchesManual(resolution, row)) return false;
     if (row.saleDate < resolution.effectiveFrom || (resolution.effectiveTo && row.saleDate > resolution.effectiveTo)) return false;
     if (resolution.status === 'approved' && row.manualResolutionId === resolution.resolutionId) return true;
@@ -272,7 +277,10 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     const quantity = row.quantityExact ?? row.unknownQty ?? row.allocatedQty ?? 0;
     projectedResolvedCost += accountingDecimal.allocation(quantity, manualCostExact).valueScaled;
   }
-  const knownCostRows = all.filter(row => rows.some(candidate => candidate.saleLineId === row.saleLineId) && row.allocatedCostAmountExact != null);
+  const saleLineIds=[...new Set(rows.map(row=>row.saleLineId).filter(Boolean))];
+  const knownCostRows = saleLineIds.length
+    ? (await db.collection('fifoAllocations').find({datasetId,saleLineId:{$in:saleLineIds}}).toArray()).filter(row=>row.allocatedCostAmountExact!=null)
+    : [];
   const oldKnownCost = knownCostRows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedCostAmountExact,accountingDecimal.MONEY_SCALE),0n);
   const purchaseLayers = new Set(rows.map(row => clean(row.purchaseLineIdentity,500)).filter(Boolean));
   return {
@@ -342,12 +350,12 @@ async function createDraft(db, input, requestedBy) {
   return { ok:true, resolution:doc };
 }
 async function getById(db, resolutionId) {
-  await ensureIndexes(db);
   const resolution = await db.collection(COLLECTION).findOne({ resolutionId:clean(resolutionId, 100) });
   if (!resolution) fail('MANUAL_COST_NOT_FOUND', 'Resolution هزینه دستی پیدا نشد.', 404);
   return resolution;
 }
 async function updateDraft(db, resolutionId, input, requestedBy) {
+  await ensureIndexes(db);
   assertRole(requestedBy?.role, EDIT_ROLES);
   const current = await getById(db, resolutionId);
   if (!['draft', 'rejected'].includes(current.status)) {
@@ -374,6 +382,7 @@ async function updateDraft(db, resolutionId, input, requestedBy) {
   return { ok:true, resolution:await getById(db, resolutionId) };
 }
 async function transition(db, resolutionId, action, requestedBy, input = {}) {
+  await ensureIndexes(db);
   const options = typeof input === 'string' ? { reason:input } : (input || {});
   const reason = clean(options.reason, 1000);
   assertRole(requestedBy?.role, action === 'submit' ? EDIT_ROLES : APPROVE_ROLES);

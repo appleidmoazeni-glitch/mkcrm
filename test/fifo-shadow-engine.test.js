@@ -188,7 +188,8 @@ test('rebuild is deterministic while historical runs coexist', async () => {
   assert.equal(first.sourceFingerprint,second.sourceFingerprint);
   assert.equal(first.allocationFingerprint,second.allocationFingerprint);
   assert.equal(db.collection(engine.DATASETS).rows.filter(row=>row.status==='completed').length,2);
-  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,second.datasetId);
+  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,'');
+  assert.equal(db.collection(engine.DATASETS).rows.every(row=>row.activationStatus==='validated-candidate'),true);
 });
 
 test('dateFrom never truncates earlier sales needed to consume FIFO history', async () => {
@@ -230,12 +231,12 @@ test('failed candidate can resume by deterministic replay without changing the a
   );
   const failed=db.collection(engine.DATASETS).rows.find(row=>row.status==='failed');
   assert.ok(failed);
-  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,active.datasetId);
+  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,'');
   const resumed=await engine.buildShadowDataset(db,{resumeDatasetId:failed.datasetId},accountant);
   assert.equal(resumed.ok,true);
   assert.equal(resumed.datasetId,failed.datasetId);
   assert.equal(resumed.resumeCount,1);
-  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,failed.datasetId);
+  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,'');
 });
 
 test('completed datasets are immutable and cannot be resumed', async () => {
@@ -247,16 +248,15 @@ test('completed datasets are immutable and cannot be resumed', async () => {
   );
 });
 
-test('a completed immutable candidate can recover only its missed state activation', async () => {
+test('a completed immutable candidate cannot be activated through resume', async () => {
   const db=seedDb();
   const result=await engine.buildShadowDataset(db,{},accountant);
   db.collection(engine.STATE).rows[0].activeDatasetId='';
-  const recovered=await engine.buildShadowDataset(db,{resumeDatasetId:result.datasetId},accountant);
-  assert.equal(recovered.activationRecovered,true);
-  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,result.datasetId);
+  await assert.rejects(engine.buildShadowDataset(db,{resumeDatasetId:result.datasetId},accountant),error=>error.code==='FIFO_DATASET_IMMUTABLE');
+  assert.equal(db.collection(engine.STATE).rows[0].activeDatasetId,'');
   const dataset=db.collection(engine.DATASETS).rows.find(row=>row.datasetId===result.datasetId);
   assert.equal(dataset.status,'completed');
-  assert.equal(dataset.activationStatus,'validated-shadow');
+  assert.equal(dataset.activationStatus,'validated-candidate');
 });
 
 test('database lease prevents concurrent FIFO shadow builds', async () => {

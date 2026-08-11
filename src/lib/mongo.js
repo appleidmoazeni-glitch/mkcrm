@@ -147,6 +147,7 @@ async function initMongo() {
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, allocationId: 1 }, { unique: true });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, saleLineId: 1, allocationSequence: 1 }, { unique: true });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, itemCode: 1, saleDate: 1 });
+  await database.collection('fifoAllocations').createIndex({ datasetId: 1, itemGuid: 1, saleDate: 1 });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, purchaseLineIdentity: 1 });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, manualResolutionId: 1 });
   await database.collection('fifoDiagnostics').createIndex({ datasetId: 1, at: 1 });

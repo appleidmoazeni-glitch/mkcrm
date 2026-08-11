@@ -60,8 +60,8 @@ async function materialized(){const db=seedDb();const result=await ledger.materi
 test('immutable FIFO facts aggregate partial allocations and keep unknown cost null',async()=>{
   const{db,result}=await materialized();assert.equal(result.factCount,3);
   const fact=db.collection(ledger.FIFO_FACTS).rows.find(row=>row.saleLineIdentity==='SL-2-4691-001-NB');
-  assert.equal(fact.quantityExact,'2.000000');assert.equal(fact.saleAmountExact,'1200.00');assert.equal(fact.fifoCostExact,'900.00');assert.equal(fact.actualFifoProfitExact,'300.00');assert.equal(fact.costCoverageStatus,'complete');assert.equal(fact.invoiceDiscountExact,'10.00');assert.equal(fact.officialProductCategoryName,'NOTEBOOK');assert.equal(fact.commissionRatePool,'NOTEBOOK');
-  const unknown=db.collection(ledger.FIFO_FACTS).rows.find(row=>row.itemCode==='X-1');assert.equal(unknown.fifoCostExact,null);assert.equal(unknown.actualFifoProfitExact,null);assert.equal(unknown.costCoverageStatus,'unknown');
+  assert.equal(fact.quantityExact,'2.000000');assert.equal(fact.saleAmountExact,'1200.00');assert.equal(fact.fifoCostExact,'900.00');assert.equal(fact.actualFifoProfitExact,'300.00');assert.equal(fact.costCoverageStatus,'complete');assert.equal(fact.profitProvenanceStatus,'PROVEN');assert.equal(fact.costSourceType,'MULTI_PURCHASE_LAYER');assert.equal(fact.provenanceSources.length,2);assert.equal(fact.provenanceReconciliation.moneyConserved,true);assert.equal(fact.invoiceDiscountExact,'10.00');assert.equal(fact.officialProductCategoryName,'NOTEBOOK');assert.equal(fact.commissionRatePool,'NOTEBOOK');
+  const unknown=db.collection(ledger.FIFO_FACTS).rows.find(row=>row.itemCode==='X-1');assert.equal(unknown.fifoCostExact,null);assert.equal(unknown.actualFifoProfitExact,null);assert.equal(unknown.costCoverageStatus,'unknown');assert.equal(unknown.profitProvenanceStatus,'UNKNOWN');assert.equal(unknown.provenanceSources[0].sourceType,'UNKNOWN');
   const replay=await ledger.materializeFifoProfitFacts(db,{},accountant);assert.equal(replay.duplicate,true);assert.equal(replay.factsFingerprint,result.factsFingerprint);assert.equal(db.collection(ledger.FIFO_FACTS).rows.length,3);
 });
 
