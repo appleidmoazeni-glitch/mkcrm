@@ -564,7 +564,7 @@ function allocateSources(datasetId, source, filters = {}) {
     }
 
     if (need > EPSILON) {
-      const manuals = matchingRows(manualIndex, sale)
+      const manuals = manualCostResolution._effectiveRowsAt(matchingRows(manualIndex, sale), sale.saleDate)
         .filter(row => manualEffective(row, sale.saleDate))
         .sort((a, b) => clean(b.effectiveFrom).localeCompare(clean(a.effectiveFrom), 'en') || clean(a.resolutionId).localeCompare(clean(b.resolutionId), 'en'));
       if (manuals.length === 1) {

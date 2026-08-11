@@ -244,3 +244,31 @@ test('a purchase return exceeding its directly linked purchase is rejected and n
   assert.equal(result.rejectedRowCount,1);
   assert.equal(await purchaseLayers.activeDataset(db),null);
 });
+
+test('incremental remediation candidate preserves active dataset and records deterministic source fingerprints',async()=>{
+  const db=new MemoryDb();
+  const activeApi=apiFor({'3':{0:[invoice(3,1230,[line(1,'OLD',2,100)])],20:[]},'7':{0:[]}});
+  const active=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:activeApi,mode:'full',reset:true,dateFrom:'14050101',maxPages:3});
+  const candidateApi=apiFor({
+    '3':{0:[
+      invoice(3,1231,[line(10,'12D3209250',5,1479820000)],{InvDate:'14050507'}),
+      invoice(3,1235,[line(20,'10M6070921',2,2055197294.7),line(21,'10G6157934',1,3508873430)],{InvDate:'14050508'})
+    ],20:[]},
+    '7':{0:[]}
+  });
+  const candidate=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:candidateApi,mode:'incremental',dateFrom:'14050507',dateTo:'14050508',maxPages:3,activate:false});
+  assert.equal(candidate.ok,true);
+  assert.equal(candidate.code,'PURCHASE_LAYER_DATASET_CANDIDATE_READY');
+  assert.equal(candidate.activationStatus,'validated-candidate');
+  assert.equal(candidate.activeDatasetId,active.datasetId);
+  assert.equal((await purchaseLayers.activeDataset(db)).datasetId,active.datasetId);
+  assert.equal(candidate.baseDatasetId,active.datasetId);
+  assert.equal(candidate.purchaseInvoiceCount,3);
+  assert.match(candidate.layerFingerprint,/^[a-f0-9]{64}$/);
+  assert.match(candidate.sourceFingerprint,/^[a-f0-9]{64}$/);
+  assert.match(candidate.candidateFingerprint,/^[a-f0-9]{64}$/);
+  const rows=db.collection('supplierPurchaseLayers').rows.filter(row=>row.datasetId===candidate.datasetId);
+  assert.equal(rows.length,4);
+  assert.ok(rows.every(row=>/^[a-f0-9]{64}$/.test(row.sourceHash)));
+  assert.deepEqual([...new Set(rows.filter(row=>[1231,1235].includes(row.purchaseInvoiceNo)).map(row=>row.purchaseInvoiceNo))],[1231,1235]);
+});

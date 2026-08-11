@@ -262,3 +262,35 @@ test('route and UI contracts expose the governed module without purchase-layer m
   assert.match(moduleSource,/profitActivationAllowed:false/);
   assert.match(moduleSource,/fifoCalculationActivated:false/);
 });
+
+test('governed supersession preserves legacy evidence and resolves only inside the explicitly bounded period',async()=>{
+  const db=seedDb();
+  const legacy={
+    resolutionId:'MCOST-1785779703360-79333248',schemaVersion:2,status:'approved',revision:3,deleted:false,
+    itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:612310000,manualCostExact:'612310000.000000',
+    effectiveFrom:'',effectiveTo:'',reason:'legacy evidence',sourceType:'legacy_cost',resolutionScope:'item',
+    createdBy:{username:'khedmati',role:'accounting'},approvedBy:{username:'admin',role:'admin'},auditLog:[{action:'approve'}]
+  };
+  db.collection('manualCostResolutions').rows.push(structuredClone(legacy));
+  await assert.rejects(
+    service.createDraft(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',sourceType:'legacy_cost',reason:'bounded correction'},accounting),
+    error=>error.code==='MANUAL_COST_OVERLAP'
+  );
+  await assert.rejects(
+    service.createDraft(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',sourceType:'legacy_cost',reason:'bounded correction',supersedesResolutionId:legacy.resolutionId},accounting),
+    error=>error.code==='MANUAL_COST_SUPERSESSION_EFFECTIVE_TO_REQUIRED'
+  );
+  const created=await service.createDraft(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',sourceType:'legacy_cost',reason:'بازه تیر ۱۴۰۵ طبق تصمیم انسانی',supersedesResolutionId:legacy.resolutionId},accounting);
+  assert.equal(created.resolution.supersedesResolutionId,legacy.resolutionId);
+  assert.match(created.resolution.contentHash,/^[a-f0-9]{64}$/);
+  const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});
+  await assert.rejects(service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:2}),error=>error.code==='MANUAL_COST_FORBIDDEN');
+  const approved=await service.transition(db,created.resolution.resolutionId,'approve',manager,{revision:pending.resolution.revision});
+  const unchanged=await service.getById(db,legacy.resolutionId);
+  assert.deepEqual(unchanged,legacy);
+  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050515').map(row=>row.resolutionId),[approved.resolution.resolutionId]);
+  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050430'),[]);
+  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050601'),[]);
+  assert.deepEqual(approved.resolution.auditLog.map(row=>row.action),['created-draft','submit','approve']);
+  assert.equal(approved.resolution.approvedBy.username,'manager-1');
+});

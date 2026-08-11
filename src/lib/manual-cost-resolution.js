@@ -9,7 +9,7 @@ const { canonicalSaleDate, normalizeJalaliRange } = require('./jalali-date');
 const accountingDecimal = require('./accounting-decimal');
 
 const COLLECTION = 'manualCostResolutions';
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 const SOURCE_TYPES = Object.freeze([
   'manual',
   'opening_inventory',
@@ -54,7 +54,8 @@ function contentProjection(value = {}) {
     reason:clean(value.reason, 1000), sourceType:clean(value.sourceType, 100),
     resolutionScope:clean(value.resolutionScope||'item',50), purchaseDatasetId:clean(value.purchaseDatasetId,100),
     purchaseLineIdentity:clean(value.purchaseLineIdentity,500), targetQuantityExact:clean(value.targetQuantityExact,100),
-    attachment:sanitizeAttachment(value.attachment), notes:clean(value.notes, 2000)
+    attachment:sanitizeAttachment(value.attachment), notes:clean(value.notes, 2000),
+    supersedesResolutionId:clean(value.supersedesResolutionId, 100)
   };
 }
 function contentHash(value) { return crypto.createHash('sha256').update(stable(contentProjection(value))).digest('hex'); }
@@ -137,7 +138,7 @@ function boundedAuditDetails(value = {}) {
 }
 function auditValueSnapshot(value) {
   if (value == null) return null;
-  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','attachment','notes','status'];
+  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','attachment','notes','supersedesResolutionId','status'];
   const output = {};
   for (const field of fields) {
     if (value[field] === undefined) continue;
@@ -180,6 +181,10 @@ function validateDraft(input = {}) {
     if(!purchaseDatasetId||!purchaseLineIdentity)fail('MANUAL_COST_PURCHASE_LAYER_REQUIRED','Dataset و Purchase Line برای Scope لایه خرید الزامی است.');
     try{const qty=accountingDecimal.parse(input.targetQuantityExact??input.targetQuantity,accountingDecimal.QUANTITY_SCALE);if(qty<=0n)throw new Error();targetQuantityExact=accountingDecimal.format(qty,accountingDecimal.QUANTITY_SCALE);}catch(_){fail('MANUAL_COST_TARGET_QUANTITY_INVALID','Quantity هدف باید دقیق و بزرگ‌تر از صفر باشد.');}
   }
+  const supersedesResolutionId=clean(input.supersedesResolutionId,100);
+  const reason=clean(input.reason,1000);
+  if(supersedesResolutionId&&!reason)fail('MANUAL_COST_SUPERSESSION_REASON_REQUIRED','دلیل اصلاح Resolution قدیمی برای supersession الزامی است.');
+  if(supersedesResolutionId&&!effectiveTo)fail('MANUAL_COST_SUPERSESSION_EFFECTIVE_TO_REQUIRED','تاریخ پایان صریح برای supersession هزینه دستی الزامی است.');
   const normalized = {
     itemGuid,
     itemCode,
@@ -188,17 +193,20 @@ function validateDraft(input = {}) {
     effectiveFrom,
     effectiveTo,
     currency,
-    reason:clean(input.reason, 1000),
+    reason,
     sourceType,
     attachment:sanitizeAttachment(input.attachment),
-    notes:clean(input.notes, 2000),resolutionScope,purchaseDatasetId,purchaseLineIdentity,targetQuantityExact
+    notes:clean(input.notes, 2000),resolutionScope,purchaseDatasetId,purchaseLineIdentity,targetQuantityExact,
+    supersedesResolutionId
   };
   return { ...normalized, contentHash:contentHash(normalized) };
 }
 function overlaps(aFrom, aTo, bFrom, bTo) {
+  const startA = aFrom || '00000000';
+  const startB = bFrom || '00000000';
   const endA = aTo || '99999999';
   const endB = bTo || '99999999';
-  return aFrom <= endB && bFrom <= endA;
+  return startA <= endB && startB <= endA;
 }
 function sameIdentity(a, b) {
   const ag = key(a.itemGuid), bg = key(b.itemGuid);
@@ -238,6 +246,16 @@ async function validatePurchaseLayerScope(db, normalized) {
   if(normalized.itemCode&&layer.itemCode&&key(normalized.itemCode)!==key(layer.itemCode))fail('MANUAL_COST_PURCHASE_LAYER_IDENTITY_MISMATCH','ItemCode با Purchase Layer هدف تطابق ندارد.',409);
   const available=accountingDecimal.parse(layer.netPurchasedQuantity??layer.remainingQuantity??layer.originalQuantity??0,accountingDecimal.QUANTITY_SCALE);
   if(accountingDecimal.parse(normalized.targetQuantityExact,accountingDecimal.QUANTITY_SCALE)>available)fail('MANUAL_COST_TARGET_QUANTITY_EXCEEDS_LAYER','Quantity هزینه دستی از Quantity لایه خرید بیشتر است.',409);
+}
+async function validateSupersession(db, candidate, excludedResolutionId = '') {
+  const supersedesResolutionId=clean(candidate.supersedesResolutionId,100);
+  if(!supersedesResolutionId)return null;
+  if(supersedesResolutionId===clean(excludedResolutionId,100))fail('MANUAL_COST_SUPERSESSION_SELF_REFERENCE','Resolution نمی‌تواند خودش را supersede کند.',409);
+  const previous=await db.collection(COLLECTION).findOne({resolutionId:supersedesResolutionId});
+  if(!previous)fail('MANUAL_COST_SUPERSEDED_NOT_FOUND','Resolution قبلی برای supersession پیدا نشد.',404);
+  if(previous.status!=='approved'||previous.deleted===true)fail('MANUAL_COST_SUPERSEDED_NOT_APPROVED','فقط Resolution تأییدشده و حذف‌نشده قابل supersession است.',409);
+  if(!sameResolutionTarget(previous,candidate))fail('MANUAL_COST_SUPERSESSION_TARGET_MISMATCH','Resolution جدید و قبلی باید Target حسابداری یکسان داشته باشند.',409);
+  return previous;
 }
 function approvedRowsFingerprint(rows = []) {
   const identities = rows.map(row => [
@@ -312,7 +330,8 @@ async function ensureNoDuplicate(db, candidate, excludedResolutionId = '') {
   const duplicate = rows.find(row =>
     row.resolutionId !== excludedResolutionId &&
     sameResolutionTarget(row, candidate) &&
-    overlaps(row.effectiveFrom, row.effectiveTo, candidate.effectiveFrom, candidate.effectiveTo)
+    overlaps(row.effectiveFrom, row.effectiveTo, candidate.effectiveFrom, candidate.effectiveTo) &&
+    row.resolutionId !== clean(candidate.supersedesResolutionId,100)
   );
   if (duplicate) fail(
     'MANUAL_COST_OVERLAP',
@@ -325,6 +344,7 @@ async function createDraft(db, input, requestedBy) {
   assertRole(requestedBy?.role, EDIT_ROLES);
   const normalized = validateDraft(input);
   await validatePurchaseLayerScope(db,normalized);
+  await validateSupersession(db,normalized);
   await ensureNoDuplicate(db, normalized);
   const now = new Date();
   const createdBy = actor(requestedBy);
@@ -367,6 +387,7 @@ async function updateDraft(db, resolutionId, input, requestedBy) {
   }
   const normalized = validateDraft({ ...current, ...input });
   await validatePurchaseLayerScope(db,normalized);
+  await validateSupersession(db,normalized,current.resolutionId);
   await ensureNoDuplicate(db, normalized, current.resolutionId);
   const changed = Object.keys(normalized).filter(field => JSON.stringify(current[field] ?? null) !== JSON.stringify(normalized[field] ?? null));
   const nextAudit = [...(current.auditLog || []), auditEntry('updated-draft', requestedBy, {
@@ -403,6 +424,10 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
   }
   if (action === 'approve' && clean(current.createdBy?.username) === clean(requestedBy?.username)) {
     fail('MANUAL_COST_SELF_APPROVAL', 'ایجادکننده نمی‌تواند Resolution خود را تأیید کند.', 403);
+  }
+  if(['submit','approve'].includes(action)){
+    await validateSupersession(db,current,current.resolutionId);
+    await ensureNoDuplicate(db,current,current.resolutionId);
   }
   const now = new Date();
   const patch = {
@@ -446,8 +471,14 @@ async function list(db, filters = {}) {
 function validAt(row, saleDate) {
   return row.status === 'approved' &&
     row.deleted !== true &&
+    /^1[34]\d{6}$/.test(clean(row.effectiveFrom, 8)) &&
     row.effectiveFrom <= saleDate &&
     (!row.effectiveTo || row.effectiveTo >= saleDate);
+}
+function effectiveRowsAt(rows = [], saleDate = '') {
+  const eligible=(rows||[]).filter(row=>validAt(row,saleDate));
+  const superseded=new Set(eligible.map(row=>clean(row.supersedesResolutionId,100)).filter(Boolean));
+  return eligible.filter(row=>!superseded.has(clean(row.resolutionId,100)));
 }
 function officialLayerValid(row) {
   const cost = Number(row.netUnitCost ?? row.grossUnitCost);
@@ -862,6 +893,8 @@ module.exports = {
   _sameIdentity:sameIdentity,
   _sameResolutionTarget:sameResolutionTarget,
   _overlaps:overlaps,
+  _effectiveRowsAt:effectiveRowsAt,
+  _validateSupersession:validateSupersession,
   _contentHash:contentHash,
   _exactUnitCost:exactUnitCost,
   _approvedRowsFingerprint:approvedRowsFingerprint

@@ -1,5 +1,6 @@
 'use strict';
 
+const crypto = require('crypto');
 const defaultShaygan = require('./shaygan');
 const saleSnapshot = require('./sale-snapshot');
 const { APP_VERSION } = require('./app-version');
@@ -14,6 +15,12 @@ const SCHEMA_VERSION = 1;
 const SOURCE_TYPES = Object.freeze([3, 7]);
 
 function clean(value) { return String(value == null ? '' : value).trim(); }
+function stable(value) {
+  if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
+  if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(field => `${JSON.stringify(field)}:${stable(value[field])}`).join(',')}}`;
+  return JSON.stringify(value);
+}
+function sha256(value) { return crypto.createHash('sha256').update(String(value)).digest('hex'); }
 function finite(value) {
   if (value == null || clean(value) === '') return null;
   const number = Number(String(value).replace(/[,،\s]/g, ''));
@@ -51,6 +58,34 @@ function lineIdentity(invoice, line, row) {
   const lineId = clean(line.LineItemId || line.LineId);
   if (guid && lineId) return `${guid}:${lineId}`;
   return `T${invoiceType(invoice)}:N${invoiceNo(invoice)}:R${row}:I${itemCode(line) || itemGuid(line) || 'MISSING'}`;
+}
+function sourceProjection(row = {}) {
+  return {
+    layerKind:clean(row.layerKind), sourceInvoiceType:Number(row.sourceInvoiceType || 0),
+    purchaseInvoiceGuid:clean(row.purchaseInvoiceGuid), purchaseInvoiceNo:Number(row.purchaseInvoiceNo || 0),
+    purchaseInvoiceDate:clean(row.purchaseInvoiceDate), sourceLineItemId:clean(row.sourceLineItemId),
+    sourceRow:Number(row.sourceRow || 0), itemGuid:clean(row.itemGuid), itemCode:clean(row.itemCode),
+    supplierGuid:clean(row.supplierGuid), supplierAccountNumber:clean(row.supplierAccountNumber),
+    originalQuantity:row.originalQuantity == null ? null : Number(row.originalQuantity),
+    returnedQuantity:row.returnedQuantity == null ? null : Number(row.returnedQuantity),
+    grossUnitCost:row.grossUnitCost == null ? null : Number(row.grossUnitCost),
+    discountAmount:row.discountAmount == null ? null : Number(row.discountAmount),
+    netUnitCost:row.netUnitCost == null ? null : Number(row.netUnitCost),
+    returnInvHeaderReference:clean(row.returnInvHeaderReference)
+  };
+}
+function sourceHash(row = {}) { return sha256(stable(sourceProjection(row))); }
+function datasetFingerprints(rows = []) {
+  const ordered = rows.map(row => ({
+    purchaseLineIdentity:clean(row.purchaseLineIdentity),
+    sourceHash:clean(row.sourceHash) || sourceHash(row),
+    netPurchasedQuantity:row.netPurchasedQuantity == null ? null : Number(row.netPurchasedQuantity),
+    returnMatchStatus:clean(row.returnMatchStatus),
+    matchedPurchaseLineIdentity:clean(row.matchedPurchaseLineIdentity)
+  })).sort((a,b)=>a.purchaseLineIdentity.localeCompare(b.purchaseLineIdentity, 'en'));
+  const layerFingerprint = sha256(stable(ordered));
+  const sourceFingerprint = sha256(stable(ordered.map(row => [row.purchaseLineIdentity, row.sourceHash])));
+  return { layerFingerprint, sourceFingerprint };
 }
 function retryable(error) {
   return /timeout|timed out|econnreset|econnrefused|socket|network|fetch|transport|429|5\d\d|temporar/i.test(clean(error));
@@ -121,7 +156,7 @@ function mapSourceLine(invoice, line, row, datasetId) {
   const costKnown = grossUnitCost != null && lineAmount != null;
   if (sourceIsPurchase && !costKnown) warnings.push('cost-unknown');
   const now = new Date();
-  return {
+  const mapped = {
     datasetId,
     datasetSchemaVersion:SCHEMA_VERSION,
     purchaseLineIdentity:lineIdentity(invoice, line, row),
@@ -163,6 +198,8 @@ function mapSourceLine(invoice, line, row, datasetId) {
     createdAt:now,
     updatedAt:now
   };
+  mapped.sourceHash = sourceHash(mapped);
+  return mapped;
 }
 
 function layerUpsertUpdate(mapped) {
@@ -178,6 +215,7 @@ async function cloneActiveLayers(db, active, datasetId) {
   const rows = await db.collection(LAYERS).find({ datasetId:active.datasetId }).toArray();
   for (const row of rows) {
     const { _id, ...copy } = row;
+    copy.sourceHash = clean(copy.sourceHash) || sourceHash(copy);
     await db.collection(LAYERS).updateOne(
       { datasetId, purchaseLineIdentity:copy.purchaseLineIdentity },
       { $set:{ ...copy, datasetId, clonedFromDatasetId:active.datasetId, clonedAt:new Date(), updatedAt:new Date() } },
@@ -305,6 +343,9 @@ async function buildPurchaseLayerDataset(db, options = {}) {
   const maxPageAttempts = Math.max(1, Math.min(Number(options.maxPageAttempts || resumed?.maxPageAttempts || 3), 5));
   const full = resumed ? resumed.mode === 'full' : options.reset === true || options.mode === 'full';
   const mode = full ? 'full' : 'incremental';
+  const activationRequested = resumed
+    ? resumed.activationRequested !== false
+    : options.activate !== false;
   const previousActive = await activeDataset(db);
   const now = new Date();
   const startedAtMs = Date.now();
@@ -313,6 +354,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     await db.collection(DATASETS).insertOne({
       datasetId, datasetSchemaVersion:SCHEMA_VERSION, scopeKey:SCOPE_KEY, status:'running',
       activationStatus:'candidate', mode, sourceDateFrom:dateFrom, sourceDateTo:dateTo,
+      activationRequested,
       pageSize, maxPages, maxPageAttempts, sourceVersion:'shaygan-invoice-get-v1',
       applicationVersion:APP_VERSION, gitSha:clean(process.env.GIT_COMMIT || process.env.COMMIT_SHA),
       createdAt:now, startedAt:now, updatedAt:now, retryCount:0, resumeCount:0,
@@ -433,12 +475,13 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     const suppliers = new Set(purchaseRows.map(row => clean(row.supplierAccountNumber || row.supplierGuid)).filter(Boolean));
     const costUnknownCount = purchaseRows.filter(row => row.costStatus === 'unknown').length;
     const successful = validation.valid;
+    const fingerprints = datasetFingerprints(rows);
     const completedAt = new Date();
     const previousActiveDatasetId = previousActive?.datasetId || '';
     const finalTypeIndex=SOURCE_TYPES.findIndex(type=>reachedEndByType[String(type)]!==true);
     const summary = {
       status:successful ? 'completed' : 'completed_with_errors',
-      activationStatus:successful ? 'validated' : 'rejected',
+      activationStatus:successful ? (activationRequested ? 'validated' : 'validated-candidate') : 'rejected',
       completedAt, updatedAt:completedAt, durationMs:Date.now() - startedAtMs,
       pageCount, retryCount, resumeCount:Number(resumed?.resumeCount||0)+(resumed?1:0),
       replayFromStartCount:Number(resumed?.replayFromStartCount||0)+(replayFromStart?1:0),
@@ -450,10 +493,16 @@ async function buildPurchaseLayerDataset(db, options = {}) {
       duplicateCount:validation.duplicateCount, rejectedRowCount:validation.rejectedRowCount,
       warningCount:validation.warningCount, errorCount:errors.length, costUnknownCount,
       validation, returnAudit, errors:errors.slice(0, 100), previousActiveDatasetId,
+      activationRequested, ...fingerprints,
+      candidateFingerprint:sha256(stable({
+        schemaVersion:SCHEMA_VERSION, mode, sourceDateFrom:dateFrom, sourceDateTo:dateTo,
+        baseDatasetId:resumed?.baseDatasetId||(!full?previousActive?.datasetId||'':''),
+        layerFingerprint:fingerprints.layerFingerprint, sourceFingerprint:fingerprints.sourceFingerprint
+      })),
       baseDatasetId:resumed?.baseDatasetId||(!full?previousActive?.datasetId||'':'')
     };
     await db.collection(DATASETS).updateOne({ datasetId }, { $set:summary });
-    if (successful) {
+    if (successful && activationRequested) {
       const activatedAt = new Date();
       await db.collection(STATE).updateOne({ scopeKey:SCOPE_KEY }, { $set:{
         scopeKey:SCOPE_KEY, activeDatasetId:datasetId, previousActiveDatasetId,
@@ -470,7 +519,17 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     }
     const coverageMetrics=await coverage(db,datasetId);
     await db.collection(DATASETS).updateOne({datasetId},{$set:{coverage:coverageMetrics,updatedAt:new Date()}});
-    const result = { ok:successful, code:successful ? 'PURCHASE_LAYER_DATASET_ACTIVATED' : 'PURCHASE_LAYER_DATASET_INCOMPLETE', datasetId, activeDatasetId:successful ? datasetId : previousActiveDatasetId, ...summary, coverage:coverageMetrics, activationStatus:successful?'active':'rejected' };
+    const result = {
+      ok:successful,
+      code:successful
+        ? (activationRequested ? 'PURCHASE_LAYER_DATASET_ACTIVATED' : 'PURCHASE_LAYER_DATASET_CANDIDATE_READY')
+        : 'PURCHASE_LAYER_DATASET_INCOMPLETE',
+      datasetId,
+      activeDatasetId:successful && activationRequested ? datasetId : previousActiveDatasetId,
+      ...summary,
+      coverage:coverageMetrics,
+      activationStatus:successful ? (activationRequested ? 'active' : 'validated-candidate') : 'rejected'
+    };
     await db.collection(DIAGNOSTICS).insertOne({ ...result, at:new Date(), applicationVersion:APP_VERSION });
     return result;
   } catch (error) {
@@ -571,5 +630,6 @@ module.exports = {
   ensureIndexes, activeDataset, buildPurchaseLayerDataset, coverage, listDatasets, status, listLayers,
   _mapSourceLine:mapSourceLine, _lineIdentity:lineIdentity, _reconcilePurchaseReturns:reconcilePurchaseReturns,
   _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate,
-  _responseTotalRecords:responseTotalRecords
+  _responseTotalRecords:responseTotalRecords, _sourceHash:sourceHash,
+  _datasetFingerprints:datasetFingerprints
 };
