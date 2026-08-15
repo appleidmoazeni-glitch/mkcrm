@@ -32,10 +32,10 @@ test('UI reads backend version and cache-bust tokens are injected from package v
   const index=fs.readFileSync(path.join(root,'public/index.html'),'utf8');
   const app=fs.readFileSync(path.join(root,'public/assets/app.js'),'utf8');
   assert.match(index,/id="sidebarVersion"/);
-  assert.equal((index.match(/__MKCRM_VERSION__/g)||[]).length,2);
+  assert.equal((index.match(/__MKCRM_VERSION__/g)||[]).length,3);
   const rendered=injectAssetVersion(index);
   assert.doesNotMatch(rendered,/__MKCRM_VERSION__/);
-  assert.equal(rendered.split(pkg.version).length-1,2);
+  assert.equal(rendered.split(pkg.version).length-1,3);
   assert.ok(app.includes("fetch('/api/version'"));
   assert.doesNotMatch(app,/window\.MKCRM_VERSION\s*=/);
 });

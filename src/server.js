@@ -20,6 +20,7 @@ const commissionPolicyGovernance = require('./lib/commission-policy-governance')
 const accountingGovernance = require('./lib/accounting-governance');
 const sellerFinancialPerformance = require('./lib/seller-financial-performance');
 const fifoReliability = require('./lib/fifo-reliability');
+const financialSourceControl = require('./lib/financial-source-control');
 const saleSnapshot = require('./lib/sale-snapshot');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
@@ -3770,6 +3771,66 @@ async function handleApi(req, res, pathname, query) {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.dataHealth(db));
+    }
+
+    // Financial Source Control is an audit/read-model boundary. It exposes no
+    // activation operation and performs no Shaygan, invoice, inventory,
+    // Purchase Dataset, Sale Snapshot or FIFO source writes.
+    const financialSourceError=(error,fallback)=>sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||fallback,error:String(error.message||error)});
+    if(pathname==='/api/accounting/financial-source-control/overview'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.overview(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_OVERVIEW_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/purchase/delta'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.purchaseDelta(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_PURCHASE_DELTA_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/gaps'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.sourceGaps(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_GAPS_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/evidence'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.costEvidence(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_EVIDENCE_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/fifo/lines'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.fifoLines(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_FIFO_LINES_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/fifo/summary'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.fifoSummary(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_FIFO_SUMMARY_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/review-center'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.reviewCenter(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_REVIEW_CENTER_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/line-actions'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,201,await financialSourceControl.lineReview(db,body,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_LINE_ACTION_FAILED');}
+    }
+    const financialReviewMatch=pathname.match(/^\/api\/accounting\/financial-source-control\/reviews\/(purchase-dataset|fifo-dataset)\/([^/]+)\/(start-review|accounting-approve|admin-approve|reject)$/);
+    if(financialReviewMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.candidateReview(db,financialReviewMatch[1],decodeURIComponent(financialReviewMatch[2]),financialReviewMatch[3],body,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_REVIEW_FAILED');}
+    }
+    const financialPreviewMatch=pathname.match(/^\/api\/accounting\/financial-source-control\/activation-preview\/(purchase-dataset|fifo-dataset)\/([^/]+)$/);
+    if(financialPreviewMatch&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.activationPreview(db,financialPreviewMatch[1],decodeURIComponent(financialPreviewMatch[2]),currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_ACTIVATION_PREVIEW_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/opening-evidence'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,201,await financialSourceControl.createOpeningDraft(db,body,currentUser(req)));}catch(error){return financialSourceError(error,'OPENING_EVIDENCE_CREATE_FAILED');}
+    }
+    const openingEvidenceMatch=pathname.match(/^\/api\/accounting\/financial-source-control\/opening-evidence\/([^/]+)(?:\/(submit|approve|reject))?$/);
+    if(openingEvidenceMatch&&['PUT','PATCH'].includes(req.method)&&!openingEvidenceMatch[2]){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.updateOpeningDraft(db,decodeURIComponent(openingEvidenceMatch[1]),body,currentUser(req)));}catch(error){return financialSourceError(error,'OPENING_EVIDENCE_UPDATE_FAILED');}
+    }
+    if(openingEvidenceMatch&&req.method==='POST'&&openingEvidenceMatch[2]){
+      if(!requireRole(req,res,openingEvidenceMatch[2]==='submit'?['admin','accounting']:['admin','manager']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.transitionOpening(db,decodeURIComponent(openingEvidenceMatch[1]),openingEvidenceMatch[2],body,currentUser(req)));}catch(error){return financialSourceError(error,'OPENING_EVIDENCE_WORKFLOW_FAILED');}
     }
 
     // 0.9.19.70: immutable FIFO profit facts, governed adjustments and
