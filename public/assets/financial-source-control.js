@@ -33,5 +33,13 @@
   window.renderMenu=renderMenu=function(){inheritedMenu?.apply(this,arguments);const menu=qs('#menu');if(!menu)return;menu.querySelectorAll(`[data-page="${PAGE}"]`).forEach(node=>node.remove());if(!ROLES.includes(role()))return;const details=qsa('details',menu).find(node=>qs('summary',node)?.textContent.trim()==='ابزارهای مالی و ممیزی');if(!details)return;const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='کنترل منابع مالی';button.onclick=event=>{event.preventDefault();location.hash=PAGE;window.route();};details.insertBefore(button,details.firstElementChild?.nextSibling||null);};
   const inheritedRoute=window.route;
   window.route=route=function(){const current=location.hash.slice(1);if(current===PAGE)return render();return inheritedRoute?.apply(this,arguments);};
-  try{window.renderMenu();if(location.hash.slice(1)===PAGE)window.route();}catch{}
+  try{
+    window.renderMenu();
+    const requested=window.__mkcrmRequestedRoute||location.hash.slice(1);
+    if(requested===PAGE&&ROLES.includes(role())){
+      if(typeof history!=='undefined'&&history.replaceState)history.replaceState(null,'',`#${PAGE}`);
+      else location.hash=PAGE;
+      window.route();
+    }
+  }catch{}
 })();
