@@ -30,7 +30,10 @@
   window.__financialSourceControl={render,api};
   try{for(const value of ['accounting','manager'])if(typeof ROLE_PAGES!=='undefined'&&Array.isArray(ROLE_PAGES[value])&&!ROLE_PAGES[value].includes(PAGE))ROLE_PAGES[value].push(PAGE);}catch{}
   const inheritedMenu=window.renderMenu;
-  window.renderMenu=renderMenu=function(){inheritedMenu?.apply(this,arguments);const menu=qs('#menu');if(!menu)return;menu.querySelectorAll(`[data-page="${PAGE}"]`).forEach(node=>node.remove());if(!ROLES.includes(role()))return;const details=qsa('details',menu).find(node=>qs('summary',node)?.textContent.trim()==='ابزارهای مالی و ممیزی');if(!details)return;const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='کنترل منابع مالی';button.onclick=event=>{event.preventDefault();location.hash=PAGE;window.route();};details.insertBefore(button,details.firstElementChild?.nextSibling||null);};
+  function installMenuEntry(){const menu=qs('#menu');if(!menu)return false;menu.querySelectorAll(`[data-page="${PAGE}"]`).forEach(node=>node.remove());if(!ROLES.includes(role()))return false;const details=qsa('details',menu).find(node=>qs('summary',node)?.textContent.trim()==='ابزارهای مالی و ممیزی');if(!details)return false;const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='کنترل منابع مالی';button.onclick=event=>{event.preventDefault();location.hash=PAGE;window.route();};details.insertBefore(button,details.firstElementChild?.nextSibling||null);return true;}
+  window.renderMenu=renderMenu=function(){inheritedMenu?.apply(this,arguments);installMenuEntry();};
+  const shellObserver=new MutationObserver(()=>{if(installMenuEntry())shellObserver.disconnect();});
+  shellObserver.observe(document.body,{childList:true,subtree:true});
   const inheritedRoute=window.route;
   window.route=route=function(){const current=location.hash.slice(1);if(current===PAGE)return render();return inheritedRoute?.apply(this,arguments);};
   try{
