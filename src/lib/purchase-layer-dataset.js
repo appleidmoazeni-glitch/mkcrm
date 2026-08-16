@@ -127,6 +127,7 @@ async function ensureIndexes(db) {
     { unique:true, partialFilterExpression:{ datasetId:{ $exists:true } } }
   );
   await db.collection(LAYERS).createIndex({ datasetId:1, itemCode:1, purchaseInvoiceDate:1 });
+  await db.collection(LAYERS).createIndex({ datasetId:1, itemGuid:1, purchaseInvoiceDate:1 });
   await db.collection(LAYERS).createIndex({ datasetId:1, supplierAccountNumber:1, purchaseInvoiceDate:1 });
   await db.collection(DIAGNOSTICS).createIndex({ datasetId:1, at:-1 });
 }

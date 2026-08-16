@@ -19,6 +19,8 @@ const SOURCE_TYPES = Object.freeze([
 ]);
 const STATUSES = Object.freeze(['draft', 'pending', 'approved', 'rejected', 'expired']);
 const RESOLUTION_SCOPES = Object.freeze(['item', 'purchase_layer']);
+const ASSISTED_WORKFLOW = 'accounting-assisted-v1';
+const ASSISTED_STATES = Object.freeze(['NEEDS_REVIEW','ACCOUNTING_REVIEW','APPROVED','DEFERRED','REJECTED']);
 const EDIT_ROLES = Object.freeze(['admin', 'accounting']);
 const APPROVE_ROLES = Object.freeze(['admin', 'manager']);
 let cachedGitMetadata;
@@ -138,7 +140,7 @@ function boundedAuditDetails(value = {}) {
 }
 function auditValueSnapshot(value) {
   if (value == null) return null;
-  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','attachment','notes','supersedesResolutionId','status'];
+  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType'];
   const output = {};
   for (const field of fields) {
     if (value[field] === undefined) continue;
@@ -229,6 +231,7 @@ async function count(collection, query = {}) {
 async function ensureIndexes(db) {
   const existing = new Set((await db.listCollections().toArray()).map(row => row.name));
   if (!existing.has(COLLECTION)) await db.createCollection(COLLECTION).catch(() => {});
+  if (!existing.has('fifoSourceInvalidations')) await db.createCollection('fifoSourceInvalidations').catch(() => {});
   const collection = db.collection(COLLECTION);
   await collection.createIndex({ resolutionId:1 }, { unique:true });
   await collection.createIndex({ itemGuid:1, status:1, effectiveFrom:1, effectiveTo:1 });
@@ -236,6 +239,9 @@ async function ensureIndexes(db) {
   await collection.createIndex({ status:1, updatedAt:-1 });
   await collection.createIndex({ status:1, contentHash:1 });
   await collection.createIndex({ purchaseDatasetId:1, purchaseLineIdentity:1, status:1 });
+  await collection.createIndex({ workflowType:1, assistedStatus:1, approvedAt:-1 });
+  await db.collection('fifoSourceInvalidations').createIndex({ invalidationId:1 }, { unique:true });
+  await db.collection('fifoSourceInvalidations').createIndex({ reason:1, createdAt:-1 });
   return { ok:true, collection:COLLECTION, schemaVersion:SCHEMA_VERSION };
 }
 async function validatePurchaseLayerScope(db, normalized) {
@@ -340,7 +346,6 @@ async function ensureNoDuplicate(db, candidate, excludedResolutionId = '') {
   );
 }
 async function createDraft(db, input, requestedBy) {
-  await ensureIndexes(db);
   assertRole(requestedBy?.role, EDIT_ROLES);
   const normalized = validateDraft(input);
   await validatePurchaseLayerScope(db,normalized);
@@ -375,7 +380,6 @@ async function getById(db, resolutionId) {
   return resolution;
 }
 async function updateDraft(db, resolutionId, input, requestedBy) {
-  await ensureIndexes(db);
   assertRole(requestedBy?.role, EDIT_ROLES);
   const current = await getById(db, resolutionId);
   if (!['draft', 'rejected'].includes(current.status)) {
@@ -403,7 +407,6 @@ async function updateDraft(db, resolutionId, input, requestedBy) {
   return { ok:true, resolution:await getById(db, resolutionId) };
 }
 async function transition(db, resolutionId, action, requestedBy, input = {}) {
-  await ensureIndexes(db);
   const options = typeof input === 'string' ? { reason:input } : (input || {});
   const reason = clean(options.reason, 1000);
   assertRole(requestedBy?.role, action === 'submit' ? EDIT_ROLES : APPROVE_ROLES);
@@ -453,7 +456,6 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
   return { ok:true, resolution:await getById(db, resolutionId) };
 }
 async function list(db, filters = {}) {
-  await ensureIndexes(db);
   let rows = await allRows(db.collection(COLLECTION), {});
   const search = key(filters.search);
   if (filters.status) rows = rows.filter(row => row.status === clean(filters.status));
@@ -547,7 +549,6 @@ const SUGGESTIONS = Object.freeze({
   unknown_cost:'ردیف خرید ناقص یا هزینه نامعتبر را بررسی کنید.'
 });
 async function loadReadinessContext(db) {
-  await ensureIndexes(db);
   const purchaseActive = await purchaseLayerDataset.activeDataset(db);
   const saleActive = await saleSnapshot._activeDataset(db);
   const allLayers = purchaseActive?.datasetId
@@ -587,6 +588,80 @@ async function loadReadinessContext(db) {
     ...indexes,
     purchaseDateFrom:clean(purchaseActive?.dataset?.sourceDateFrom || purchaseActive?.dataset?.request?.dateFrom)
   };
+}
+
+function identityMatches(row, target) {
+  const targetGuid=key(target.itemGuid),rowGuid=key(row.itemGuid);
+  if(targetGuid&&rowGuid)return targetGuid===rowGuid;
+  return Boolean(key(target.itemCode))&&key(target.itemCode)===key(row.itemCode);
+}
+function eligibleSuggestionLayer(row, target, applicableDate) {
+  if(!identityMatches(row,target)||row.layerKind!=='purchase')return false;
+  if(['rejected','invalid'].includes(clean(row.validationStatus).toLowerCase()))return false;
+  if(row.returnMatchStatus&&['ambiguous','quantity-exceeds-purchase','unmatched'].includes(clean(row.returnMatchStatus)))return false;
+  const purchaseDate=clean(row.purchaseInvoiceDate,8);
+  if(!/^1[34]\d{6}$/.test(purchaseDate)||purchaseDate>applicableDate)return false;
+  try {
+    const quantity=accountingDecimal.parse(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,accountingDecimal.QUANTITY_SCALE);
+    const unitCost=accountingDecimal.parse(row.netUnitCostExact??row.netUnitCost??row.grossUnitCostExact??row.grossUnitCost,accountingDecimal.UNIT_COST_SCALE);
+    return quantity>0n&&unitCost>0n;
+  } catch (_) { return false; }
+}
+function suggestionFromLayers(rows=[], target={}, applicableDate='') {
+  const eligible=rows.filter(row=>eligibleSuggestionLayer(row,target,applicableDate));
+  if(!eligible.length)return {available:false,method:'NO_VALID_HISTORICAL_PURCHASE',suggestedCostExact:null,purchaseCount:0,quantityBasisExact:'0.000000',sourcePurchaseIds:[],sourceFingerprint:crypto.createHash('sha256').update('[]').digest('hex'),evidence:[]};
+  let quantity=0n,totalCost=0n;
+  const evidence=eligible.map(row=>{
+    const q=accountingDecimal.parse(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,accountingDecimal.QUANTITY_SCALE);
+    const c=accountingDecimal.parse(row.netUnitCostExact??row.netUnitCost??row.grossUnitCostExact??row.grossUnitCost,accountingDecimal.UNIT_COST_SCALE);
+    quantity+=q;totalCost+=q*c;
+    return {purchaseLineIdentity:clean(row.purchaseLineIdentity,500),purchaseInvoiceNumber:Number(row.purchaseInvoiceNo||0),purchaseInvoiceDate:clean(row.purchaseInvoiceDate,8),supplierIdentity:clean(row.supplierAccountNumber||row.supplierGuid,100),supplierName:clean(row.supplierName,250),quantityExact:accountingDecimal.format(q,accountingDecimal.QUANTITY_SCALE),unitCostExact:accountingDecimal.format(c,accountingDecimal.UNIT_COST_SCALE),sourceHash:clean(row.sourceHash,128)};
+  }).sort((a,b)=>a.purchaseInvoiceDate.localeCompare(b.purchaseInvoiceDate)||a.purchaseLineIdentity.localeCompare(b.purchaseLineIdentity));
+  const weighted=accountingDecimal.divideRounded(totalCost,quantity);
+  const costs=evidence.map(row=>accountingDecimal.parse(row.unitCostExact,accountingDecimal.UNIT_COST_SCALE));
+  const latest=evidence[evidence.length-1];
+  const fingerprint=crypto.createHash('sha256').update(stable(evidence.map(row=>[row.purchaseLineIdentity,row.sourceHash,row.quantityExact,row.unitCostExact]))).digest('hex');
+  return {available:true,method:'WEIGHTED_AVERAGE_HISTORICAL_OFFICIAL_PURCHASES',suggestedCostExact:accountingDecimal.format(weighted,accountingDecimal.UNIT_COST_SCALE),purchaseCount:evidence.length,quantityBasisExact:accountingDecimal.format(quantity,accountingDecimal.QUANTITY_SCALE),dateFrom:evidence[0].purchaseInvoiceDate,dateTo:latest.purchaseInvoiceDate,minPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a<b?a:b),accountingDecimal.UNIT_COST_SCALE),maxPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a>b?a:b),accountingDecimal.UNIT_COST_SCALE),latestPurchaseCostExact:latest.unitCostExact,sourcePurchaseIds:[...new Set(evidence.map(row=>String(row.purchaseInvoiceNumber)))],sourceFingerprint:fingerprint,evidence};
+}
+async function assistedSuggestion(db,input={},requestedBy={}) {
+  assertRole(requestedBy?.role,['admin','accounting','manager']);
+  const itemGuid=clean(input.itemGuid,100),itemCode=clean(input.itemCode,100);
+  if(!itemGuid&&!itemCode)fail('MANUAL_COST_TARGET_REQUIRED','هویت هدف هزینه الزامی است.');
+  const applicableDate=date8(input.applicableDate,'applicableDate');
+  const active=await purchaseLayerDataset.activeDataset(db);
+  const datasetId=clean(input.purchaseDatasetId||active?.datasetId,100);
+  if(!datasetId)fail('PURCHASE_DATASET_REQUIRED','Purchase Dataset رسمی در دسترس نیست.',409);
+  const dataset=await db.collection(purchaseLayerDataset.DATASETS).findOne({datasetId});
+  if(!dataset||dataset.status!=='completed')fail('PURCHASE_DATASET_NOT_CANONICAL','فقط Dataset ساخته‌شده توسط Purchase Engine رسمی مجاز است.',409);
+  const identityParts=[];if(itemGuid)identityParts.push({itemGuid});if(itemCode)identityParts.push({itemCode});
+  const layerQuery={datasetId,layerKind:'purchase',purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})};
+  const layers=await db.collection(purchaseLayerDataset.LAYERS).find(layerQuery).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(5001).toArray();
+  if(layers.length>5000)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target:{itemGuid,itemCode},available:false,method:'EVIDENCE_LIMIT_EXCEEDED',suggestedCostExact:null,purchaseCount:layers.length,evidenceComplete:false,limit:5000};
+  return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target:{itemGuid,itemCode},evidenceComplete:true,...suggestionFromLayers(layers,{itemGuid,itemCode},applicableDate)};
+}
+async function assistedDecision(db,input={},requestedBy={}) {
+  assertRole(requestedBy?.role,['accounting']);
+  const suggestion=await assistedSuggestion(db,input,requestedBy);
+  const decision=clean(input.decision,50).toUpperCase();
+  if(['DEFERRED','REJECTED'].includes(decision)) {
+    const reason=clean(input.reason,1000);if(!reason)fail('MANUAL_COST_DECISION_REASON_REQUIRED','دلیل تصمیم الزامی است.');
+    const now=new Date(),record={resolutionId:newResolutionId(),schemaVersion:SCHEMA_VERSION,workflowType:ASSISTED_WORKFLOW,assistedStatus:decision,status:decision==='DEFERRED'?'draft':'rejected',itemGuid:suggestion.target.itemGuid,itemCode:suggestion.target.itemCode,suggestion,reason,revision:1,contentHash:crypto.createHash('sha256').update(stable({decision,target:suggestion.target,suggestionFingerprint:suggestion.sourceFingerprint,reason})).digest('hex'),createdBy:actor(requestedBy),auditLog:[auditEntry('assisted-decision',requestedBy,{reason,fromStatus:'ACCOUNTING_REVIEW',toStatus:decision})],createdAt:now,updatedAt:now,deleted:false};
+    await db.collection(COLLECTION).insertOne(record);return {ok:true,resolution:record,fifoStale:false};
+  }
+  if(decision!=='APPROVE_SUGGESTED'&&decision!=='APPROVE_OVERRIDE')fail('MANUAL_COST_DECISION_INVALID','تصمیم حسابداری معتبر نیست.');
+  const finalInput=decision==='APPROVE_SUGGESTED'?suggestion.suggestedCostExact:input.finalCost;
+  if(decision==='APPROVE_SUGGESTED'&&!suggestion.available)fail('MANUAL_COST_SUGGESTION_UNAVAILABLE','قیمت پیشنهادی معتبر وجود ندارد.',409);
+  const finalCostExact=exactUnitCost(finalInput);if(!finalCostExact)fail('MANUAL_COST_INVALID_AMOUNT','هزینه نهایی معتبر نیست.');
+  const reason=clean(input.reason,1000);
+  if((decision==='APPROVE_OVERRIDE'||!suggestion.available)&&!reason)fail('MANUAL_COST_DECISION_REASON_REQUIRED','برای مبلغ متفاوت یا ورود دستی، دلیل الزامی است.');
+  const normalized=validateDraft({itemGuid:suggestion.target.itemGuid,itemCode:suggestion.target.itemCode,manualCostExact:finalCostExact,effectiveFrom:input.effectiveFrom,effectiveTo:input.effectiveTo||'',currency:'IRR',sourceType:'historical_purchase',resolutionScope:input.resolutionScope||'item',purchaseDatasetId:input.purchaseDatasetId,purchaseLineIdentity:input.purchaseLineIdentity,targetQuantityExact:input.targetQuantityExact,reason,notes:input.notes||''});
+  await validatePurchaseLayerScope(db,normalized);await ensureNoDuplicate(db,normalized);
+  const now=new Date(),suggested=suggestion.suggestedCostExact?accountingDecimal.parse(suggestion.suggestedCostExact,accountingDecimal.UNIT_COST_SCALE):null,final=accountingDecimal.parse(finalCostExact,accountingDecimal.UNIT_COST_SCALE),delta=suggested==null?null:final-suggested;
+  const decisionContentHash=crypto.createHash('sha256').update(stable({normalized,suggestionFingerprint:suggestion.sourceFingerprint,suggestedCostExact:suggestion.suggestedCostExact,finalCostExact,decisionType:decision})).digest('hex');
+  const doc={resolutionId:newResolutionId(),schemaVersion:SCHEMA_VERSION,...normalized,contentHash:decisionContentHash,workflowType:ASSISTED_WORKFLOW,assistedStatus:'APPROVED',status:'approved',revision:1,suggestedCostExact:suggestion.suggestedCostExact,finalCostExact,deltaAmountExact:delta==null?null:accountingDecimal.format(delta,accountingDecimal.UNIT_COST_SCALE),deltaPercent:suggested&&suggested!==0n?Number((Number(delta)*100/Number(suggested)).toFixed(6)):null,decisionType:suggestion.available?(decision==='APPROVE_SUGGESTED'?'accepted-suggestion':'overridden'):'manual-entry',suggestionEvidence:suggestion,createdBy:actor(requestedBy),approvedBy:actor(requestedBy),approvedAt:now,deleted:false,auditLog:[auditEntry('assisted-needs-review',requestedBy,{fromStatus:null,toStatus:'NEEDS_REVIEW'}),auditEntry('assisted-accounting-review',requestedBy,{fromStatus:'NEEDS_REVIEW',toStatus:'ACCOUNTING_REVIEW'}),auditEntry('assisted-approved',requestedBy,{reason,fromStatus:'ACCOUNTING_REVIEW',toStatus:'APPROVED',oldValue:{suggestedCostExact:suggestion.suggestedCostExact},newValue:{finalCostExact}})],createdAt:now,updatedAt:now};
+  await db.collection(COLLECTION).insertOne(doc);
+  await db.collection('fifoSourceInvalidations').insertOne({invalidationId:`FST-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,reason:'approved-manual-cost-set-changed',resolutionId:doc.resolutionId,manualCostContentHash:doc.contentHash,createdBy:actor(requestedBy),createdAt:now,immutable:true});
+  return {ok:true,resolution:doc,fifoStale:true,adminApprovalRequired:false};
 }
 function assessSaleRow(row, context) {
   const officialRows = indexedRows(context, 'official', row, true).filter(layer => matchesOfficial(layer, row));
@@ -885,6 +960,8 @@ module.exports = {
   readiness,
   coverage,
   dataHealth,
+  assistedSuggestion,
+  assistedDecision,
   approvedSetFingerprint,
   impactPreview,
   _validAt:validAt,
@@ -897,5 +974,6 @@ module.exports = {
   _validateSupersession:validateSupersession,
   _contentHash:contentHash,
   _exactUnitCost:exactUnitCost,
-  _approvedRowsFingerprint:approvedRowsFingerprint
+  _approvedRowsFingerprint:approvedRowsFingerprint,
+  _suggestionFromLayers:suggestionFromLayers
 };
