@@ -161,6 +161,8 @@ async function initMongo() {
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, sellerIdentity: 1, saleLineId: 1 });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, officialProductCategoryGuid: 1, saleLineId: 1 });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, productCategoryGuid: 1, saleLineId: 1 });
+  await database.collection('fifoAllocations').createIndex({ datasetId: 1, officialProductCategoryName: 1, saleLineId: 1 });
+  await database.collection('fifoAllocations').createIndex({ datasetId: 1, productCategory: 1, saleLineId: 1 });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, purchaseLineIdentity: 1 });
   await database.collection('fifoAllocations').createIndex({ datasetId: 1, manualResolutionId: 1 });
   await database.collection('fifoDiagnostics').createIndex({ datasetId: 1, at: 1 });
