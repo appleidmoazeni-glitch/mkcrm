@@ -5421,7 +5421,7 @@ async function pageSellerProfit(){
       </div><div class="warn">این داشبورد فقط آمادگی داده را نشان می‌دهد؛ FIFO، سود، ROI و پورسانت همچنان غیرفعال‌اند.</div>`;
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
-  async function refreshAll(){await Promise.all([loadCoverage(),loadQueue(),loadResolutions(),loadHealth()]);}
+  async function refreshAll(){await loadQueue();await Promise.all([loadCoverage(),loadResolutions(),loadHealth()]);}
   window.pageManualCostResolution=async function(){
     setPage('رفع هزینه خرید نامشخص',`<main class="main-content">
       <div class="card"><div class="card-header"><h5>Accounting Readiness — بدون FIFO و بدون سود</h5></div><div class="card-body"><div id="mcDatasetMeta" class="small muted"></div><div id="mcCoverageCards" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"></div></div></div>
@@ -5441,7 +5441,7 @@ async function pageSellerProfit(){
       <div class="card"><div class="card-header"><h5>Data Health</h5></div><div class="card-body"><div id="mcHealth"></div></div></div>
     </main>`);
     if(['manager','purchase'].includes(userRole())&&q('#mcSave'))q('#mcSave').closest('.card').style.display='none';
-    q('#mcApply').onclick=()=>{queuePage=1;refreshAll();};
+    q('#mcApply').onclick=()=>{queuePage=1;loadQueue();};
     q('#mcExport').onclick=()=>{location.href='/api/accounting/missing-purchase-costs/export?'+queryString({page:'',pageSize:''});};
     q('#mcClear').onclick=()=>{selectedResolutionId='';selectedResolutionRevision=0;q('#mcResolutionId').textContent='Resolution جدید';['#mcItemCode','#mcItemGuid','#mcCost','#mcPurchaseDataset','#mcPurchaseLine','#mcTargetQuantity','#mcFrom','#mcTo','#mcAttachment','#mcReason','#mcNotes','#mcSupersedes'].forEach(id=>{q(id).value='';});q('#mcScope').value='item';};
     q('#mcSave').onclick=async()=>{
