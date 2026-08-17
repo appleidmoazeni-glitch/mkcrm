@@ -23,4 +23,6 @@ test('runtime smoke harness terminates its bounded client after completion',()=>
   const source=fs.readFileSync(path.join(__dirname,'../scripts/test-all.js'),'utf8');
   assert.match(source,/main\(\)\.then\(\(\)=>process\.exit\(0\)\)/);
   assert.match(source,/AbortSignal\.timeout\(5000\)/);
+  assert.doesNotMatch(source,/\/api\/items\/|\/api\/invoices\/|\/api\/shaygan\//);
+  for(const route of ['/health','/api/version','/api/server-time','/api/mongo/health'])assert.match(source,new RegExp(route.replaceAll('/','\\/')));
 });

@@ -12,6 +12,6 @@ function resolveBase(env=process.env){
   return url.origin;
 }
 async function get(url){const r=await fetch(url,{signal:AbortSignal.timeout(5000)});const t=await r.text();console.log('\n###',url,r.status);console.log(t.slice(0,2000));}
-async function main(env=process.env){const base=resolveBase(env);for(const path of ['/health','/api/mongo/health','/api/shaygan/health','/api/items/11I0305535/inventory','/api/items/11I0305535/kardex','/api/invoices/last-sale','/api/template-map'])await get(base+path);}
+async function main(env=process.env){const base=resolveBase(env);for(const path of ['/health','/api/version','/api/server-time','/api/mongo/health'])await get(base+path);}
 if(require.main===module)main().then(()=>process.exit(0)).catch(error=>{console.error(error.message);process.exit(1);});
 module.exports={resolveBase,main};
