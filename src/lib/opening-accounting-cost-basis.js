@@ -17,6 +17,10 @@ function stable(value) {
 }
 function hash(value) { return crypto.createHash('sha256').update(stable(value)).digest('hex'); }
 function exact(value, scale) { return decimal.format(decimal.parse(value, scale), scale); }
+function sourceDate(value) {
+  const raw=clean(value,50);
+  return canonicalSaleDate(/^\d{4}-\d{2}-\d{2}T/.test(raw)?raw.slice(0,10):raw,{field:'openingDate',required:true});
+}
 
 function fromKardex(result={}, extractedAt=new Date()) {
   const basis=result.openingBasis;
@@ -24,7 +28,7 @@ function fromKardex(result={}, extractedAt=new Date()) {
   if (!result.ok || !basis || result.meta?.reachedLimit) return null;
   const first=movements.slice().sort((a,b)=>String(a.date||'').localeCompare(String(b.date||'')))[0];
   if (!first?.date) return null;
-  const openingDate=canonicalSaleDate(first.date,{field:'openingDate',required:true});
+  const openingDate=sourceDate(first.date);
   const quantityExact=exact(basis.openingQuantity,decimal.QUANTITY_SCALE);
   const totalValueExact=exact(basis.openingTotalValue,decimal.MONEY_SCALE);
   const unitCostExact=exact(basis.openingUnitCost || Number(basis.openingTotalValue)/Number(basis.openingQuantity),decimal.UNIT_COST_SCALE);
