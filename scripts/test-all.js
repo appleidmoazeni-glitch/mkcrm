@@ -1,4 +1,5 @@
 'use strict';
+const http=require('node:http');
 
 function resolveBase(env=process.env){
   const raw=String(env.MKCRM_TEST_BASE_URL||'').trim();
@@ -11,7 +12,7 @@ function resolveBase(env=process.env){
   if(target==='production')throw new Error('Production is forbidden for automated tests.');
   return url.origin;
 }
-async function get(url){const r=await fetch(url,{signal:AbortSignal.timeout(5000)});const t=await r.text();console.log('\n###',url,r.status);console.log(t.slice(0,2000));}
+async function get(url){return new Promise((resolve,reject)=>{const request=http.get(url,{agent:false},response=>{let text='';response.setEncoding('utf8');response.on('data',chunk=>{if(text.length<2000)text+=chunk;});response.on('end',()=>{console.log('\n###',url,response.statusCode);console.log(text.slice(0,2000));resolve();});});request.setTimeout(5000,()=>request.destroy(new Error('The operation timed out')));request.on('error',reject);});}
 async function main(env=process.env){const base=resolveBase(env);for(const path of ['/health','/api/version','/api/server-time','/api/mongo/health'])await get(base+path);}
-if(require.main===module)main().then(()=>process.exit(0)).catch(error=>{console.error(error.message);process.exit(1);});
+if(require.main===module)main().catch(error=>{console.error(error.message);process.exitCode=1;});
 module.exports={resolveBase,main};

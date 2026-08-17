@@ -21,8 +21,9 @@ test('explicit local non-production server is accepted',()=>{
 });
 test('runtime smoke harness terminates its bounded client after completion',()=>{
   const source=fs.readFileSync(path.join(__dirname,'../scripts/test-all.js'),'utf8');
-  assert.match(source,/main\(\)\.then\(\(\)=>process\.exit\(0\)\)/);
-  assert.match(source,/AbortSignal\.timeout\(5000\)/);
+  assert.match(source,/http\.get\(url,\{agent:false\}/);
+  assert.match(source,/request\.setTimeout\(5000/);
+  assert.doesNotMatch(source,/process\.exit\(/);
   assert.doesNotMatch(source,/\/api\/items\/|\/api\/invoices\/|\/api\/shaygan\//);
   for(const route of ['/health','/api/version','/api/server-time','/api/mongo/health'])assert.match(source,new RegExp(route.replaceAll('/','\\/')));
 });
