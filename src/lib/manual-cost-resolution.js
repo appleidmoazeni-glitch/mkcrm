@@ -576,13 +576,13 @@ async function loadReadinessContext(db) {
   const [purchaseActive,saleActive]=await Promise.all([purchaseLayerDataset.activeDataset(db),saleSnapshot._activeDataset(db)]);
   const cacheKey=`${clean(purchaseActive?.datasetId,100)}|${clean(saleActive?.snapshotId,100)}`;
   const cached=db.databaseName?readinessCache.get(db):null;
-  if(cached&&cached.key===cacheKey&&Date.now()-cached.at<READINESS_CACHE_TTL_MS)return cached.value;
-  const [allLayers,manual,saleRows,legacyLayers]=await Promise.all([
-    purchaseActive?.datasetId?allRows(db.collection(purchaseLayerDataset.LAYERS),{datasetId:purchaseActive.datasetId}):[],
-    allRows(db.collection(COLLECTION),{status:'approved'}),
-    allRows(db.collection(saleActive.lineCollection),{...saleActive.lineQuery,saleInvoiceType:2}),
-    allRows(db.collection(purchaseLayerDataset.LAYERS),{datasetId:{$exists:false}}).catch(()=>[])
-  ]);
+  if(cached&&cached.key===cacheKey&&Date.now()-cached.at<READINESS_CACHE_TTL_MS)return cached.value||cached.promise;
+  const loading=(async()=>{const [allLayers,manual,saleRows,legacyLayers]=await Promise.all([
+      purchaseActive?.datasetId?allRows(db.collection(purchaseLayerDataset.LAYERS),{datasetId:purchaseActive.datasetId}):[],
+      allRows(db.collection(COLLECTION),{status:'approved'}),
+      allRows(db.collection(saleActive.lineCollection),{...saleActive.lineQuery,saleInvoiceType:2}),
+      allRows(db.collection(purchaseLayerDataset.LAYERS),{datasetId:{$exists:false}}).catch(()=>[])
+    ]);
   const official = allLayers.filter(officialLayerValid);
   const returns = allLayers.filter(row => row.layerKind === 'purchase-return');
   const indexes = {};
@@ -613,7 +613,9 @@ async function loadReadinessContext(db) {
     legacyLayers,
     ...indexes,
     purchaseDateFrom:clean(purchaseActive?.dataset?.sourceDateFrom || purchaseActive?.dataset?.request?.dateFrom)
-  };if(db.databaseName)readinessCache.set(db,{key:cacheKey,at:Date.now(),value});return value;
+  };return value;})();
+  if(db.databaseName)readinessCache.set(db,{key:cacheKey,at:Date.now(),promise:loading});
+  try{const value=await loading;if(db.databaseName)readinessCache.set(db,{key:cacheKey,at:Date.now(),value});return value;}catch(error){invalidateReadinessCache(db);throw error;}
 }
 
 function identityMatches(row, target) {
