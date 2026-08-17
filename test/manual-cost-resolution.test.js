@@ -225,6 +225,34 @@ test('missing queue classifies unknown cost, supports paging and reports current
   assert.equal(queue.list[0].fifoAllocationCreated,false);
 });
 
+test('clean-case discovery excludes every prior Manual Cost and Opening Evidence identity',async()=>{
+  const db=seedDb();
+  db.collection('manualCostResolutions').rows.push({resolutionId:'OLD-TEST',status:'rejected',itemGuid:'GUID-U',itemCode:'UNKNOWN'});
+  let report=await service.cleanCaseCandidates(db,{});
+  assert.equal(report.list.some(row=>row.itemCode==='UNKNOWN'),false);
+  assert.equal(report.list.some(row=>row.itemCode==='MANUAL'),true);
+  db.collection('openingInventoryEvidence').rows.push({evidenceId:'OIE-TEST',status:'cancelled',itemGuid:'GUID-M',itemCode:'MANUAL'});
+  report=await service.cleanCaseCandidates(db,{});
+  assert.equal(report.list.some(row=>row.itemCode==='MANUAL'),false);
+});
+
+test('clean-case discovery exposes only materialized canonical opening suggestions without writing',async()=>{
+  const db=seedDb();
+  db.collection('openingAccountingCostBasis').rows.push({evidenceId:'OACB-CLEAN',status:'available',extractionComplete:true,itemGuid:'GUID-U',itemCode:'UNKNOWN',openingQuantityExact:'2.000000',openingUnitCostExact:'750.125000',effectiveOpeningDate:'14050101',sourceFingerprint:'c'.repeat(64)});
+  const before=structuredClone(db.collection('openingAccountingCostBasis').rows);
+  const report=await service.cleanCaseCandidates(db,{}),row=report.list.find(item=>item.itemCode==='UNKNOWN');
+  assert.equal(row.sourceClass,'OPENING_ACCOUNTING_COST');assert.equal(row.evidenceQuantityCapacityExact,'2.000000');assert.equal(row.priorManualCost,false);assert.equal(row.openingInventoryEvidence,false);assert.deepEqual(db.collection('openingAccountingCostBasis').rows,before);
+});
+
+test('queue reuses bounded active-source cache and governed writes invalidate it',async()=>{
+  const db=seedDb();db.databaseName='mkcrm_staging';
+  const lines=db.collection('saleSnapshotDatasetLines'),original=lines.find.bind(lines);let reads=0;
+  lines.find=(...args)=>{reads++;return original(...args);};
+  await service.missingQueue(db,{coverage:'unknown'});await service.missingQueue(db,{coverage:'unknown'});assert.equal(reads,1);
+  await service.createDraft(db,{itemCode:'CACHE-INVALIDATION',manualCost:1,effectiveFrom:'14050101'},accounting);
+  await service.missingQueue(db,{coverage:'unknown'});assert.equal(reads,2);
+});
+
 test('data health reports active datasets, retries, resumes and zero duplicates', async () => {
   const db=seedDb();
   await approvedManual(db);

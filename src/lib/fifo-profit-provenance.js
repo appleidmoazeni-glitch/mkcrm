@@ -17,6 +17,7 @@ const COST_SOURCE_TYPES = Object.freeze({
   MANUAL_COST_PURCHASE_LAYER:'MANUAL_COST_PURCHASE_LAYER',
   MANUAL_COST_ITEM_LEGACY:'MANUAL_COST_ITEM_LEGACY',
   MANUAL_COST_OPENING_BASIS:'MANUAL_COST_OPENING_BASIS',
+  MANUAL_COST_HISTORICAL_EVIDENCE:'MANUAL_COST_HISTORICAL_EVIDENCE',
   OPENING_INVENTORY_EVIDENCE:'OPENING_INVENTORY_EVIDENCE',
   UNKNOWN:'UNKNOWN'
 });
@@ -33,6 +34,7 @@ function allocationSourceType(row={}){
   if(reversed==='official_purchase_layer')return COST_SOURCE_TYPES.OFFICIAL_PURCHASE_LAYER;
   if(reversed==='approved_manual_purchase_layer')return COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER;
   if(reversed==='approved_manual_opening_quantity')return COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS;
+  if(reversed==='approved_manual_evidence_quantity')return COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE;
   if(reversed==='approved_manual_cost')return COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY;
   if(reversed==='opening_inventory_evidence')return COST_SOURCE_TYPES.OPENING_INVENTORY_EVIDENCE;
   return COST_SOURCE_TYPES.UNKNOWN;
@@ -41,7 +43,7 @@ function allocationSourceType(row={}){
 function actor(value){return value&&typeof value==='object'?{username:clean(value.username||value.user,100),role:clean(value.role,50)}:null;}
 function sourceProjection(row={},manual={}){
   const sourceType=allocationSourceType(row);
-  const manualSource=[COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER,COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY,COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS].includes(sourceType);
+  const manualSource=[COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER,COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY,COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS,COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE].includes(sourceType);
   return {
     allocationId:clean(row.allocationId,100),
     purchaseDatasetId:clean(row.purchaseDatasetId,100),
@@ -63,7 +65,7 @@ function sourceProjection(row={},manual={}){
     approvedBy:manualSource?actor(row.manualApprovedBy||manual.approvedBy):null,
     approvedAt:manualSource?(row.manualApprovedAt||manual.approvedAt||null):null,
     manualCostExact:manualSource?clean(row.manualCostExact||manual.manualCostExact||manual.manualCost,100):'',
-    evidenceQuality:sourceType===COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER?'GOVERNED_EXACT_LAYER':sourceType===COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS?'GOVERNED_OPENING_ACCOUNTING_BASIS':sourceType===COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY?'GOVERNED_LEGACY_ITEM':sourceType===COST_SOURCE_TYPES.OFFICIAL_PURCHASE_LAYER?'OFFICIAL_PURCHASE_DOCUMENT':'UNPROVEN',
+    evidenceQuality:sourceType===COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER?'GOVERNED_EXACT_LAYER':sourceType===COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS?'GOVERNED_OPENING_ACCOUNTING_BASIS':sourceType===COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE?'GOVERNED_BOUNDED_HISTORICAL_AVERAGE':sourceType===COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY?'GOVERNED_LEGACY_ITEM':sourceType===COST_SOURCE_TYPES.OFFICIAL_PURCHASE_LAYER?'OFFICIAL_PURCHASE_DOCUMENT':'UNPROVEN',
     warning:sourceType===COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY?'این هزینه به فاکتور خرید مشخص متصل نیست.':'',
     unknownReason:sourceType===COST_SOURCE_TYPES.UNKNOWN?clean(row.unknownReason,200):''
   };
