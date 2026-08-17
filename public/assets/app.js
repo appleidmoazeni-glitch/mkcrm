@@ -21,7 +21,7 @@ const ROLE_PAGES = {
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
   accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','fifo-profit-facts','profit-adjustment-review','saved-profit-ledger','supplier-incentive-ledger','commission-rate-versions','commission-policy-governance','commission-category-governance','commission-rate-governance','saved-profit-opening-governance','commission-export-readiness','draft-commission-report','tir-1405-reconstruction','accounting-excel-audit','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
-  purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','reports'],
+  purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
   manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','fifo-profit-facts','profit-adjustment-review','saved-profit-ledger','supplier-incentive-ledger','commission-rate-versions','commission-policy-governance','commission-category-governance','commission-rate-governance','saved-profit-opening-governance','commission-export-readiness','draft-commission-report','tir-1405-reconstruction','accounting-excel-audit','reports'],
   supervisor: ['dashboard','seller-profit','reports']
@@ -5339,19 +5339,29 @@ async function pageSellerProfit(){
         <td>${number(row.saleAmount)}</td><td>${safe(row.coverage)}</td>
         <td>${safe(reasonLabel(row.reason))}</td><td>${safe(row.firstSaleDate)}<br>${safe(row.lastSaleDate)}</td>
         <td>${safe(row.purchaseLayerStatus)}</td><td style="white-space:normal">${safe(row.suggestedResolution)}</td>
-        <td>${row.coverage==='unknown'&&['admin','accounting'].includes(userRole())?`<button class="mini mc-resolve" data-code="${safe(row.itemCode)}" data-guid="${safe(row.itemGuid)}">ثبت Resolution</button>`:'—'}</td>
+        <td>${row.coverage==='unknown'&&['admin','accounting','purchase'].includes(userRole())?`<button class="mini mc-resolve" data-row="${safe(encodeURIComponent(JSON.stringify(row)))}">بررسی و تعیین هزینه</button>`:'—'}</td>
       </tr>`).join('');
       box.innerHTML=`<div class="info">آیتم‌ها: ${number(report.total)} | صفحه ${number(report.page)} | Snapshot: ${safe(report.activeSnapshotId||'')}</div>
         <table class="table"><thead><tr><th>کد / GUID</th><th>شرح</th><th>موجودی</th><th>فاکتور / تعداد</th><th>مبلغ فروش</th><th>پوشش</th><th>علت</th><th>اولین / آخرین فروش</th><th>وضعیت لایه</th><th>راهکار</th><th></th></tr></thead><tbody>${rows||'<tr><td colspan="11">رکوردی وجود ندارد.</td></tr>'}</tbody></table>
         <div class="actions"><button class="btn" id="mcPrev" ${report.page<=1?'disabled':''}>قبلی</button><button class="btn" id="mcNext" ${report.page*report.pageSize>=report.total?'disabled':''}>بعدی</button></div>`;
       q('#mcPrev').onclick=()=>{queuePage=Math.max(1,queuePage-1);loadQueue();};
       q('#mcNext').onclick=()=>{queuePage++;loadQueue();};
-      document.querySelectorAll('.mc-resolve').forEach(button=>button.onclick=()=>{
-        selectedResolutionId='';selectedResolutionRevision=0;
-        q('#mcResolutionId').textContent='Resolution جدید';
-        q('#mcItemCode').value=button.dataset.code||'';
-        q('#mcItemGuid').value=button.dataset.guid||'';
-        q('#mcCost').focus();
+      document.querySelectorAll('.mc-resolve').forEach(button=>button.onclick=async()=>{
+        const row=JSON.parse(decodeURIComponent(button.dataset.row));const detail=q('#mcAssistedDetail');
+        detail.innerHTML='<div class="info">در حال خواندن read-modelهای رسمی و materialized…</div>';
+        const params=new URLSearchParams({itemCode:row.itemCode||'',itemGuid:row.itemGuid||'',applicableDate:row.firstSaleDate||'',affectedQuantityExact:String(row.saleQuantity||0),purchaseDatasetId:report.activePurchaseLayerDatasetId||''});
+        for(const [name,value]of [...params])if(!value)params.delete(name);
+        try{
+          const suggestion=await json('/api/manual-cost-resolutions/assisted/suggestion?'+params);
+          const labels={EXACT_OFFICIAL_PURCHASE_LAYER:'فاکتور خرید رسمی',OPENING_ACCOUNTING_COST:'قیمت میانگین موجودی ابتدای دوره',HISTORICAL_PURCHASE_AVERAGE:'میانگین موزون خریدهای معتبر',NO_VALID_COST_BASIS:'بدون مأخذ پیشنهادی',CONFLICT_REQUIRES_REVIEW:'تعارض مأخذ — نیازمند بررسی'};
+          const canDecide=['admin','accounting','purchase'].includes(userRole());
+          const canFinalize=canDecide&&!['EXACT_OFFICIAL_PURCHASE_LAYER','CONFLICT_REQUIRES_REVIEW'].includes(suggestion.sourceClass);
+          detail.innerHTML=`<div class="card"><div class="card-header"><h5>بررسی و تعیین هزینه — ${safe(row.itemCode)}</h5></div><div class="card-body"><div class="row four"><div><small>مبلغ پیشنهادی سیستم</small><br><b>${suggestion.available?number(suggestion.suggestedCostExact)+' ریال':'قیمت پیشنهادی قابل محاسبه نیست؛ مأخذ معتبر کافی وجود ندارد.'}</b></div><div><small>نوع مأخذ</small><br>${safe(labels[suggestion.sourceClass]||suggestion.sourceClass)}</div><div><small>ارزش فروش در معرض</small><br>${number(row.saleAmount)} ریال</div><div><small>ردیف / مقدار</small><br>${number(row.saleLineCount)} / ${number(row.saleQuantity)}</div></div>${suggestion.sourceClass==='OPENING_ACCOUNTING_COST'?`<div class="info">مأخذ پیشنهاد: قیمت میانگین موجودی ابتدای دوره شایگان<br>تاریخ مبنا: ${safe(suggestion.effectiveOpeningDate)} | مانده ابتدای دوره: ${safe(suggestion.openingQuantityExact)} | قیمت میانگین/تمام‌شده: ${safe(suggestion.openingUnitCostExact)} | ارزش کل مبنا: ${safe(suggestion.openingTotalValueExact)}<br>اولین فروش تحت تأثیر: ${safe(row.firstSaleDate)} | Evidence: ${safe(suggestion.evidenceQuality)} | Fingerprint: <code>${safe(suggestion.sourceFingerprint)}</code></div>`:''}${suggestion.sourceClass==='HISTORICAL_PURCHASE_AVERAGE'?`<div class="info">خرید معتبر: ${number(suggestion.purchaseCount)} | مقدار: ${safe(suggestion.quantityBasisExact)} | بازه: ${safe(suggestion.dateFrom)} تا ${safe(suggestion.dateTo)} | Min/Max/Latest: ${safe(suggestion.minPurchaseCostExact)} / ${safe(suggestion.maxPurchaseCostExact)} / ${safe(suggestion.latestPurchaseCostExact)}</div><details><summary>فاکتورها و تأمین‌کنندگان</summary><pre>${safe(JSON.stringify(suggestion.evidence||[],null,2))}</pre></details>`:''}${suggestion.sourceClass==='CONFLICT_REQUIRES_REVIEW'?`<div class="error">تعارض مأخذها باید پیش از تصمیم انسانی رفع شود.<pre>${safe(JSON.stringify(suggestion.conflicts||[],null,2))}</pre></div>`:''}${canFinalize?`<div class="row four"><input id="mcAssistFrom" value="${safe(row.firstSaleDate||'')}" placeholder="شروع اثر"><input id="mcAssistTo" value="${safe(row.lastSaleDate||'')}" placeholder="پایان اثر"><input id="mcAssistCost" inputmode="decimal" value="${safe(suggestion.suggestedCostExact||'')}" placeholder="مبلغ نهایی"><input id="mcAssistReason" placeholder="دلیل Override/Manual"></div><button class="btn green" id="mcAssistAccept" ${suggestion.available?'':'disabled'}>تأیید مبلغ پیشنهادی</button> <button class="btn" id="mcAssistOverride">اصلاح/ورود مبلغ دستی</button>`:'<div class="warn">این مأخذ قابل finalize نیست؛ مسیر اصلاح منبع یا رفع تعارض را انجام دهید.</div>'}${canDecide?'<div><input id="mcAssistReason" placeholder="دلیل تعویق / نیازمند بررسی"><button class="mini" id="mcAssistDefer">تعویق / نیازمند بررسی</button></div>':''}</div></div>`;
+          const submit=async decision=>{const payload={decision,itemCode:row.itemCode,itemGuid:row.itemGuid,applicableDate:row.firstSaleDate,affectedQuantityExact:String(row.saleQuantity||0),affectedLineCount:Number(row.saleLineCount||0),saleValueExposure:Number(row.saleAmount||0),purchaseDatasetId:report.activePurchaseLayerDatasetId||'',effectiveFrom:q('#mcAssistFrom')?.value||row.firstSaleDate,effectiveTo:q('#mcAssistTo')?.value||row.lastSaleDate,finalCost:q('#mcAssistCost')?.value||'',reason:q('#mcAssistReason')?.value||''};await json('/api/manual-cost-resolutions/assisted/decisions',{method:'POST',body:JSON.stringify(payload)});detail.innerHTML='<div class="success">تصمیم governed ثبت شد؛ فقط FIFO Candidate بعدی stale است و Dataset فعال تغییر نکرد.</div>';await refreshAll();};
+          q('#mcAssistAccept')?.addEventListener('click',()=>submit('APPROVE_SUGGESTED').catch(error=>detail.insertAdjacentHTML('afterbegin',`<div class="error">${safe(error.message)}</div>`)));
+          q('#mcAssistOverride')?.addEventListener('click',()=>submit('APPROVE_OVERRIDE').catch(error=>detail.insertAdjacentHTML('afterbegin',`<div class="error">${safe(error.message)}</div>`)));
+          q('#mcAssistDefer')?.addEventListener('click',()=>submit('DEFERRED').catch(error=>detail.insertAdjacentHTML('afterbegin',`<div class="error">${safe(error.message)}</div>`)));
+        }catch(error){detail.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
       });
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
@@ -5418,7 +5428,7 @@ async function pageSellerProfit(){
         <div class="row four"><div class="form-group"><label>از تاریخ شمسی</label><input id="mcDateFrom" placeholder="14050101"></div><div class="form-group"><label>تا تاریخ شمسی</label><input id="mcDateTo" placeholder="14051229"></div><div class="form-group"><label>جستجو</label><input id="mcSearch" placeholder="کد، شرح یا GUID"></div><div class="form-group"><label>پوشش</label><select id="mcCoverage"><option value="unknown">فقط نامشخص</option><option value="all">همه</option><option value="official">رسمی</option><option value="manual">Manual</option></select></div></div>
         <div class="row four"><div class="form-group"><label>تأمین‌کننده</label><input id="mcSupplier"></div><div class="form-group"><label>برند</label><input id="mcBrand"></div><div class="form-group"><label>فروشگاه</label><input id="mcStore"></div><div class="form-group"><label>دسته</label><input id="mcCategory"></div></div>
         <div class="row four"><div class="form-group"><label>مرتب‌سازی</label><select id="mcSort"><option value="saleAmount">مبلغ فروش</option><option value="saleCount">تعداد فروش</option><option value="saleQuantity">تعداد کالا</option><option value="currentInventory">موجودی</option><option value="itemCode">کد کالا</option><option value="firstSaleDate">اولین فروش</option><option value="lastSaleDate">آخرین فروش</option></select></div><div class="form-group"><label>جهت</label><select id="mcDirection"><option value="desc">نزولی</option><option value="asc">صعودی</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="mcApply">اعمال فیلتر</button></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="mcExport">Export CSV</button></div></div>
-        <div id="mcQueue"></div></div></div>
+        <div id="mcQueue"></div><div id="mcAssistedDetail" class="mt"></div></div></div>
       <div class="card"><div class="card-header"><h5 id="mcResolutionId">Resolution جدید</h5></div><div class="card-body">
         <div class="warn">Manual Cost هرگز لایه رسمی نیست؛ فقط در نبود لایه رسمی معتبر و پس از Approval برای FIFO آینده eligible خواهد بود.</div>
         <div class="row four"><div class="form-group"><label>ItemCode</label><input id="mcItemCode"></div><div class="form-group"><label>ItemGuid</label><input id="mcItemGuid"></div><div class="form-group"><label>هزینه دستی دقیق (ریال)</label><input id="mcCost" inputmode="decimal"></div><div class="form-group"><label>Scope</label><select id="mcScope"><option value="item">Item (Legacy fallback)</option><option value="purchase_layer">Purchase Layer (ترجیحی)</option></select></div></div><div class="row four"><div class="form-group"><label>Purchase Dataset ID</label><input id="mcPurchaseDataset"></div><div class="form-group"><label>Purchase Line Identity</label><input id="mcPurchaseLine"></div><div class="form-group"><label>Target Quantity</label><input id="mcTargetQuantity" inputmode="decimal"></div><div class="form-group"><label>نوع منبع</label><select id="mcSource"><option value="manual">manual</option><option value="opening_inventory">opening_inventory</option><option value="historical_purchase">historical_purchase</option><option value="accounting_adjustment">accounting_adjustment</option><option value="legacy_cost">legacy_cost</option></select></div></div>
@@ -5429,7 +5439,7 @@ async function pageSellerProfit(){
       <div class="card"><div class="card-header"><h5>Workflow و Audit</h5></div><div class="card-body"><div id="mcResolutions"></div></div></div>
       <div class="card"><div class="card-header"><h5>Data Health</h5></div><div class="card-body"><div id="mcHealth"></div></div></div>
     </main>`);
-    if(userRole()==='manager'&&q('#mcSave'))q('#mcSave').closest('.card').style.display='none';
+    if(['manager','purchase'].includes(userRole())&&q('#mcSave'))q('#mcSave').closest('.card').style.display='none';
     q('#mcApply').onclick=()=>{queuePage=1;refreshAll();};
     q('#mcExport').onclick=()=>{location.href='/api/accounting/missing-purchase-costs/export?'+queryString({page:'',pageSize:''});};
     q('#mcClear').onclick=()=>{selectedResolutionId='';selectedResolutionRevision=0;q('#mcResolutionId').textContent='Resolution جدید';['#mcItemCode','#mcItemGuid','#mcCost','#mcPurchaseDataset','#mcPurchaseLine','#mcTargetQuantity','#mcFrom','#mcTo','#mcAttachment','#mcReason','#mcNotes','#mcSupersedes'].forEach(id=>{q(id).value='';});q('#mcScope').value='item';};
@@ -5446,7 +5456,7 @@ async function pageSellerProfit(){
   const inheritedMenu=window.renderMenu||renderMenu;
   window.renderMenu=renderMenu=function(){
     inheritedMenu.apply(this,arguments);
-    if(!['admin','accounting','manager'].includes(userRole()))return;
+    if(!['admin','accounting','manager','purchase'].includes(userRole()))return;
     const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
     const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='رفع هزینه خرید نامشخص';
     button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
@@ -5456,7 +5466,7 @@ async function pageSellerProfit(){
   const inheritedRoute=window.route||route;
   window.route=route=async function(){
     const page=location.hash.slice(1)||firstAllowedPage();
-    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageManualCostResolution();
+    if(page===PAGE&&['admin','accounting','manager','purchase'].includes(userRole()))return window.pageManualCostResolution();
     return inheritedRoute.apply(this,arguments);
   };
   try{renderMenu();}catch{}
@@ -5803,7 +5813,7 @@ async function pageSellerProfit(){
     'commission-export-readiness':'financial-data-health'
   };
   const HIDDEN_DIRECT={
-    'manual-cost-resolution':['admin','accounting','manager'],
+    'manual-cost-resolution':['admin','accounting','manager','purchase'],
     'fifo-shadow-validation':['admin','accounting','manager'],
     'saved-profit-opening-governance':['admin','accounting','manager']
   };
@@ -5994,7 +6004,7 @@ window.__saleIssuanceHotfix={refreshStatus:refreshIssuanceStatus,enforceOneCostE
   function denied(){page('عدم دسترسی','<div class="error">این ابزار مالی برای نقش فعلی مجاز نیست. مجوز Backend مرجع نهایی است.</div>');}
   window.__financialOperationsNavigation={main:MAIN,advanced:ADVANCED,redirects:REDIRECTS};
   const inheritedMenu=window.renderMenu||renderMenu;
-  window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);const menu=document.querySelector('#menu');if(!menu)return;menu.querySelectorAll('[data-financial-operations="true"]').forEach(node=>node.remove());for(const id of IDS)menu.querySelectorAll(`[data-page="${id}"]`).forEach(node=>node.remove());if(!FINANCIAL_ROLES.includes(userRole()))return;const add=(parent,row)=>{const button=document.createElement('button');button.className='navbtn';button.dataset.page=row.id;button.dataset.financialOperations='true';button.textContent=row.label;button.onclick=event=>{event.preventDefault();navTo(row.id);};parent.appendChild(button);};const title=document.createElement('div');title.className='menu-group';title.dataset.financialOperations='true';title.textContent='عملیات مالی';menu.appendChild(title);MAIN.forEach(row=>add(menu,row));const details=document.createElement('details');details.className='financial-advanced-menu';details.dataset.financialOperations='true';const summary=document.createElement('summary');summary.className='menu-group';summary.textContent='ابزارهای مالی و ممیزی';details.appendChild(summary);ADVANCED.forEach(row=>add(details,row));menu.appendChild(details);};
+  window.renderMenu=renderMenu=function(){inheritedMenu.apply(this,arguments);const menu=document.querySelector('#menu');if(!menu)return;menu.querySelectorAll('[data-financial-operations="true"]').forEach(node=>node.remove());for(const id of IDS)menu.querySelectorAll(`[data-page="${id}"]`).forEach(node=>node.remove());const currentRole=userRole();const add=(parent,row)=>{const button=document.createElement('button');button.className='navbtn';button.dataset.page=row.id;button.dataset.financialOperations='true';button.textContent=row.label;button.onclick=event=>{event.preventDefault();navTo(row.id);};parent.appendChild(button);};if(currentRole==='purchase'){const title=document.createElement('div');title.className='menu-group';title.dataset.financialOperations='true';title.textContent='رفع هزینه خرید';menu.appendChild(title);add(menu,{id:'manual-cost-resolution',label:'Manual Cost Resolution'});return;}if(!FINANCIAL_ROLES.includes(currentRole))return;const title=document.createElement('div');title.className='menu-group';title.dataset.financialOperations='true';title.textContent='عملیات مالی';menu.appendChild(title);MAIN.forEach(row=>add(menu,row));const details=document.createElement('details');details.className='financial-advanced-menu';details.dataset.financialOperations='true';const summary=document.createElement('summary');summary.className='menu-group';summary.textContent='ابزارهای مالی و ممیزی';details.appendChild(summary);ADVANCED.forEach(row=>add(details,row));menu.appendChild(details);};
   const inheritedRoute=window.route||route;
   window.route=route=async function(){const requested=location.hash.slice(1)||firstAllowedPage();const current=REDIRECTS[requested]||requested;if(REDIRECTS[requested]&&typeof history!=='undefined')history.replaceState(null,'',`#${current}`);if(['official-group-catalog','fifo-audit'].includes(current)){if(!FINANCIAL_ROLES.includes(userRole()))return denied();return current==='official-group-catalog'?officialCatalogPage():fifoAuditPage();}if(current==='commission-rate-governance'){const renderer=window.__phaseBFinancialRenderers?.[current];if(renderer)return renderer();}if(current==='financial-data-health'){const renderer=window.__accountingGovernanceRenderers?.['commission-export-readiness']||window.pageAccountingFifoReadiness;if(renderer)return renderer();}return inheritedRoute.apply(this,arguments);};
   try{renderMenu();}catch{}

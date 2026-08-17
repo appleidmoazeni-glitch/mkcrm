@@ -3673,9 +3673,17 @@ async function handleApi(req, res, pathname, query) {
     // 0.9.19.65: accounting readiness and governed manual-cost evidence.
     // This is deliberately separate from supplierPurchaseLayers and does not calculate FIFO, profit or commission.
     if (pathname === '/api/manual-cost-resolutions' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.list(db,query));
+    }
+    if(pathname==='/api/manual-cost-resolutions/assisted/suggestion'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.assistedSuggestion(db,query,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_SUGGESTION_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/manual-cost-resolutions/assisted/decisions'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting','purchase']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,201,await manualCostResolution.assistedDecision(db,body,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_DECISION_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/manual-cost-resolutions' && req.method === 'POST') {
       if (!requireRole(req,res,['admin','accounting'])) return;
@@ -3689,14 +3697,14 @@ async function handleApi(req, res, pathname, query) {
     }
     const manualCostPreviewMatch=pathname.match(/^\/api\/manual-cost-resolutions\/([^/]+)\/impact-preview$/);
     if (manualCostPreviewMatch && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try{return sendJson(res,200,await manualCostResolution.impactPreview(db,decodeURIComponent(manualCostPreviewMatch[1]),currentUser(req)));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_PREVIEW_FAILED',error:String(error.message||error)});}
     }
     const manualCostMatch=pathname.match(/^\/api\/manual-cost-resolutions\/([^/]+)(?:\/(submit|approve|reject|expire))?$/);
     if (manualCostMatch && req.method === 'GET' && !manualCostMatch[2]) {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try {
         return sendJson(res,200,{ok:true,resolution:await manualCostResolution.getById(db,decodeURIComponent(manualCostMatch[1]))});
@@ -3725,7 +3733,7 @@ async function handleApi(req, res, pathname, query) {
       }
     }
     if (pathname === '/api/accounting/missing-purchase-costs' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try {
         return sendJson(res,200,await manualCostResolution.missingQueue(db,query));
@@ -3734,7 +3742,7 @@ async function handleApi(req, res, pathname, query) {
       }
     }
     if (pathname === '/api/accounting/missing-purchase-costs/export' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try {
         const report=await manualCostResolution.missingQueue(db,{...query,export:true,page:1,pageSize:5000});
@@ -3762,7 +3770,7 @@ async function handleApi(req, res, pathname, query) {
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_READINESS_INVALID',error:String(error.message||error)});}
     }
     if (pathname === '/api/accounting/cost-coverage' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try{return sendJson(res,200,await manualCostResolution.coverage(db,query));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'COST_COVERAGE_INVALID',error:String(error.message||error)});}
@@ -3809,21 +3817,9 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
       try{return sendJson(res,200,await financialSourceControl.selectorOptions(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_SELECTORS_FAILED');}
     }
-    if(pathname==='/api/accounting/financial-source-control/manual-cost/queue'&&req.method==='GET'){
-      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
-      try{return sendJson(res,200,await financialSourceControl.manualCostQueue(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'MANUAL_COST_ASSISTED_QUEUE_FAILED');}
-    }
-    if(pathname==='/api/accounting/financial-source-control/manual-cost/suggestion'&&req.method==='GET'){
-      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
-      try{return sendJson(res,200,await manualCostResolution.assistedSuggestion(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'MANUAL_COST_SUGGESTION_FAILED');}
-    }
     if(pathname==='/api/accounting/financial-source-control/manual-cost/decisions'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
       try{return sendJson(res,200,await financialSourceControl.manualCostDecisions(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'MANUAL_COST_DECISIONS_FAILED');}
-    }
-    if(pathname==='/api/accounting/financial-source-control/manual-cost/decisions'&&req.method==='POST'){
-      if(!requireRole(req,res,['accounting']))return;const body=await collectBody(req),db=await connectMongo();
-      try{return sendJson(res,201,await manualCostResolution.assistedDecision(db,body,currentUser(req)));}catch(error){return financialSourceError(error,'MANUAL_COST_DECISION_FAILED');}
     }
     if(pathname==='/api/accounting/financial-source-control/maintenance/indexes'&&req.method==='POST'){
       if(!requireRole(req,res,['admin']))return;const db=await connectMongo();

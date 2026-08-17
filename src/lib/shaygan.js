@@ -295,6 +295,21 @@ function normalizeKardexRow(row = {}) {
   };
 }
 
+function normalizeKardexOpeningBasis(row = {}) {
+  const quantity = Number(row.BeginDurationRemainQuan1 || 0);
+  const totalValue = Number(row.BeginDurationRemainPrice1 || 0);
+  if (!Number.isFinite(quantity) || quantity <= 0 || !Number.isFinite(totalValue) || totalValue <= 0) return null;
+  return {
+    openingQuantity:quantity,
+    openingTotalValue:totalValue,
+    openingUnitCost:totalValue / quantity,
+    sourceFields:{
+      quantity:'BeginDurationRemainQuan1',
+      totalValue:'BeginDurationRemainPrice1'
+    }
+  };
+}
+
 function isRealKardexMovement(row = {}) {
   return Boolean(row.Date || row.InvoiceNumber || Number(row.IncomeQuan1 || 0) || Number(row.OutComeQuan1 || 0) || Number(row.IncomeQuan || 0) || Number(row.OutComeQuan || 0));
 }
@@ -314,6 +329,7 @@ async function getKardexByItemCode(itemCode, stockNumber = '', opts = {}) {
   const seen = new Set();
   let firstRes = null;
   let item = null;
+  let openingBasis = null;
   let error = '';
   let fetchedPages = 0;
 
@@ -327,6 +343,7 @@ async function getKardexByItemCode(itemCode, stockNumber = '', opts = {}) {
     if (!item && pageItem) item = pageItem;
     const pageRows = Array.isArray(pageItem?.ItemKardex) ? pageItem.ItemKardex : [];
     for (const rawRow of pageRows) {
+      if (!openingBasis) openingBasis = normalizeKardexOpeningBasis(rawRow);
       if (!isRealKardexMovement(rawRow)) continue;
       const normalized = normalizeKardexRow(rawRow);
       const key = kardexDedupKey(normalized);
@@ -342,6 +359,7 @@ async function getKardexByItemCode(itemCode, stockNumber = '', opts = {}) {
     ok: error ? false : true,
     error,
     item: item ? { itemCode: item.ItemCode, itemDescription: item.ItemDesc, itemGuid: item.ItemGuId } : null,
+    openingBasis,
     rows,
     meta: { fetchedPages, maxRows, reachedLimit, movementCount: rows.length, stockNumber: stockNumber || '' }
   };
@@ -908,4 +926,4 @@ async function putPurchaseInvoice(input) {
   return await put('/api/Invoice/Put', buildPurchaseInvoicePut(input));
 }
 
-module.exports = { searchAccounts, getAccountsPage, getStocks, getInventoryByItemCode, getInventoryPage, getKardexByItemCode, getItemsPage, getItemGroupsPage, getProductListPage, getInvoice, getInvoiceByGuid, getInvoicePageByDate, getInvoicePageByTypeRange, getInvoicePageByTypeNumberRange, getLastInvoiceNumber, getLastSaleInvoiceNumber, getLastPurchaseInvoiceNumber, putSaleInvoice, buildSaleInvoicePut, putPurchaseInvoice, buildPurchaseInvoicePut, formatDate8, getAccountStatement, getSerialsByItemStock, _itemGroupDomain:itemGroupDomain };
+module.exports = { searchAccounts, getAccountsPage, getStocks, getInventoryByItemCode, getInventoryPage, getKardexByItemCode, getItemsPage, getItemGroupsPage, getProductListPage, getInvoice, getInvoiceByGuid, getInvoicePageByDate, getInvoicePageByTypeRange, getInvoicePageByTypeNumberRange, getLastInvoiceNumber, getLastSaleInvoiceNumber, getLastPurchaseInvoiceNumber, putSaleInvoice, buildSaleInvoicePut, putPurchaseInvoice, buildPurchaseInvoicePut, formatDate8, getAccountStatement, getSerialsByItemStock, _itemGroupDomain:itemGroupDomain, _normalizeKardexOpeningBasis:normalizeKardexOpeningBasis };

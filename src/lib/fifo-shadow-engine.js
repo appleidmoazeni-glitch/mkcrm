@@ -449,6 +449,20 @@ function allocateSources(datasetId, source, filters = {}) {
     if(available<=EPSILON||scoped<=EPSILON||!validDate(target.purchaseInvoiceDate))continue;
     officialRows.push({...target,validationStatus:'manual-cost-approved',netUnitCost:manual.manualCostExact??manual.manualCost,fifoRemainingQuantity:round(Math.min(available,scoped)),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],fifoSourceType:'approved_manual_purchase_layer',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:'purchase_layer',manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)});
   }
+  for(const manual of source.manuals.filter(row=>row.resolutionScope==='opening_quantity')){
+    const scoped=finite(manual.targetQuantityExact)||0;
+    if(scoped<=EPSILON||!validDate(manual.effectiveFrom)||finite(manual.manualCostExact??manual.manualCost)<=0)continue;
+    officialRows.push({
+      datasetId:source.purchaseActive.datasetId,
+      purchaseLineIdentity:`MANUAL-OPENING-${clean(manual.resolutionId,100)}`,
+      layerKind:'governed-manual-opening-quantity',validationStatus:'manual-cost-approved',
+      purchaseInvoiceDate:clean(manual.effectiveFrom,8),purchaseInvoiceNo:0,sourceRow:0,
+      itemGuid:clean(manual.itemGuid,100),itemCode:clean(manual.itemCode,100),itemDescription:'',
+      netPurchasedQuantity:scoped,netUnitCost:manual.manualCostExact??manual.manualCost,
+      fifoRemainingQuantity:round(scoped),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],
+      fifoSourceType:'approved_manual_opening_quantity',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:'opening_quantity',manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)
+    });
+  }
   officialRows.sort(compareLayers);
   const purchaseReturns = source.purchaseLayers.filter(row => row.layerKind === 'purchase-return');
   const purchaseReturnByIdentity = new Map(purchaseReturns.map(row => [purchaseIdentity(row), row]));
@@ -519,8 +533,8 @@ function allocateSources(datasetId, source, filters = {}) {
         schemaVersion:SCHEMA_VERSION,
         algorithmVersion:ALGORITHM_VERSION,
         sourceType:layer.fifoSourceType||'official_purchase_layer',
-        costSourceType:layer.fifoSourceType?'MANUAL_COST_PURCHASE_LAYER':'OFFICIAL_PURCHASE_LAYER',
-        sourceConfidence:layer.fifoSourceType?'manual-approved-purchase-line':'official',
+        costSourceType:layer.fifoSourceType==='approved_manual_opening_quantity'?'MANUAL_COST_OPENING_BASIS':(layer.fifoSourceType?'MANUAL_COST_PURCHASE_LAYER':'OFFICIAL_PURCHASE_LAYER'),
+        sourceConfidence:layer.fifoSourceType==='approved_manual_opening_quantity'?'manual-approved-opening-basis':(layer.fifoSourceType?'manual-approved-purchase-line':'official'),
         saleSnapshotId:source.saleActive.snapshotId,
         saleLineId,
         saleInvoiceType:Number(sale.saleInvoiceType),
@@ -861,7 +875,7 @@ function reconcile(result) {
   let negativeRemainingCount = 0;
   let orphanLayerCount = 0;
   const officialByIdentity = new Map(result.officialRows.map(row => [purchaseIdentity(row), row]));
-  for (const row of result.allocations.filter(item => ['official_purchase_layer','approved_manual_purchase_layer'].includes(item.sourceType))) {
+  for (const row of result.allocations.filter(item => ['official_purchase_layer','approved_manual_purchase_layer','approved_manual_opening_quantity'].includes(item.sourceType))) {
     const source = officialByIdentity.get(row.purchaseLineIdentity);
     if (!source) orphanLayerCount++;
     if (Number(row.layerRemainingQuantity) < -EPSILON) negativeRemainingCount++;
@@ -873,7 +887,7 @@ function reconcile(result) {
     }
   }
   const inactiveSourceCount = result.allocations.filter(row =>
-    !['official_purchase_layer', 'approved_manual_purchase_layer', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
+    !['official_purchase_layer', 'approved_manual_purchase_layer', 'approved_manual_opening_quantity', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
   ).length;
   let monetaryReconciliationDifference = 0n;
   let monetaryPrecisionMismatchCount = 0;
@@ -933,6 +947,7 @@ function summarize(result, validation) {
   const bySource = {
     official_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
+    approved_manual_opening_quantity:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_cost:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     unknown_cost:{ quantity:0, saleValue:0, costValue:null, rows:0, items:new Set() }
   };
@@ -988,15 +1003,15 @@ function summarize(result, validation) {
   }
   const confidenceScore = round(
     shaped.official_purchase_layer.quantityPercent +
-    (shaped.approved_manual_cost.quantityPercent + shaped.approved_manual_purchase_layer.quantityPercent) * 0.6,
+    (shaped.approved_manual_cost.quantityPercent + shaped.approved_manual_purchase_layer.quantityPercent + shaped.approved_manual_opening_quantity.quantityPercent) * 0.6,
     2
   );
   let confidence = 'Unknown';
   if (shaped.unknown_cost.quantity <= EPSILON) {
-    if (shaped.approved_manual_cost.quantity + shaped.approved_manual_purchase_layer.quantity <= EPSILON) confidence = 'Official Complete';
+    if (shaped.approved_manual_cost.quantity + shaped.approved_manual_purchase_layer.quantity + shaped.approved_manual_opening_quantity.quantity <= EPSILON) confidence = 'Official Complete';
     else if (shaped.official_purchase_layer.quantity <= EPSILON) confidence = 'Manual Complete';
     else confidence = 'Mixed';
-  } else if (shaped.official_purchase_layer.quantity > EPSILON || shaped.approved_manual_cost.quantity > EPSILON || shaped.approved_manual_purchase_layer.quantity > EPSILON) {
+  } else if (shaped.official_purchase_layer.quantity > EPSILON || shaped.approved_manual_cost.quantity > EPSILON || shaped.approved_manual_purchase_layer.quantity > EPSILON || shaped.approved_manual_opening_quantity.quantity > EPSILON) {
     confidence = 'Official Partial';
   }
   return {
@@ -1007,7 +1022,7 @@ function summarize(result, validation) {
     soldQuantityExact:accountingDecimal.format(totalQuantityScaled,accountingDecimal.QUANTITY_SCALE),
     saleValueExact:accountingDecimal.format(totalSaleValueScaled,accountingDecimal.MONEY_SCALE),
     official:shaped.official_purchase_layer,
-    manual:{...shaped.approved_manual_cost,rows:shaped.approved_manual_cost.rows+shaped.approved_manual_purchase_layer.rows,quantity:round(shaped.approved_manual_cost.quantity+shaped.approved_manual_purchase_layer.quantity),saleValue:round(shaped.approved_manual_cost.saleValue+shaped.approved_manual_purchase_layer.saleValue,VALUE_SCALE),costValue:round(shaped.approved_manual_cost.costValue+shaped.approved_manual_purchase_layer.costValue,VALUE_SCALE),purchaseLayerScoped:shaped.approved_manual_purchase_layer},
+    manual:{...shaped.approved_manual_cost,rows:shaped.approved_manual_cost.rows+shaped.approved_manual_purchase_layer.rows+shaped.approved_manual_opening_quantity.rows,quantity:round(shaped.approved_manual_cost.quantity+shaped.approved_manual_purchase_layer.quantity+shaped.approved_manual_opening_quantity.quantity),saleValue:round(shaped.approved_manual_cost.saleValue+shaped.approved_manual_purchase_layer.saleValue+shaped.approved_manual_opening_quantity.saleValue,VALUE_SCALE),costValue:round(shaped.approved_manual_cost.costValue+shaped.approved_manual_purchase_layer.costValue+shaped.approved_manual_opening_quantity.costValue,VALUE_SCALE),purchaseLayerScoped:shaped.approved_manual_purchase_layer,openingQuantityScoped:shaped.approved_manual_opening_quantity},
     unknown:shaped.unknown_cost,
     confidenceScore,
     confidence,
@@ -1481,7 +1496,7 @@ async function validationReport(db, datasetId = '') {
       topHighestAllocatedValue:topValues(new Map(itemRows.map(row => [sourceKey(row), row])), 'allocatedCostAmount'),
       topUnresolvedItems:topValues(unresolvedByItem, 'unknownQuantity'),
       purchaseReturns:exceptions.filter(row => row.code === 'PURCHASE_RETURN_STATUS'),
-      manualSamples:allocations.filter(row => ['approved_manual_cost','approved_manual_purchase_layer'].includes(row.sourceType)).slice(0, 20),
+      manualSamples:allocations.filter(row => ['approved_manual_cost','approved_manual_purchase_layer','approved_manual_opening_quantity'].includes(row.sourceType)).slice(0, 20),
       unknownSamples:allocations.filter(row => row.sourceType === 'unknown_cost').slice(0, 20)
     },
     topExceptions:exceptions.filter(row => row.status === 'unresolved').slice(0, 50),
