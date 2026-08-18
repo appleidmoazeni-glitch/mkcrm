@@ -3,6 +3,7 @@
 const shaygan = require('./shaygan');
 const { APP_VERSION: VERSION } = require('./app-version');
 const { normalizeJalaliRange, canonicalSaleDate } = require('./jalali-date');
+const canonicalItemCatalog = require('./canonical-item-catalog');
 const AMOUNT_TOLERANCE_RIAL = 0.01;
 const DATASET_HEADERS = 'saleSnapshotDatasetHeaders';
 const DATASET_LINES = 'saleSnapshotDatasetLines';
@@ -562,6 +563,7 @@ async function buildSaleSnapshot(db, opts={}){
     );
     if(Number(headerWrite.upsertedCount||0)>0) counters.insertedHeaders++; else { counters.updatedHeaders++; counters.duplicatePrevented++; }
     const lines=saleLineDocs(inv, sid, sellerMaps, pageGroupMap);
+    if(lines.length)await canonicalItemCatalog.ensureCatalogItems(db,lines.map(line=>({itemGuid:line.itemGuid,itemCode:line.itemCode,itemDescription:line.itemName})),{source:'canonical-sale-snapshot'});
     linesParsed += lines.length;
     counters.groupFallbackLines += lines.filter(x=>x.mainGroupSource==='item-code-prefix-fallback').length;
     const lineAmountTotal=lines.reduce((sum,line)=>sum+num(line.saleValue,0),0);

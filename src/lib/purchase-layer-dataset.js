@@ -5,6 +5,7 @@ const defaultShaygan = require('./shaygan');
 const saleSnapshot = require('./sale-snapshot');
 const { APP_VERSION } = require('./app-version');
 const { normalizeJalaliRange, canonicalSaleDate } = require('./jalali-date');
+const canonicalItemCatalog = require('./canonical-item-catalog');
 
 const DATASETS = 'purchaseLayerDatasets';
 const STATE = 'purchaseLayerDatasetState';
@@ -432,11 +433,13 @@ async function buildPurchaseLayerDataset(db, options = {}) {
           reachedEndByType[key] = true;
           break;
         }
+        const pageCatalogItems=[];
         for (const invoice of sourceRows) {
           lastInvoiceNoByType[key] = Math.max(Number(lastInvoiceNoByType[key] || 0), invoiceNo(invoice));
           const body = invoiceBody(invoice);
           for (let index = 0; index < body.length; index++) {
             const mapped = mapSourceLine(invoice, body[index], index + 1, datasetId);
+            pageCatalogItems.push({itemGuid:mapped.itemGuid,itemCode:mapped.itemCode,itemDescription:mapped.itemDescription});
             await db.collection(LAYERS).updateOne(
               { datasetId, purchaseLineIdentity:mapped.purchaseLineIdentity },
               layerUpsertUpdate(mapped),
@@ -444,6 +447,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
             );
           }
         }
+        if(pageCatalogItems.length)await canonicalItemCatalog.ensureCatalogItems(db,pageCatalogItems,{source:'canonical-purchase-engine'});
         // Advance only after every row in the page is durable. A failed page is replayed on resume.
         nextRowStartByType[key] = rowStart + pageSize;
         if(pagingByType[key].mode==='total-records' &&
@@ -594,6 +598,32 @@ async function coverage(db, datasetId = '') {
   };
 }
 
+async function buildRecoveryCandidate(db, options = {}) {
+  await ensureIndexes(db);
+  const previousActive=await activeDataset(db);
+  if(!previousActive?.datasetId)throw Object.assign(new Error('Active canonical Purchase Dataset required'),{code:'PURCHASE_DATASET_REQUIRED'});
+  const candidateIds=[...new Set((options.candidateIds||[]).map(clean).filter(Boolean))];
+  if(!candidateIds.length)throw Object.assign(new Error('Reviewed recovery candidates required'),{code:'PURCHASE_RECOVERY_CANDIDATES_REQUIRED'});
+  const reviewed=await db.collection('purchaseLayerRecoveryCandidates').find({candidateId:{$in:candidateIds},approvedForDatasetRebuild:true}).toArray();
+  if(reviewed.length!==candidateIds.length)throw Object.assign(new Error('Every recovery candidate must be independently reviewed'),{code:'PURCHASE_RECOVERY_REVIEW_REQUIRED'});
+  const datasetId=newDatasetId(),now=new Date();
+  await db.collection(DATASETS).insertOne({datasetId,datasetSchemaVersion:SCHEMA_VERSION,scopeKey:SCOPE_KEY,status:'running',activationStatus:'candidate',activationRequested:false,mode:'recovery-candidate',baseDatasetId:previousActive.datasetId,sourceDateFrom:previousActive.dataset?.sourceDateFrom||'',sourceDateTo:previousActive.dataset?.sourceDateTo||'',sourceVersion:'canonical-purchase-engine-reviewed-recovery-v1',applicationVersion:APP_VERSION,gitSha:clean(process.env.GIT_COMMIT||process.env.COMMIT_SHA),createdAt:now,startedAt:now,updatedAt:now});
+  const clonedLayerCount=await cloneActiveLayers(db,previousActive,datasetId);
+  for(const row of reviewed){
+    const mapped={...(row.canonicalLayer||{}),datasetId,source:'canonical-purchase-engine-reviewed-recovery',recoveryCandidateId:row.candidateId,reviewedBy:row.reviewedBy||null,reviewedAt:row.reviewedAt||null,updatedAt:new Date()};
+    if(!mapped.purchaseLineIdentity||mapped.layerKind!=='purchase')throw Object.assign(new Error(`Invalid canonical recovery layer ${row.candidateId}`),{code:'PURCHASE_RECOVERY_LAYER_INVALID'});
+    mapped.sourceHash=clean(mapped.sourceHash)||sourceHash(mapped);
+    await db.collection(LAYERS).updateOne({datasetId,purchaseLineIdentity:mapped.purchaseLineIdentity},layerUpsertUpdate(mapped),{upsert:true});
+  }
+  const returnAudit=await reconcilePurchaseReturns(db,datasetId);
+  const {rows,validation}=await validateDataset(db,datasetId,{'3':true,'7':true},[]);
+  validation.purchaseReturns=returnAudit;
+  validation.valid=validation.valid&&returnAudit.quantityInvariantErrors===0;
+  const fingerprints=datasetFingerprints(rows),completedAt=new Date();
+  await db.collection(DATASETS).updateOne({datasetId},{$set:{status:validation.valid?'completed':'completed_with_errors',activationStatus:validation.valid?'validated-candidate':'rejected',completedAt,updatedAt:completedAt,clonedLayerCount,recoveredLayerCount:reviewed.length,reviewedRecoveryCandidateIds:candidateIds,layerCount:rows.length,validation,returnAudit,...fingerprints}});
+  return {ok:validation.valid,datasetId,status:validation.valid?'completed':'completed_with_errors',activationStatus:validation.valid?'validated-candidate':'rejected',activeDatasetId:previousActive.datasetId,clonedLayerCount,recoveredLayerCount:reviewed.length,validation,...fingerprints,activationPerformed:false};
+}
+
 async function listDatasets(db, limit = 20) {
   await ensureIndexes(db);
   const active = await activeDataset(db);
@@ -628,7 +658,7 @@ async function listLayers(db, filters = {}) {
 
 module.exports = {
   DATASETS, STATE, LAYERS, DIAGNOSTICS, SCHEMA_VERSION, SOURCE_TYPES,
-  ensureIndexes, activeDataset, buildPurchaseLayerDataset, coverage, listDatasets, status, listLayers,
+  ensureIndexes, activeDataset, buildPurchaseLayerDataset, buildRecoveryCandidate, coverage, listDatasets, status, listLayers,
   _mapSourceLine:mapSourceLine, _lineIdentity:lineIdentity, _reconcilePurchaseReturns:reconcilePurchaseReturns,
   _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate,
   _responseTotalRecords:responseTotalRecords, _sourceHash:sourceHash,

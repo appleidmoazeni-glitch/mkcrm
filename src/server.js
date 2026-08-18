@@ -22,6 +22,7 @@ const sellerFinancialPerformance = require('./lib/seller-financial-performance')
 const fifoReliability = require('./lib/fifo-reliability');
 const financialSourceControl = require('./lib/financial-source-control');
 const saleSnapshot = require('./lib/sale-snapshot');
+const canonicalItemCatalog = require('./lib/canonical-item-catalog');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
@@ -923,6 +924,7 @@ async function upsertInventoryRows(db, rows, meta = {}) {
   arr.forEach(x => { if (x.itemCode && !itemMap.has(x.itemCode)) itemMap.set(x.itemCode, x); });
   const itemOps = [...itemMap.values()].map(x => ({ updateOne: { filter: { itemCode: x.itemCode }, update: { $set: { itemCode:x.itemCode, itemDescription:x.itemDescription, itemGuid:x.itemGuid, searchText: normalizeFa(`${x.itemCode} ${x.itemDescription}`), syncedAt: now, updatedAt: now } }, upsert:true } }));
   if (itemOps.length) await db.collection('itemCatalog').bulkWrite(itemOps, { ordered:false }).catch(()=>{});
+  if (arr.length) await canonicalItemCatalog.ensureCatalogItems(db, arr, { source:meta.source || sourceProbe || 'inventory-getremain' });
 }
 
 
@@ -973,7 +975,7 @@ async function refreshInventoryCacheForItem(db, itemCode, reason = 'manual-refre
     return { ok:true, itemCode:code, refreshed:false, zeroUntrusted:true, preserved:true, rows:oldRows, rowCount:oldRows.length, liveRowCount:0, oldRowCount:oldRows.length, source:'safe-authoritative-item-refresh-zero-preserved-cache' };
   }
 
-  await upsertInventoryRows(db, rows);
+  await upsertInventoryRows(db, rows, { source:'exact-code-repair', reason:reasonText });
   let zeroedCount = 0;
   if ((opts.allowStockReduction === true || opts.confirmReduction === true) && reducedStocks.length) {
     const upd = await db.collection('itemInventoryCatalog').updateMany(
@@ -1434,6 +1436,7 @@ async function upsertAllItemRows(db, items) {
     }
   }));
   if (ops.length) await db.collection('itemCatalogAll').bulkWrite(ops, { ordered:false }).catch(()=>{});
+  if ((items||[]).length) await canonicalItemCatalog.ensureCatalogItems(db, items, { source:'all-items-catalog-bootstrap' });
 }
 
 async function searchAllItems(q, limit = 50, maxPages = config.inventoryCatalogSyncPages, opts = {}) {
@@ -5152,6 +5155,7 @@ async function handleApi(req, res, pathname, query) {
       const dbk = await connectMongo();
       const inventoryEnsure = await authoritativeLiveReconcileItem(dbk, code, 'before-kardex').catch(e => ({ ok:false, error:String(e.message||e) }));
       const r = await shaygan.getKardexByItemCode(code, query.stockNumber || query.STNumber || '', { maxRows, hardMaxRows: roleHardMax }).catch(e => ({ ok:false, rows:[], item:null, meta:{}, error:String(e.message||e) }));
+      if(r.ok)await canonicalItemCatalog.ensureCatalogItem(dbk,{itemCode:code,...(r.item||{})},{source:'kardex-exact-code-lookup'});
       let inventoryRepair = null;
       if (r.ok) inventoryRepair = await repairInventorySnapshotFromKardex(dbk, code, query.stockNumber || query.STNumber || '', r).catch(e => ({ ok:false, error:String(e.message||e) }));
       return sendJson(res, 200, { ok: r.ok, item: r.item, rows: r.rows || [], meta: r.meta || {}, inventoryEnsure, inventoryRepair, error: r.error || '' });
@@ -5163,6 +5167,7 @@ async function handleApi(req, res, pathname, query) {
       const code = decodeURIComponent(lastPurchaseMatch[1]);
       // 0.9.19.17→WS: SQL last-purchase حذف شد
       const r = await shaygan.getKardexByItemCode(code, '', { maxRows: config.kardexAdminFullMaxRows, hardMaxRows: config.kardexAdminFullMaxRows });
+      if(r.ok){const dbc=await connectMongo();await canonicalItemCatalog.ensureCatalogItem(dbc,{itemCode:code,...(r.item||{})},{source:'kardex-last-purchase-lookup'});}
       const rows = (r.rows || []).filter(x => Number(x.inQty || 0) > 0);
       rows.sort((a,b) => String(b.date||'').localeCompare(String(a.date||'')) || Number(b.invoiceNumber||0)-Number(a.invoiceNumber||0));
       const row = rows[0] || null;
@@ -5259,7 +5264,7 @@ async function handleApi(req, res, pathname, query) {
       if(!await sellerCanAccessInvoice(user,inv))return deny(res,'برای کاردکس اقلام این فاکتور دسترسی ندارید');
       const body=Array.isArray(inv.Body)?inv.Body:(Array.isArray(inv.InvoiceBody)?inv.InvoiceBody:[]);const line=body.find(x=>String(x.ItemNumber||x.ItemCode||'')===code);if(!line)return sendJson(res,403,{ok:false,error:'کالا در فاکتور مجاز وجود ندارد'});
       const role=String(user.role||'seller'),requested=Number(query.maxRows||0),hard=role==='admin'?config.kardexAdminFullMaxRows:config.kardexSellerMaxRows,maxRows=requested?Math.min(requested,hard):(role==='admin'?config.kardexAdminQuickMaxRows:config.kardexSellerMaxRows);
-      const r=await shaygan.getKardexByItemCode(code,'',{maxRows,hardMaxRows:hard});return sendJson(res,200,{ok:r.ok,item:r.item,rows:r.rows||[],meta:r.meta||{},invoice:{invNo,invType},error:r.error||''});
+      const r=await shaygan.getKardexByItemCode(code,'',{maxRows,hardMaxRows:hard});if(r.ok){const dbc=await connectMongo();await canonicalItemCatalog.ensureCatalogItem(dbc,{itemCode:code,...(r.item||{})},{source:'invoice-line-kardex-lookup'});}return sendJson(res,200,{ok:r.ok,item:r.item,rows:r.rows||[],meta:r.meta||{},invoice:{invNo,invType},error:r.error||''});
     }
     if (pathname === '/api/invoices/last-sale') return sendJson(res, 200, await shaygan.getLastSaleInvoiceNumber());
     if (pathname === '/api/invoice-numbers/reserve' && req.method === 'POST') return sendJson(res, 200, await reserveInvoiceNumber(await collectBody(req)));

@@ -60,6 +60,12 @@ function seedDb() {
       { itemCode:'MANUAL', stockNumber:'1', quantity:7 },
       { itemCode:'UNKNOWN', stockNumber:'1', quantity:9 }
     ],
+    itemCatalogAll:[
+      {itemCode:'OFFICIAL',itemGuid:'GUID-O',canonicalIdentity:'guid:guido',historyCompleteness:'complete'},
+      {itemCode:'MANUAL',itemGuid:'GUID-M',canonicalIdentity:'guid:guidm',historyCompleteness:'complete'},
+      {itemCode:'UNKNOWN',itemGuid:'GUID-U',canonicalIdentity:'guid:guidu',historyCompleteness:'complete'}
+    ],
+    purchaseHistoryDiscoveryQueue:[],
     manualCostResolutions:[],
     appJobs:[
       { jobId:'J1', status:'completed', result:{ retryCount:1 } },
@@ -242,6 +248,20 @@ test('clean-case discovery exposes only materialized canonical opening suggestio
   const before=structuredClone(db.collection('openingAccountingCostBasis').rows);
   const report=await service.cleanCaseCandidates(db,{}),row=report.list.find(item=>item.itemCode==='UNKNOWN');
   assert.equal(row.sourceClass,'OPENING_ACCOUNTING_COST');assert.equal(row.evidenceQuantityCapacityExact,'2.000000');assert.equal(row.priorManualCost,false);assert.equal(row.openingInventoryEvidence,false);assert.deepEqual(db.collection('openingAccountingCostBasis').rows,before);
+});
+
+test('source reclassification prefers governed opening evidence and requires reviewed history before true no-cost',async()=>{
+  const db=seedDb();
+  const catalogRow=db.collection('itemCatalogAll').rows.find(row=>row.itemCode==='UNKNOWN');catalogRow.historyCompleteness='incomplete';
+  let report=await service.sourceReclassificationReport(db);
+  assert.equal(report.list.find(row=>row.itemCode==='UNKNOWN').sourceClass,'SOURCE_HISTORY_INCOMPLETE');
+  db.collection('openingAccountingCostBasis').rows.push({evidenceId:'O-U',status:'available',extractionComplete:true,itemCode:'UNKNOWN',itemGuid:'GUID-U',effectiveOpeningDate:'14050101',openingQuantityExact:'4',openingUnitCostExact:'500',sourceFingerprint:'e'.repeat(64)});
+  report=await service.sourceReclassificationReport(db);
+  assert.equal(report.list.find(row=>row.itemCode==='UNKNOWN').sourceClass,'OPENING_ACCOUNTING_COST');
+  db.collection('openingAccountingCostBasis').rows.length=0;catalogRow.historyCompleteness='complete';
+  report=await service.sourceReclassificationReport(db);
+  assert.equal(report.list.find(row=>row.itemCode==='UNKNOWN').sourceClass,'TRUE_NO_VALID_COST_BASIS');
+  assert.equal(report.historicalFinancialFactsMutated,false);
 });
 
 test('queue reuses bounded active-source cache and governed writes invalidate it',async()=>{

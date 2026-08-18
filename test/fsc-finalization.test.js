@@ -27,6 +27,7 @@ function db(){return new MemoryDb({
     {datasetId:'F-C',allocationId:'U3',sourceType:'unknown_cost',saleLineId:'SL3',saleInvoiceNo:3,saleInvoiceType:2,saleDate:'14050112',itemGuid:'G-Y',itemCode:'Y',itemDescription:'Item Y',quantityExact:'1',allocatedSaleValueExact:'500',sellerIdentity:'117',sellerName:'فروشنده یک',officialProductCategoryGuid:'NB-G',officialProductCategoryName:'NOTEBOOK'}
   ],
   fifoExceptions:[],manualCostResolutions:[],fifoSourceInvalidations:[],openingInventoryEvidence:[],financialSourceReviews:[],financialSourceReviewActions:[],
+  itemCatalogAll:[{itemCode:'X',itemGuid:'G-X',canonicalIdentity:'guid:gx',historyCompleteness:'complete'},{itemCode:'Y',itemGuid:'G-Y',canonicalIdentity:'guid:gy',historyCompleteness:'complete'},{itemCode:'Z',itemGuid:'G-Z',canonicalIdentity:'guid:gz',historyCompleteness:'complete'}],purchaseHistoryDiscoveryQueue:[],
   accountingOfficialGroupCatalogRuns:[{catalogRunId:'CAT',fetchedAt:new Date()}],
   accountingOfficialItemGroups:[{catalogRunId:'CAT',isMainGroup:true,sourceGroupGuid:'CPU-G',groupNumber:'84',groupName:'CPU',resolvedMainGroupGuid:'CPU-G',resolvedMainGroupName:'CPU'},{catalogRunId:'CAT',isMainGroup:true,sourceGroupGuid:'NB-G',groupNumber:'1',groupName:'NOTEBOOK',resolvedMainGroupGuid:'NB-G',resolvedMainGroupName:'NOTEBOOK'}]
 });}

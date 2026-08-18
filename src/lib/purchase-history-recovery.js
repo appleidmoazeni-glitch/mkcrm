@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const defaultShaygan = require('./shaygan');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
 const accountingDecimal = require('./accounting-decimal');
+const canonicalItemCatalog = require('./canonical-item-catalog');
 
 const COLLECTION = 'purchaseLayerRecoveryCandidates';
 const MODULE_VERSION = 'purchase-history-recovery-1.0.0';
@@ -106,6 +107,7 @@ async function recover(db, options = {}) {
   const maxKardexRows = bounded(options.maxKardexRows, DEFAULT_MAX_KARDEX_ROWS, HARD_MAX_KARDEX_ROWS);
   const timeoutMs = Math.min(bounded(options.timeoutMs, DEFAULT_TIMEOUT_MS, 15000), 15000);
   const priority = await unresolvedPriority(db, fifoDatasetId, { maxItems });
+  await canonicalItemCatalog.ensureCatalogItems(db,priority.selectedItems,{source:'purchase-history-recovery-discovery'});
   const existing = await db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:purchaseDatasetId }).toArray();
   const existingIdentities = new Set(existing.map(row => clean(row.purchaseLineIdentity, 500)));
   const recovered = [];
@@ -154,6 +156,7 @@ async function recover(db, options = {}) {
             firstSaleDate:item.firstSaleDate, lastSaleDate:item.lastSaleDate,
             affectedUnknownLineCount:item.unknownLineCount, affectedUnknownSaleValueExact:item.unknownSaleValueExact,
             purchaseReturnEvidence:returnMovements.slice(0,20).map(row => ({ invoiceNo:Number(row.invoiceNumber), date:canonicalDate(row.date), quantity:finite(row.outQty || row.inQty) })),
+            canonicalLayer:{...mapped,datasetId:''},
             evidenceSource:'shaygan-kardex-plus-official-invoice-get', status:'detected',
             reviewRequired:true, approvedForDatasetRebuild:false
           };
@@ -171,6 +174,14 @@ async function recover(db, options = {}) {
         { $setOnInsert:{ ...row, createdBy:{ username:clean(options.actor?.username || 'fifo-r2-recovery', 100), role:clean(options.actor?.role || 'system', 50) }, revision:1, auditLog:[{ action:'official-evidence-detected', by:{ username:clean(options.actor?.username || 'fifo-r2-recovery', 100), role:clean(options.actor?.role || 'system', 50) }, at:now }], createdAt:now }, $set:{ lastVerifiedAt:now, updatedAt:now } },
         { upsert:true }
       );
+    }
+    for(const item of priority.selectedItems){
+      const history=await canonicalItemCatalog.historyStatus(db,item);
+      const identity=history.catalog?.canonicalIdentity||canonicalItemCatalog._identityOf(item);
+      if(!identity)continue;
+      const itemRecovered=recovered.filter(row=>row.itemCode===item.itemCode);
+      const itemFailures=failures.filter(row=>row.itemCode===item.itemCode);
+      await db.collection(canonicalItemCatalog.HISTORY_QUEUE).updateOne({canonicalIdentity:identity},{$set:{status:itemFailures.length?'failed':'pending_review',recoveredEvidenceCount:itemRecovered.length,lastAttemptAt:new Date(),lastError:itemFailures[0]?.error||'',updatedAt:new Date()},$inc:{attempts:1}},{upsert:true});
     }
   }
   return {

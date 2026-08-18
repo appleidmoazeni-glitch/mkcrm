@@ -3,6 +3,7 @@ const { config } = require('./config');
 function range(from = '', to = '', arr = []) { return { From: String(from || ''), To: String(to || ''), In: arr }; }
 function sortRange(value = '0') { return { From: String(value), To: '', In: [] }; } // Shaygan GetStatement requires Sort.From = 0 or 1
 function body(domain) { return { StartVersion: '0', EndVersion: '', Domain: domain, Config: { ConnectionName: config.shayganConnectionName } }; }
+function domainDate8(value) { return String(value||'').replace(/[۰-۹]/g,d=>String('۰۱۲۳۴۵۶۷۸۹'.indexOf(d))).replace(/[٠-٩]/g,d=>String('٠١٢٣٤٥٦٧٨٩'.indexOf(d))).replace(/\D/g,'').slice(0,8); }
 
 async function post(endpoint, domain, rowStart = 0, rowCount = 100, opts = {}) {
   const safeRowCount = Math.max(1, Math.min(Number(rowCount || 100), Number(opts.maxRowCount || 100)));
@@ -321,8 +322,10 @@ function kardexDedupKey(x = {}) {
 
 async function getKardexByItemCode(itemCode, stockNumber = '', opts = {}) {
   const maxRows = Math.max(1, Math.min(Number(opts.maxRows || config.kardexSellerMaxRows || 20), Number(opts.hardMaxRows || config.kardexAdminFullMaxRows || 100)));
+  const kardexDateFrom=domainDate8(opts.dateFrom);
+  const kardexDateTo=domainDate8(opts.dateTo);
   const domain = {
-    InvDate: range(), InvType: range(), ItemMainGroupCode: range(), ItemCode: range(itemCode, itemCode), STNumber: stockNumber ? range(stockNumber, stockNumber) : range(), STGuId: range(),
+    InvDate: (kardexDateFrom || kardexDateTo) ? range(kardexDateFrom, kardexDateTo) : range(), InvType: range(), ItemMainGroupCode: range(), ItemCode: range(itemCode, itemCode), STNumber: stockNumber ? range(stockNumber, stockNumber) : range(), STGuId: range(),
     ItemGuId: range(), AccountGuId: range(), JobGuId: range(), ItemGroupCode: range()
   };
   const rows = [];
@@ -361,7 +364,7 @@ async function getKardexByItemCode(itemCode, stockNumber = '', opts = {}) {
     item: item ? { itemCode: item.ItemCode, itemDescription: item.ItemDesc, itemGuid: item.ItemGuId } : null,
     openingBasis,
     rows,
-    meta: { fetchedPages, maxRows, reachedLimit, movementCount: rows.length, stockNumber: stockNumber || '' }
+    meta: { fetchedPages, maxRows, reachedLimit, movementCount: rows.length, stockNumber: stockNumber || '', openingDate:kardexDateFrom }
   };
 }
 
