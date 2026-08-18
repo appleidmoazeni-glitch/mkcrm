@@ -65,9 +65,12 @@ function aggregateWarehouseKardex(entries=[], extractedAt=new Date()) {
   for(const entry of entries||[]){
     const warehouseNumber=clean(entry.warehouseNumber??entry.stockNumber??entry.result?.meta?.stockNumber,100);
     const identity=warehouseNumber||'__UNRESTRICTED__';
-    const evidence=fromKardex(entry.result||entry,extractedAt);
-    if(!evidence)continue;
-    const row={...evidence,warehouseNumber,warehouseName:clean(entry.warehouseName,300),included:entry.included!==false,exclusionReason:entry.included===false?clean(entry.reason||'warehouse-not-operationally-relevant',300):''};
+    const result=entry.result||entry;
+    if(!result?.ok||result?.meta?.reachedLimit)return {ok:false,sourceClass:SOURCE_CLASS,code:'OPENING_WAREHOUSE_EXTRACTION_INCOMPLETE',failedWarehouse:warehouseNumber,failureReason:result?.meta?.reachedLimit?'kardex-row-limit-reached':clean(result?.error||'source-request-failed',500),warehouseEvidence:[...byWarehouse.values()],duplicates,extractionComplete:false};
+    const evidence=fromKardex(result,extractedAt);
+    const row=evidence
+      ? {...evidence,warehouseNumber,warehouseName:clean(entry.warehouseName,300),included:entry.included!==false,exclusionReason:entry.included===false?clean(entry.reason||'warehouse-not-operationally-relevant',300):''}
+      : {sourceClass:SOURCE_CLASS,sourceEndpoint:'Item/GetKardex',itemGuid:clean(result.item?.itemGuid,100),itemCode:clean(result.item?.itemCode,100),itemDescription:clean(result.item?.itemDescription,500),effectiveOpeningDate:clean(result.meta?.openingDate,8),openingQuantityExact:'0.000000',openingUnitCostExact:'0.000000',openingTotalValueExact:'0.00',evidenceScope:'warehouse',warehouseNumber,warehouseName:clean(entry.warehouseName,300),sourceFields:{quantity:'BeginDurationRemainQuan1',totalValue:'BeginDurationRemainPrice1'},earliestMovement:null,evidenceQuality:'AUTHORITATIVE_ZERO_OPENING_RESPONSE',extractionComplete:true,sourceFingerprint:hash({warehouseNumber,openingDate:clean(result.meta?.openingDate,8),openingQuantityExact:'0.000000',openingTotalValueExact:'0.00'}),included:false,exclusionReason:entry.included===false?clean(entry.reason||'warehouse-not-operationally-relevant',300):'no-positive-authoritative-opening-basis',extractedAt};
     if(byWarehouse.has(identity)){
       const existing=byWarehouse.get(identity);
       duplicates.push({warehouseNumber,identical:existing.sourceFingerprint===row.sourceFingerprint,keptFingerprint:existing.sourceFingerprint,ignoredFingerprint:row.sourceFingerprint});
@@ -91,7 +94,7 @@ function aggregateWarehouseKardex(entries=[], extractedAt=new Date()) {
   const unitCostScaleFactor=10n**BigInt(decimal.UNIT_COST_SCALE+decimal.QUANTITY_SCALE-decimal.MONEY_SCALE);
   const unitCostExact=decimal.format(decimal.divideRounded(totalValue*unitCostScaleFactor,quantity),decimal.UNIT_COST_SCALE);
   const first=included.map(row=>row.earliestMovement).filter(Boolean).sort((a,b)=>String(a.date).localeCompare(String(b.date)))[0]||null;
-  const evidence={sourceClass:SOURCE_CLASS,sourceEndpoint:'Item/GetKardex',itemGuid:included.find(row=>row.itemGuid)?.itemGuid||'',itemCode:included.find(row=>row.itemCode)?.itemCode||'',itemDescription:included.find(row=>row.itemDescription)?.itemDescription||'',effectiveOpeningDate:dates[0],openingQuantityExact:quantityExact,openingUnitCostExact:unitCostExact,openingTotalValueExact:totalValueExact,sourceFields:{quantity:'BeginDurationRemainQuan1',totalValue:'BeginDurationRemainPrice1',aggregation:'sum-by-distinct-operational-warehouse'},earliestMovement:first,evidenceScope:'global-active-warehouses',warehouseEvidence,warehouseCount:included.length,excludedWarehouseCount:warehouseEvidence.length-included.length,duplicateWarehouseCount:duplicates.length,duplicates,evidenceQuality:'PROVEN_GLOBAL_WAREHOUSE_AGGREGATION',aggregationMethod:'SUM_QUANTITY_AND_VALUE_WEIGHTED_UNIT_COST',extractionComplete:true,extractedAt};
+  const evidence={sourceClass:SOURCE_CLASS,sourceEndpoint:'Item/GetKardex',itemGuid:included.find(row=>row.itemGuid)?.itemGuid||'',itemCode:included.find(row=>row.itemCode)?.itemCode||'',itemDescription:included.find(row=>row.itemDescription)?.itemDescription||'',effectiveOpeningDate:dates[0],openingQuantityExact:quantityExact,openingUnitCostExact:unitCostExact,openingTotalValueExact:totalValueExact,sourceFields:{quantity:'BeginDurationRemainQuan1',totalValue:'BeginDurationRemainPrice1',aggregation:'sum-by-distinct-operational-warehouse'},earliestMovement:first,evidenceScope:'global-active-warehouses',warehouseEvidence,warehouseCount:included.length,queriedWarehouseCount:warehouseEvidence.length,excludedWarehouseCount:warehouseEvidence.length-included.length,duplicateWarehouseCount:duplicates.length,duplicates,evidenceQuality:'PROVEN_GLOBAL_WAREHOUSE_AGGREGATION',aggregationMethod:'SUM_QUANTITY_AND_VALUE_WEIGHTED_UNIT_COST',extractionComplete:true,extractedAt};
   evidence.sourceFingerprint=hash({...evidence,extractedAt:undefined});
   evidence.evidenceId=`OACB-${evidence.sourceFingerprint.slice(0,24)}`;
   return evidence;
@@ -125,7 +128,7 @@ async function materialize(db,input={},options={}) {
   if(evidence.ok===false)return {ok:false,itemCode,materialized:false,code:evidence.code,details:evidence,readOnlySource:true};
   const now=new Date();
   await db.collection(COLLECTION).updateOne({itemCode:evidence.itemCode,sourceFingerprint:evidence.sourceFingerprint},{$setOnInsert:{...evidence,moduleVersion:MODULE_VERSION,status:'available',createdAt:now},$set:{lastVerifiedAt:now,updatedAt:now}},{upsert:true});
-  return {ok:true,itemCode,evidenceId:evidence.evidenceId,sourceFingerprint:evidence.sourceFingerprint,warehouseCount:evidence.warehouseCount,openingQuantityExact:evidence.openingQuantityExact,materialized:true,readOnlySource:true,purchaseLayerWrites:0,fifoWrites:0};
+  return {ok:true,itemCode,evidenceId:evidence.evidenceId,sourceFingerprint:evidence.sourceFingerprint,warehouseCount:evidence.warehouseCount,queriedWarehouseCount:evidence.queriedWarehouseCount,openingQuantityExact:evidence.openingQuantityExact,materialized:true,readOnlySource:true,purchaseLayerWrites:0,fifoWrites:0};
 }
 
 module.exports={COLLECTION,MODULE_VERSION,SOURCE_CLASS,fromKardex,aggregateWarehouseKardex,materialize,_hash:hash};
