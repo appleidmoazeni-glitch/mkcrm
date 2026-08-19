@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const { ObjectId } = require('mongodb');
 const catalog = require('./canonical-item-catalog');
 
 const AUDIT_COLLECTION = 'itemCatalogMasterRenameAudit';
@@ -81,12 +82,13 @@ async function apply(db, authoritativeRows = [], options = {}) {
   const results=[];
   try {
     for (const rename of current.renames) {
-      const before=await db.collection(catalog.CATALOG).findOne({ canonicalItemGuid:rename.guid });
-      if (!before || catalog.normalizedItemCode(before.itemCode)!==rename.oldNormalizedItemCode) throw Object.assign(new Error(`catalog row changed for ${rename.guid}`),{ code:'CATALOG_MASTER_RENAME_ROW_STALE' });
+      const documentIds=ObjectId.isValid(rename.documentId)?[rename.documentId,new ObjectId(rename.documentId)]:[rename.documentId];
+      const before=await db.collection(catalog.CATALOG).findOne({ _id:{ $in:documentIds } });
+      if (!before || catalog.canonicalItemGuid(before.canonicalItemGuid||before.itemGuid)!==rename.guid || catalog.normalizedItemCode(before.itemCode)!==rename.oldNormalizedItemCode) throw Object.assign(new Error(`catalog row changed for ${rename.guid}`),{ code:'CATALOG_MASTER_RENAME_ROW_STALE' });
       const changedAt=new Date(), history={ itemCode:rename.oldCode, normalizedItemCode:rename.oldNormalizedItemCode, replacedBy:rename.newCode, changedAt, source:'shaygan-item-master-full', sourceFingerprint:current.sourceFingerprint, activeAlias:false };
       const canonicalIdentity=clean(before.canonicalIdentity,300)||catalog._identityOf(before);
-      const update={ itemCode:rename.newCode, normalizedItemCode:rename.newNormalizedItemCode, itemDescription:rename.incoming.itemDescription||before.itemDescription||'', groupNumber:rename.incoming.groupNumber||before.groupNumber||'', groupGuid:rename.incoming.groupGuid||before.groupGuid||'', canonicalIdentity, searchText:`${rename.newCode} ${rename.incoming.itemDescription||before.itemDescription||''}`.trim().toLocaleLowerCase('fa'), raw:rename.incoming.raw, syncedAt:changedAt, lastDiscoveredAt:changedAt, updatedAt:changedAt, moduleVersion:catalog.MODULE_VERSION, lastMasterRename:{ reconciliationId, oldCode:rename.oldCode, newCode:rename.newCode, changedAt, sourceFingerprint:current.sourceFingerprint } };
-      const write=await db.collection(catalog.CATALOG).updateOne({ _id:before._id, canonicalItemGuid:rename.guid, normalizedItemCode:rename.oldNormalizedItemCode },{ $set:update,$push:{ codeHistory:history } });
+      const update={ itemGuid:rename.guid, canonicalItemGuid:rename.guid, itemCode:rename.newCode, normalizedItemCode:rename.newNormalizedItemCode, itemDescription:rename.incoming.itemDescription||before.itemDescription||'', groupNumber:rename.incoming.groupNumber||before.groupNumber||'', groupGuid:rename.incoming.groupGuid||before.groupGuid||'', canonicalIdentity, searchText:`${rename.newCode} ${rename.incoming.itemDescription||before.itemDescription||''}`.trim().toLocaleLowerCase('fa'), raw:rename.incoming.raw, syncedAt:changedAt, lastDiscoveredAt:changedAt, updatedAt:changedAt, moduleVersion:catalog.MODULE_VERSION, lastMasterRename:{ reconciliationId, oldCode:rename.oldCode, newCode:rename.newCode, changedAt, sourceFingerprint:current.sourceFingerprint } };
+      const write=await db.collection(catalog.CATALOG).updateOne({ _id:before._id, normalizedItemCode:rename.oldNormalizedItemCode },{ $set:update,$push:{ codeHistory:history } });
       if (Number(write.matchedCount||0)!==1) throw Object.assign(new Error(`rename write mismatch for ${rename.guid}`),{ code:'CATALOG_MASTER_RENAME_WRITE_MISMATCH' });
       await db.collection('purchaseHistoryDiscoveryQueue').updateOne({ canonicalIdentity },{ $set:{ itemGuid:rename.guid,itemCode:rename.newCode,itemDescription:update.itemDescription,updatedAt:changedAt } });
       results.push({ guid:rename.guid, oldCode:rename.oldCode, newCode:rename.newCode, documentId:String(before._id), canonicalIdentityBefore:clean(before.canonicalIdentity,300), canonicalIdentityAfter:canonicalIdentity, result:'renamed', auditHistory:history });

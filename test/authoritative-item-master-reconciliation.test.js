@@ -11,7 +11,7 @@ const item=(guid,code,description='Item')=>({ItemGuId:guid,ItemCode:code,ItemDes
 const row=(guid,code,extra={})=>({_id:`id-${guid}`,itemGuid:guid,canonicalItemGuid:guid.toLowerCase(),itemCode:code,normalizedItemCode:code.toUpperCase(),canonicalIdentity:`guid:${guid.toLowerCase().replaceAll('-','')}`,itemDescription:'Old',...extra});
 
 test('authoritative full master accepts same-GUID rename and preserves identity with inactive history',async()=>{
-  const database=new MemoryDb({itemCatalogAll:[row('G-1','OLD')],purchaseHistoryDiscoveryQueue:[{canonicalIdentity:'guid:g1',itemGuid:'g-1',itemCode:'OLD'}]});
+  const database=new MemoryDb({itemCatalogAll:[row('G-1','OLD',{canonicalItemGuid:'G-1'})],purchaseHistoryDiscoveryQueue:[{canonicalIdentity:'guid:g1',itemGuid:'g-1',itemCode:'OLD'}]});
   const source=[item('G-1','NEW','New description')],plan=await master.plan(database,source,options);
   assert.equal(plan.safeToApply,true);assert.equal(plan.plannedRenames,1);
   const out=await master.apply(database,source,{...options,planFingerprint:plan.planFingerprint,backupEvidence:'fresh:test'});
