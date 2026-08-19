@@ -5764,6 +5764,15 @@ async function handleApi(req, res, pathname, query) {
       return sendJson(res, 200, { ok:true, purchaseInvoiceNo:no, inserted:results.filter(x=>x.inserted).length, skipped:results.filter(x=>!x.inserted).length, results, inventoryRefresh });
     }
 
+    if(pathname==='/api/sales/issuance/active'&&req.method==='GET'){
+      if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
+      const db=await connectMongo(),user=currentUser(req)||{},username=String(user.username||'');
+      const attempt=await db.collection(saleIssuance.ATTEMPTS).findOne({
+        issuanceState:{$in:saleIssuance.LOCKED_STATES},
+        $or:[{mappingUsername:username},{'requestedBy.username':username}]
+      },{sort:{updatedAt:-1}});
+      return sendJson(res,200,{ok:true,issuance:attempt?saleIssuance.publicAttempt(attempt):null});
+    }
     const saleIssuanceStatusMatch=pathname.match(/^\/api\/sales\/issuance\/([^/]+)$/);
     if(saleIssuanceStatusMatch&&req.method==='GET'){
       if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
