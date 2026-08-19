@@ -30,7 +30,7 @@ test('genuine same-GUID code conflict blocks automatic catalog reconciliation',a
   const db=new MemoryDb({itemCatalogAll:[{_id:'a',itemCode:'A',itemGuid:'G'},{_id:'b',itemCode:'B',itemGuid:'G'}]});
   const plan=await reconciliation.plan(db);
   assert.equal(plan.safeToApply,false);assert.equal(plan.unsafeGuidGroupCount,1);
-  await assert.rejects(reconciliation.apply(db,{planFingerprint:plan.planFingerprint,backupEvidence:'fresh'}),error=>error.code==='CATALOG_RECONCILIATION_UNSAFE_CONFLICT');
+  await assert.rejects(reconciliation.apply(db,{planFingerprint:plan.planFingerprint,backupEvidence:'fresh'}),error=>error.code==='CATALOG_RECONCILIATION_UNSAFE_GUID_GROUP');
   assert.equal(db.collection('itemCatalogAll').rows.length,2);
 });
 
@@ -38,6 +38,21 @@ test('different GUID same normalized code blocks automatic catalog reconciliatio
   const db=new MemoryDb({itemCatalogAll:[{_id:'a',itemCode:'A',itemGuid:'G1'},{_id:'b',itemCode:' A ',itemGuid:'G2'}]});
   const plan=await reconciliation.plan(db);
   assert.equal(plan.safeToApply,false);assert.equal(plan.codeConflictCount,1);
+});
+
+test('safe duplicate groups reconcile while unrelated code conflicts remain untouched and block release',async()=>{
+  const db=new MemoryDb({itemCatalogAll:[
+    {_id:'safe-a',itemCode:' CODE-SAFE',itemGuid:'GUID-SAFE'},
+    {_id:'safe-b',itemCode:'CODE-SAFE',itemGuid:'guid-safe'},
+    {_id:'conflict-a',itemCode:'CODE-CONFLICT',itemGuid:'GUID-A',itemDescription:'A'},
+    {_id:'conflict-b',itemCode:'CODE-CONFLICT',itemGuid:'GUID-B',itemDescription:'B'}
+  ]});
+  const plan=await reconciliation.plan(db);
+  assert.equal(plan.safeToApply,false);assert.equal(plan.safeGroupsReconciliationAllowed,true);
+  const out=await reconciliation.apply(db,{planFingerprint:plan.planFingerprint,backupEvidence:'fresh-staging-backup'});
+  assert.equal(out.status,'completed_with_identity_conflicts');assert.equal(out.releaseGatePass,false);
+  assert.equal(out.reconciledGroups,1);assert.equal(out.removedDocuments,1);
+  assert.equal(db.collection('itemCatalogAll').rows.filter(row=>row.itemCode==='CODE-CONFLICT').length,2);
 });
 
 test('canonical purchase contract classifies and excludes legacy Supplier Sleep rows',()=>{

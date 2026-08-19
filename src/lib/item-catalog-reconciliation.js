@@ -115,7 +115,9 @@ async function plan(db) {
     duplicateNormalizedCodeGroupCount:duplicateCodeGroups.length,
     unsafeGuidGroupCount:unsafeGroups.length,
     codeConflictCount:codeConflicts.length,
+    safeGroupCount:groups.filter(group => group.safeNormalizationDuplicate).length,
     safeToApply:unsafeGroups.length === 0 && codeConflicts.length === 0,
+    safeGroupsReconciliationAllowed:unsafeGroups.length === 0 && groups.some(group => group.safeNormalizationDuplicate),
     groups,
     codeConflicts
   };
@@ -158,7 +160,8 @@ async function apply(db, options = {}) {
   if (!backupEvidence) throw Object.assign(new Error('fresh backup evidence is required'), { code:'CATALOG_RECONCILIATION_BACKUP_REQUIRED' });
   const current = await plan(db);
   if (current.planFingerprint !== expectedFingerprint) throw Object.assign(new Error('catalog changed after reconciliation plan'), { code:'CATALOG_RECONCILIATION_PLAN_STALE', currentFingerprint:current.planFingerprint });
-  if (!current.safeToApply) throw Object.assign(new Error('unsafe catalog identity conflict requires human review'), { code:'CATALOG_RECONCILIATION_UNSAFE_CONFLICT', unsafeGuidGroupCount:current.unsafeGuidGroupCount, codeConflictCount:current.codeConflictCount });
+  if (current.unsafeGuidGroupCount) throw Object.assign(new Error('unsafe duplicate-GUID group requires human review'), { code:'CATALOG_RECONCILIATION_UNSAFE_GUID_GROUP', unsafeGuidGroupCount:current.unsafeGuidGroupCount, codeConflictCount:current.codeConflictCount });
+  if (!current.safeGroupCount) throw Object.assign(new Error('no safe duplicate groups require reconciliation'), { code:'CATALOG_RECONCILIATION_NOT_REQUIRED', codeConflictCount:current.codeConflictCount });
   await db.collection(AUDIT_COLLECTION).createIndex({ reconciliationId:1 }, { unique:true });
   await db.collection(AUDIT_COLLECTION).createIndex({ planFingerprint:1, status:1 });
   const reconciliationId = `ICR-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
@@ -186,9 +189,10 @@ async function apply(db, options = {}) {
       removedDocuments += duplicateIds.length;
     }
     const after = await plan(db), completedAt = new Date();
-    if (after.duplicateGuidGroupCount || after.duplicateNormalizedCodeGroupCount || after.codeConflictCount) throw Object.assign(new Error('post-reconciliation identity gate failed'), { code:'CATALOG_RECONCILIATION_POST_GATE_FAILED', after });
-    await db.collection(AUDIT_COLLECTION).updateOne({ reconciliationId }, { $set:{ status:'completed', completedAt, reconciledGroups, removedDocuments, after:{ sourceCount:after.sourceCount, duplicateGuidGroupCount:after.duplicateGuidGroupCount, duplicateNormalizedCodeGroupCount:after.duplicateNormalizedCodeGroupCount, codeConflictCount:after.codeConflictCount, planFingerprint:after.planFingerprint } } });
-    return { ok:true, reconciliationId, reconciledGroups, removedDocuments, before:current.sourceCount, after:after.sourceCount, postGate:after };
+    if (after.duplicateGuidGroupCount || after.unsafeGuidGroupCount) throw Object.assign(new Error('post-reconciliation safe-duplicate gate failed'), { code:'CATALOG_RECONCILIATION_POST_GATE_FAILED', after });
+    const status=after.codeConflictCount ? 'completed_with_identity_conflicts' : 'completed';
+    await db.collection(AUDIT_COLLECTION).updateOne({ reconciliationId }, { $set:{ status, completedAt, reconciledGroups, removedDocuments, unresolvedIdentityConflicts:after.codeConflicts, after:{ sourceCount:after.sourceCount, duplicateGuidGroupCount:after.duplicateGuidGroupCount, duplicateNormalizedCodeGroupCount:after.duplicateNormalizedCodeGroupCount, codeConflictCount:after.codeConflictCount, planFingerprint:after.planFingerprint } } });
+    return { ok:true, releaseGatePass:after.codeConflictCount === 0, status, reconciliationId, reconciledGroups, removedDocuments, before:current.sourceCount, after:after.sourceCount, postGate:after };
   } catch (error) {
     await db.collection(AUDIT_COLLECTION).updateOne({ reconciliationId }, { $set:{ status:'failed', failedAt:new Date(), errorCode:clean(error.code||'CATALOG_RECONCILIATION_FAILED',100), error:clean(error.message,1000), reconciledGroups, removedDocuments } }).catch(() => {});
     throw error;
