@@ -55,6 +55,19 @@ test('safe duplicate groups reconcile while unrelated code conflicts remain unto
   assert.equal(db.collection('itemCatalogAll').rows.filter(row=>row.itemCode==='CODE-CONFLICT').length,2);
 });
 
+test('empty code-only placeholder reconciles into the single official GUID survivor',async()=>{
+  const db=new MemoryDb({itemCatalogAll:[
+    {_id:'official',itemCode:'item-1',itemGuid:'GUID-1',itemDescription:'Official item'},
+    {_id:'placeholder',itemCode:' ITEM-1 ',itemGuid:'',itemDescription:'',groupNumber:''}
+  ]});
+  const plan=await reconciliation.plan(db);
+  assert.equal(plan.groups.length,1);assert.equal(plan.groups[0].classification,'SAFE_CODE_ONLY_PLACEHOLDER_DUPLICATE');
+  assert.equal(plan.groups[0].proposedSurvivorId,'official');
+  const out=await reconciliation.apply(db,{planFingerprint:plan.planFingerprint,backupEvidence:'fresh'});
+  assert.equal(out.removedDocuments,1);assert.equal(db.collection('itemCatalogAll').rows.length,1);
+  assert.equal(db.collection('itemCatalogAll').rows[0].itemGuid,'guid-1');
+});
+
 test('canonical purchase contract classifies and excludes legacy Supplier Sleep rows',()=>{
   const canonical=canonicalLayer(),legacy={snapshotId:'S1',persistentLayerId:'OLD',itemCode:'A',purchaseQty:2,unitCost:100};
   assert.equal(layerContract.isCanonicalPurchaseLayer(canonical),true);

@@ -77,7 +77,12 @@ async function plan(db) {
   const byGuid = groupRows(rows, guidKey), byCode = groupRows(rows, codeKey);
   const duplicateGuidGroups = [...byGuid.entries()].filter(([,list]) => list.length > 1);
   const duplicateCodeGroups = [...byCode.entries()].filter(([,list]) => list.length > 1);
-  const referenceMap = await referencesFor(db,duplicateGuidGroups.flatMap(([,list])=>list));
+  const codeOnlyPlaceholderGroups = duplicateCodeGroups.filter(([,list]) => {
+    const guids=[...new Set(list.map(guidKey).filter(Boolean))];
+    const placeholders=list.filter(row=>!guidKey(row));
+    return guids.length===1 && placeholders.length>0 && placeholders.every(row=>!clean(row.itemDescription,500)&&!clean(row.groupNumber,100)&&!guidKey({itemGuid:row.groupGuid}));
+  });
+  const referenceMap = await referencesFor(db,[...duplicateGuidGroups.flatMap(([,list])=>list),...codeOnlyPlaceholderGroups.flatMap(([,list])=>list)]);
   const groups = [];
   for (const [guid, list] of duplicateGuidGroups) {
     const normalizedCodes = [...new Set(list.map(codeKey).filter(Boolean))];
@@ -97,6 +102,22 @@ async function plan(db) {
       proposedSurvivorId:survivor ? documentId(survivor) : '',
       proposedDuplicateIds:survivor ? list.filter(row => documentId(row)!==documentId(survivor)).map(documentId) : [],
       proposedAliasHandling:safe ? 'preserve normalized raw aliases and merged discovery metadata in survivor plus immutable reconciliation audit' : 'manual investigation required; no mutation'
+    });
+  }
+  const alreadyPlanned=new Set(groups.flatMap(group=>group.documentIds));
+  for(const [normalizedCode,list] of codeOnlyPlaceholderGroups){
+    if(list.some(row=>alreadyPlanned.has(documentId(row))))continue;
+    const survivor=list.find(row=>guidKey(row));
+    groups.push({
+      guid:guidKey(survivor),
+      rawItemCodes:list.map(row=>String(row.itemCode==null?'':row.itemCode)),
+      normalizedCodes:[normalizedCode],normalizedItemCode:normalizedCode,
+      documentIds:list.map(documentId),
+      timestamps:list.map(row=>({documentId:documentId(row),createdAt:row.createdAt||null,firstDiscoveredAt:row.firstDiscoveredAt||null,updatedAt:row.updatedAt||null,syncedAt:row.syncedAt||null})),
+      references:list.flatMap(row=>(referenceMap.get(documentId(row))||[]).map(reference=>({documentId:documentId(row),...reference}))),
+      safeNormalizationDuplicate:true,classification:'SAFE_CODE_ONLY_PLACEHOLDER_DUPLICATE',
+      proposedSurvivorId:documentId(survivor),proposedDuplicateIds:list.filter(row=>documentId(row)!==documentId(survivor)).map(documentId),
+      proposedAliasHandling:'attach empty code-only discovery placeholder to the single official GUID survivor and retain immutable reconciliation audit'
     });
   }
   const codeConflicts = duplicateCodeGroups.filter(([,list]) => new Set(list.map(guidKey).filter(Boolean)).size > 1).map(([normalizedCode,list]) => ({
@@ -175,7 +196,7 @@ async function apply(db, options = {}) {
       const rows = await db.collection(catalog.CATALOG).find({ _id:{ $in:idCandidates } }).toArray();
       // The fallback is read-only and filtered again below; it supports non-ObjectId test stores and legacy GUID formatting.
       const actualRows = rows.length === group.documentIds.length ? rows : await db.collection(catalog.CATALOG).find({}).toArray();
-      const scopedRows = actualRows.filter(row => guidKey(row) === group.guid && codeKey(row) === group.normalizedItemCode);
+      const scopedRows = actualRows.filter(row => codeKey(row) === group.normalizedItemCode && (group.classification==='SAFE_CODE_ONLY_PLACEHOLDER_DUPLICATE' ? (!guidKey(row)||guidKey(row)===group.guid) : guidKey(row)===group.guid));
       if (scopedRows.length !== group.documentIds.length) throw Object.assign(new Error(`group changed for ${group.guid}`), { code:'CATALOG_RECONCILIATION_GROUP_STALE' });
       const survivor = scopedRows.find(row => documentId(row) === group.proposedSurvivorId);
       if (!survivor) throw Object.assign(new Error(`survivor missing for ${group.guid}`), { code:'CATALOG_RECONCILIATION_SURVIVOR_MISSING' });
