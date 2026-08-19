@@ -66,6 +66,8 @@ test('empty code-only placeholder reconciles into the single official GUID survi
   const out=await reconciliation.apply(db,{planFingerprint:plan.planFingerprint,backupEvidence:'fresh'});
   assert.equal(out.removedDocuments,1);assert.equal(db.collection('itemCatalogAll').rows.length,1);
   assert.equal(db.collection('itemCatalogAll').rows[0].itemGuid,'guid-1');
+  assert.equal(db.collection('itemCatalogAll').rows[0].itemCode,'item-1');
+  assert.equal(db.collection('itemCatalogAll').rows[0].normalizedItemCode,'ITEM-1');
 });
 
 test('canonical purchase contract classifies and excludes legacy Supplier Sleep rows',()=>{

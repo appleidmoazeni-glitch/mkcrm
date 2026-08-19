@@ -151,7 +151,7 @@ function mergedDocument(rows, survivor, normalizedCode, now) {
   const sources = [...new Set(rows.flatMap(row => Array.isArray(row.discoverySources) ? row.discoverySources : []).filter(Boolean))];
   const rawAliases = rows.map(row => ({ documentId:documentId(row), itemCode:String(row.itemCode == null ? '' : row.itemCode), itemGuid:String(row.itemGuid == null ? '' : row.itemGuid), sourceHash:sha(stable(row.raw || { itemCode:row.itemCode, itemGuid:row.itemGuid, itemDescription:row.itemDescription })) }));
   return {
-    itemCode:catalog.canonicalItemCode(normalizedCode),
+    itemCode:catalog.canonicalItemCode(survivor.itemCode),
     normalizedItemCode:normalizedCode,
     itemGuid:catalog.canonicalItemGuid(survivor.itemGuid),
     canonicalItemGuid:catalog.canonicalItemGuid(survivor.itemGuid),
