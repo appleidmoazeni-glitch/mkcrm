@@ -43,6 +43,7 @@ function seedDb() {
     }],
     supplierPurchaseLayers:[{
       datasetId:'PURCHASE-ACTIVE',
+      datasetSchemaVersion:1,
       purchaseLineIdentity:'P-1',
       layerKind:'purchase',
       validationStatus:'valid',

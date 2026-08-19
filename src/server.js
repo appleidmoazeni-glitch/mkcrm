@@ -1427,16 +1427,10 @@ async function searchItems(q, limit = 20, maxPages = config.inventorySearchLiveP
 
 
 async function upsertAllItemRows(db, items) {
-  const now = new Date();
-  const ops = (items || []).filter(x => x.itemCode).map(x => ({
-    updateOne: {
-      filter: { itemCode: x.itemCode },
-      update: { $set: { itemCode: x.itemCode, itemDescription: x.itemDescription, itemGuid: x.itemGuid, groupNumber: x.groupNumber || '', groupGuid: x.groupGuid || '', searchText: normalizeFa(`${x.itemCode || ''} ${x.itemDescription || ''}`), syncedAt: now, raw: x.raw || x } },
-      upsert: true
-    }
-  }));
-  if (ops.length) await db.collection('itemCatalogAll').bulkWrite(ops, { ordered:false }).catch(()=>{});
-  if ((items||[]).length) await canonicalItemCatalog.ensureCatalogItems(db, items, { source:'all-items-catalog-bootstrap' });
+  return canonicalItemCatalog.ensureCatalogItems(db, items || [], {
+    source:'all-items-catalog-bootstrap',
+    retainRaw:true
+  });
 }
 
 async function searchAllItems(q, limit = 50, maxPages = config.inventoryCatalogSyncPages, opts = {}) {
@@ -1477,7 +1471,7 @@ async function syncAllItemsCatalog(pages = config.inventoryCatalogSyncPages, opt
   const requested = Number(pages || 0);
   const maxPages = requested > 0 ? Math.min(requested, 20000) : 20000;
   const jobId = opts.jobId || `JOB-ALLITEMS-${Date.now()}-${Math.random().toString(16).slice(2,8)}`;
-  let total = 0, upserted = 0, page = 0, emptyPages = 0;
+  let total = 0, upserted = 0, page = 0, emptyPages = 0, created = 0, updated = 0, unchanged = 0;
   const errors = [];
   await db.collection('appJobs').updateOne({ jobId }, { $set:{ jobId, type:'all-items-catalog-sync', status:'running', startedAt:new Date(), updatedAt:new Date(), pageSize, maxPages, currentPage:0, total:0, upserted:0 } }, { upsert:true }).catch(()=>{});
   for (let rowStart = 0; page < maxPages; page++, rowStart += pageSize) {
@@ -1489,15 +1483,25 @@ async function syncAllItemsCatalog(pages = config.inventoryCatalogSyncPages, opt
     }
     const list = res.list || [];
     if (!list.length) { emptyPages++; break; }
-    await upsertAllItemRows(db, list);
-    total += list.length; upserted += list.filter(x=>x && x.itemCode).length;
+    const catalogResult = await upsertAllItemRows(db, list);
+    if (!catalogResult.ok) {
+      const identityConflicts = catalogResult.conflicts || [];
+      errors.push({ page, rowStart, code:'CATALOG_IDENTITY_CONFLICT', identityConflicts });
+      await db.collection('appJobs').updateOne({ jobId }, { $set:{ status:'failed', updatedAt:new Date(), finishedAt:new Date(), currentPage:page, total, upserted, errors } }).catch(()=>{});
+      return { ok:false, jobId, total, upserted, page, rowStart, code:'CATALOG_IDENTITY_CONFLICT', identityConflicts, errors };
+    }
+    total += list.length;
+    upserted += catalogResult.created + catalogResult.updated;
+    created += catalogResult.created;
+    updated += catalogResult.updated;
+    unchanged += catalogResult.unchanged;
     if (page % 5 === 0) await db.collection('appJobs').updateOne({ jobId }, { $set:{ status:'running', updatedAt:new Date(), currentPage:page+1, rowStart, total, upserted, lastBatchCount:list.length } }).catch(()=>{});
     // Do NOT stop on list.length < pageSize. Shaygan can return short pages before the real end.
   }
   const completedAtEnd = emptyPages > 0;
-  await db.collection('appJobs').updateOne({ jobId }, { $set:{ status: completedAtEnd ? 'completed' : 'max_pages_reached', updatedAt:new Date(), finishedAt:new Date(), currentPage:page, total, upserted, emptyPages, completedAtEnd, errors } }, { upsert:true }).catch(()=>{});
-  await db.collection('appLogs').insertOne({ type:'all_items_catalog_sync', jobId, total, upserted, pages:page, emptyPages, completedAtEnd, errors, at:new Date() }).catch(()=>{});
-  return { ok:true, jobId, total, upserted, pages:page, emptyPages, completedAtEnd, mode:'all-items-catalog-full-paging-no-short-stop', note: completedAtEnd ? 'تا صفحه خالی ادامه داده شد.' : 'به سقف صفحات رسید؛ برای ادامه pages را بیشتر بگذارید.' };
+  await db.collection('appJobs').updateOne({ jobId }, { $set:{ status: completedAtEnd ? 'completed' : 'max_pages_reached', updatedAt:new Date(), finishedAt:new Date(), currentPage:page, total, upserted, created, updated, unchanged, emptyPages, completedAtEnd, errors } }, { upsert:true }).catch(()=>{});
+  await db.collection('appLogs').insertOne({ type:'all_items_catalog_sync', jobId, total, upserted, created, updated, unchanged, pages:page, emptyPages, completedAtEnd, errors, at:new Date() }).catch(()=>{});
+  return { ok:true, jobId, total, upserted, created, updated, unchanged, pages:page, emptyPages, completedAtEnd, mode:'all-items-catalog-full-paging-no-short-stop', note: completedAtEnd ? 'تا صفحه خالی ادامه داده شد.' : 'به سقف صفحات رسید؛ برای ادامه pages را بیشتر بگذارید.' };
 }
 
 function accountKey(a = {}) {
@@ -4656,6 +4660,11 @@ async function handleApi(req, res, pathname, query) {
         supplierAccountNumber:query.supplierAccountNumber||'',layerKind:query.layerKind||'',
         validationStatus:query.validationStatus||'',limit:Number(query.limit||500)
       }));
+    }
+    if (pathname === '/api/purchase-layer-datasets/population-diagnostics' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting'])) return;
+      const db=await connectMongo();
+      return sendJson(res,200,await purchaseLayerDataset.populationDiagnostics(db));
     }
 
     // 0.9.19.27: Supplier stock sleep based on purchase invoice layers, not Kardex.

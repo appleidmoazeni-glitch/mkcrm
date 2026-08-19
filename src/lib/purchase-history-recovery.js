@@ -3,6 +3,7 @@
 const crypto = require('crypto');
 const defaultShaygan = require('./shaygan');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const accountingDecimal = require('./accounting-decimal');
 const canonicalItemCatalog = require('./canonical-item-catalog');
 
@@ -108,7 +109,7 @@ async function recover(db, options = {}) {
   const timeoutMs = Math.min(bounded(options.timeoutMs, DEFAULT_TIMEOUT_MS, 15000), 15000);
   const priority = await unresolvedPriority(db, fifoDatasetId, { maxItems });
   await canonicalItemCatalog.ensureCatalogItems(db,priority.selectedItems,{source:'purchase-history-recovery-discovery'});
-  const existing = await db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:purchaseDatasetId }).toArray();
+  const existing = await db.collection(purchaseLayerDataset.LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId:purchaseDatasetId })).toArray();
   const existingIdentities = new Set(existing.map(row => clean(row.purchaseLineIdentity, 500)));
   const recovered = [];
   const failures = [];

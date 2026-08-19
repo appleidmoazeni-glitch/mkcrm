@@ -42,7 +42,7 @@ test('conservation mismatches and duplicate allocation identities make FIFO unre
 
 test('purchase source freshness compares Gregorian read-model dates as canonical Jalali dates',async()=>{
   const db=seed();
-  db.collection('supplierPurchaseLayers').rows.push({datasetId:'BUY-R',layerKind:'purchase',purchaseInvoiceNo:1,purchaseInvoiceDate:'14050501'});
+  db.collection('supplierPurchaseLayers').rows.push({datasetId:'BUY-R',datasetSchemaVersion:1,purchaseLineIdentity:'BUY-R:1',layerKind:'purchase',purchaseInvoiceNo:1,purchaseInvoiceDate:'14050501'});
   db.collection('supplierPurchaseInvoices').rows.push({invTyp:3,invNo:1,invDate:'2026-07-26',items:[]});
   const report=await reliability.report(db,{});
   assert.equal(report.sourceCompleteness.latestPurchaseDateInDataset,'14050501');

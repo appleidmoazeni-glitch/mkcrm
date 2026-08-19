@@ -9,6 +9,7 @@ const { canonicalSaleDate, normalizeJalaliRange } = require('./jalali-date');
 const accountingDecimal = require('./accounting-decimal');
 const openingCostBasis = require('./opening-accounting-cost-basis');
 const canonicalItemCatalog = require('./canonical-item-catalog');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 
 const COLLECTION = 'manualCostResolutions';
 const SCHEMA_VERSION = 3;
@@ -255,8 +256,8 @@ async function ensureIndexes(db) {
 }
 async function validatePurchaseLayerScope(db, normalized) {
   if(normalized.resolutionScope!=='purchase_layer')return;
-  const layer=await db.collection(purchaseLayerDataset.LAYERS).findOne({datasetId:normalized.purchaseDatasetId,purchaseLineIdentity:normalized.purchaseLineIdentity});
-  if(!layer||layer.layerKind!=='purchase')fail('MANUAL_COST_PURCHASE_LAYER_NOT_FOUND','Purchase Layer هدف در Dataset تعیین‌شده پیدا نشد.',409);
+  const layer=await db.collection(purchaseLayerDataset.LAYERS).findOne(canonicalLayerContract.canonicalPurchaseQuery({datasetId:normalized.purchaseDatasetId,purchaseLineIdentity:normalized.purchaseLineIdentity}));
+  if(!layer)fail('MANUAL_COST_PURCHASE_LAYER_NOT_FOUND','Purchase Layer هدف در Dataset تعیین‌شده پیدا نشد.',409);
   if(normalized.itemGuid&&layer.itemGuid&&key(normalized.itemGuid)!==key(layer.itemGuid))fail('MANUAL_COST_PURCHASE_LAYER_IDENTITY_MISMATCH','ItemGuid با Purchase Layer هدف تطابق ندارد.',409);
   if(normalized.itemCode&&layer.itemCode&&key(normalized.itemCode)!==key(layer.itemCode))fail('MANUAL_COST_PURCHASE_LAYER_IDENTITY_MISMATCH','ItemCode با Purchase Layer هدف تطابق ندارد.',409);
   const available=accountingDecimal.parse(layer.netPurchasedQuantity??layer.remainingQuantity??layer.originalQuantity??0,accountingDecimal.QUANTITY_SCALE);
@@ -580,7 +581,7 @@ async function loadReadinessContext(db) {
   const cached=db.databaseName?readinessCache.get(db):null;
   if(cached&&cached.key===cacheKey&&Date.now()-cached.at<READINESS_CACHE_TTL_MS)return cached.value||cached.promise;
   const loading=(async()=>{const [allLayers,manual,saleRows,legacyLayers]=await Promise.all([
-      purchaseActive?.datasetId?allRows(db.collection(purchaseLayerDataset.LAYERS),{datasetId:purchaseActive.datasetId}):[],
+      purchaseActive?.datasetId?allRows(db.collection(purchaseLayerDataset.LAYERS),canonicalLayerContract.canonicalLayerQuery({datasetId:purchaseActive.datasetId})):[],
       allRows(db.collection(COLLECTION),{status:'approved'}),
       allRows(db.collection(saleActive.lineCollection),{...saleActive.lineQuery,saleInvoiceType:2}),
       allRows(db.collection(purchaseLayerDataset.LAYERS),{datasetId:{$exists:false}}).catch(()=>[])
@@ -686,7 +687,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const dataset=await db.collection(purchaseLayerDataset.DATASETS).findOne({datasetId});
   if(!dataset||dataset.status!=='completed')fail('PURCHASE_DATASET_NOT_CANONICAL','فقط Dataset ساخته‌شده توسط Purchase Engine رسمی مجاز است.',409);
   const identityParts=[];if(itemGuid)identityParts.push({itemGuid});if(itemCode)identityParts.push({itemCode});
-  const layerQuery={datasetId,layerKind:'purchase',purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})};
+  const layerQuery=canonicalLayerContract.canonicalPurchaseQuery({datasetId,purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})});
   const [layers,openingRows,governedOpening]=await Promise.all([
     db.collection(purchaseLayerDataset.LAYERS).find(layerQuery).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(5001).toArray(),
     db.collection(openingCostBasis.COLLECTION).find({...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:applicableDate}}).sort({effectiveOpeningDate:-1,updatedAt:-1}).limit(10).toArray(),

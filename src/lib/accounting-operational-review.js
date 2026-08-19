@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const saleSnapshot = require('./sale-snapshot');
 const decimal = require('./accounting-decimal');
 const readiness = require('./accounting-evidence-confidence');
@@ -313,7 +314,7 @@ async function syncInvestigations(db, context, by) {
     sourceActive:{ $ne:false }, priority:'P0'
   }).sort({ affectedSaleValue:-1 }).toArray();
   const [layers, invoices, purchaseReturns, saleReturns] = await Promise.all([
-    db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:context.purchase.datasetId }).toArray(),
+    db.collection(purchaseLayerDataset.LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId:context.purchase.datasetId })).toArray(),
     db.collection('supplierPurchaseInvoices').find({ invTyp:3 }).toArray(),
     db.collection(readiness.PURCHASE_RETURNS).find({}).toArray(),
     db.collection(readiness.SALE_RETURNS).find({}).toArray()
@@ -526,7 +527,7 @@ async function syncReturnCases(db, context, by) {
   const [purchaseResolutions, saleResolutions, layers, saleLines, allocations] = await Promise.all([
     db.collection(readiness.PURCHASE_RETURNS).find({}).toArray(),
     db.collection(readiness.SALE_RETURNS).find({}).toArray(),
-    db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:context.purchase.datasetId }).toArray(),
+    db.collection(purchaseLayerDataset.LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId:context.purchase.datasetId })).toArray(),
     db.collection(context.sale.lineCollection).find(context.sale.lineQuery).toArray(),
     db.collection('fifoAllocations').find({ datasetId:context.fifo.datasetId }).toArray()
   ]);

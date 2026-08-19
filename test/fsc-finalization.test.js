@@ -14,10 +14,10 @@ function db(){return new MemoryDb({
   purchaseLayerDatasetState:[{scopeKey:'purchase-invoices-types-3-7',activeDatasetId:'P-A'}],
   purchaseLayerDatasets:[{datasetId:'P-A',status:'completed',activationStatus:'active',completedAt:new Date('2026-08-10')},{datasetId:'P-C',status:'completed',activationStatus:'candidate',completedAt:new Date('2026-08-11')}],
   supplierPurchaseLayers:[
-    {datasetId:'P-C',purchaseLineIdentity:'L1',layerKind:'purchase',validationStatus:'valid',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:10,purchaseInvoiceDate:'14050101',supplierAccountNumber:'S1',supplierName:'A',netPurchasedQuantityExact:'2',netUnitCostExact:'100',sourceHash:'h1'},
-    {datasetId:'P-C',purchaseLineIdentity:'L2',layerKind:'purchase',validationStatus:'valid',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:11,purchaseInvoiceDate:'14050102',supplierAccountNumber:'S2',supplierName:'B',netPurchasedQuantityExact:'3',netUnitCostExact:'200',sourceHash:'h2'},
-    {datasetId:'P-C',purchaseLineIdentity:'FUT',layerKind:'purchase',validationStatus:'valid',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:12,purchaseInvoiceDate:'14050201',netPurchasedQuantityExact:'100',netUnitCostExact:'999',sourceHash:'hf'},
-    {datasetId:'P-C',purchaseLineIdentity:'BAD',layerKind:'purchase',validationStatus:'rejected',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:13,purchaseInvoiceDate:'14050103',netPurchasedQuantityExact:'5',netUnitCostExact:'1',sourceHash:'hb'}
+    {datasetId:'P-C',datasetSchemaVersion:1,purchaseLineIdentity:'L1',layerKind:'purchase',validationStatus:'valid',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:10,purchaseInvoiceDate:'14050101',supplierAccountNumber:'S1',supplierName:'A',netPurchasedQuantityExact:'2',netUnitCostExact:'100',sourceHash:'h1'},
+    {datasetId:'P-C',datasetSchemaVersion:1,purchaseLineIdentity:'L2',layerKind:'purchase',validationStatus:'valid',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:11,purchaseInvoiceDate:'14050102',supplierAccountNumber:'S2',supplierName:'B',netPurchasedQuantityExact:'3',netUnitCostExact:'200',sourceHash:'h2'},
+    {datasetId:'P-C',datasetSchemaVersion:1,purchaseLineIdentity:'FUT',layerKind:'purchase',validationStatus:'valid',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:12,purchaseInvoiceDate:'14050201',netPurchasedQuantityExact:'100',netUnitCostExact:'999',sourceHash:'hf'},
+    {datasetId:'P-C',datasetSchemaVersion:1,purchaseLineIdentity:'BAD',layerKind:'purchase',validationStatus:'rejected',itemGuid:'G-X',itemCode:'X',purchaseInvoiceNo:13,purchaseInvoiceDate:'14050103',netPurchasedQuantityExact:'5',netUnitCostExact:'1',sourceHash:'hb'}
   ],
   fifoDatasetState:[{scopeKey:'fifo-shadow-v2-precision-evidence',activeDatasetId:'F-A'}],
   fifoDatasets:[{datasetId:'F-A',status:'completed',activationStatus:'active',completedAt:new Date('2026-08-10')},{datasetId:'F-C',status:'completed',activationStatus:'candidate',sourcePurchaseDatasetId:'P-C',completedAt:new Date('2026-08-11')}],

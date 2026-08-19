@@ -12,7 +12,7 @@ function seed(){
       {datasetId:'FIFO-C',sourceType:'unknown_cost',saleLineId:'L2',saleDate:'14050506',itemGuid:'G-H',itemCode:'HIGH-1',itemDescription:'CPU A',officialProductCategoryName:'CPU',quantityExact:'1.000000',allocatedSaleValueExact:'5000000.00'},
       {datasetId:'FIFO-C',sourceType:'unknown_cost',saleLineId:'L3',saleDate:'14050510',itemGuid:'G-H',itemCode:'HIGH-1',itemDescription:'CPU A',officialProductCategoryName:'CPU',quantityExact:'1.000000',allocatedSaleValueExact:'1000000.00'}
     ],
-    supplierPurchaseLayers:[{datasetId:'PLAYER-C',purchaseLineIdentity:'GUID-3-100:1',layerKind:'purchase'}],
+    supplierPurchaseLayers:[{datasetId:'PLAYER-C',datasetSchemaVersion:1,purchaseLineIdentity:'GUID-3-100:1',layerKind:'purchase'}],
     purchaseLayerRecoveryCandidates:[]
   });
 }

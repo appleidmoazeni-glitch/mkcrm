@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const saleSnapshot = require('./sale-snapshot');
 const decimal = require('./accounting-decimal');
 
@@ -356,7 +357,7 @@ function purchaseCandidateScore(returnRow, purchaseRow) {
   return score;
 }
 async function syncPurchaseReturns(db, sources, by) {
-  const rows = await db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:sources.purchase.datasetId }).toArray();
+  const rows = await db.collection(purchaseLayerDataset.LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId:sources.purchase.datasetId })).toArray();
   const purchases = rows.filter(row => row.layerKind === 'purchase');
   const returns = rows.filter(row => row.layerKind === 'purchase-return');
   let created = 0;

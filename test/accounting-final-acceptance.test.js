@@ -54,7 +54,7 @@ function seedDb() {
     purchaseLayerDatasetState:[{ scopeKey:'purchase-invoices-types-3-7', activeDatasetId:'PURCHASE-A' }],
     purchaseLayerDatasets:[{ datasetId:'PURCHASE-A', status:'completed', activationStatus:'active' }],
     supplierPurchaseLayers:[{
-      datasetId:'PURCHASE-A', purchaseLineIdentity:'PL-1', layerKind:'purchase',
+      datasetId:'PURCHASE-A', datasetSchemaVersion:1, purchaseLineIdentity:'PL-1', layerKind:'purchase',
       validationStatus:'valid', itemCode:'ITEM-A', itemGuid:'GUID-A', originalQuantity:1,
       unitCostExact:'500.000000', remainingQuantity:0
     }],

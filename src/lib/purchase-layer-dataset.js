@@ -6,6 +6,7 @@ const saleSnapshot = require('./sale-snapshot');
 const { APP_VERSION } = require('./app-version');
 const { normalizeJalaliRange, canonicalSaleDate } = require('./jalali-date');
 const canonicalItemCatalog = require('./canonical-item-catalog');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 
 const DATASETS = 'purchaseLayerDatasets';
 const STATE = 'purchaseLayerDatasetState';
@@ -214,7 +215,7 @@ function layerUpsertUpdate(mapped) {
 
 async function cloneActiveLayers(db, active, datasetId) {
   if (!active?.datasetId) return 0;
-  const rows = await db.collection(LAYERS).find({ datasetId:active.datasetId }).toArray();
+  const rows = await db.collection(LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId:active.datasetId })).toArray();
   for (const row of rows) {
     const { _id, ...copy } = row;
     copy.sourceHash = clean(copy.sourceHash) || sourceHash(copy);
@@ -229,8 +230,8 @@ async function cloneActiveLayers(db, active, datasetId) {
 
 async function reconcilePurchaseReturns(db, datasetId) {
   const collection = db.collection(LAYERS);
-  const purchases = await collection.find({ datasetId, layerKind:'purchase' }).toArray();
-  const returns = await collection.find({ datasetId, layerKind:'purchase-return' }).toArray();
+  const purchases = await collection.find(canonicalLayerContract.canonicalPurchaseQuery({ datasetId })).toArray();
+  const returns = await collection.find(canonicalLayerContract.canonicalPurchaseReturnQuery({ datasetId })).toArray();
   const purchasesByHeaderItem = new Map();
   for (const purchase of purchases) {
     const header = clean(purchase.sourceInvHeaderId || purchase.purchaseInvoiceGuid);
@@ -285,7 +286,7 @@ async function reconcilePurchaseReturns(db, datasetId) {
 }
 
 async function validateDataset(db, datasetId, reachedEndByType, errors) {
-  const rows = await db.collection(LAYERS).find({ datasetId }).toArray();
+  const rows = await db.collection(LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId })).toArray();
   const identities = rows.map(row => row.purchaseLineIdentity);
   const duplicateCount = identities.length - new Set(identities).size;
   const purchases = rows.filter(row => row.layerKind === 'purchase');
@@ -557,7 +558,7 @@ async function coverage(db, datasetId = '') {
     ? { datasetId, dataset:await db.collection(DATASETS).findOne({ datasetId }) }
     : await activeDataset(db);
   if (!active?.datasetId) return { ok:true, available:false, profitActivationAllowed:false, reason:'NO_ACTIVE_PURCHASE_LAYER_DATASET' };
-  const layers = await db.collection(LAYERS).find({ datasetId:active.datasetId, layerKind:'purchase' }).toArray();
+  const layers = await db.collection(LAYERS).find(canonicalLayerContract.canonicalPurchaseQuery({ datasetId:active.datasetId })).toArray();
   const purchaseItems = new Set(layers.map(row => clean(row.itemCode)).filter(Boolean));
   const saleSource=await saleSnapshot._activeDataset(db);
   const saleRows=await db.collection(saleSource.lineCollection).find({...saleSource.lineQuery,saleInvoiceType:2}).toArray().catch(()=>[]);
@@ -569,8 +570,8 @@ async function coverage(db, datasetId = '') {
   const coveredSaleAmount = coveredRows.reduce((sum, row) => sum + Number(row.saleValue || 0), 0);
   const missingPurchaseLayerItems = [...saleItems].filter(code => !purchaseItems.has(code)).sort();
   const invalidRows = layers.filter(row => row.validationStatus === 'rejected').length;
-  const returnRows = await count(db.collection(LAYERS), { datasetId:active.datasetId, layerKind:'purchase-return' });
-  const returnAccountedRows = await count(db.collection(LAYERS), { datasetId:active.datasetId, layerKind:'purchase-return', returnMatchStatus:{ $in:['matched', 'unmatched', 'ambiguous', 'quantity-exceeds-purchase'] } });
+  const returnRows = await count(db.collection(LAYERS), canonicalLayerContract.canonicalPurchaseReturnQuery({ datasetId:active.datasetId }));
+  const returnAccountedRows = await count(db.collection(LAYERS), canonicalLayerContract.canonicalPurchaseReturnQuery({ datasetId:active.datasetId, returnMatchStatus:{ $in:['matched', 'unmatched', 'ambiguous', 'quantity-exceeds-purchase'] } }));
   return {
     ok:true, available:true, datasetId:active.datasetId, datasetStatus:active.dataset?.status || '',
     profitActivationAllowed:false, fifoCalculationActivated:false,
@@ -610,7 +611,7 @@ async function buildRecoveryCandidate(db, options = {}) {
   await db.collection(DATASETS).insertOne({datasetId,datasetSchemaVersion:SCHEMA_VERSION,scopeKey:SCOPE_KEY,status:'running',activationStatus:'candidate',activationRequested:false,mode:'recovery-candidate',baseDatasetId:previousActive.datasetId,sourceDateFrom:previousActive.dataset?.sourceDateFrom||'',sourceDateTo:previousActive.dataset?.sourceDateTo||'',sourceVersion:'canonical-purchase-engine-reviewed-recovery-v1',applicationVersion:APP_VERSION,gitSha:clean(process.env.GIT_COMMIT||process.env.COMMIT_SHA),createdAt:now,startedAt:now,updatedAt:now});
   const clonedLayerCount=await cloneActiveLayers(db,previousActive,datasetId);
   for(const row of reviewed){
-    const mapped={...(row.canonicalLayer||{}),datasetId,source:'canonical-purchase-engine-reviewed-recovery',recoveryCandidateId:row.candidateId,reviewedBy:row.reviewedBy||null,reviewedAt:row.reviewedAt||null,updatedAt:new Date()};
+    const mapped={...(row.canonicalLayer||{}),datasetId,datasetSchemaVersion:SCHEMA_VERSION,source:'canonical-purchase-engine-reviewed-recovery',recoveryCandidateId:row.candidateId,reviewedBy:row.reviewedBy||null,reviewedAt:row.reviewedAt||null,updatedAt:new Date()};
     if(!mapped.purchaseLineIdentity||mapped.layerKind!=='purchase')throw Object.assign(new Error(`Invalid canonical recovery layer ${row.candidateId}`),{code:'PURCHASE_RECOVERY_LAYER_INVALID'});
     mapped.sourceHash=clean(mapped.sourceHash)||sourceHash(mapped);
     await db.collection(LAYERS).updateOne({datasetId,purchaseLineIdentity:mapped.purchaseLineIdentity},layerUpsertUpdate(mapped),{upsert:true});
@@ -652,13 +653,32 @@ async function listLayers(db, filters = {}) {
   if(filters.layerKind)query.layerKind=clean(filters.layerKind);
   if(filters.validationStatus)query.validationStatus=clean(filters.validationStatus);
   const limit=Math.max(1,Math.min(Number(filters.limit||500),5000));
-  const list=await db.collection(LAYERS).find(query).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(limit).toArray();
+  const list=await db.collection(LAYERS).find(canonicalLayerContract.canonicalLayerQuery(query)).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(limit).toArray();
   return {ok:true,datasetId:active.datasetId,dataState:list.length?'ready':'no-data',list};
 }
 
+async function populationDiagnostics(db) {
+  const [rows,datasets,state]=await Promise.all([
+    db.collection(LAYERS).find({}).toArray(),
+    db.collection(DATASETS).find({}).toArray(),
+    db.collection(STATE).findOne({scopeKey:SCOPE_KEY})
+  ]);
+  const canonicalRows=rows.filter(canonicalLayerContract.isCanonicalPurchaseLayer);
+  const legacyRows=rows.filter(row=>!canonicalLayerContract.isCanonicalPurchaseLayer(row));
+  const datasetById=new Map(datasets.map(row=>[clean(row.datasetId),row]));
+  const grouped=new Map();
+  for(const row of canonicalRows){const id=clean(row.datasetId);if(!grouped.has(id))grouped.set(id,[]);grouped.get(id).push(row);}
+  const canonicalDatasets=[...grouped.entries()].map(([datasetId,list])=>{
+    const dataset=datasetById.get(datasetId),identityCounts=new Map();
+    for(const row of list){const identity=clean(row.purchaseLineIdentity);identityCounts.set(identity,(identityCounts.get(identity)||0)+1);}
+    return {datasetId,classification:datasetId===clean(state?.activeDatasetId)?'active':(['candidate','validated-candidate'].includes(clean(dataset?.activationStatus))?'candidate':'historical'),status:clean(dataset?.status)||'orphan',activationStatus:clean(dataset?.activationStatus),count:list.length,withinDatasetDuplicateCount:[...identityCounts.values()].filter(value=>value>1).reduce((sum,value)=>sum+value-1,0),orphan:!dataset};
+  }).sort((a,b)=>a.datasetId.localeCompare(b.datasetId,'en'));
+  return {ok:true,readOnly:true,collectionTotal:rows.length,canonicalCount:canonicalRows.length,canonicalDatasets,legacyNoncanonicalCount:legacyRows.length,legacyClassification:canonicalLayerContract.CLASSIFICATION.LEGACY,orphanCanonicalCount:canonicalDatasets.filter(row=>row.orphan).reduce((sum,row)=>sum+row.count,0),withinDatasetDuplicateCount:canonicalDatasets.reduce((sum,row)=>sum+row.withinDatasetDuplicateCount,0)};
+}
+
 module.exports = {
-  DATASETS, STATE, LAYERS, DIAGNOSTICS, SCHEMA_VERSION, SOURCE_TYPES,
-  ensureIndexes, activeDataset, buildPurchaseLayerDataset, buildRecoveryCandidate, coverage, listDatasets, status, listLayers,
+  DATASETS, STATE, LAYERS, DIAGNOSTICS, SCOPE_KEY, SCHEMA_VERSION, SOURCE_TYPES,
+  ensureIndexes, activeDataset, buildPurchaseLayerDataset, buildRecoveryCandidate, coverage, listDatasets, status, listLayers, populationDiagnostics,
   _mapSourceLine:mapSourceLine, _lineIdentity:lineIdentity, _reconcilePurchaseReturns:reconcilePurchaseReturns,
   _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate,
   _responseTotalRecords:responseTotalRecords, _sourceHash:sourceHash,

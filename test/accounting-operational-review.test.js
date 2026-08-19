@@ -28,8 +28,8 @@ function seedDb(){
     purchaseLayerDatasetState:[{scopeKey:'purchase-invoices-types-3-7',activeDatasetId:'PURCHASE-ACTIVE'}],
     purchaseLayerDatasets:[{datasetId:'PURCHASE-ACTIVE',status:'completed',activationStatus:'active'}],
     supplierPurchaseLayers:[
-      {datasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'PL-A',layerKind:'purchase',validationStatus:'valid',purchaseInvoiceDate:'14041220',purchaseInvoiceNo:10,supplierAccountNumber:'SUP-1',itemGuid:'GUID-A',itemCode:'A',originalQuantity:1,remainingQuantity:0,unitCostExact:'500.00'},
-      {datasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'PR-A',layerKind:'purchase-return',validationStatus:'valid',purchaseInvoiceDate:'14050103',purchaseInvoiceNo:11,supplierAccountNumber:'SUP-1',itemGuid:'GUID-A',itemCode:'A',originalQuantity:1}
+      {datasetId:'PURCHASE-ACTIVE',datasetSchemaVersion:1,purchaseLineIdentity:'PL-A',layerKind:'purchase',validationStatus:'valid',purchaseInvoiceDate:'14041220',purchaseInvoiceNo:10,supplierAccountNumber:'SUP-1',itemGuid:'GUID-A',itemCode:'A',originalQuantity:1,remainingQuantity:0,unitCostExact:'500.00'},
+      {datasetId:'PURCHASE-ACTIVE',datasetSchemaVersion:1,purchaseLineIdentity:'PR-A',layerKind:'purchase-return',validationStatus:'valid',purchaseInvoiceDate:'14050103',purchaseInvoiceNo:11,supplierAccountNumber:'SUP-1',itemGuid:'GUID-A',itemCode:'A',originalQuantity:1}
     ],
     supplierPurchaseInvoices:[
       {invNo:20,guId:'PURCHASE-GUID-20',invDate:'14041210',invTyp:3,supplierAccountNo:'SUP-2',supplierName:'Supplier 2',items:[

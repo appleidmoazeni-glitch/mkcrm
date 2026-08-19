@@ -8,6 +8,7 @@ const decimal = require('./accounting-decimal');
 const fifo = require('./fifo-shadow-engine');
 const ledger = require('./profit-commission-ledger');
 const manualCost = require('./manual-cost-resolution');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const { canonicalSaleDate } = require('./jalali-date');
 const crypto = require('crypto');
 
@@ -53,7 +54,7 @@ async function report(db,input={}){
     db.collection(ledger.FIFO_FACTS).find({fifoDatasetId:active.datasetId}).toArray(),
     db.collection(fifo.EXCEPTIONS).find({datasetId:active.datasetId}).toArray(),
     db.collection(manualCost.COLLECTION).find({status:'approved'}).toArray(),
-    db.collection('supplierPurchaseLayers').find({datasetId:active.dataset.sourcePurchaseDatasetId}).toArray(),
+    db.collection('supplierPurchaseLayers').find(canonicalLayerContract.canonicalLayerQuery({datasetId:active.dataset.sourcePurchaseDatasetId})).toArray(),
     db.collection('supplierPurchaseInvoices').find({}).toArray(),
     db.collection('saleSnapshotState').findOne({activeSnapshotId:{$exists:true}},{sort:{activatedAt:-1}})
   ]);

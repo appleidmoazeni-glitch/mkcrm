@@ -30,15 +30,52 @@ test('catalog identity persists when inventory becomes zero and repeated discove
   assert.equal(db.collection('purchaseHistoryDiscoveryQueue').rows.length,1);
 });
 
-test('stable GUID prevents duplicate canonical identity when ItemCode changes',async()=>{
+test('same GUID with genuinely different normalized ItemCode is an explicit conflict',async()=>{
   const db=new MemoryDb({itemCatalogAll:[],purchaseHistoryDiscoveryQueue:[]});
-  const first=await catalog.ensureCatalogItem(db,{itemCode:'OLD-CODE',itemGuid:'G-STABLE',itemDescription:'Alpha'},{source:'inventory-getremain'});
-  await catalog.ensureCatalogItems(db,[{itemCode:'NEW-CODE',itemGuid:'G-STABLE',itemDescription:'Alpha renamed'}],{source:'canonical-sale-snapshot'});
+  await catalog.ensureCatalogItem(db,{itemCode:'OLD-CODE',itemGuid:'G-STABLE',itemDescription:'Alpha'},{source:'inventory-getremain'});
+  const result=await catalog.ensureCatalogItems(db,[{itemCode:'NEW-CODE',itemGuid:'G-STABLE',itemDescription:'Alpha renamed'}],{source:'canonical-sale-snapshot'});
+  assert.equal(result.ok,false);
+  assert.equal(result.conflicts[0].code,'IDENTITY_CONFLICT_SAME_GUID_DIFFERENT_CODE');
   assert.equal(db.collection('itemCatalogAll').rows.length,1);
-  assert.equal(db.collection('itemCatalogAll').rows[0].itemCode,'NEW-CODE');
-  assert.equal(db.collection('itemCatalogAll').rows[0].canonicalIdentity,first.canonicalIdentity);
+  assert.equal(db.collection('itemCatalogAll').rows[0].itemCode,'OLD-CODE');
   assert.equal(db.collection('purchaseHistoryDiscoveryQueue').rows.length,1);
-  assert.equal(db.collection('purchaseHistoryDiscoveryQueue').rows[0].itemCode,'NEW-CODE');
+});
+
+test('leading and trailing whitespace use one normalized catalog identity',async()=>{
+  const db=new MemoryDb({itemCatalogAll:[],purchaseHistoryDiscoveryQueue:[]});
+  const first=await catalog.ensureCatalogItem(db,{itemCode:'  CODE',itemGuid:'{ABC-123}'},{source:'all-items-catalog-bootstrap'});
+  const second=await catalog.ensureCatalogItem(db,{itemCode:'CODE  ',itemGuid:'abc-123'},{source:'inventory-getremain'});
+  assert.equal(first.ok,true);assert.equal(second.ok,true);assert.equal(second.created,false);
+  assert.equal(db.collection('itemCatalogAll').rows.length,1);
+  assert.equal(db.collection('itemCatalogAll').rows[0].itemCode,'CODE');
+  assert.equal(db.collection('itemCatalogAll').rows[0].normalizedItemCode,'CODE');
+  assert.equal(db.collection('itemCatalogAll').rows[0].canonicalItemGuid,'abc-123');
+});
+
+test('different GUID with the same normalized ItemCode is an explicit conflict',async()=>{
+  const db=new MemoryDb({itemCatalogAll:[],purchaseHistoryDiscoveryQueue:[]});
+  await catalog.ensureCatalogItem(db,{itemCode:'CODE',itemGuid:'GUID-1'},{source:'inventory-getremain'});
+  const result=await catalog.ensureCatalogItems(db,[{itemCode:' CODE ',itemGuid:'GUID-2'}],{source:'canonical-sale-snapshot'});
+  assert.equal(result.ok,false);
+  assert.equal(result.conflicts[0].code,'IDENTITY_CONFLICT_DIFFERENT_GUID_SAME_CODE');
+  assert.equal(db.collection('itemCatalogAll').rows.length,1);
+});
+
+test('code-only discovery enriches the existing GUID identity without creating a duplicate',async()=>{
+  const db=new MemoryDb({itemCatalogAll:[],purchaseHistoryDiscoveryQueue:[]});
+  await catalog.ensureCatalogItem(db,{itemCode:'CODE',itemGuid:'GUID-1',itemDescription:'Alpha'},{source:'canonical-sale-snapshot'});
+  const result=await catalog.ensureCatalogItems(db,[{itemCode:' CODE ',itemDescription:'Alpha'}],{source:'inventory-getremain'});
+  assert.equal(result.ok,true);assert.equal(db.collection('itemCatalogAll').rows.length,1);
+  assert.equal(db.collection('itemCatalogAll').rows[0].canonicalItemGuid,'guid-1');
+});
+
+test('repeated canonical batch discovery is idempotent and does not delete zero-stock identity',async()=>{
+  const db=new MemoryDb({itemCatalogAll:[],purchaseHistoryDiscoveryQueue:[]});
+  const input=[{itemCode:' A ',itemGuid:'G-A',itemDescription:'Alpha'}];
+  const first=await catalog.ensureCatalogItems(db,input,{source:'all-items-catalog-bootstrap',retainRaw:true});
+  const second=await catalog.ensureCatalogItems(db,input,{source:'all-items-catalog-bootstrap',retainRaw:true});
+  assert.equal(first.created,1);assert.equal(second.created,0);assert.equal(db.collection('itemCatalogAll').rows.length,1);
+  assert.equal(db.collection('itemCatalogAll').rows[0].deletedByZeroStock,false);
 });
 
 test('reviewed history completion changes only catalog and queue state',async()=>{
@@ -51,7 +88,7 @@ test('reviewed history completion changes only catalog and queue state',async()=
 });
 
 test('canonical Purchase Engine alone materializes reviewed recovery into inactive candidate',async()=>{
-  const layer={datasetId:'',purchaseLineIdentity:'INV:1',layerKind:'purchase',sourceInvoiceType:3,purchaseInvoiceGuid:'INV',purchaseInvoiceNo:1,purchaseInvoiceDate:'14050101',sourceLineItemId:'1',sourceRow:1,itemGuid:'G-A',itemCode:'A',itemDescription:'Alpha',supplierGuid:'S',supplierAccountNumber:'1',supplierName:'Supplier',originalQuantity:2,returnedQuantity:0,netPurchasedQuantity:2,remainingQuantity:2,grossUnitCost:100,netUnitCost:100,validationStatus:'valid',validationWarnings:[],returnMatchStatus:'not-applicable',sourceHash:'a'.repeat(64)};
+  const layer={datasetId:'',datasetSchemaVersion:1,purchaseLineIdentity:'INV:1',layerKind:'purchase',sourceInvoiceType:3,purchaseInvoiceGuid:'INV',purchaseInvoiceNo:1,purchaseInvoiceDate:'14050101',sourceLineItemId:'1',sourceRow:1,itemGuid:'G-A',itemCode:'A',itemDescription:'Alpha',supplierGuid:'S',supplierAccountNumber:'1',supplierName:'Supplier',originalQuantity:2,returnedQuantity:0,netPurchasedQuantity:2,remainingQuantity:2,grossUnitCost:100,netUnitCost:100,validationStatus:'valid',validationWarnings:[],returnMatchStatus:'not-applicable',sourceHash:'a'.repeat(64)};
   const db=new MemoryDb({purchaseLayerDatasetState:[{scopeKey:'purchase-invoices-types-3-7',activeDatasetId:'P-ACTIVE'}],purchaseLayerDatasets:[{datasetId:'P-ACTIVE',status:'completed',activationStatus:'active',sourceDateFrom:'12000101'}],supplierPurchaseLayers:[{...layer,datasetId:'P-ACTIVE',purchaseLineIdentity:'OLD:1'}],purchaseLayerDiagnostics:[],purchaseLayerRecoveryCandidates:[{candidateId:'R1',approvedForDatasetRebuild:true,canonicalLayer:layer,reviewedBy:{username:'admin'},reviewedAt:new Date()}]});
   const result=await purchase.buildRecoveryCandidate(db,{candidateIds:['R1']});
   assert.equal(result.ok,true);assert.equal(result.activationPerformed,false);assert.equal(result.activeDatasetId,'P-ACTIVE');assert.equal(result.recoveredLayerCount,1);
@@ -73,4 +110,7 @@ test('canonical paths are wired for inventory sale purchase and exact repair',()
   assert.match(server,/exact-code-repair/);
   assert.match(sale,/source:'canonical-sale-snapshot'/);
   assert.match(purchaseSource,/source:'canonical-purchase-engine'/);
+  const fullSyncIngest=server.slice(server.indexOf('async function upsertAllItemRows'),server.indexOf('async function searchAllItems'));
+  assert.doesNotMatch(fullSyncIngest,/bulkWrite|itemCode:\s*x\.itemCode/);
+  assert.match(server,/retainRaw:true/);
 });

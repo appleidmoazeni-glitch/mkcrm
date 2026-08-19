@@ -27,6 +27,7 @@ function sale(overrides = {}) {
 function layer(overrides = {}) {
   return {
     datasetId:'PURCHASE-ACTIVE',
+    datasetSchemaVersion:1,
     purchaseLineIdentity:'P-A-1',
     layerKind:'purchase',
     validationStatus:'valid',

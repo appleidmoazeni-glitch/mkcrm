@@ -2,6 +2,7 @@
 
 const crypto = require('crypto');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const manualCostResolution = require('./manual-cost-resolution');
 const saleSnapshot = require('./sale-snapshot');
 const accountingDecimal = require('./accounting-decimal');
@@ -370,7 +371,7 @@ async function loadSources(db, pinned = {}) {
   const [saleLines, saleHeaders, purchaseLayers, manuals, purchaseReturnResolutions, saleReturnResolutions] = await Promise.all([
     db.collection(saleActive.lineCollection).find(saleActive.lineQuery).toArray(),
     db.collection(saleActive.headerCollection).find(saleActive.headerQuery).toArray(),
-    db.collection(purchaseLayerDataset.LAYERS).find({ datasetId:purchaseActive.datasetId }).toArray(),
+    db.collection(purchaseLayerDataset.LAYERS).find(canonicalLayerContract.canonicalLayerQuery({ datasetId:purchaseActive.datasetId })).toArray(),
     db.collection(manualCostResolution.COLLECTION).find({ status:'approved', deleted:{ $ne:true } }).toArray(),
     db.collection('purchaseReturnResolutions').find({ status:'confirmed_linked' }).toArray(),
     db.collection('saleReturnResolutions').find({ status:'confirmed_linked' }).toArray()
