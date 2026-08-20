@@ -18,7 +18,7 @@ function storage(initial={}){
 }
 function element(){return{disabled:false,textContent:'',innerHTML:'',value:'',dataset:{},onclick:null,querySelector:()=>null,selectedOptions:[],isConnected:true};}
 function harness({fetchImpl}={}){
-  const elements=new Map([['#issueBtn',element()],['#saleOut',element()],['#buyerName',element()],['#buyerMobile',element()],['#buyerNational',element()],['#leadId',element()],['#saleQ',element()],['#saleSelected',element()],['#STNumber',element()],['#Quan',element()],['#Price',element()],['#saleGeneralRef',element()],['#saleDiscount',element()],['#saleInventory',element()],['#serialBox',element()],['#priceWarn',element()],['#saleExtrasRows',element()],['#content',element()],['#logoutBtn',element()]]);
+  const elements=new Map([['#issueBtn',element()],['#saleOut',element()],['#releaseSaleAttempt',element()],['#saleResolutionActionOut',element()],['#buyerName',element()],['#buyerMobile',element()],['#buyerNational',element()],['#leadId',element()],['#saleQ',element()],['#saleSelected',element()],['#STNumber',element()],['#Quan',element()],['#Price',element()],['#saleGeneralRef',element()],['#saleDiscount',element()],['#saleInventory',element()],['#serialBox',element()],['#priceWarn',element()],['#saleExtrasRows',element()],['#content',element()],['#logoutBtn',element()]]);
   elements.get('#Quan').value='1';elements.get('#saleDiscount').value='0';
   const localStorage=storage(),sessionStorage=storage();
   const listeners={};
@@ -26,7 +26,7 @@ function harness({fetchImpl}={}){
   const context={
     state,localStorage,sessionStorage,location:{hash:'#sale'},crypto:{randomUUID:()=>`uuid-${Math.random()}`},
     document:{querySelector:selector=>elements.get(selector)||null,querySelectorAll:()=>[]},
-    window:{addEventListener:(name,fn)=>{listeners[name]=fn;}},
+    window:{addEventListener:(name,fn)=>{listeners[name]=fn;},confirm:()=>true},
     MutationObserver:class{observe(){}disconnect(){}},uiPageLifecycle:{add(){}},
     esc:value=>String(value),renderSaleLines(){},setTimeout:()=>1,clearTimeout(){},
     fetch:fetchImpl||(async()=>({status:200,json:async()=>({ok:true,issuance:null})})),
@@ -68,6 +68,12 @@ test('login/page recovery discovers a real server-side unresolved attempt and st
   assert.equal(h.localStorage.value('mkcrm.activeSaleIssuance.seller-a'),'sale:SERVER');assert.equal(h.elements.get('#issueBtn').disabled,true);assert.match(h.elements.get('#saleOut').innerHTML,/از صدور مجدد خودداری کنید/);
 });
 
+test('explicit continuity release preserves server history and unlocks a clean draft in the same browser',async()=>{
+  const calls=[];const h=harness({fetchImpl:async(url,options={})=>{calls.push({url,options});if(url.endsWith('/active'))return{status:200,json:async()=>({ok:true,issuance:{issuanceAttemptId:'sale:SERVER',state:'manual_reconciliation_required',issuanceLocked:true}})};if(url.endsWith('/release'))return{status:200,ok:true,json:async()=>({ok:true,issuance:{issuanceAttemptId:'sale:SERVER',state:'operator_released',operatorReleased:true,canIssueAgain:true}})};return{status:200,json:async()=>({ok:true})};}});
+  await h.api.discoverActive();assert.equal(h.elements.get('#issueBtn').disabled,true);await h.elements.get('#releaseSaleAttempt').onclick();
+  assert.equal(calls.filter(x=>x.url.endsWith('/release')).length,1);const releaseBody=JSON.parse(calls.find(x=>x.url.endsWith('/release')).options.body);assert.equal(releaseBody.confirmCashboxChecked,true);assert.equal(h.localStorage.has('mkcrm.activeSaleIssuance.seller-a'),false);assert.equal(h.elements.get('#issueBtn').disabled,false);assert.equal(h.state.saleLines.length,0);
+});
+
 test('no server-side unresolved attempt leaves a clean draft unlocked',async()=>{
   const h=harness();await h.api.discoverActive();assert.equal(h.elements.get('#issueBtn').disabled,false);assert.equal(h.state.saleIssueInFlight,false);
 });
@@ -95,6 +101,10 @@ test('cross-tab storage changes trigger server reconciliation instead of blind u
 test('active-attempt endpoint is read-only, owner-scoped, and precedes the dynamic attempt route',()=>{
   const active=server.indexOf("pathname==='/api/sales/issuance/active'"),dynamic=server.indexOf('const saleIssuanceStatusMatch');assert.ok(active>0&&active<dynamic);
   const block=server.slice(active,dynamic);assert.match(block,/req\.method==='GET'/);assert.match(block,/issuanceState:\{\$in:saleIssuance\.LOCKED_STATES\}/);assert.match(block,/mappingUsername:username/);assert.match(block,/'requestedBy\.username':username/);assert.doesNotMatch(block,/insertOne|updateOne|deleteOne|putSaleInvoice/);
+});
+
+test('business-continuity release endpoint is authorized, owner-scoped, and does not call Invoice Put',()=>{
+  const marker="const saleIssuanceReleaseMatch=pathname.match(/^\\/api\\/sales\\/issuance\\/([^/]+)\\/release$/)";const start=server.indexOf(marker);assert.ok(start>0);const block=server.slice(start,server.indexOf("if ((pathname === '/api/sales/issue'",start));assert.match(block,/requireRole\(req,res,\['seller','seller_buyer','accounting'\]\)/);assert.match(block,/existing\.mappingUsername/);assert.match(block,/releaseForBusinessContinuity/);assert.doesNotMatch(block,/putSaleInvoice|Invoice\/Put/);
 });
 
 test('single cost editor, duplicate-click guard, print and Lead ID contracts remain present',()=>{

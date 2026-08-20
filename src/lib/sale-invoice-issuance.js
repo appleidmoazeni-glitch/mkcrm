@@ -15,7 +15,8 @@ const STATES = Object.freeze({
   PUT_SUCCEEDED_RESOLVE_PENDING:'put_succeeded_resolve_pending',
   RESOLVED:'resolved',
   MANUAL_RECONCILIATION_REQUIRED:'manual_reconciliation_required',
-  CONFIRMED_PUT_FAILURE:'confirmed_put_failure'
+  CONFIRMED_PUT_FAILURE:'confirmed_put_failure',
+  OPERATOR_RELEASED:'operator_released'
 });
 
 const LOCKED_STATES = Object.freeze([
@@ -117,6 +118,8 @@ function publicAttempt(row={}){
       ?'فاکتور احتمالاً در شایگان ثبت شده است، اما شماره نهایی آن بازیابی نشد. از صدور مجدد خودداری کنید. سیستم در حال بازیابی یا بررسی فاکتور است.'
       :state===STATES.CONFIRMED_PUT_FAILURE
         ?'عدم ثبت فاکتور به‌صورت قطعی تأیید شده است.'
+        :state===STATES.OPERATOR_RELEASED
+          ?'قفل درخواست قبلی با تأیید صریح کاربر و برای تداوم عملیات آزاد شده است.'
         :'درخواست صدور آماده ارسال است.';
   return{
     issuanceAttemptId:row.issuanceAttemptId||row._id||'',
@@ -125,7 +128,8 @@ function publicAttempt(row={}){
     invoiceNumber:Number(row.invoiceNumber||0),invoiceGuid:clean(row.invoiceGuid,100),printUrl:clean(row.printUrl,300),
     issuanceLocked:LOCKED_STATES.includes(state),resolved:state===STATES.RESOLVED,
     canRetryResolution:RESOLUTION_STATES.includes(state),manualReconciliationRequired:state===STATES.MANUAL_RECONCILIATION_REQUIRED,
-    canIssueAgain:state===STATES.CONFIRMED_PUT_FAILURE,
+    canIssueAgain:[STATES.CONFIRMED_PUT_FAILURE,STATES.OPERATOR_RELEASED].includes(state),
+    operatorReleased:state===STATES.OPERATOR_RELEASED,
     actions:LOCKED_STATES.includes(state)?['retry_resolution','view_status','refer_accounting']:[],message,
     updatedAt:row.updatedAt||null
   };
@@ -245,6 +249,24 @@ async function confirmNoInvoice(db,attemptId,input={},user={},at=new Date()){
   if(Number(input.revision)!==Number(row.revision||0)){const error=new Error('Revision درخواست صدور تغییر کرده است.');error.code='ISSUANCE_REVISION_CONFLICT';error.statusCode=409;throw error;}
   return markConfirmedFailure(db,attemptId,{error:'Accounting confirmed no Shaygan invoice exists',manualNoInvoiceConfirmedAt:nowDate(at),manualNoInvoiceEvidence:{reason,evidenceReference,confirmedBy:actor(user)}},user,at);
 }
+async function releaseForBusinessContinuity(db,attemptId,input={},user={},at=new Date()){
+  if(input.confirmCashboxChecked!==true){const error=new Error('تأیید بررسی حساب صندوق الزامی است.');error.code='ISSUANCE_RELEASE_CONFIRMATION_REQUIRED';error.statusCode=400;throw error;}
+  const reason=clean(input.reason,1000);
+  if(!reason){const error=new Error('دلیل آزادسازی قفل الزامی است.');error.code='ISSUANCE_RELEASE_REASON_REQUIRED';error.statusCode=400;throw error;}
+  const row=await db.collection(ATTEMPTS).findOne({_id:attemptId});
+  if(!row){const error=new Error('Issuance attempt پیدا نشد.');error.code='ISSUANCE_ATTEMPT_NOT_FOUND';error.statusCode=404;throw error;}
+  const releasedAt=nowDate(at),previousState=legacyState(row);
+  const evidence={
+    actor:actor(user),releasedAt,reason,previousState,
+    requestFingerprint:row.requestFingerprint||'',putCallCount:Number(row.putCallCount||0),putHttpStatus:Number(row.putHttpStatus||0),
+    knownInvoiceNumber:Number(row.invoiceNumber||row.putResponseIdentifiers?.invoiceNumber||0),
+    knownInvoiceGuid:clean(row.invoiceGuid||row.putResponseIdentifiers?.invoiceGuid,100),
+    lastResolution:row.lastResolution||null
+  };
+  const updated=await transition(db,attemptId,LOCKED_STATES,STATES.OPERATOR_RELEASED,{releasedAt,releasedBy:actor(user),releaseReason:reason,releaseEvidence:evidence,auditDetails:evidence},user,releasedAt,'invoice-lock-released-for-business-continuity');
+  await db.collection(FINGERPRINT_LOCKS).updateOne({_id:updated.requestFingerprint,attemptId},{$set:{state:STATES.OPERATOR_RELEASED,duplicateWindowUntil:new Date(0),updatedAt:releasedAt}}).catch(()=>{});
+  return updated;
+}
 async function technicalAudit(db,{attemptId,stage,state,response={},resolution=null,user={},at=new Date()}={}){
   const row=await db.collection(ATTEMPTS).findOne({_id:attemptId});
   return db.collection(AUDIT_LOGS).insertOne({
@@ -254,4 +276,4 @@ async function technicalAudit(db,{attemptId,stage,state,response={},resolution=n
   });
 }
 
-module.exports={ATTEMPTS,FINGERPRINT_LOCKS,AUDIT_LOGS,STATES,LOCKED_STATES,RESOLUTION_STATES,SCHEMA_VERSION,requestFingerprint,fingerprintMaterial,requestSnapshot,normalizedAttemptId,legacyState,isLocked,publicAttempt,ensureIndexes,beginAttempt,markPutInProgress,markPutSucceededResolvePending,markAmbiguous,markManualReconciliation,markResolved,markConfirmedFailure,startResolutionRetry,confirmNoInvoice,technicalAudit,_stable:stable};
+module.exports={ATTEMPTS,FINGERPRINT_LOCKS,AUDIT_LOGS,STATES,LOCKED_STATES,RESOLUTION_STATES,SCHEMA_VERSION,requestFingerprint,fingerprintMaterial,requestSnapshot,normalizedAttemptId,legacyState,isLocked,publicAttempt,ensureIndexes,beginAttempt,markPutInProgress,markPutSucceededResolvePending,markAmbiguous,markManualReconciliation,markResolved,markConfirmedFailure,startResolutionRetry,confirmNoInvoice,releaseForBusinessContinuity,technicalAudit,_stable:stable};

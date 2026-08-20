@@ -5893,9 +5893,10 @@ async function pageSellerProfit(){
     const button=qs('#issueBtn');if(button){button.disabled=Boolean(locked);button.textContent=locked?'صدور قفل است':label;}
     issueDiagnostic(locked?'button-locked':'button-unlocked',{reason:locked?'issuance-state':'idle'});
   }
-  function statusActions(attemptId){return`<div class="actions"><button class="btn" id="retrySaleResolution" type="button">بررسی مجدد وضعیت</button><button class="btn" id="viewSaleResolution" type="button">مشاهده وضعیت بازیابی</button><button class="btn" id="referSaleAccounting" type="button">ارجاع به حسابداری</button></div><div id="saleResolutionActionOut" class="mt"></div><div class="small muted">شناسه پیگیری: ${safe(attemptId)}</div>`;}
+  function statusActions(attemptId){return`<div class="actions"><button class="btn" id="retrySaleResolution" type="button">بررسی مجدد وضعیت فاکتور</button><button class="btn" id="releaseSaleAttempt" type="button">شروع فاکتور جدید</button><button class="btn" id="viewSaleResolution" type="button">مشاهده وضعیت بازیابی</button><button class="btn" id="referSaleAccounting" type="button">ارجاع به حسابداری</button></div><div id="saleResolutionActionOut" class="mt"></div><div class="small muted">شناسه پیگیری: ${safe(attemptId)}</div>`;}
   function bindStatusActions(attemptId){
     const retry=qs('#retrySaleResolution');if(retry)retry.onclick=async()=>{retry.disabled=true;const out=qs('#saleResolutionActionOut');if(out)out.innerHTML='<div class="info">فقط خواندن وضعیت فاکتور از شایگان در حال انجام است؛ Invoice/Put تکرار نمی‌شود.</div>';try{const {payload}=await requestJson(`/api/sales/issuance/${encodeURIComponent(attemptId)}/retry-resolution`,{method:'POST',body:'{}'});handleIssuancePayload(payload);}catch(error){if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;}finally{retry.disabled=false;}};
+    const release=qs('#releaseSaleAttempt');if(release)release.onclick=async()=>{const warning='نتیجه صدور قبلی از شایگان دریافت نشده است. قبل از ادامه، حساب صندوق را بررسی کنید تا از صدور یا عدم صدور فاکتور قبلی مطمئن شوید.\n\nحساب صندوق را بررسی کردم و می‌خواهم فاکتور جدید شروع کنم.';if(!window.confirm(warning))return;release.disabled=true;const out=qs('#saleResolutionActionOut');if(out)out.innerHTML='<div class="warn">در حال ثبت آزادسازی حسابرسی‌شده قفل؛ فاکتور قبلی دوباره ارسال نمی‌شود.</div>';try{const {response,payload}=await requestJson(`/api/sales/issuance/${encodeURIComponent(attemptId)}/release`,{method:'POST',body:JSON.stringify({confirmCashboxChecked:true,reason:'operator-confirmed-cashbox-check-business-continuity'})});if(!response.ok||!payload.ok)throw new Error(payload.error||'آزادسازی قفل ناموفق بود');await resetIssueInvoiceForNewDraft();issueMessage('warn','قفل قبلی با ثبت سابقه آزاد شد. فاکتور جدید آماده است؛ فاکتور قبلی دوباره ارسال نشد.');}catch(error){if(out)out.innerHTML=`<div class="error">${safe(error.message||error)}</div>`;release.disabled=false;}};
     const view=qs('#viewSaleResolution');if(view)view.onclick=()=>refreshIssuanceStatus(attemptId,true);
     const refer=qs('#referSaleAccounting');if(refer)refer.onclick=()=>{const out=qs('#saleResolutionActionOut');if(out)out.innerHTML=`<div class="warn">این شناسه را برای بررسی به حسابداری/مدیر بدهید: <b>${safe(attemptId)}</b>. تا تأیید قطعی عدم وجود فاکتور، صدور مجدد مجاز نیست.</div>`;};
   }
@@ -5915,7 +5916,7 @@ async function pageSellerProfit(){
     const issuance=payload.issuance||{};
     if(payload.ok||issuance.resolved)return showResolved(payload);
     if(payload.issuanceLocked||payload.ambiguous||LOCKED.has(issuance.state))return showLocked(issuance);
-    if(issuance.state==='confirmed_put_failure'){
+    if(issuance.state==='confirmed_put_failure'||issuance.state==='operator_released'){
       storeAttempt('');state.saleIssueKey=newAttemptId();clearStoredSaleDraft();setIssueLocked(false);const out=qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(payload.error||issuance.message||'عدم ثبت فاکتور به‌صورت قطعی تأیید شد.')}</div>`;return;
     }
     setIssueLocked(false);const out=qs('#saleOut');if(out)out.innerHTML=`<div class="error">${safe(payload.error||'خطای ثبت فاکتور')}</div>`;

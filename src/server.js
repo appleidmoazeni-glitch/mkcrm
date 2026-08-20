@@ -5816,6 +5816,16 @@ async function handleApi(req, res, pathname, query) {
       try{const attempt=await saleIssuance.confirmNoInvoice(db,attemptId,body,user);return sendJson(res,200,{ok:true,issuance:saleIssuance.publicAttempt(attempt),invoiceWriteCount:0,shayganWriteCount:0});}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ISSUANCE_RECONCILIATION_FAILED',error:String(error.message||error)});}
     }
+    const saleIssuanceReleaseMatch=pathname.match(/^\/api\/sales\/issuance\/([^/]+)\/release$/);
+    if(saleIssuanceReleaseMatch&&req.method==='POST'){
+      if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
+      const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceReleaseMatch[1]),user=currentUser(req)||{},body=await collectBody(req);
+      const existing=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:attemptId});
+      if(!existing)return sendJson(res,404,{ok:false,code:'ISSUANCE_ATTEMPT_NOT_FOUND',error:'درخواست صدور پیدا نشد.'});
+      if(['seller','seller_buyer'].includes(user.role)&&String(existing.mappingUsername)!==String(user.username))return deny(res,'این درخواست صدور متعلق به کاربر دیگری است.');
+      try{const attempt=await saleIssuance.releaseForBusinessContinuity(db,attemptId,body,user);return sendJson(res,200,{ok:true,issuance:saleIssuance.publicAttempt(attempt),invoiceWriteCount:0,shayganWriteCount:0});}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ISSUANCE_RELEASE_FAILED',error:String(error.message||error)});}
+    }
 
     if ((pathname === '/api/sales/issue' || pathname === '/admin/accounting/putInvoice') && req.method === 'POST') {
       if (!canUseSalesFlow(req, res)) return;
