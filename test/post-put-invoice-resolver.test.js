@@ -1,7 +1,7 @@
 'use strict';
 
 const assert = require('node:assert/strict');
-const { resolveIssuedInvoiceAfterPut } = require('../src/lib/post-put-invoice-resolver');
+const { resolveIssuedInvoiceAfterPut, originalIssueDate8 } = require('../src/lib/post-put-invoice-resolver');
 
 let tests=0;
 async function test(name,fn){await fn();tests++;process.stderr.write(`ok ${tests} - ${name}\n`);}
@@ -56,6 +56,17 @@ function request(issueResponse,shaygan,extra={}){
     const r=await request({result:[{Number:0,GuId:'guid-expected'}]},shaygan);
     assert.equal(r.ok,true);assert.equal(r.invoiceNumber,100);assert.equal(r.method,'date-search-verified');
     assert.equal(r.result.Body.length,3);assert.deepEqual(shaygan.calls.exact,[[100,2]]);assert.equal(shaygan.calls.guid,0);
+  });
+  await test('historical retry uses the original PUT date when request date is empty',async()=>{
+    const date=originalIssueDate8({requestSnapshot:{invDate:''},putStartedAt:'2026-08-10T15:01:37.561Z'},d=>d.toISOString().slice(0,10).replace(/-/g,''));
+    assert.equal(date,'20260810');
+  });
+  await test('invoice expenses participate in candidate amount matching',async()=>{
+    const expenseBody={...body,invoiceExtras:[{accountNumber:'92307002',amount:1800}]};
+    const c=candidate({InvNo:105,GuId:'',Expense:[{AccountNumber:'92307002',InvExpRowAmount:1800}]});
+    const shaygan=api({pages:[[c],[]],verified:c});
+    const r=await resolveIssuedInvoiceAfterPut({issueResponse:{result:[{Number:0,GuId:''}]},body:expenseBody,mapping,invoiceType:2,crmId:'CRM-1',shaygan,formatDate8,issuedAt,maxPages:5,rowCount:20});
+    assert.equal(r.ok,true);assert.equal(r.invoiceNumber,105);assert(r.matchReasons.includes('amount'));
   });
   await test('best of multiple candidates is verified',async()=>{
     const weak=candidate({InvNo:101,GuId:'other-guid',InvDescription:'',CreatedDate:'2026-07-25T08:00:00Z'});

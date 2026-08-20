@@ -26,7 +26,7 @@ const canonicalItemCatalog = require('./lib/canonical-item-catalog');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
-const {extractIssuedInvoiceMeta,saleRequestAmount,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
+const {extractIssuedInvoiceMeta,saleRequestAmount,originalIssueDate8,resolveIssuedInvoiceAfterPut:resolvePostPutInvoice}=require('./lib/post-put-invoice-resolver');
 const saleIssuance=require('./lib/sale-invoice-issuance');
 const { compareItemCodeClassifiers } = require('./lib/item-code-classifier-v2');
 const { emitSearchEvent } = require('./lib/search-observability');
@@ -2070,7 +2070,10 @@ async function finalizeResolvedSaleIssue({db,attemptId,body,result,invoiceNumber
 async function retrySaleIssueResolution({db,attemptId,user}){
   const started=await saleIssuance.startResolutionRetry(db,attemptId,user);
   if(started.alreadyResolved)return{ok:true,duplicate:true,attempt:started.attempt,resolution:started.attempt.lastResolution||null};
-  const attempt=started.attempt,body={...(attempt.requestSnapshot||{}),crmId:attemptId,invoiceNumber:0},mapping=attempt.mapping||{};
+  const attempt=started.attempt;
+  const body={...(attempt.requestSnapshot||{}),crmId:attemptId,invoiceNumber:0};
+  if(!String(body.invDate||'').trim())body.invDate=originalIssueDate8(attempt,shaygan.formatDate8);
+  const mapping=attempt.mapping||{};
   const envelope=attempt.resolveEnvelope||{ok:true,status:attempt.putHttpStatus||0,result:attempt.putResponseIdentifiers?.resultIdentifiers||[]};
   let resolution;
   try{

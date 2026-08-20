@@ -28,8 +28,26 @@ function normInvDate8(v='') {
   const d = x.replace(/[^0-9]/g,'').slice(0,8);
   return d.length === 8 ? d : '';
 }
+function originalIssueDate8(attempt = {}, formatDate8 = ()=>'') {
+  const explicit = normInvDate8(attempt.requestSnapshot?.invDate || attempt.invDate || '');
+  if (explicit) return explicit;
+  const source = attempt.putStartedAt || attempt.putSentAt || attempt.requestTimestamp || attempt.createdAt;
+  const date = source ? new Date(source) : new Date();
+  return normInvDate8(formatDate8(date));
+}
 function invoiceBodyAmount(inv = {}) {
   return (Array.isArray(inv.Body) ? inv.Body : []).reduce((s,x)=>s + Number(x.Amount || (Number(x.Quan||0) * Number(x.Price||0)) || 0), 0);
+}
+function invoiceExpenseAmount(inv = {}) {
+  const rows = Array.isArray(inv.Expense) ? inv.Expense
+    : Array.isArray(inv.Expenses) ? inv.Expenses
+      : Array.isArray(inv.InvoiceExpenses) ? inv.InvoiceExpenses
+        : [];
+  return rows.reduce((sum,row)=>sum + Number(row.InvExpRowAmount || row.Amount || 0),0);
+}
+function invoiceTotalAmount(inv = {}) {
+  const declared = Number(inv.SourceTotalAmount || inv.TotalAmount || 0);
+  return declared || (invoiceBodyAmount(inv) + invoiceExpenseAmount(inv));
 }
 function saleRequestAmount(body = {}) {
   const rows = Array.isArray(body.items) ? body.items : [];
@@ -68,7 +86,7 @@ function scoreIssuedInvoiceCandidate(inv = {}, body = {}, mapping = {}, putGuid 
   const gotDate = normInvDate8(inv.InvDate || inv.InvoiceDate || '');
   if (reqDate && gotDate && reqDate === gotDate) { score += 400; reasons.push('date'); }
   const reqAmount = saleRequestAmount(body);
-  const invAmount = Number(inv.SourceTotalAmount || inv.TotalAmount || 0) || invoiceBodyAmount(inv);
+  const invAmount = invoiceTotalAmount(inv);
   if (reqAmount > 0 && invAmount > 0 && Math.abs(reqAmount - invAmount) <= 1) { score += 1200; reasons.push('amount'); }
   const desc = String(inv.InvDescription || inv.Description || '');
   if (crmId && desc.includes(String(crmId))) { score += 2500; reasons.push('crmId'); }
@@ -178,4 +196,4 @@ async function resolveIssuedInvoiceAfterPut({ issueResponse = {}, body = {}, map
   return { ...out, ok:true, invoiceNumber:bestNo, invoiceGuid:verifiedGuid||putGuid, result:{...verified,Number:bestNo,GuId:verifiedGuid||putGuid}, method:'date-search-verified', matchScore:best.sc.score, matchReasons:best.sc.reasons, candidateCount:candidates.length, candidates:auditedCandidates };
 }
 
-module.exports = { extractIssuedInvoiceMeta, saleRequestAmount, scoreIssuedInvoiceCandidate, reliableCandidate, resolveIssuedInvoiceAfterPut, totalRecordsOf };
+module.exports = { extractIssuedInvoiceMeta, saleRequestAmount, invoiceExpenseAmount, invoiceTotalAmount, originalIssueDate8, scoreIssuedInvoiceCandidate, reliableCandidate, resolveIssuedInvoiceAfterPut, totalRecordsOf };
