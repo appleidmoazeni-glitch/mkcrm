@@ -107,6 +107,22 @@ test('business-continuity release endpoint is authorized, owner-scoped, and does
   const marker="const saleIssuanceReleaseMatch=pathname.match(/^\\/api\\/sales\\/issuance\\/([^/]+)\\/release$/)";const start=server.indexOf(marker);assert.ok(start>0);const block=server.slice(start,server.indexOf("if ((pathname === '/api/sales/issue'",start));assert.match(block,/requireRole\(req,res,\['seller','seller_buyer','accounting'\]\)/);assert.match(block,/existing\.mappingUsername/);assert.match(block,/releaseForBusinessContinuity/);assert.doesNotMatch(block,/putSaleInvoice|Invoice\/Put/);
 });
 
+test('historical resolution retry reconciles authoritative inventory without a second deduct or board event',()=>{
+  const retryStart=server.indexOf('async function retrySaleIssueResolution');
+  const retryEnd=server.indexOf('async function applyLocalSaleInventoryDeductAfterSuccess',retryStart);
+  const retryBlock=server.slice(retryStart,retryEnd);
+  assert.match(retryBlock,/resolution\.historicalRecovery=.*10\*60\*1000/);
+  assert.match(retryBlock,/finalizeResolvedSaleIssue\([^)]*resolution/);
+
+  const postStart=server.indexOf('async function runSaleIssuePostProcessing');
+  const postEnd=server.indexOf('async function upsertCustomerForSale',postStart);
+  const postBlock=server.slice(postStart,postEnd);
+  assert.match(postBlock,/historicalRecovery\s*\?\s*\{ok:true,skipped:true,reason:'historical-recovery-authoritative-live-reconcile'/);
+  assert.match(postBlock,/authoritativeLiveReconcileItem\(db,itemCode,'historical-sale-issue-recovery'\)/);
+  assert.match(postBlock,/historicalRecovery\?\[\]:await createStockOutBoardEventsAfterSale/);
+  assert.match(postBlock,/: await applyLocalSaleInventoryDeductAfterSuccess/);
+});
+
 test('single cost editor, duplicate-click guard, print and Lead ID contracts remain present',()=>{
   assert.match(hotfix,/function enforceOneCostEditor\(\)/);assert.match(hotfix,/if\(state\.saleIssueInFlight\)/);assert.match(hotfix,/leadId:qs\('#leadId'\)/);assert.match(hotfix,/\/print\/invoice\//);
 });

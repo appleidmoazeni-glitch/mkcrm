@@ -2063,7 +2063,7 @@ async function finalizeResolvedSaleIssue({db,attemptId,body,result,invoiceNumber
   await db.collection('invoiceReservations').updateOne({invType:2,invoiceNumber:Number(invoiceNumber)},{$set:{status:'used',shayganGuid:invoiceGuid||'',usedAt:new Date(),mappingUsername:mapping.username}}).catch(()=>{});
   await db.collection(saleIssuance.ATTEMPTS).updateOne({_id:attemptId,issuanceState:saleIssuance.STATES.RESOLVED},{$set:{mapping:mappingView,result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),printUrl,leadManual:{...leadManual,shayganInvoiceNo:String(invoiceNumber||''),shayganGuid:String(invoiceGuid||'')},postProcessingStatus:'queued',updatedAt:new Date()}});
   attempt={...attempt,mapping:mappingView,result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),printUrl,leadManual:{...leadManual,shayganInvoiceNo:String(invoiceNumber||''),shayganGuid:String(invoiceGuid||'')},postProcessingStatus:'queued'};
-  setImmediate(()=>runSaleIssuePostProcessing({db,body:{...body},result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),saleIssueKey:attemptId,leadManual, mappingView,user:user||{}}).catch(error=>console.error('sale issue post-processing warning:',error.message)));
+  setImmediate(()=>runSaleIssuePostProcessing({db,body:{...body},result,invoiceNumber:Number(invoiceNumber),invoiceGuid:String(invoiceGuid||''),saleIssueKey:attemptId,leadManual,mappingView,user:user||{},historicalRecovery:Boolean(resolution?.historicalRecovery)}).catch(error=>console.error('sale issue post-processing warning:',error.message)));
   return attempt;
 }
 
@@ -2093,6 +2093,8 @@ async function retrySaleIssueResolution({db,attemptId,user}){
     await saleIssuance.technicalAudit(db,{attemptId,stage:'retry-resolution',state:manual.issuanceState,response:{status:attempt.putHttpStatus,error:resolution.error},resolution,user});
     return{ok:false,attempt:manual,resolution};
   }
+  const originalPutAt=new Date(attempt.putStartedAt||attempt.putSentAt||attempt.requestTimestamp||attempt.createdAt||Date.now()).getTime();
+  resolution.historicalRecovery=Number.isFinite(originalPutAt)&&(Date.now()-originalPutAt)>10*60*1000;
   const result={...(resolution.result||{}),Number:Number(resolution.invoiceNumber)};
   if(resolution.invoiceGuid&&!result.GuId)result.GuId=resolution.invoiceGuid;
   const leadManual=attempt.leadManual||manualLeadMeta(body,mapping,user||{});
@@ -2156,17 +2158,22 @@ async function activeQtyForItemFromMongo(db, itemCode) {
   return { totalQty, rows, activeWarehouseNumbers };
 }
 
-async function runSaleIssuePostProcessing({ db, body, result, invoiceNumber, invoiceGuid, saleIssueKey, leadManual, mappingView, user }) {
+async function runSaleIssuePostProcessing({ db, body, result, invoiceNumber, invoiceGuid, saleIssueKey, leadManual, mappingView, user, historicalRecovery=false }) {
   const timings = {};
   const started = Date.now();
   try {
     const invoiceTotal = saleRequestAmount(body);
     let t = Date.now();
-    const localInventoryDeduct = await applyLocalSaleInventoryDeductAfterSuccess({ db, body, invoiceNumber, invoiceGuid, saleIssueKey }).catch(e => ({ ok:false, error:String(e.message||e), lines:[] }));
+    let historicalInventoryReconcile=[];
+    const itemCodes=[...new Set((Array.isArray(body?.items)?body.items:[]).map(x=>String(x.itemCode||x.ItemCode||x.ItemNumber||'').trim()).filter(Boolean))];
+    const localInventoryDeduct = historicalRecovery
+      ? {ok:true,skipped:true,reason:'historical-recovery-authoritative-live-reconcile',lines:[],lineCount:0}
+      : await applyLocalSaleInventoryDeductAfterSuccess({ db, body, invoiceNumber, invoiceGuid, saleIssueKey }).catch(e => ({ ok:false, error:String(e.message||e), lines:[] }));
+    if(historicalRecovery)historicalInventoryReconcile=await Promise.all(itemCodes.map(itemCode=>authoritativeLiveReconcileItem(db,itemCode,'historical-sale-issue-recovery').catch(e=>({ok:false,itemCode,error:String(e.message||e)}))));
     timings.localInventoryDeductMs = Date.now() - t;
-    await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ localInventoryDeduct } }).catch(()=>{});
+    await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ localInventoryDeduct,historicalRecovery:Boolean(historicalRecovery),historicalInventoryReconcile } }).catch(()=>{});
     t = Date.now();
-    const boardStockOut = await createStockOutBoardEventsAfterSale({ db, body, result, mapping:mappingView, user:user||{}, invoiceNumber, invoiceGuid, localInventoryDeduct, saleIssueKey, source:'sale_invoice_issue_local_snapshot_after_deduct' }).catch(e => [{ ok:false, error:String(e.message||e) }]);
+    const boardStockOut = historicalRecovery?[]:await createStockOutBoardEventsAfterSale({ db, body, result, mapping:mappingView, user:user||{}, invoiceNumber, invoiceGuid, localInventoryDeduct, saleIssueKey, source:'sale_invoice_issue_local_snapshot_after_deduct' }).catch(e => [{ ok:false, error:String(e.message||e) }]);
     timings.boardMs = Date.now() - t;
     await db.collection('saleIssueLocks').updateOne({ _id:saleIssueKey }, { $set:{ boardStockOut } }).catch(()=>{});
     t = Date.now();
