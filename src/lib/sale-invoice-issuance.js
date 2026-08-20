@@ -263,7 +263,7 @@ async function releaseForBusinessContinuity(db,attemptId,input={},user={},at=new
     knownInvoiceGuid:clean(row.invoiceGuid||row.putResponseIdentifiers?.invoiceGuid,100),
     lastResolution:row.lastResolution||null
   };
-  const updated=await transition(db,attemptId,LOCKED_STATES,STATES.OPERATOR_RELEASED,{releasedAt,releasedBy:actor(user),releaseReason:reason,releaseEvidence:evidence,auditDetails:evidence},user,releasedAt,'invoice-lock-released-for-business-continuity');
+  const updated=await transition(db,attemptId,RESOLUTION_STATES,STATES.OPERATOR_RELEASED,{releasedAt,releasedBy:actor(user),releaseReason:reason,releaseEvidence:evidence,auditDetails:evidence},user,releasedAt,'invoice-lock-released-for-business-continuity');
   await db.collection(FINGERPRINT_LOCKS).updateOne({_id:updated.requestFingerprint,attemptId},{$set:{state:STATES.OPERATOR_RELEASED,duplicateWindowUntil:new Date(0),updatedAt:releasedAt}}).catch(()=>{});
   return updated;
 }
