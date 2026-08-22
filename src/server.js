@@ -891,9 +891,11 @@ async function upsertInventoryRows(db, rows, meta = {}) {
   // the same item-stock from a stale WebService response. Exact live item refresh can still verify/revive.
   const sourceProbe = String(meta.source || arr[0]?.syncSource || arr[0]?.refreshSource || arr[0]?.source || '').toLowerCase();
   const isAutoPositiveSource = /auto|global|getremain|stock-filter|reconciliation|inventory-stock/.test(sourceProbe) && !/live|exact|item-refresh|kardex|debug/.test(sourceProbe);
+  const existingByKey = new Map();
   if (isAutoPositiveSource && arr.length) {
     const keys = arr.map(x => ({ itemCode:String(x.itemCode||'').trim(), stockNumber:String(x.stockNumber||'').trim() })).filter(x=>x.itemCode&&x.stockNumber);
-    const existing = await db.collection('itemInventoryCatalog').find({ $or:keys.slice(0,150).map(k=>({ itemCode:k.itemCode, stockNumber:k.stockNumber })) }, { projection:{ itemCode:1, stockNumber:1, quantity:1, pendingShayganConfirm:1, lastLocalSaleDeductAt:1 } }).toArray().catch(()=>[]);
+    const existing = await db.collection('itemInventoryCatalog').find({ $or:keys.slice(0,150).map(k=>({ itemCode:k.itemCode, stockNumber:k.stockNumber })) }, { projection:{ itemCode:1, stockNumber:1, quantity:1, pendingShayganConfirm:1, lastLocalSaleDeductAt:1, inventoryAuthority:1, lastAuthoritativeExactAt:1 } }).toArray().catch(()=>[]);
+    existing.forEach(row => existingByKey.set(`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`, row));
     const blocked = new Set();
     const ttlMs = Number(process.env.LOCAL_SALE_DEDUCT_PROTECT_MS || 30*60*1000);
     for (const e of existing) {
@@ -905,6 +907,32 @@ async function upsertInventoryRows(db, rows, meta = {}) {
       arr = arr.filter(x => !blocked.has(`${String(x.itemCode||'').trim()}::${String(x.stockNumber||'').trim()}`));
       await db.collection('appLogs').insertOne({ type:'inventory_auto_positive_skipped_after_local_sale_deduct', skipped:before-arr.length, source:sourceProbe, at:now }).catch(()=>{});
     }
+    const precedenceConflicts = arr.filter(row => inventoryAutoSyncPolicy.shouldProtectExactFromBroad(
+      existingByKey.get(`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`) || {},
+      row
+    ));
+    if (precedenceConflicts.length) {
+      const conflictOps = precedenceConflicts.map(row => ({ updateOne:{
+        filter:{ itemCode:String(row.itemCode||'').trim(), stockNumber:String(row.stockNumber||'').trim() },
+        update:{
+          $set:{
+            broadObservedQuantity:Number(row.quantity ?? row.Quantity1 ?? 0),
+            broadObservedAt:now,
+            broadObservationSource:sourceProbe,
+            needsLiveVerify:true,
+            verificationQueueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.STALE_POSITIVE,
+            verificationReason:'broad-positive-conflicts-exact',
+            lastQueuedAt:now
+          },
+          $min:{ firstMissingInStockAt:now },
+          $inc:{ broadExactConflictCount:1 }
+        }
+      } }));
+      await db.collection('itemInventoryCatalog').bulkWrite(conflictOps, { ordered:false }).catch(()=>{});
+      const conflictKeys = new Set(precedenceConflicts.map(row=>`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`));
+      arr = arr.filter(row => !conflictKeys.has(`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`));
+      await db.collection('appLogs').insertOne({ type:'inventory_broad_exact_precedence_conflict', source:sourceProbe, conflictCount:precedenceConflicts.length, itemCodes:[...new Set(precedenceConflicts.map(row=>String(row.itemCode||'').trim()).filter(Boolean))].slice(0,200), at:now }).catch(()=>{});
+    }
   }
   const ops = arr.map(x => {
     const searchText = normalizeFa(rowSearchText(x));
@@ -914,6 +942,13 @@ async function upsertInventoryRows(db, rows, meta = {}) {
     if (/global/i.test(src)) { set.lastGlobalSeenAt = now; set.globalSyncBatchId = x.syncBatchId || meta.batchId || ''; }
     if (/stock|warehouse/i.test(src)) { set.lastStockSeenAt = now; set.stockSyncBatchId = x.syncBatchId || meta.batchId || ''; }
     if (/live|refresh|kardex|item/i.test(src)) { set.lastLiveVerifiedAt = now; set.liveVerifyReason = x.refreshReason || meta.reason || src; }
+    if (/authoritative-live|live-item-refresh|exact-code-repair|kardex/i.test(src)) {
+      set.inventoryAuthority = 'exact-getremain';
+      set.lastAuthoritativeExactAt = now;
+      set.authoritativeQuantity = Number(x.quantity ?? x.Quantity1 ?? 0);
+      set.lastLiveResult = 'positive';
+      set.nextLiveVerifyEligibleAt = null;
+    }
     set.missingInGlobalSync = false;
     set.missingInStockSync = false;
     set.needsLiveVerify = false;
@@ -1034,7 +1069,7 @@ async function authoritativeLiveReconcileItem(db, itemCode, reason = 'authoritat
   if (missingStocks.length) {
     const upd = await db.collection('itemInventoryCatalog').updateMany(
       { itemCode:code, stockNumber:{ $in:[...new Set(missingStocks)] } },
-      { $set:{ quantity:0, quantity2:0, missingInLiveRefresh:false, missingInStockSync:false, needsLiveVerify:false, protectedFromAutoSyncStale:false, pendingShayganConfirm:false, zeroConfirmedBy:'authoritative-live-item-refresh', refreshReason:reasonText, lastLiveVerifiedAt:new Date(), syncedAt:new Date(), updatedAt:new Date() }, $addToSet:{ sourceEvidence:'authoritative-live-zero' } }
+      { $set:{ quantity:0, quantity2:0, missingInLiveRefresh:false, missingInStockSync:false, needsLiveVerify:false, protectedFromAutoSyncStale:false, pendingShayganConfirm:false, zeroConfirmedBy:'authoritative-live-item-refresh', refreshReason:reasonText, inventoryAuthority:'exact-getremain', authoritativeQuantity:0, lastLiveResult:'zero', nextLiveVerifyEligibleAt:null, lastAuthoritativeExactAt:new Date(), lastLiveVerifiedAt:new Date(), syncedAt:new Date(), updatedAt:new Date() }, $addToSet:{ sourceEvidence:'authoritative-live-zero' } }
     ).catch(()=>({ modifiedCount:0 }));
     zeroedCount = Number(upd.modifiedCount || 0);
   }
@@ -1058,17 +1093,17 @@ async function verifyMissingStockRowsLive(db, stockNumber, batchId, reason = 'st
   }
   const remaining = await db.collection('itemInventoryCatalog').updateMany(
     { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId } },
-    { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, lastMissingInStockAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
+    { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, verificationQueueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.STALE_POSITIVE, verificationReason:'broad-missing-crm-positive', lastMissingInStockAt:new Date(), lastQueuedAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
   ).catch(()=>({ modifiedCount:0 }));
   return { checked:codes.length, zeroedCount:results.reduce((s,x)=>s+Number(x.zeroedCount||0),0), failed:results.filter(x=>!x.ok).length, remainingQueued:Number(remaining.modifiedCount||0), results };
 }
 
 async function inventoryVerificationQueueStats(db, filter = {}) {
-  const rowFilter = { quantity:{ $gt:0 }, needsLiveVerify:true, ...filter };
+  const rowFilter = { needsLiveVerify:true, ...filter };
   const [rows, codes, oldest] = await Promise.all([
     db.collection('itemInventoryCatalog').countDocuments(rowFilter).catch(()=>0),
     db.collection('itemInventoryCatalog').distinct('itemCode', rowFilter).catch(()=>[]),
-    db.collection('itemInventoryCatalog').find(rowFilter, { projection:{ itemCode:1, firstMissingInStockAt:1, lastMissingInStockAt:1, lastLiveAttemptAt:1 } }).sort(inventoryAutoSyncPolicy.missingVerificationSort()).limit(1).toArray().catch(()=>[])
+    db.collection('itemInventoryCatalog').find(rowFilter, { projection:{ itemCode:1, firstMissingInStockAt:1, lastMissingInStockAt:1, lastLiveAttemptAt:1 } }).sort({ firstMissingInStockAt:1, _id:1 }).limit(1).toArray().catch(()=>[])
   ]);
   const oldestAt = oldest[0]?.firstMissingInStockAt || oldest[0]?.lastMissingInStockAt || oldest[0]?.lastLiveAttemptAt || null;
   return { rows:Number(rows||0), distinctItems:(codes||[]).filter(Boolean).length, oldestAt, oldestAgeMs:oldestAt ? Math.max(0, Date.now()-new Date(oldestAt).getTime()) : 0 };
@@ -1082,27 +1117,39 @@ async function verifyQueuedMissingRowsLive(db, reason = 'auto-missing-live-verif
     startedAt
   });
   const queueBefore = await inventoryVerificationQueueStats(db);
+  const eligibleAt = new Date();
   const candidates = await db.collection('itemInventoryCatalog').find(
-    { quantity:{ $gt:0 }, needsLiveVerify:true },
+    { needsLiveVerify:true, ...inventoryAutoSyncPolicy.staleEligibleAtFilter(eligibleAt) },
     { projection:{ itemCode:1 } }
-  ).sort(inventoryAutoSyncPolicy.missingVerificationSort()).limit(Math.max(budget.maxItems * 10, budget.maxItems)).toArray().catch(()=>[]);
+  ).sort(inventoryAutoSyncPolicy.missingVerificationSort()).limit(Math.max(budget.maxItems * 50, budget.maxItems)).toArray().catch(()=>[]);
   const codes = [...new Set(candidates.map(row=>String(row.itemCode||'').trim()).filter(Boolean))].slice(0, budget.maxItems);
   const results = [];
   for (const code of codes) {
     if (!inventoryAutoSyncPolicy.budgetAllowsAttempt(budget, results.length)) break;
     const attemptedAt = new Date();
     await db.collection('itemInventoryCatalog').updateMany(
-      { itemCode:code, quantity:{ $gt:0 }, needsLiveVerify:true },
-      { $set:{ lastLiveAttemptAt:attemptedAt, lastLiveAttemptReason:reason } }
+      { itemCode:code, needsLiveVerify:true },
+      { $set:{ lastLiveAttemptAt:attemptedAt, lastLiveAttemptReason:reason }, $inc:{ liveVerifyAttemptCount:1 } }
     ).catch(()=>{});
     const result = await authoritativeLiveReconcileItem(db, code, reason).catch(error => ({ ok:false, itemCode:code, error:String(error.message||error) }));
-    results.push({ itemCode:code, ok:!!result.ok, zeroedCount:Number(result.zeroedCount||0), missingStocks:result.missingStocks||[], timeout:/timeout/i.test(String(result.error||'')), error:String(result.error||'').slice(0,500) });
+    const outcome = result.ok ? (Number(result.livePositiveCount||0) > 0 ? 'positive' : 'zero') : 'error';
+    const timeout = /timeout/i.test(String(result.error||''));
+    if (!result.ok) {
+      const retryAt = new Date(Date.now() + inventoryAutoSyncPolicy.retryDelayMs(1));
+      await db.collection('itemInventoryCatalog').updateMany(
+        { itemCode:code, needsLiveVerify:true },
+        { $set:{ lastLiveResult:timeout ? 'timeout' : 'error', lastLiveError:String(result.error||'').slice(0,500), nextLiveVerifyEligibleAt:retryAt } }
+      ).catch(()=>{});
+    }
+    results.push({ itemCode:code, ok:!!result.ok, outcome, positiveRowCount:Number(result.livePositiveCount||0), zeroedCount:Number(result.zeroedCount||0), missingStocks:result.missingStocks||[], timeout, error:String(result.error||'').slice(0,500) });
   }
   const queueAfter = await inventoryVerificationQueueStats(db);
   return {
     attempted:results.length,
     distinctAttempted:new Set(results.map(row=>row.itemCode)).size,
     zeroedRows:results.reduce((sum,row)=>sum+row.zeroedCount,0),
+    positiveReconciliations:results.filter(row=>row.outcome==='positive').length,
+    zeroReconciliations:results.filter(row=>row.outcome==='zero').length,
     timeouts:results.filter(row=>row.timeout).length,
     failed:results.filter(row=>!row.ok).length,
     durationMs:Date.now()-startedAt,
@@ -1121,33 +1168,48 @@ async function verifyNewOperationalItemsLive(db, reason = 'auto-new-operational-
     startedAt
   });
   const limit = budget.maxItems;
-  const queueBefore = await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).countDocuments({ status:'pending' }).catch(()=>0);
+  const now = new Date();
+  const queueFilter = { status:'pending', ...inventoryAutoSyncPolicy.eligibleAtFilter(now) };
+  const [queueBeforeCount, oldestBefore] = await Promise.all([
+    db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).countDocuments({ status:'pending' }).catch(()=>0),
+    db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).find({ status:'pending' }, { projection:{ firstQueuedAt:1, createdAt:1 } }).sort({ firstQueuedAt:1, createdAt:1, _id:1 }).limit(1).toArray().catch(()=>[])
+  ]);
+  const oldestBeforeAt = oldestBefore[0]?.firstQueuedAt || oldestBefore[0]?.createdAt || null;
+  const queueBefore = { items:Number(queueBeforeCount||0), oldestAt:oldestBeforeAt, oldestAgeMs:oldestBeforeAt ? Math.max(0, Date.now()-new Date(oldestBeforeAt).getTime()) : 0 };
   const rows = await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).find(
-    { status:'pending' },
-    { projection:{ itemCode:1, itemGuid:1, queueId:1, attempts:1 } }
-  ).sort({ attempts:1, createdAt:1, _id:1 }).limit(limit).toArray().catch(()=>[]);
+    queueFilter,
+    { projection:{ itemCode:1, itemGuid:1, queueId:1, attempts:1, attemptCount:1 } }
+  ).sort(inventoryAutoSyncPolicy.discoveryVerificationSort()).limit(limit).toArray().catch(()=>[]);
   const results = [];
   for (const row of rows) {
     if (!inventoryAutoSyncPolicy.budgetAllowsAttempt(budget, results.length)) break;
     const itemCode = String(row.itemCode || '').trim();
+    const attemptedAt = new Date();
     const result = await authoritativeLiveReconcileItem(db, itemCode, reason).catch(error => ({ ok:false, itemCode, error:String(error.message || error) }));
     if (result.ok) {
       const positiveRows = (result.rows || []).filter(item => Number(item.quantity || 0) > 0);
       await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).updateOne(
         { _id:row._id, status:'pending' },
-        { $set:{ status:'verified', outcome:positiveRows.length ? 'positive' : 'zero', verifiedAt:new Date(), updatedAt:new Date(), verificationSource:'exact-getremain', positiveRowCount:positiveRows.length, error:'' }, $inc:{ attempts:1 } }
+        { $set:{ status:'verified', outcome:positiveRows.length ? 'positive' : 'zero', lastResult:positiveRows.length ? 'positive' : 'zero', lastAttemptAt:attemptedAt, verifiedAt:new Date(), updatedAt:new Date(), verificationSource:'exact-getremain', positiveRowCount:positiveRows.length, error:'', nextEligibleAt:null }, $inc:{ attempts:1, attemptCount:1 } }
       ).catch(()=>{});
       results.push({ itemCode, ok:true, outcome:positiveRows.length ? 'positive' : 'zero', positiveRowCount:positiveRows.length });
     } else {
+      const attempts = Number(row.attemptCount || row.attempts || 0) + 1;
+      const nextEligibleAt = new Date(Date.now() + inventoryAutoSyncPolicy.retryDelayMs(attempts));
       await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).updateOne(
         { _id:row._id, status:'pending' },
-        { $set:{ lastAttemptAt:new Date(), updatedAt:new Date(), error:String(result.error || '').slice(0,500) }, $inc:{ attempts:1 } }
+        { $set:{ lastAttemptAt:attemptedAt, lastResult:/timeout/i.test(String(result.error||'')) ? 'timeout' : 'error', nextEligibleAt, updatedAt:new Date(), error:String(result.error || '').slice(0,500) }, $inc:{ attempts:1, attemptCount:1 } }
       ).catch(()=>{});
       results.push({ itemCode, ok:false, outcome:'error', positiveRowCount:0, error:String(result.error || '') });
     }
   }
-  const remainingQueued = await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).countDocuments({ status:'pending' }).catch(()=>0);
-  return { checked:results.length, distinctAttempted:new Set(results.map(row=>row.itemCode)).size, verified:results.filter(row=>row.ok).length, discoveredPositive:results.filter(row=>row.outcome==='positive').length, failed:results.filter(row=>!row.ok).length, timeouts:results.filter(row=>/timeout/i.test(String(row.error||''))).length, durationMs:Date.now()-startedAt, queueBefore:Number(queueBefore||0), remainingQueued:Number(remainingQueued || 0), budget:{ maxItems:budget.maxItems, budgetMs:budget.budgetMs, exhaustedByItems:results.length>=budget.maxItems, exhaustedByTime:(Date.now()-startedAt)>=budget.budgetMs }, results };
+  const [remainingQueued, oldestAfter] = await Promise.all([
+    db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).countDocuments({ status:'pending' }).catch(()=>0),
+    db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).find({ status:'pending' }, { projection:{ firstQueuedAt:1, createdAt:1 } }).sort({ firstQueuedAt:1, createdAt:1, _id:1 }).limit(1).toArray().catch(()=>[])
+  ]);
+  const oldestAfterAt = oldestAfter[0]?.firstQueuedAt || oldestAfter[0]?.createdAt || null;
+  const queueAfter = { items:Number(remainingQueued||0), oldestAt:oldestAfterAt, oldestAgeMs:oldestAfterAt ? Math.max(0, Date.now()-new Date(oldestAfterAt).getTime()) : 0 };
+  return { checked:results.length, distinctAttempted:new Set(results.map(row=>row.itemCode)).size, verified:results.filter(row=>row.ok).length, discoveredPositive:results.filter(row=>row.outcome==='positive').length, verifiedZero:results.filter(row=>row.outcome==='zero').length, failed:results.filter(row=>!row.ok).length, timeouts:results.filter(row=>/timeout/i.test(String(row.error||''))).length, durationMs:Date.now()-startedAt, queueBefore, queueAfter, remainingQueued:Number(remainingQueued || 0), budget:{ maxItems:budget.maxItems, budgetMs:budget.budgetMs, exhaustedByItems:results.length>=budget.maxItems, exhaustedByTime:(Date.now()-startedAt)>=budget.budgetMs }, results };
 }
 async function ensureItemInventoryFresh(db, itemCode, reason = 'ensure-item-inventory', options = {}) {
   return await refreshInventoryCacheForItem(db, itemCode, reason, { allowZeroReplace:false, ...options });
@@ -1802,7 +1864,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     } else if (completed) {
       const remaining = await db.collection('itemInventoryCatalog').updateMany(
         { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId } },
-        { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, lastMissingInStockAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
+        { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, verificationQueueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.STALE_POSITIVE, verificationReason:'broad-missing-crm-positive', lastMissingInStockAt:new Date(), lastQueuedAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
       ).catch(()=>({ modifiedCount:0 }));
       queuedForLiveVerify = Number(remaining.modifiedCount||0);
       liveMissingVerify = { deferred:true, checked:0, zeroedCount:0, failed:0, remainingQueued:queuedForLiveVerify, results:[] };
@@ -1959,7 +2021,30 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   const missingVerification = await verifyQueuedMissingRowsLive(db).catch(error => ({ attempted:0, distinctAttempted:0, zeroedRows:0, timeouts:0, failed:1, durationMs:0, queueBefore:null, queueAfter:null, results:[], error:String(error.message||error) }));
   const exactVerificationDurationMs = Number(newItemVerification.durationMs||0) + Number(missingVerification.durationMs||0);
   const distinctExactItemsAttempted = new Set([...(newItemVerification.results||[]), ...(missingVerification.results||[])].map(row=>String(row.itemCode||'').trim()).filter(Boolean)).size;
-  const result = { ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active, stockRows:stockTotal, stockCompleted, protectedFromStale, stockSyncDurationMs, exactVerificationDurationMs, exactItemsAttempted:Number(newItemVerification.checked||0)+Number(missingVerification.attempted||0), distinctExactItemsAttempted, checkedMissingLive:missingVerification.attempted||0, zeroedAfterExactVerify:missingVerification.zeroedRows||0, failedLiveVerify:missingVerification.failed||0, exactTimeouts:Number(newItemVerification.timeouts||0)+Number(missingVerification.timeouts||0), queuedForLiveVerify:missingVerification.queueAfter?.distinctItems||0, missingVerification, newItemVerification, durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-bounded-exact-verify', atTehran:time.formatTehranDateTime(new Date()) };
+  const queueBefore = { NEW_IDENTITY:newItemVerification.queueBefore||null, STALE_POSITIVE:missingVerification.queueBefore||null };
+  const queueAfter = { NEW_IDENTITY:newItemVerification.queueAfter||null, STALE_POSITIVE:missingVerification.queueAfter||null };
+  const oldestQueueAge = Math.max(Number(newItemVerification.queueAfter?.oldestAgeMs||0), Number(missingVerification.queueAfter?.oldestAgeMs||0));
+  const result = {
+    ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active,
+    stockRows:stockTotal, stockCompleted, protectedFromStale,
+    stockSyncDurationMs, broadSyncDuration:stockSyncDurationMs,
+    exactVerificationDurationMs, exactVerificationDuration:exactVerificationDurationMs,
+    newIdentityAttempted:Number(newItemVerification.checked||0),
+    stalePositiveAttempted:Number(missingVerification.attempted||0),
+    exactItemsAttempted:Number(newItemVerification.checked||0)+Number(missingVerification.attempted||0),
+    distinctExactItemsAttempted, distinctItemsAttempted:distinctExactItemsAttempted,
+    checkedMissingLive:missingVerification.attempted||0,
+    zeroedAfterExactVerify:missingVerification.zeroedRows||0,
+    zeroTransitionsConfirmed:Number(newItemVerification.verifiedZero||0)+Number(missingVerification.zeroReconciliations||0),
+    positiveReconciliations:Number(newItemVerification.discoveredPositive||0)+Number(missingVerification.positiveReconciliations||0),
+    failedLiveVerify:missingVerification.failed||0,
+    exactTimeouts:Number(newItemVerification.timeouts||0)+Number(missingVerification.timeouts||0),
+    timeouts:Number(newItemVerification.timeouts||0)+Number(missingVerification.timeouts||0),
+    queueBefore, queueAfter, oldestQueueAge,
+    queuedForLiveVerify:missingVerification.queueAfter?.distinctItems||0,
+    missingVerification, newItemVerification,
+    durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-bounded-fair-exact-verify', atTehran:time.formatTehranDateTime(new Date())
+  };
   jobControl?.progress?.({phase:'Finalize',current:0,total:1,message:'Finalizing inventory synchronization'});
   jobControl?.checkCancellation?.();
   await db.collection('appLogs').insertOne({ type:'inventory_active_stock_sync', ...result, at:new Date(), source:opts.source || 'auto' }).catch(()=>{});

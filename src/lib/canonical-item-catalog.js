@@ -169,12 +169,15 @@ async function ensureCatalogItems(db, inputs = [], options = {}) {
     // Newly discovered operational identities must not depend on a future Full
     // Catalog Sync or a human Kardex lookup to enter the inventory read model.
     // This queue is only a bounded exact-GetRemain trigger; it stores no stock.
-    if (!existing && inventoryAutoSyncPolicy.isOperationalDiscoverySource(source)) {
+    const priorDiscoverySources = Array.isArray(existing?.discoverySources) ? existing.discoverySources : [];
+    const firstOperationalDiscovery = inventoryAutoSyncPolicy.isOperationalDiscoverySource(source)
+      && !priorDiscoverySources.some(value => inventoryAutoSyncPolicy.isOperationalDiscoverySource(value));
+    if (firstOperationalDiscovery) {
       inventoryQueueOps.push({ updateOne:{
-        filter:{ canonicalIdentity:identity },
+        filter:{ queueId:inventoryAutoSyncPolicy.discoveryQueueId(identity) },
         update:{
-          $set:{ itemGuid:canonical.itemGuid, itemCode:item.itemCode, itemDescription:canonical.itemDescription, source, status:'pending', updatedAt:now },
-          $setOnInsert:{ queueId:inventoryAutoSyncPolicy.discoveryQueueId(identity), attempts:0, createdAt:now }
+          $set:{ canonicalIdentity:identity, itemGuid:canonical.itemGuid, itemCode:item.itemCode, itemDescription:canonical.itemDescription, source, reason:'first-authoritative-operational-discovery', queueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.NEW_IDENTITY, status:'pending', lastQueuedAt:now, nextEligibleAt:now, updatedAt:now },
+          $setOnInsert:{ queueId:inventoryAutoSyncPolicy.discoveryQueueId(identity), attemptCount:0, attempts:0, firstQueuedAt:now, createdAt:now }
         },
         upsert:true
       } });
