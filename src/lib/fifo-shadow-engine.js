@@ -171,6 +171,7 @@ function eligibleOfficial(row) {
   const unitCost = finite(row.netUnitCost ?? row.grossUnitCost);
   return row.layerKind === 'purchase' &&
     row.validationStatus !== 'rejected' &&
+    row.costStatus !== 'pending-purchase-price-correction' &&
     quantity != null && quantity > 0 &&
     unitCost != null && unitCost > 0 &&
     validDate(row.purchaseInvoiceDate);
@@ -207,6 +208,8 @@ function classifyUnknownSource(sale, source, eligibleForSale, manuals) {
   if (unresolvedReturn) return 'purchase_return_affected';
   const futurePurchase = allMatches.some(row => row.layerKind === 'purchase' && validDate(row.purchaseInvoiceDate) && row.purchaseInvoiceDate > sale.saleDate);
   if (futurePurchase) return 'purchase_chronology_problem';
+  const pendingPurchasePrice = allMatches.some(row => row.layerKind === 'purchase' && row.costStatus === 'pending-purchase-price-correction');
+  if (pendingPurchasePrice) return 'purchase_price_pending_correction';
   const invalidPurchase = allMatches.some(row => row.layerKind === 'purchase');
   if (invalidPurchase) return 'purchase_exists_but_invalid_cost';
   const sameCodeDifferentGuid = (allIndex.byCode.get(identity(sale.itemCode)) || []).some(row => identity(row.itemGuid) && identity(row.itemGuid) !== identity(sale.itemGuid));

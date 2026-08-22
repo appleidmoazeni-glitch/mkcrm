@@ -158,6 +158,11 @@ function mapSourceLine(invoice, line, row, datasetId) {
   if (!supplierAccountNumber) warnings.push('supplier');
   const costKnown = grossUnitCost != null && lineAmount != null;
   if (sourceIsPurchase && !costKnown) warnings.push('cost-unknown');
+  // Shaygan may temporarily persist a newly received item at one rial until
+  // Procurement completes the purchase invoice price. Preserve the official
+  // value verbatim, but do not advertise it as an accounting-ready cost.
+  const purchasePricePendingCorrection = sourceIsPurchase && costKnown && grossUnitCost === 1;
+  if (purchasePricePendingCorrection) warnings.push('purchase-price-pending-correction');
   const now = new Date();
   const mapped = {
     datasetId,
@@ -195,7 +200,9 @@ function mapSourceLine(invoice, line, row, datasetId) {
     sourceStatus:sourceIsPurchase ? 'purchase-source' : 'purchase-return-source',
     validationStatus:rejectedReasons.length ? 'rejected' : (warnings.length ? 'warning' : 'valid'),
     validationWarnings:[...rejectedReasons,...warnings],
-    costStatus:sourceIsPurchase ? (costKnown ? 'known-from-shaygan-line' : 'unknown') : 'not-applicable-return-row',
+    costStatus:sourceIsPurchase
+      ? (purchasePricePendingCorrection ? 'pending-purchase-price-correction' : (costKnown ? 'known-from-shaygan-line' : 'unknown'))
+      : 'not-applicable-return-row',
     returnMatchStatus:sourceIsPurchase ? 'not-applicable' : 'unmatched',
     source:'shaygan-webservice-invoice-get',
     createdAt:now,
@@ -480,6 +487,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     const itemKeys = new Set(purchaseRows.map(row => clean(row.itemCode || row.itemGuid)).filter(Boolean));
     const suppliers = new Set(purchaseRows.map(row => clean(row.supplierAccountNumber || row.supplierGuid)).filter(Boolean));
     const costUnknownCount = purchaseRows.filter(row => row.costStatus === 'unknown').length;
+    const pendingPurchasePriceCount = purchaseRows.filter(row => row.costStatus === 'pending-purchase-price-correction').length;
     const successful = validation.valid;
     const fingerprints = datasetFingerprints(rows);
     const completedAt = new Date();
@@ -497,7 +505,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
       purchaseLineCount:purchaseRows.length, purchaseReturnLineCount:rows.length - purchaseRows.length,
       layerCount:rows.length, itemCount:itemKeys.size, supplierCount:suppliers.size,
       duplicateCount:validation.duplicateCount, rejectedRowCount:validation.rejectedRowCount,
-      warningCount:validation.warningCount, errorCount:errors.length, costUnknownCount,
+      warningCount:validation.warningCount, errorCount:errors.length, costUnknownCount, pendingPurchasePriceCount,
       validation, returnAudit, errors:errors.slice(0, 100), previousActiveDatasetId,
       activationRequested, ...fingerprints,
       candidateFingerprint:sha256(stable({
@@ -559,7 +567,8 @@ async function coverage(db, datasetId = '') {
     : await activeDataset(db);
   if (!active?.datasetId) return { ok:true, available:false, profitActivationAllowed:false, reason:'NO_ACTIVE_PURCHASE_LAYER_DATASET' };
   const layers = await db.collection(LAYERS).find(canonicalLayerContract.canonicalPurchaseQuery({ datasetId:active.datasetId })).toArray();
-  const purchaseItems = new Set(layers.map(row => clean(row.itemCode)).filter(Boolean));
+  const accountingEligibleLayers=layers.filter(row => row.costStatus !== 'pending-purchase-price-correction' && Number(row.netUnitCost ?? row.grossUnitCost) > 0);
+  const purchaseItems = new Set(accountingEligibleLayers.map(row => clean(row.itemCode)).filter(Boolean));
   const saleSource=await saleSnapshot._activeDataset(db);
   const saleRows=await db.collection(saleSource.lineCollection).find({...saleSource.lineQuery,saleInvoiceType:2}).toArray().catch(()=>[]);
   const saleItems = new Set(saleRows.map(row => clean(row.itemCode)).filter(Boolean));

@@ -63,6 +63,16 @@ test('maps purchases and purchase returns with deterministic identities and unkn
   assert.equal(returned.netPurchasedQuantity,null);
 });
 
+test('one-rial Shaygan purchase price is preserved but remains pending accounting correction',()=>{
+  const purchase=invoice(3,1445,[line(29370,'NB-PENDING',2,1)]);
+  const mapped=purchaseLayers._mapSourceLine(purchase,purchase.Body[0],1,'D1');
+  assert.equal(mapped.grossUnitCost,1);
+  assert.equal(mapped.netUnitCost,1);
+  assert.equal(mapped.costStatus,'pending-purchase-price-correction');
+  assert.equal(mapped.validationStatus,'warning');
+  assert.ok(mapped.validationWarnings.includes('purchase-price-pending-correction'));
+});
+
 test('layer upsert keeps immutable createdAt out of $set',()=>{
   const createdAt=new Date('2026-07-29T00:00:00.000Z');
   const update=purchaseLayers._layerUpsertUpdate({

@@ -146,6 +146,28 @@ test('approved manual follows official priority and unknown cost is explicit, ne
   assert.equal(result.summary.unknown.quantity,4);
 });
 
+test('pending one-rial purchase price never creates PROVEN FIFO profit',async()=>{
+  const db=seedDb();
+  const pending=db.collection('supplierPurchaseLayers').rows.find(row=>row.purchaseLineIdentity==='P-A-1');
+  Object.assign(pending,{netUnitCost:1,grossUnitCost:1,costStatus:'pending-purchase-price-correction',validationStatus:'warning'});
+  const layers=db.collection('supplierPurchaseLayers').rows;
+  for(const identity of ['P-A-2','PR-UNRESOLVED']){
+    const index=layers.findIndex(row=>row.purchaseLineIdentity===identity);
+    if(index>=0)layers.splice(index,1);
+  }
+  db.collection('manualCostResolutions').rows.length=0;
+  const result=await engine.buildShadowDataset(db,{},accountant);
+  const rows=db.collection(engine.ALLOCATIONS).rows.filter(row=>row.datasetId===result.datasetId&&row.saleLineId==='SL-2-1-001-A');
+  assert.equal(rows.length,1);
+  assert.equal(rows[0].sourceType,'unknown_cost');
+  assert.equal(rows[0].unknownReason,'purchase_price_pending_correction');
+  assert.equal(rows[0].unitCost,null);
+  assert.equal(rows[0].allocatedCostAmountExact,null);
+  const facts=engine._provenanceFacts(rows,[]);
+  assert.equal(facts[0].profitProvenanceStatus,'UNKNOWN');
+  assert.equal(facts[0].fifoProfitExact,null);
+});
+
 test('purchase-line-scoped manual evidence costs only its targeted invalid layer',async()=>{
   const db=seedDb();db.collection('saleSnapshotDatasetLines').rows.push(sale({saleLineId:'SL-2-5-001-D',saleInvoiceNo:5,saleDate:'14050113',itemGuid:'GUID-D',itemCode:'D',qty:2,saleValue:1000}));db.collection('supplierPurchaseLayers').rows.push(layer({purchaseLineIdentity:'P-D-1',purchaseInvoiceNo:20,purchaseInvoiceDate:'14050102',itemGuid:'GUID-D',itemCode:'D',netPurchasedQuantity:2,netUnitCost:null,validationStatus:'warning'}));db.collection('manualCostResolutions').rows.push({resolutionId:'MC-D-LAYER',revision:3,status:'approved',deleted:false,resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-D-1',targetQuantityExact:'2.000000',itemGuid:'GUID-D',itemCode:'D',manualCostExact:'125.500000',effectiveFrom:'14050101',effectiveTo:''});await engine.buildShadowDataset(db,{},accountant);const rows=db.collection(engine.ALLOCATIONS).rows.filter(row=>row.saleLineId==='SL-2-5-001-D');assert.equal(rows.length,1);assert.equal(rows[0].sourceType,'approved_manual_purchase_layer');assert.equal(rows[0].purchaseLineIdentity,'P-D-1');assert.equal(rows[0].manualResolutionId,'MC-D-LAYER');assert.equal(rows[0].allocatedCostAmountExact,'251.00');
 });
