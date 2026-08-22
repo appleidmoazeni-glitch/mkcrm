@@ -18,14 +18,14 @@ function storage(initial={}){
 }
 function element(){return{disabled:false,textContent:'',innerHTML:'',value:'',dataset:{},onclick:null,querySelector:()=>null,selectedOptions:[],isConnected:true};}
 function harness({fetchImpl}={}){
-  const elements=new Map([['#issueBtn',element()],['#saleOut',element()],['#releaseSaleAttempt',element()],['#saleResolutionActionOut',element()],['#buyerName',element()],['#buyerMobile',element()],['#buyerNational',element()],['#leadId',element()],['#saleQ',element()],['#saleSelected',element()],['#STNumber',element()],['#Quan',element()],['#Price',element()],['#saleGeneralRef',element()],['#saleDiscount',element()],['#saleInventory',element()],['#serialBox',element()],['#priceWarn',element()],['#saleExtrasRows',element()],['#content',element()],['#logoutBtn',element()]]);
+  const elements=new Map([['#issueBtn',element()],['#saleOut',element()],['#newSaleAfterSafeIssue',element()],['#releaseSaleAttempt',element()],['#saleResolutionActionOut',element()],['#buyerName',element()],['#buyerMobile',element()],['#buyerNational',element()],['#leadId',element()],['#saleQ',element()],['#saleSelected',element()],['#STNumber',element()],['#Quan',element()],['#Price',element()],['#saleGeneralRef',element()],['#saleDiscount',element()],['#saleInventory',element()],['#serialBox',element()],['#priceWarn',element()],['#saleExtrasRows',element()],['#content',element()],['#logoutBtn',element()]]);
   elements.get('#Quan').value='1';elements.get('#saleDiscount').value='0';
   const localStorage=storage(),sessionStorage=storage();
   const listeners={};
   const state={user:{username:'seller-a'},saleLines:[],selectedItem:null,selectedStock:null,selectedSerials:[],serialInfo:null,invoiceNumber:null,selectedMapping:{username:'seller-a',cashboxAccountNumber:'CASH',employeeAccountNumber:'SELLER'}};
   const context={
     state,localStorage,sessionStorage,location:{hash:'#sale'},crypto:{randomUUID:()=>`uuid-${Math.random()}`},
-    document:{querySelector:selector=>elements.get(selector)||null,querySelectorAll:()=>[]},
+    document:{querySelector:selector=>elements.get(selector)||null,querySelectorAll:()=>[],addEventListener:(name,fn)=>{listeners[`document:${name}`]=fn;}},
     window:{addEventListener:(name,fn)=>{listeners[name]=fn;},confirm:()=>true},
     MutationObserver:class{observe(){}disconnect(){}},uiPageLifecycle:{add(){}},
     esc:value=>String(value),renderSaleLines(){},setTimeout:()=>1,clearTimeout(){},
@@ -44,6 +44,29 @@ test('successful resolved status exposes print, view, and new-invoice actions',a
   const output=h.elements.get('#saleOut').innerHTML;
   for(const text of ['چاپ','مشاهده فاکتور','صدور فاکتور جدید'])assert.match(output,new RegExp(text));
   assert.equal(h.elements.get('#issueBtn').disabled,true);
+  assert.equal(typeof h.elements.get('#newSaleAfterSafeIssue').onclick,'function');
+});
+
+test('the rendered resolved-invoice button opens a clean draft on its first click',async()=>{
+  const h=harness({fetchImpl:async()=>({status:200,json:async()=>({ok:true,issuance:{issuanceAttemptId:'sale:A',state:'resolved',resolved:true,invoiceNumber:6075}})})});
+  h.state.saleLines=[{itemCode:'OLD'}];h.localStorage.setItem('mkcrm.activeSaleIssuance.seller-a','sale:A');
+  await h.api.refreshStatus('sale:A');
+  await h.elements.get('#newSaleAfterSafeIssue').onclick({preventDefault(){}});
+  assert.equal(h.state.saleLines.length,0);assert.equal(h.state.saleIssued,false);assert.equal(h.elements.get('#issueBtn').disabled,false);assert.equal(h.localStorage.has('mkcrm.activeSaleIssuance.seller-a'),false);
+});
+
+test('a late resolved-status response cannot rehydrate the invoice after new-draft reset',async()=>{
+  let completeStatus;
+  const pendingStatus=new Promise(resolve=>{completeStatus=resolve;});
+  const h=harness({fetchImpl:async url=>url.includes('/api/sales/issuance/sale%3AOLD')?pendingStatus:{status:200,json:async()=>({ok:true,issuance:null})}});
+  h.localStorage.setItem('mkcrm.activeSaleIssuance.seller-a','sale:OLD');
+  const refresh=h.api.refreshStatus('sale:OLD');
+  await h.api.resetForNewDraft();
+  completeStatus({status:200,json:async()=>({ok:true,issuance:{issuanceAttemptId:'sale:OLD',state:'resolved',resolved:true,invoiceNumber:6075}})});
+  await refresh;
+  assert.equal(h.localStorage.has('mkcrm.activeSaleIssuance.seller-a'),false);
+  assert.equal(h.state.saleIssued,false);
+  assert.doesNotMatch(h.elements.get('#saleOut').innerHTML,/6075/);
 });
 
 test('new invoice reset clears all prior identity, lines, serials, lock, and persisted draft state',async()=>{
@@ -95,7 +118,7 @@ test('request attempt is persisted only immediately before the protected issue r
 });
 
 test('cross-tab storage changes trigger server reconciliation instead of blind unlock',()=>{
-  assert.match(hotfix,/window\.addEventListener\('storage'/);assert.match(hotfix,/const attemptId=event\.newValue\|\|event\.oldValue/);assert.match(hotfix,/refreshIssuanceStatus\(attemptId\)/);
+  assert.match(hotfix,/window\.addEventListener\('storage'/);assert.match(hotfix,/const attemptId=event\.newValue\|\|''/);assert.match(hotfix,/if\(attemptId\)refreshIssuanceStatus\(attemptId\);else discoverActiveIssuance\(\)/);assert.doesNotMatch(hotfix,/event\.newValue\|\|event\.oldValue/);
 });
 
 test('active-attempt endpoint is read-only, owner-scoped, and precedes the dynamic attempt route',()=>{
