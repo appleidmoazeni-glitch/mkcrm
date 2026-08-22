@@ -58,6 +58,7 @@ async function initMongo() {
   await database.collection('inventoryDiscoveryVerificationQueue').createIndex({ canonicalIdentity:1 }, { unique:true });
   await database.collection('inventoryDiscoveryVerificationQueue').createIndex({ status:1, attempts:1, createdAt:1 });
   await database.collection('itemInventoryCatalog').createIndex({ stockNumber:1, quantity:1, stockSyncBatchId:1, lastLiveVerifiedAt:1 });
+  await database.collection('itemInventoryCatalog').createIndex({ needsLiveVerify:1, quantity:1, lastLiveAttemptAt:1, lastLiveVerifiedAt:1, firstMissingInStockAt:1 });
   await database.collection('accountCatalog').createIndex({ accountNumber: 1 }, { unique: true });
   await database.collection('accountCatalog').createIndex({ searchText: 1 });
   await database.collection('searchCache').createIndex({ key: 1 }, { unique: true });

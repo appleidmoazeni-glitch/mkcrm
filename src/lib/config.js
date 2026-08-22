@@ -64,6 +64,10 @@ const config = {
   autoInventorySyncDelayBetweenStocksMs: Number(process.env.AUTO_INVENTORY_SYNC_DELAY_BETWEEN_STOCKS_MS || 1000),
   autoInventorySyncPageLimit: Number(process.env.AUTO_INVENTORY_SYNC_PAGE_LIMIT || 300),
   autoInventorySyncDeleteStalePerStock: String(process.env.AUTO_INVENTORY_SYNC_DELETE_STALE_PER_STOCK || 'true').toLowerCase() !== 'false',
+  inventoryMissingLiveVerifyCycleLimit: Number(process.env.INVENTORY_MISSING_LIVE_VERIFY_CYCLE_LIMIT || 30),
+  inventoryMissingLiveVerifyBudgetMs: Number(process.env.INVENTORY_MISSING_LIVE_VERIFY_BUDGET_MS || 90000),
+  inventoryNewItemVerifyCycleLimit: Number(process.env.INVENTORY_NEW_ITEM_VERIFY_CYCLE_LIMIT || 5),
+  inventoryNewItemVerifyBudgetMs: Number(process.env.INVENTORY_NEW_ITEM_VERIFY_BUDGET_MS || 15000),
   saleInventorySnapshotMaxAgeMinutes: Number(process.env.SALE_INVENTORY_SNAPSHOT_MAX_AGE_MINUTES || 30)
 };
 

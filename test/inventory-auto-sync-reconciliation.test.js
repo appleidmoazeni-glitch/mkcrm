@@ -9,7 +9,18 @@ const catalog = require('../src/lib/canonical-item-catalog');
 const policy = require('../src/lib/inventory-auto-sync-policy');
 
 test('missing-row verification is oldest-first so a successful exact read rotates behind the backlog', () => {
-  assert.deepEqual(policy.missingVerificationSort(), { lastLiveVerifiedAt:1, lastMissingInStockAt:1, _id:1 });
+  assert.deepEqual(policy.missingVerificationSort(), { lastLiveAttemptAt:1, lastLiveVerifiedAt:1, firstMissingInStockAt:1, _id:1 });
+});
+
+test('bounded exact-verification budget stops on item count without draining backlog', () => {
+  const budget = policy.boundedBudget({ maxItems:30, budgetMs:90000, startedAt:Date.now() });
+  assert.equal(policy.budgetAllowsAttempt(budget, 29), true);
+  assert.equal(policy.budgetAllowsAttempt(budget, 30), false);
+});
+
+test('bounded exact-verification budget stops on elapsed time', () => {
+  const budget = policy.boundedBudget({ maxItems:30, budgetMs:1000, startedAt:Date.now()-1001 });
+  assert.equal(policy.budgetAllowsAttempt(budget, 0), false);
 });
 
 test('cycle metrics report real exact verification, zero transitions and remaining queue', () => {
@@ -45,10 +56,23 @@ test('server keeps exact verification authoritative and does not perform a reque
   assert.match(verify, /authoritativeLiveReconcileItem/);
   assert.doesNotMatch(verify, /syncAllItemsCatalog|syncCatalog|deleteMany/);
   const discovery = source.slice(source.indexOf('async function verifyNewOperationalItemsLive'), source.indexOf('async function ensureItemInventoryFresh'));
-  assert.match(discovery, /INVENTORY_NEW_ITEM_VERIFY_LIMIT \|\| 20/);
+  assert.match(discovery, /inventoryNewItemVerifyCycleLimit/);
+  assert.match(discovery, /budgetAllowsAttempt/);
   assert.match(discovery, /authoritativeLiveReconcileItem/);
   assert.doesNotMatch(discovery, /Invoice\/Put|putSaleInvoice|syncAllItemsCatalog|deleteMany/);
   const mongo = fs.readFileSync(path.join(__dirname, '../src/lib/mongo.js'), 'utf8');
   assert.match(mongo, /inventoryDiscoveryVerificationQueue/);
-  assert.match(mongo, /stockNumber:1, quantity:1, stockSyncBatchId:1, lastLiveVerifiedAt:1/);
+  assert.match(mongo, /needsLiveVerify:1, quantity:1, lastLiveAttemptAt:1, lastLiveVerifiedAt:1, firstMissingInStockAt:1/);
+});
+
+test('automatic reconciliation completes positive stock reads before bounded exact verification', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
+  const reconcile = source.slice(source.indexOf('async function syncInventoryReconciliation'), source.indexOf('async function runAutoInventorySyncTick'));
+  assert.match(reconcile, /deferMissingVerification:true/);
+  assert.match(reconcile, /stockSyncDurationMs/);
+  assert.match(reconcile, /verifyQueuedMissingRowsLive/);
+  assert.match(reconcile, /exactVerificationDurationMs/);
+  assert.match(reconcile, /exactItemsAttempted/);
+  assert.match(reconcile, /distinctExactItemsAttempted/);
+  assert.match(reconcile, /exactTimeouts/);
 });

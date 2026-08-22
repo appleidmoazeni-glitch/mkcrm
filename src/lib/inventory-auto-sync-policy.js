@@ -21,10 +21,23 @@ function discoveryQueueId(identity) {
 }
 
 function missingVerificationSort() {
-  // Never-verified and oldest-verified rows are processed first. A successful
-  // exact verification updates lastLiveVerifiedAt and naturally rotates the
-  // row behind the remaining backlog.
-  return { lastLiveVerifiedAt:1, lastMissingInStockAt:1, _id:1 };
+  // Every attempt, including a timeout, advances lastLiveAttemptAt. This keeps
+  // one slow Shaygan item from monopolizing every reconciliation cycle.
+  return { lastLiveAttemptAt:1, lastLiveVerifiedAt:1, firstMissingInStockAt:1, _id:1 };
+}
+
+function boundedBudget({ maxItems, budgetMs, startedAt = Date.now() } = {}) {
+  return {
+    maxItems:Math.max(1, Number(maxItems || 1)),
+    budgetMs:Math.max(1000, Number(budgetMs || 1000)),
+    startedAt:Number(startedAt || Date.now())
+  };
+}
+
+function budgetAllowsAttempt(budget, attempted) {
+  if (!budget) return true;
+  return Number(attempted || 0) < budget.maxItems
+    && (Date.now() - budget.startedAt) < budget.budgetMs;
 }
 
 function summarizeStockResults(results = []) {
@@ -43,5 +56,7 @@ module.exports = {
   isOperationalDiscoverySource,
   discoveryQueueId,
   missingVerificationSort,
+  boundedBudget,
+  budgetAllowsAttempt,
   summarizeStockResults
 };
