@@ -17,7 +17,7 @@ const EXCEPTIONS = 'fifoExceptions';
 const STATE = 'fifoDatasetState';
 const SCOPE_KEY = 'fifo-shadow-v2-precision-evidence';
 const SCHEMA_VERSION = 3;
-const ALGORITHM_VERSION = 'fifo-shadow-v3-profit-provenance';
+const ALGORITHM_VERSION = 'fifo-shadow-v4-sale-return-restoration';
 const QUANTITY_SCALE = 6;
 const VALUE_SCALE = 2;
 const EPSILON = 0.000001;
@@ -105,6 +105,27 @@ function validDate(value) {
 function compareSales(a, b) {
   return clean(a.saleDate).localeCompare(clean(b.saleDate), 'en') ||
     Number(a.saleInvoiceNo || 0) - Number(b.saleInvoiceNo || 0) ||
+    Number(a.row || 0) - Number(b.row || 0) ||
+    saleIdentity(a).localeCompare(saleIdentity(b), 'en');
+}
+function eventTimestamp(row) {
+  const value = Date.parse(clean(row.createdDate, 100));
+  return Number.isFinite(value) ? value : null;
+}
+function compareSaleEvents(a, b) {
+  const dateOrder = clean(a.saleDate).localeCompare(clean(b.saleDate), 'en');
+  if (dateOrder) return dateOrder;
+  const aTime = eventTimestamp(a);
+  const bTime = eventTimestamp(b);
+  if (aTime != null && bTime != null && aTime !== bTime) return aTime - bTime;
+  const aType = Number(a.saleInvoiceType || 0);
+  const bType = Number(b.saleInvoiceType || 0);
+  const aRef = Number(clean(a.generalRef, 100));
+  const bRef = Number(clean(b.generalRef, 100));
+  if (aType === 6 && bType === 2 && aRef === Number(b.saleInvoiceNo || 0)) return 1;
+  if (bType === 6 && aType === 2 && bRef === Number(a.saleInvoiceNo || 0)) return -1;
+  if (aType !== bType) return aType === 2 ? -1 : (bType === 2 ? 1 : aType - bType);
+  return Number(a.saleInvoiceNo || 0) - Number(b.saleInvoiceNo || 0) ||
     Number(a.row || 0) - Number(b.row || 0) ||
     saleIdentity(a).localeCompare(saleIdentity(b), 'en');
 }
@@ -487,9 +508,190 @@ function allocateSources(datasetId, source, filters = {}) {
   const exceptions = [];
   const consumedByLayer = new Map();
   const sourceSaleLineIds = new Set();
+  const sourceReturnLineIds = new Set();
   let allocationSequenceGlobal = 0;
 
-  for (const sale of sales) {
+  const saleHeadersByGuid = new Map();
+  for (const header of source.saleHeaders.filter(row => Number(row.invTyp) === 2)) {
+    const key = identity(header.guId);
+    if (key) addIndex(saleHeadersByGuid, key, header);
+  }
+  const salesByInvoice = new Map();
+  for (const sale of sales) addIndex(salesByInvoice, String(Number(sale.saleInvoiceNo || 0)), sale);
+  const confirmedSaleReturns = new Map((source.saleReturnResolutions || []).map(row => [clean(row.returnLineIdentity, 500), row]));
+  const originalAllocations = new Map();
+  const reversedByAllocation = new Map();
+  const sameItem = (a, b) => {
+    const aGuid = identity(a.itemGuid);
+    const bGuid = identity(b.itemGuid);
+    return aGuid && bGuid ? aGuid === bGuid : identity(a.itemCode) === identity(b.itemCode);
+  };
+  const resolveReturn = row => {
+    const returnLineId = saleIdentity(row);
+    const resolution = confirmedSaleReturns.get(returnLineId);
+    if (resolution?.selectedOriginalSaleLineId) {
+      return {
+        originalSaleLineId:clean(resolution.selectedOriginalSaleLineId, 500),
+        resolution,
+        linkageSource:'CONFIRMED_RESOLUTION',
+        linkageReference:clean(resolution.resolutionId, 100)
+      };
+    }
+    const referenceGuid = identity(row.relatedInvHeaderId || row.invHeaderIdRoot);
+    const headers = referenceGuid ? saleHeadersByGuid.get(referenceGuid) || [] : [];
+    const headerInvoices = new Set(headers.map(header => Number(header.invNo || header.saleInvoiceNo || 0)).filter(Boolean));
+    const generalRef = Number(clean(row.generalRef, 100));
+    const invoiceNumbers = new Set([...headerInvoices, ...(Number.isFinite(generalRef) && generalRef > 0 ? [generalRef] : [])]);
+    const candidates = [...invoiceNumbers]
+      .flatMap(invoiceNo => salesByInvoice.get(String(invoiceNo)) || [])
+      .filter(sale => sameItem(sale, row) && clean(sale.saleDate) <= clean(row.saleDate));
+    const unique = [...new Map(candidates.map(sale => [saleIdentity(sale), sale])).values()];
+    if (unique.length !== 1) {
+      return {
+        originalSaleLineId:'',
+        resolution:null,
+        linkageSource:unique.length ? 'AMBIGUOUS_SOURCE_REFERENCE' : 'UNLINKED',
+        linkageReference:clean(row.generalRef || row.relatedInvHeaderId || row.invHeaderIdRoot, 200),
+        candidateCount:unique.length
+      };
+    }
+    return {
+      originalSaleLineId:saleIdentity(unique[0]),
+      resolution:null,
+      linkageSource:headerInvoices.has(Number(unique[0].saleInvoiceNo || 0)) ? 'SOURCE_HEADER_GUID' : 'SOURCE_GENERAL_REF',
+      linkageReference:clean(row.generalRef || row.relatedInvHeaderId || row.invHeaderIdRoot, 200),
+      candidateCount:1
+    };
+  };
+
+  for (const sale of [...sales, ...saleReturns].sort(compareSaleEvents)) {
+    if (Number(sale.saleInvoiceType) === 6) {
+      const returnLineId = saleIdentity(sale);
+      if (sourceReturnLineIds.has(returnLineId)) {
+        exceptions.push(exception(datasetId, 'DUPLICATE_SALE_RETURN_LINE', 'unresolved', {
+          saleReturnLineId:returnLineId,itemGuid:sale.itemGuid,itemCode:sale.itemCode,
+          reason:'Sale Snapshot contains a duplicate sale-return line identity; the duplicate was not applied.'
+        }));
+        continue;
+      }
+      sourceReturnLineIds.add(returnLineId);
+      const link = resolveReturn(sale);
+      const originals = link.originalSaleLineId
+        ? (originalAllocations.get(link.originalSaleLineId) || []).slice().sort((a,b)=>Number(b.allocationSequence||0)-Number(a.allocationSequence||0))
+        : [];
+      if (!link.originalSaleLineId || !originals.length) {
+        exceptions.push(exception(datasetId, 'SALE_RETURN_NOT_ALLOCATED', link.originalSaleLineId ? 'return-without-original-allocation' : 'unresolved', {
+          saleReturnLineId:returnLineId,
+          itemGuid:sale.itemGuid,
+          itemCode:sale.itemCode,
+          reference:link.linkageReference,
+          reason:link.originalSaleLineId
+            ? `Sale return has deterministic ${link.linkageSource} linkage, but the original sale has no allocation to reverse.`
+            : `Sale return linkage is ${link.linkageSource.toLowerCase().replace(/_/g, '-')}; no FIFO allocation was generated.`
+        }));
+        continue;
+      }
+      let returnNeed = round(Math.abs(finite(sale.qty) || finite(link.resolution?.returnQuantity) || 0));
+      const returnQuantity = returnNeed;
+      const originalQuantityTotal = round(originals.reduce((sum, row) => sum + Math.abs(finite(row.allocatedQty || row.unknownQty) || 0), 0));
+      if (originals.length > 1 && returnNeed + EPSILON < originalQuantityTotal) {
+        exceptions.push(exception(datasetId, 'SALE_RETURN_ALLOCATION_AMBIGUOUS', 'unresolved', {
+          saleReturnLineId:returnLineId,
+          itemGuid:sale.itemGuid,
+          itemCode:sale.itemCode,
+          reference:link.linkageReference,
+          reason:`Partial return quantity ${returnNeed} maps to ${originals.length} distinct original allocations; no line/serial evidence selects which cost basis to restore.`
+        }));
+        continue;
+      }
+      const returnSaleValue = Math.abs(finite(sale.saleValue) || 0);
+      const returnUnitSaleValue = returnNeed > EPSILON ? returnSaleValue / returnNeed : 0;
+      let returnSequence = 0;
+      for (const original of originals) {
+        if (returnNeed <= EPSILON) break;
+        const originalQuantity = round(Math.abs(finite(original.allocatedQty || original.unknownQty) || 0));
+        const alreadyReversed = round(reversedByAllocation.get(original.allocationId) || 0);
+        const reversible = round(Math.max(0, originalQuantity - alreadyReversed));
+        const reversedQuantity = round(Math.min(returnNeed, reversible));
+        if (reversedQuantity <= EPSILON) continue;
+        returnNeed = round(returnNeed - reversedQuantity);
+        reversedByAllocation.set(original.allocationId, round(alreadyReversed + reversedQuantity));
+        returnSequence++;
+        allocationSequenceGlobal++;
+        const isUnknown = original.sourceType === 'unknown_cost';
+        const unitCostSource = original.unitCostExact ?? original.unitCost;
+        const exact = isUnknown ? unknownPrecisionFields(-reversedQuantity) : precisionFields(-reversedQuantity, unitCostSource);
+        allocations.push({
+          ...original,
+          allocationId:`FA-${sha256(`${datasetId}|${returnLineId}|${returnSequence}|${original.allocationId}|reversal`).slice(0, 32)}`,
+          allocationSequence:returnSequence,
+          globalSequence:allocationSequenceGlobal,
+          sourceType:'sale_return_reversal',
+          reversedSourceType:original.sourceType,
+          sourceConfidence:'authoritative-source-return-linkage',
+          saleLineId:returnLineId,
+          originalSaleLineId:link.originalSaleLineId,
+          originalAllocationId:original.allocationId,
+          originSaleInvoiceNo:Number(original.saleInvoiceNo || 0),
+          originSaleInvoiceGuid:clean(original.saleGuid, 100),
+          saleInvoiceType:6,
+          saleInvoiceNo:Number(sale.saleInvoiceNo || 0),
+          saleGuid:clean(sale.saleGuid, 100),
+          saleDate:clean(sale.saleDate, 8),
+          saleRow:Number(sale.row || 0),
+          returnOperatorAccountNumber:clean(sale.sellerAccountNumber, 100),
+          returnOperatorName:clean(sale.sellerName, 200),
+          returnStoreName:clean(sale.sellerStoreName || sale.stockName, 200),
+          soldQuantity:-returnQuantity,
+          saleValue:-returnSaleValue,
+          allocatedSaleValue:round(-reversedQuantity * returnUnitSaleValue, VALUE_SCALE),
+          allocatedQty:isUnknown ? 0 : -reversedQuantity,
+          unknownQty:isUnknown ? -reversedQuantity : 0,
+          saleRemainingQuantity:returnNeed,
+          unitCost:isUnknown ? null : round(finite(unitCostSource), VALUE_SCALE),
+          allocatedCostAmount:isUnknown ? null : accountingDecimal.toNumber(accountingDecimal.parse(exact.allocatedCostAmountExact, accountingDecimal.MONEY_SCALE), accountingDecimal.MONEY_SCALE),
+          saleReturnResolutionId:clean(link.resolution?.resolutionId, 100),
+          returnSource:'SALE_SNAPSHOT_INVTYPE_6',
+          returnInvoiceNo:Number(sale.saleInvoiceNo || 0),
+          returnInvoiceGuid:clean(sale.saleGuid, 100),
+          returnDate:clean(sale.saleDate, 8),
+          returnLinkageSource:link.linkageSource,
+          returnLinkageQuality:'EXACT_ORIGIN_LINK',
+          returnLinkageReference:link.linkageReference,
+          returnEffect:isUnknown ? 'unknown-cost-reversal-no-restoration' : 'reverse-original-allocation-and-restore-cost-capacity',
+          restoredQuantity:isUnknown ? 0 : reversedQuantity,
+          restoredCostAmountExact:isUnknown ? null : accountingDecimal.format(-accountingDecimal.parse(exact.allocatedCostAmountExact, accountingDecimal.MONEY_SCALE), accountingDecimal.MONEY_SCALE),
+          layerAvailableBefore:null,
+          layerRemainingQuantity:null,
+          ...exact,
+          createdAt:new Date()
+        });
+        if (!isUnknown) {
+          const sourceLayer = officialRows.find(layer => purchaseIdentity(layer) === clean(original.purchaseLineIdentity, 500));
+          if (sourceLayer) {
+            sourceLayer.fifoRemainingQuantity = round(Number(sourceLayer.fifoRemainingQuantity || 0) + reversedQuantity);
+            sourceLayer.saleReturnRestoredQuantity = round(Number(sourceLayer.saleReturnRestoredQuantity || 0) + reversedQuantity);
+            sourceLayer.saleReturnLineIds = [...new Set([...(sourceLayer.saleReturnLineIds || []), returnLineId])];
+            consumedByLayer.set(purchaseIdentity(sourceLayer), round(Math.max(0, Number(consumedByLayer.get(purchaseIdentity(sourceLayer)) || 0) - reversedQuantity)));
+          }
+        }
+      }
+      assignSaleValuePrecision(
+        allocations.filter(item => item.saleLineId === returnLineId && item.sourceType === 'sale_return_reversal'),
+        returnQuantity,
+        -returnSaleValue
+      );
+      exceptions.push(exception(datasetId, 'SALE_RETURN_RESOLUTION', returnNeed <= EPSILON ? 'source-linked-reversed-restored' : 'source-link-insufficient-original-quantity', {
+        saleReturnLineId:returnLineId,
+        itemGuid:sale.itemGuid,
+        itemCode:sale.itemCode,
+        reference:link.linkageReference,
+        reason:returnNeed <= EPSILON
+          ? `${link.linkageSource} reversed the original allocation and restored its known cost capacity chronologically.`
+          : `Original allocation was insufficient by ${returnNeed}; excess return did not create cost capacity.`
+      }));
+      continue;
+    }
     const saleLineId = saleIdentity(sale);
     if (sourceSaleLineIds.has(saleLineId)) {
       exceptions.push(exception(datasetId, 'DUPLICATE_SALE_LINE', 'unresolved', {
@@ -720,100 +922,7 @@ function allocateSources(datasetId, source, filters = {}) {
       soldQuantity,
       saleValue
     );
-  }
-
-  const saleHeadersByGuid = new Map();
-  for (const header of source.saleHeaders.filter(row => Number(row.invTyp) === 2)) {
-    const key = identity(header.guId);
-    if (key) addIndex(saleHeadersByGuid, key, header);
-  }
-  const confirmedSaleReturns = new Map((source.saleReturnResolutions || []).map(row => [clean(row.returnLineIdentity, 500), row]));
-  const originalAllocations = new Map();
-  for (const row of allocations.filter(item => Number(item.saleInvoiceType) === 2)) addIndex(originalAllocations, row.saleLineId, row);
-  for (const row of saleReturns) {
-    const returnLineId = saleIdentity(row);
-    const resolution = confirmedSaleReturns.get(returnLineId);
-    if (resolution?.selectedOriginalSaleLineId) {
-      const originals = (originalAllocations.get(clean(resolution.selectedOriginalSaleLineId, 500)) || [])
-        .sort((a,b)=>Number(a.allocationSequence||0)-Number(b.allocationSequence||0));
-      let returnNeed = round(Math.abs(finite(row.qty) || finite(resolution.returnQuantity) || 0));
-      const returnSaleValue = Math.abs(finite(row.saleValue) || 0);
-      const returnUnitSaleValue = returnNeed > EPSILON ? returnSaleValue / returnNeed : 0;
-      let returnSequence = 0;
-      for (const original of originals) {
-        if (returnNeed <= EPSILON) break;
-        const originalQuantity = round(finite(original.allocatedQty || original.unknownQty) || 0);
-        const reversedQuantity = round(Math.min(returnNeed, originalQuantity));
-        if (reversedQuantity <= EPSILON) continue;
-        returnNeed = round(returnNeed - reversedQuantity);
-        returnSequence++;
-        allocationSequenceGlobal++;
-        const isUnknown = original.sourceType === 'unknown_cost';
-        const unitCostSource = original.unitCostExact ?? original.unitCost;
-        const exact = isUnknown
-          ? unknownPrecisionFields(-reversedQuantity)
-          : precisionFields(-reversedQuantity, unitCostSource);
-        allocations.push({
-          ...original,
-          allocationId:`FA-${sha256(`${datasetId}|${returnLineId}|${returnSequence}|${original.allocationId}|reversal`).slice(0, 32)}`,
-          allocationSequence:returnSequence,
-          globalSequence:allocationSequenceGlobal,
-          sourceType:'sale_return_reversal',
-          reversedSourceType:original.sourceType,
-          sourceConfidence:'confirmed-return-linkage',
-          saleLineId:returnLineId,
-          originalSaleLineId:clean(resolution.selectedOriginalSaleLineId, 500),
-          saleInvoiceType:6,
-          saleInvoiceNo:Number(row.saleInvoiceNo || 0),
-          saleGuid:clean(row.saleGuid, 100),
-          saleDate:clean(row.saleDate, 8),
-          saleRow:Number(row.row || 0),
-          soldQuantity:-Math.abs(finite(row.qty) || finite(resolution.returnQuantity) || 0),
-          saleValue:-returnSaleValue,
-          allocatedSaleValue:round(-reversedQuantity * returnUnitSaleValue, VALUE_SCALE),
-          allocatedQty:isUnknown ? 0 : -reversedQuantity,
-          unknownQty:isUnknown ? -reversedQuantity : 0,
-          saleRemainingQuantity:returnNeed,
-          unitCost:isUnknown ? null : round(finite(unitCostSource), VALUE_SCALE),
-          allocatedCostAmount:isUnknown ? null : accountingDecimal.toNumber(
-            accountingDecimal.parse(exact.allocatedCostAmountExact, accountingDecimal.MONEY_SCALE),
-            accountingDecimal.MONEY_SCALE
-          ),
-          saleReturnResolutionId:clean(resolution.resolutionId, 100),
-          returnEffect:'deterministic-reversal-of-original-allocation',
-          layerAvailableBefore:null,
-          layerRemainingQuantity:null,
-          ...exact,
-          createdAt:new Date()
-        });
-      }
-      assignSaleValuePrecision(
-        allocations.filter(item => item.saleLineId === returnLineId && item.sourceType === 'sale_return_reversal'),
-        Math.abs(finite(row.qty) || finite(resolution.returnQuantity) || 0),
-        -returnSaleValue
-      );
-      exceptions.push(exception(datasetId, 'SALE_RETURN_RESOLUTION', returnNeed <= EPSILON ? 'confirmed-linked-reversed' : 'confirmed-link-insufficient-original-quantity', {
-        saleReturnLineId:returnLineId,
-        itemGuid:row.itemGuid,
-        itemCode:row.itemCode,
-        reference:resolution.resolutionId,
-        reason:returnNeed <= EPSILON
-          ? 'Confirmed sale return reversed the original allocation deterministically.'
-          : `Confirmed original allocation was insufficient by ${returnNeed}; no arbitrary allocation was invented.`
-      }));
-      continue;
-    }
-    const reference = identity(row.relatedInvHeaderId || row.invHeaderIdRoot);
-    const candidates = reference ? saleHeadersByGuid.get(reference) || [] : [];
-    exceptions.push(exception(datasetId, 'SALE_RETURN_NOT_ALLOCATED', candidates.length === 1 ? 'linked-not-allocated' : 'unresolved', {
-      saleReturnLineId:returnLineId,
-      itemGuid:row.itemGuid,
-      itemCode:row.itemCode,
-      reference,
-      reason:candidates.length === 1
-        ? 'Sale return is linked to one sale header and intentionally does not create a FIFO allocation.'
-        : 'Sale return linkage is missing or ambiguous; no FIFO allocation was generated.'
-    }));
+    originalAllocations.set(saleLineId, allocations.filter(row => row.saleLineId === saleLineId && Number(row.saleInvoiceType) === 2));
   }
   for (const row of purchaseReturns) {
     const confirmedResolution = (source.purchaseReturnResolutions || []).find(resolution =>
@@ -1165,6 +1274,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       saleSnapshotId:pinned.saleSnapshotId,
       purchaseDatasetId:pinned.purchaseDatasetId,
       sales:result.sales.map(row => [saleIdentity(row), row.saleDate, round(row.qty), round(row.saleValue, VALUE_SCALE)]),
+      saleReturns:result.saleReturns.map(row => [saleIdentity(row), row.saleDate, clean(row.createdDate,100), round(row.qty), round(row.saleValue, VALUE_SCALE), clean(row.generalRef,100), clean(row.relatedInvHeaderId,100), clean(row.invHeaderIdRoot,100)]),
       purchases:result.officialRows.map(row => [purchaseIdentity(row), row.purchaseInvoiceDate, round(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity), round(row.netUnitCost ?? row.grossUnitCost, VALUE_SCALE)]),
       manuals:[...source.manuals]
         .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
@@ -1405,13 +1515,17 @@ function topValues(map, sortField, limit = 10) {
 }
 function provenanceFacts(allocations,manualRows=[]){
   const grouped=new Map(),manualById=new Map(manualRows.map(row=>[clean(row.resolutionId,100),row]));
-  for(const row of allocations.filter(item=>Number(item.saleInvoiceType)===2))addIndex(grouped,clean(row.saleLineId,500),row);
+  for(const row of allocations){
+    if(Number(row.saleInvoiceType)===2)addIndex(grouped,clean(row.saleLineId,500),row);
+    else if(row.sourceType==='sale_return_reversal'&&clean(row.originalSaleLineId,500))addIndex(grouped,clean(row.originalSaleLineId,500),row);
+  }
   const facts=[];
   for(const [saleLineId,rows] of grouped){
-    const first=rows[0];
+    const first=rows.find(row=>Number(row.saleInvoiceType)===2)||rows[0];
+    const netQuantityExact=accountingDecimal.format(rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.quantityExact??row.allocatedQty??row.unknownQty??0,accountingDecimal.QUANTITY_SCALE),0n),accountingDecimal.QUANTITY_SCALE);
     const saleValueExact=accountingDecimal.format(rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedSaleValueExact??row.allocatedSaleValue??0,accountingDecimal.MONEY_SCALE),0n),accountingDecimal.MONEY_SCALE);
-    const provenance=profitProvenance.lineProvenance(rows,{saleQtyExact:first.soldQuantity,saleValueExact,manualById});
-    facts.push({saleLineId,saleInvoiceNo:Number(first.saleInvoiceNo||0),sellerIdentity:clean(first.sellerAccountNumber,100)||'UNRESOLVED',productCategory:clean(first.officialProductCategoryName,300)||'UNRESOLVED',itemCode:clean(first.itemCode,100),quantityExact:provenance.provenanceReconciliation.requiredQtyExact,saleValueExact,fifoCostExact:provenance.provenanceReconciliation.allocatedCostExact,fifoProfitExact:provenance.provenanceReconciliation.fifoProfitExact,profitProvenanceStatus:provenance.profitProvenanceStatus,costSourceType:provenance.costSourceType,provenanceSources:provenance.provenanceSources,provenanceFingerprint:provenance.provenanceFingerprint});
+    const provenance=profitProvenance.lineProvenance(rows,{saleQtyExact:netQuantityExact,saleValueExact,manualById});
+    facts.push({saleLineId,saleInvoiceNo:Number(first.saleInvoiceNo||0),sellerIdentity:clean(first.sellerAccountNumber,100)||'UNRESOLVED',productCategory:clean(first.officialProductCategoryName,300)||'UNRESOLVED',itemCode:clean(first.itemCode,100),quantityExact:provenance.provenanceReconciliation.requiredQtyExact,saleValueExact,fifoCostExact:provenance.provenanceReconciliation.allocatedCostExact,fifoProfitExact:provenance.provenanceReconciliation.fifoProfitExact,profitProvenanceStatus:provenance.profitProvenanceStatus,costSourceType:provenance.costSourceType,provenanceSources:provenance.provenanceSources,provenanceFingerprint:provenance.provenanceFingerprint,returnAllocationCount:rows.filter(row=>row.sourceType==='sale_return_reversal').length});
   }
   return facts;
 }

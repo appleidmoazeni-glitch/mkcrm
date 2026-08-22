@@ -58,7 +58,7 @@ function seedDb() {
       sale(),
       sale({ saleLineId:'SL-2-2-001-B', saleInvoiceNo:2, saleGuid:'SALE-GUID-2', saleDate:'14050111', itemGuid:'GUID-B', itemCode:'B', itemName:'Item B', qty:3, saleValue:6000 }),
       sale({ saleLineId:'SL-2-3-001-C', saleInvoiceNo:3, saleGuid:'SALE-GUID-3', saleDate:'14050112', itemGuid:'GUID-C', itemCode:'C', itemName:'Item C', qty:4, saleValue:8000 }),
-      sale({ saleLineId:'SL-6-4-001-A', saleInvoiceType:6, saleInvoiceNo:4, saleGuid:'SALE-RETURN-GUID', relatedInvHeaderId:'SALE-GUID-1', qty:1, saleValue:1000 })
+      sale({ saleLineId:'SL-6-4-001-A', saleInvoiceType:6, saleInvoiceNo:4, saleGuid:'SALE-RETURN-GUID', relatedInvHeaderId:'SALE-GUID-1', saleDate:'14050120', qty:1, saleValue:1000 })
     ],
     purchaseLayerDatasetState:[{ scopeKey:'purchase-invoices-types-3-7', activeDatasetId:'PURCHASE-ACTIVE' }],
     purchaseLayerDatasets:[{
@@ -191,14 +191,14 @@ test('partial official exhaustion uses approved manual only after official layer
   assert.equal(rows[1].unitCost,999);
 });
 
-test('purchase and sale returns never create fake allocations and uncertain linkage remains unresolved', async () => {
+test('source-linked partial multi-layer sale return remains ambiguous and purchase return quarantine is preserved', async () => {
   const db=seedDb();
   const result=await engine.buildShadowDataset(db,{},accountant);
   const allocations=db.collection(engine.ALLOCATIONS).rows.filter(row=>row.datasetId===result.datasetId);
   assert.equal(allocations.some(row=>row.saleInvoiceType===6),false);
   assert.equal(allocations.some(row=>row.purchaseLineIdentity==='PR-UNRESOLVED'),false);
   const exceptions=db.collection(engine.EXCEPTIONS).rows.filter(row=>row.datasetId===result.datasetId);
-  assert.equal(exceptions.find(row=>row.code==='SALE_RETURN_NOT_ALLOCATED').status,'linked-not-allocated');
+  assert.equal(exceptions.find(row=>row.code==='SALE_RETURN_ALLOCATION_AMBIGUOUS').status,'unresolved');
   assert.equal(exceptions.find(row=>row.code==='PURCHASE_RETURN_STATUS').status,'unresolved');
   assert.equal(result.summary.purchaseReturns.unresolved,1);
 });

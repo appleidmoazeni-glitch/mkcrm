@@ -246,6 +246,7 @@ test('purchase return may be formally confirmed unmatched with reason', async ()
 
 test('confirmed sale return performs a deterministic partial reversal of original allocations', async () => {
   const db=seedDb();
+  Object.assign(db.collection('supplierPurchaseLayers').rows.find(row=>row.purchaseLineIdentity==='PL-A'),{ originalQuantity:3, netPurchasedQuantity:3 });
   db.collection('fifoDatasets').rows=[];
   db.collection('fifoAllocations').rows=[];
   db.collection('fifoExceptions').rows=[];
@@ -270,7 +271,7 @@ test('unresolved sale return remains an exception and never invents a cost', asy
   db.collection('fifoDatasetState').rows=[];
   const result=await fifo.buildShadowDataset(db,{},accounting);
   assert.equal(db.collection(fifo.ALLOCATIONS).rows.some(row=>row.datasetId===result.datasetId&&row.saleInvoiceType===6),false);
-  assert.ok(db.collection(fifo.EXCEPTIONS).rows.find(row=>row.datasetId===result.datasetId&&row.code==='SALE_RETURN_NOT_ALLOCATED'));
+  assert.ok(db.collection(fifo.EXCEPTIONS).rows.find(row=>row.datasetId===result.datasetId&&row.code==='SALE_RETURN_ALLOCATION_AMBIGUOUS'));
 });
 
 test('official layer still has priority over an approved manual resolution under precision v2', async () => {
