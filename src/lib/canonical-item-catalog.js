@@ -1,6 +1,7 @@
 'use strict';
 
 const crypto = require('crypto');
+const inventoryAutoSyncPolicy = require('./inventory-auto-sync-policy');
 
 const CATALOG = 'itemCatalogAll';
 const HISTORY_QUEUE = 'purchaseHistoryDiscoveryQueue';
@@ -127,7 +128,7 @@ async function ensureCatalogItems(db, inputs = [], options = {}) {
   const identities = [...new Set(existingRows.map(row => clean(row.canonicalIdentity, 300)).filter(Boolean))];
   const queueRows = options.queueHistory === false || !identities.length ? [] : await db.collection(HISTORY_QUEUE).find({ canonicalIdentity:{ $in:identities } }).toArray();
   const queueByIdentity = new Map(queueRows.map(row => [clean(row.canonicalIdentity, 300), row]));
-  const catalogOps = [], queueOps = [];
+  const catalogOps = [], queueOps = [], inventoryQueueOps = [];
 
   for (const item of items) {
     const codeKey = normalizedItemCode(item.itemCode), guidKey = canonicalItemGuid(item.itemGuid);
@@ -165,6 +166,20 @@ async function ensureCatalogItems(db, inputs = [], options = {}) {
     else summary.updated++;
     if (!unchanged) catalogOps.push({ updateOne:{ filter:existing ? { _id:existing._id } : { normalizedItemCode:codeKey }, update:{ $set:canonical, $setOnInsert:{ createdAt:now, firstDiscoveredAt:now } }, upsert:true } });
 
+    // Newly discovered operational identities must not depend on a future Full
+    // Catalog Sync or a human Kardex lookup to enter the inventory read model.
+    // This queue is only a bounded exact-GetRemain trigger; it stores no stock.
+    if (!existing && inventoryAutoSyncPolicy.isOperationalDiscoverySource(source)) {
+      inventoryQueueOps.push({ updateOne:{
+        filter:{ canonicalIdentity:identity },
+        update:{
+          $set:{ itemGuid:canonical.itemGuid, itemCode:item.itemCode, itemDescription:canonical.itemDescription, source, status:'pending', updatedAt:now },
+          $setOnInsert:{ queueId:inventoryAutoSyncPolicy.discoveryQueueId(identity), attempts:0, createdAt:now }
+        },
+        upsert:true
+      } });
+    }
+
     if (options.queueHistory !== false && existing?.historyCompleteness !== 'complete') {
       const queue = queueByIdentity.get(identity);
       if (!queue) summary.queued++;
@@ -175,6 +190,7 @@ async function ensureCatalogItems(db, inputs = [], options = {}) {
   }
   if (catalogOps.length) await db.collection(CATALOG).bulkWrite(catalogOps, { ordered:false });
   if (queueOps.length) await db.collection(HISTORY_QUEUE).bulkWrite(queueOps, { ordered:false });
+  if (inventoryQueueOps.length) await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).bulkWrite(inventoryQueueOps, { ordered:false });
   summary.ok = summary.conflicts.length === 0;
   return summary;
 }

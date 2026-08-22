@@ -23,6 +23,7 @@ const fifoReliability = require('./lib/fifo-reliability');
 const financialSourceControl = require('./lib/financial-source-control');
 const saleSnapshot = require('./lib/sale-snapshot');
 const canonicalItemCatalog = require('./lib/canonical-item-catalog');
+const inventoryAutoSyncPolicy = require('./lib/inventory-auto-sync-policy');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
@@ -1048,7 +1049,7 @@ async function verifyMissingStockRowsLive(db, stockNumber, batchId, reason = 'st
   const candidates = await db.collection('itemInventoryCatalog').find(
     { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId } },
     { projection:{ itemCode:1 } }
-  ).limit(limit).toArray().catch(()=>[]);
+  ).sort(inventoryAutoSyncPolicy.missingVerificationSort()).limit(limit).toArray().catch(()=>[]);
   const codes = [...new Set(candidates.map(x=>String(x.itemCode||'').trim()).filter(Boolean))];
   const results = [];
   for (const code of codes) {
@@ -1060,6 +1061,35 @@ async function verifyMissingStockRowsLive(db, stockNumber, batchId, reason = 'st
     { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, lastMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
   ).catch(()=>({ modifiedCount:0 }));
   return { checked:codes.length, zeroedCount:results.reduce((s,x)=>s+Number(x.zeroedCount||0),0), failed:results.filter(x=>!x.ok).length, remainingQueued:Number(remaining.modifiedCount||0), results };
+}
+
+async function verifyNewOperationalItemsLive(db, reason = 'auto-new-operational-item-discovery') {
+  const limit = Math.max(1, Number(process.env.INVENTORY_NEW_ITEM_VERIFY_LIMIT || 20));
+  const rows = await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).find(
+    { status:'pending' },
+    { projection:{ itemCode:1, itemGuid:1, queueId:1, attempts:1 } }
+  ).sort({ attempts:1, createdAt:1, _id:1 }).limit(limit).toArray().catch(()=>[]);
+  const results = [];
+  for (const row of rows) {
+    const itemCode = String(row.itemCode || '').trim();
+    const result = await authoritativeLiveReconcileItem(db, itemCode, reason).catch(error => ({ ok:false, itemCode, error:String(error.message || error) }));
+    if (result.ok) {
+      const positiveRows = (result.rows || []).filter(item => Number(item.quantity || 0) > 0);
+      await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).updateOne(
+        { _id:row._id, status:'pending' },
+        { $set:{ status:'verified', outcome:positiveRows.length ? 'positive' : 'zero', verifiedAt:new Date(), updatedAt:new Date(), verificationSource:'exact-getremain', positiveRowCount:positiveRows.length, error:'' }, $inc:{ attempts:1 } }
+      ).catch(()=>{});
+      results.push({ itemCode, ok:true, outcome:positiveRows.length ? 'positive' : 'zero', positiveRowCount:positiveRows.length });
+    } else {
+      await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).updateOne(
+        { _id:row._id, status:'pending' },
+        { $set:{ lastAttemptAt:new Date(), updatedAt:new Date(), error:String(result.error || '').slice(0,500) }, $inc:{ attempts:1 } }
+      ).catch(()=>{});
+      results.push({ itemCode, ok:false, outcome:'error', positiveRowCount:0, error:String(result.error || '') });
+    }
+  }
+  const remainingQueued = await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).countDocuments({ status:'pending' }).catch(()=>0);
+  return { checked:rows.length, verified:results.filter(row=>row.ok).length, discoveredPositive:results.filter(row=>row.outcome==='positive').length, failed:results.filter(row=>!row.ok).length, remainingQueued:Number(remainingQueued || 0), results };
 }
 async function ensureItemInventoryFresh(db, itemCode, reason = 'ensure-item-inventory', options = {}) {
   return await refreshInventoryCacheForItem(db, itemCode, reason, { allowZeroReplace:false, ...options });
@@ -1686,7 +1716,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       if (!res.ok) {
         const result = { ok:false, stockNumber:st, total, pages:page, error:res.error, batchId, completed:false, mode:'inventory-stock-positive-snapshot' };
         await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_error', stockNumber:st, total, pages:page, error:res.error || '', batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
-        await saveAutoInventoryStatus({ running:false, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:res.error || '' });
+        await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:res.error || '' });
         return result;
       }
       if (!res.list.length) { endedNaturally = true; break; }
@@ -1714,13 +1744,13 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     }
     const result = { ok:true, stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
     await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, batchId, at:new Date(), source:opts.source || 'manual', durationMs:result.durationMs }).catch(()=>{});
-    await saveAutoInventoryStatus({ running:false, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:'' });
+    await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:'' });
     return result;
   } catch (e) {
     const err = String(e.message || e);
     const result = { ok:false, stockNumber:st, total, pages:page, error:err, batchId, completed:false, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-positive-snapshot-exception' };
     await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_exception', stockNumber:st, total, pages:page, error:err, batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
-    await saveAutoInventoryStatus({ running:false, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:err });
+    await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:err });
     if(e?.code==='JOB_CANCELLED') throw e;
     return result;
   }
@@ -1845,17 +1875,21 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
     jobControl?.progress?.({phase:'Reading warehouses',current:warehouseIndex,total:active.length,message:`Starting warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     await saveAutoInventoryStatus({ running:true, mode:'active-stock-sync-positive-only', currentStockNumber:String(st), lastStockNumber:String(st) });
-    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock`, jobControl });
+    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock`, jobControl, parentCycle:true });
     stockTotal += Number(r.total || 0);
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
-    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, error:r.error||'' });
+    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, error:r.error||'' });
     jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
   }
-  const result = { ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active, stockRows:stockTotal, stockCompleted, protectedFromStale, queuedForLiveVerify:protectedFromStale, durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-no-global-no-delete', atTehran:time.formatTehranDateTime(new Date()) };
+  jobControl?.progress?.({phase:'New item verification',current:0,total:1,message:'Verifying newly discovered operational items'});
+  jobControl?.checkCancellation?.();
+  const newItemVerification = await verifyNewOperationalItemsLive(db).catch(error => ({ checked:0, verified:0, discoveredPositive:0, failed:1, remainingQueued:0, results:[], error:String(error.message || error) }));
+  const missingVerification = inventoryAutoSyncPolicy.summarizeStockResults(stockResults);
+  const result = { ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active, stockRows:stockTotal, stockCompleted, protectedFromStale, checkedMissingLive:missingVerification.checked, zeroedAfterExactVerify:missingVerification.zeroed, failedLiveVerify:missingVerification.failed, queuedForLiveVerify:missingVerification.remainingQueued, newItemVerification, durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-exact-verify-rotating', atTehran:time.formatTehranDateTime(new Date()) };
   jobControl?.progress?.({phase:'Finalize',current:0,total:1,message:'Finalizing inventory synchronization'});
   jobControl?.checkCancellation?.();
   await db.collection('appLogs').insertOne({ type:'inventory_active_stock_sync', ...result, at:new Date(), source:opts.source || 'auto' }).catch(()=>{});
