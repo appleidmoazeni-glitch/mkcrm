@@ -99,6 +99,8 @@ test('server keeps exact verification authoritative and does not perform a reque
   const verify = source.slice(source.indexOf('async function verifyMissingStockRowsLive'), source.indexOf('async function ensureItemInventoryFresh'));
   assert.match(verify, /sort\(inventoryAutoSyncPolicy\.missingVerificationSort\(\)\)/);
   assert.match(verify, /authoritativeLiveReconcileItem/);
+  assert.match(verify, /queueRowsCleared/);
+  assert.match(verify, /needsLiveVerify:false/);
   assert.doesNotMatch(verify, /syncAllItemsCatalog|syncCatalog|deleteMany/);
   const discovery = source.slice(source.indexOf('async function verifyNewOperationalItemsLive'), source.indexOf('async function ensureItemInventoryFresh'));
   assert.match(discovery, /inventoryNewItemVerifyCycleLimit/);
