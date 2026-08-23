@@ -1865,32 +1865,44 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
   const startedAt = new Date();
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, lastStockNumber:st, lastStartedAt:startedAt, lastError:'', lastResult:null });
   let total = 0, page = 0, endedNaturally = false;
+  let rawRows = 0;
+  let terminalCondition = '';
+  let pageEvidence = [];
   const quantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
   const quantityDirectionSamples = [];
   const jobControl=opts.jobControl;
   try {
-    for (let rowStart = 0; page < safePages; page++, rowStart += 100) {
-      jobControl?.progress?.({phase:'Reading Shaygan pages',current:page,total:safePages,message:`Reading warehouse ${st}, page ${page+1}`});
-      jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
-      const res = await shaygan.getInventoryPage(rowStart, 100, { stockNumber:st });
-      if (!res.ok) {
-        const result = { ok:false, stockNumber:st, total, pages:page, error:res.error, batchId, completed:false, mode:'inventory-stock-positive-snapshot' };
-        await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_error', stockNumber:st, total, pages:page, error:res.error || '', batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
-        await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:res.error || '' });
-        return result;
+    const pagination = await inventoryAutoSyncPolicy.walkAuthoritativeInventoryPages({
+      pageSize:100,
+      maxPages:safePages,
+      fetchPage:async ({ pageIndex, rowStart, rowCount }) => {
+        jobControl?.progress?.({phase:'Reading Shaygan pages',current:pageIndex,total:safePages,message:`Reading warehouse ${st}, page ${pageIndex+1}`});
+        jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
+        return await shaygan.getInventoryPage(rowStart, rowCount, { stockNumber:st });
+      },
+      onPage:async ({ pageIndex, response:res }) => {
+        jobControl?.checkCancellation?.();
+        const rows = (res.list || []).map(x => ({ ...x, stockNumber:String(x.stockNumber || st), syncBatchId:batchId, syncStockNumber:st, syncSource:opts.source || 'stock-filter-positive-sync' }));
+        const persisted = await upsertInventoryRows(db, rows, { source:opts.source || 'stock-filter-positive-sync' });
+        for (const key of Object.keys(quantityDirections)) quantityDirections[key] += Number(persisted?.quantityDirections?.[key] || 0);
+        for (const sample of (persisted?.quantityDirectionSamples||[])) if (quantityDirectionSamples.length < 50) quantityDirectionSamples.push(sample);
+        total += rows.length;
+        jobControl?.progress?.({phase:'Persist inventory',current:pageIndex+1,total:safePages,message:`Persisted warehouse ${st}, page ${pageIndex+1}`});
+        jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
       }
-      if (!res.list.length) { endedNaturally = true; break; }
-      jobControl?.checkCancellation?.();
-      const rows = (res.list || []).map(x => ({ ...x, stockNumber:String(x.stockNumber || st), syncBatchId:batchId, syncStockNumber:st, syncSource:opts.source || 'stock-filter-positive-sync' }));
-      const persisted = await upsertInventoryRows(db, rows, { source:opts.source || 'stock-filter-positive-sync' });
-      for (const key of Object.keys(quantityDirections)) quantityDirections[key] += Number(persisted?.quantityDirections?.[key] || 0);
-      for (const sample of (persisted?.quantityDirectionSamples||[])) if (quantityDirectionSamples.length < 50) quantityDirectionSamples.push(sample);
-      total += rows.length;
-      jobControl?.progress?.({phase:'Persist inventory',current:page+1,total:safePages,message:`Persisted warehouse ${st}, page ${page+1}`});
-      jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
-      if (res.list.length < 100) { endedNaturally = true; break; }
+    });
+    page = pagination.pagesRead;
+    rawRows = pagination.rawRows;
+    terminalCondition = pagination.terminalCondition;
+    pageEvidence = pagination.evidence;
+    if (!pagination.ok) {
+      const result = { ok:false, stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, error:pagination.error, batchId, completed:false, mode:'inventory-stock-positive-snapshot' };
+      await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_error', stockNumber:st, total, rawRows, pages:page, pagesRead:page, pageEvidence, terminalCondition, error:pagination.error || '', batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
+      await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:pagination.error || '' });
+      return result;
     }
-    const completed = Boolean(endedNaturally && page < safePages);
+    endedNaturally = pagination.completed;
+    const completed = Boolean(endedNaturally);
     let removedStale = 0;
     let protectedFromStale = 0;
     let queuedForLiveVerify = 0;
@@ -1911,8 +1923,8 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       queuedForLiveVerify = Number(remaining.modifiedCount||0);
       liveMissingVerify = { deferred:true, checked:0, zeroedCount:0, failed:0, remainingQueued:queuedForLiveVerify, results:[] };
     }
-    const result = { ok:true, stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, quantityDirections, quantityDirectionSamples, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
-    await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, batchId, at:new Date(), source:opts.source || 'manual', durationMs:result.durationMs }).catch(()=>{});
+    const result = { ok:true, stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, quantityDirections, quantityDirectionSamples, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
+    await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, batchId, at:new Date(), source:opts.source || 'manual', durationMs:result.durationMs }).catch(()=>{});
     await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:'' });
     return result;
   } catch (e) {
@@ -2050,7 +2062,7 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
     for (const key of Object.keys(broadQuantityDirections)) broadQuantityDirections[key] += Number(r.quantityDirections?.[key] || 0);
-    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, quantityDirections:r.quantityDirections||null, quantityDirectionSamples:(r.quantityDirectionSamples||[]).slice(0,50), error:r.error||'' });
+    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, rawRows:r.rawRows||0, positiveRows:r.positiveRows||0, pages:r.pages||0, pagesRead:r.pagesRead||0, pageEvidence:(r.pageEvidence||[]).slice(0,300), terminalCondition:r.terminalCondition||'', completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, quantityDirections:r.quantityDirections||null, quantityDirectionSamples:(r.quantityDirectionSamples||[]).slice(0,50), error:r.error||'' });
     jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);

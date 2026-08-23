@@ -102,6 +102,118 @@ test('first operational discovery queues an identity that was previously known o
   assert.equal(db.collection('inventoryDiscoveryVerificationQueue').rows[0].queueClass, 'NEW_IDENTITY');
 });
 
+test('INV-H03 full raw page continues after positive normalization filters one row', async () => {
+  const target = { itemCode:'9799STV545', itemGuid:'GUID-9799', itemDescription:'ST VGA XFX RX580 8G', stockNumber:'01', quantity:2 };
+  const fullRaw = prefix => Array.from({ length:100 }, (_, index) => ({ ItemCode:`${prefix}-${index}`, Quantity1:index === 0 ? 0 : 1 }));
+  const pages = [
+    { ok:true, result:fullRaw('P0'), list:fullRaw('P0').slice(1) },
+    { ok:true, result:[target, ...fullRaw('P1').slice(1)], list:[target, ...fullRaw('P1').slice(1)] },
+    { ok:true, result:[{ ItemCode:'FINAL', Quantity1:1 }], list:[{ itemCode:'FINAL', stockNumber:'01', quantity:1 }] }
+  ];
+  const requested = [];
+  const db = new MemoryDb({ itemCatalogAll:[], purchaseHistoryDiscoveryQueue:[], inventoryDiscoveryVerificationQueue:[], itemInventoryCatalog:[] });
+  await catalog.ensureCatalogItem(db, target, { source:'all-items-catalog-bootstrap' });
+  const walked = await policy.walkAuthoritativeInventoryPages({
+    pageSize:100,
+    maxPages:10,
+    fetchPage:async ({ pageIndex, rowStart }) => { requested.push(rowStart); return pages[pageIndex]; },
+    onPage:async ({ response }) => {
+      for (const row of response.list || []) {
+        if (row.itemCode !== target.itemCode) continue;
+        await db.collection('itemInventoryCatalog').insertOne(row);
+        await catalog.ensureCatalogItem(db, row, { source:'auto-active-stock-filter-positive' });
+      }
+    }
+  });
+  assert.equal(walked.ok, true);
+  assert.equal(walked.completed, true);
+  assert.deepEqual(requested, [0, 100, 200]);
+  assert.equal(walked.evidence[0].rawCount, 100);
+  assert.equal(walked.evidence[0].positiveCount, 99);
+  assert.equal(walked.evidence[0].terminal, false);
+  assert.equal(db.collection('itemInventoryCatalog').rows.length, 1);
+  const queue = db.collection('inventoryDiscoveryVerificationQueue').rows;
+  assert.equal(queue.length, 1);
+  assert.equal(queue[0].queueClass, 'NEW_IDENTITY');
+  let exactCalls = 0;
+  for (const candidate of queue.filter(row => row.status === 'pending')) {
+    exactCalls++;
+    assert.equal(candidate.itemCode, target.itemCode);
+    candidate.status = 'verified';
+    candidate.outcome = 'positive';
+  }
+  assert.equal(exactCalls, 1);
+  assert.equal(queue[0].status, 'verified');
+});
+
+test('authoritative inventory pagination supports consecutive full pages and a partial final raw page', async () => {
+  const full = Array.from({ length:100 }, (_, i) => ({ ItemCode:`I-${i}` }));
+  const pages = [
+    { ok:true, result:full, list:full },
+    { ok:true, result:full, list:full },
+    { ok:true, result:full.slice(0, 7), list:full.slice(0, 6) }
+  ];
+  let calls = 0;
+  const result = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => pages[calls++], pageSize:100, maxPages:10 });
+  assert.equal(result.completed, true);
+  assert.equal(result.pagesRead, 3);
+  assert.equal(result.rawRows, 207);
+  assert.equal(result.positiveRows, 206);
+  assert.equal(result.terminalCondition, 'partial-raw-page');
+});
+
+test('explicit empty raw page remains a valid terminal page', async () => {
+  const full = Array.from({ length:100 }, (_, i) => ({ ItemCode:`I-${i}` }));
+  const pages = [{ ok:true, result:full, list:full }, { ok:true, result:[], list:[] }];
+  let calls = 0;
+  const result = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => pages[calls++], pageSize:100, maxPages:10 });
+  assert.equal(result.completed, true);
+  assert.equal(result.pagesRead, 2);
+  assert.equal(result.terminalCondition, 'empty-raw-page');
+});
+
+test('all-zero full raw page does not terminate on an empty normalized list', async () => {
+  const zeroPage = Array.from({ length:100 }, (_, i) => ({ ItemCode:`ZERO-${i}`, Quantity1:0 }));
+  const pages = [{ ok:true, result:zeroPage, list:[] }, { ok:true, result:[], list:[] }];
+  const starts = [];
+  const result = await policy.walkAuthoritativeInventoryPages({ fetchPage:async ({ rowStart }) => { starts.push(rowStart); return pages[starts.length-1]; }, pageSize:100, maxPages:10 });
+  assert.deepEqual(starts, [0, 100]);
+  assert.equal(result.completed, true);
+  assert.equal(result.evidence[0].terminal, false);
+  assert.equal(result.evidence[0].filteredCount, 100);
+});
+
+test('intermediate timeout is an error and never a terminal page', async () => {
+  const full = Array.from({ length:100 }, (_, i) => ({ ItemCode:`I-${i}` }));
+  const pages = [{ ok:true, result:full, list:full }, { ok:false, result:[], list:[], error:'Shaygan request timeout' }];
+  let calls = 0;
+  const result = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => pages[calls++], pageSize:100, maxPages:10 });
+  assert.equal(result.ok, false);
+  assert.equal(result.completed, false);
+  assert.equal(result.pagesRead, 2);
+  assert.equal(result.terminalCondition, 'source-error');
+  assert.match(result.error, /timeout/i);
+});
+
+test('explicit TotalRecords metadata takes precedence over filtered counts', async () => {
+  const raw = Array.from({ length:100 }, (_, i) => ({ ItemCode:`I-${i}` }));
+  const evidence = policy.authoritativeInventoryPageEvidence({ ok:true, raw:{ TotalRecords:150 }, result:raw, list:raw.slice(0, 80) }, { rowStart:0, rowCount:100 });
+  assert.equal(evidence.totalRecords, 150);
+  assert.equal(evidence.terminal, false);
+  const final = policy.authoritativeInventoryPageEvidence({ ok:true, raw:{ TotalRecords:150 }, result:raw.slice(0, 50), list:raw.slice(0, 45) }, { rowStart:100, rowCount:100 });
+  assert.equal(final.terminal, true);
+  assert.equal(final.terminalCondition, 'total-records-reached');
+});
+
+test('repeated full pages are bounded by maxPages instead of being mistaken for completion', async () => {
+  const full = Array.from({ length:100 }, (_, i) => ({ ItemCode:`I-${i}` }));
+  const result = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => ({ ok:true, result:full, list:full }), pageSize:100, maxPages:3 });
+  assert.equal(result.ok, true);
+  assert.equal(result.completed, false);
+  assert.equal(result.pagesRead, 3);
+  assert.equal(result.terminalCondition, 'max-pages-guard');
+});
+
 test('server keeps exact verification authoritative and does not perform a request-time full catalog scan', () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
   const verify = source.slice(source.indexOf('async function verifyMissingStockRowsLive'), source.indexOf('async function ensureItemInventoryFresh'));
@@ -139,6 +251,11 @@ test('automatic reconciliation completes positive stock reads before bounded exa
   assert.match(reconcile, /broadQuantityDirections/);
   assert.match(reconcile, /quantityDirections:r\.quantityDirections/);
   assert.match(reconcile, /quantityDirectionSamples:\(r\.quantityDirectionSamples\|\|\[\]\)\.slice\(0,50\)/);
+  assert.match(reconcile, /pageEvidence:\(r\.pageEvidence\|\|\[\]\)\.slice\(0,300\)/);
+  const stockSync = source.slice(source.indexOf('async function syncInventoryStock'), source.indexOf('async function syncInventoryGlobal'));
+  assert.match(stockSync, /walkAuthoritativeInventoryPages/);
+  assert.doesNotMatch(stockSync, /res\.list\.length\s*<\s*100/);
+  assert.doesNotMatch(stockSync, /!res\.list\.length/);
 });
 
 test('direction evidence remains bounded and excludes unchanged rows', () => {
