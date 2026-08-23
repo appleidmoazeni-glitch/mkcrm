@@ -138,4 +138,14 @@ test('automatic reconciliation completes positive stock reads before bounded exa
   assert.match(reconcile, /oldestQueueAge/);
   assert.match(reconcile, /broadQuantityDirections/);
   assert.match(reconcile, /quantityDirections:r\.quantityDirections/);
+  assert.match(reconcile, /quantityDirectionSamples:\(r\.quantityDirectionSamples\|\|\[\]\)\.slice\(0,50\)/);
+});
+
+test('direction evidence remains bounded and excludes unchanged rows', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
+  const upsert = source.slice(source.indexOf('async function upsertInventoryRows'), source.indexOf('async function readInventoryRowsForItem'));
+  assert.match(upsert, /quantityDirectionSamples\.length < 25/);
+  assert.match(upsert, /direction !== 'unchanged'/);
+  assert.match(upsert, /beforeQuantity/);
+  assert.match(upsert, /afterQuantity/);
 });
