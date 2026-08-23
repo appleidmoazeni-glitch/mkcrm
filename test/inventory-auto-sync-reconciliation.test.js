@@ -148,4 +148,6 @@ test('direction evidence remains bounded and excludes unchanged rows', () => {
   assert.match(upsert, /direction !== 'unchanged'/);
   assert.match(upsert, /beforeQuantity/);
   assert.match(upsert, /afterQuantity/);
+  assert.match(upsert, /itemCode:String\(x\.itemCode\|\|''\), stockNumber:String\(x\.stockNumber\|\|''\)/);
+  assert.doesNotMatch(upsert, /itemCode:String\(x\.itemCode\|\|''\)\.trim\(\), stockNumber:String\(x\.stockNumber\|\|''\)\.trim\(\)/);
 });

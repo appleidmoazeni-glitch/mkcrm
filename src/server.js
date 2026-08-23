@@ -895,7 +895,11 @@ async function upsertInventoryRows(db, rows, meta = {}) {
   const quantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
   const quantityDirectionSamples = [];
   if (isAutoPositiveSource && arr.length) {
-    const keys = arr.map(x => ({ itemCode:String(x.itemCode||'').trim(), stockNumber:String(x.stockNumber||'').trim() })).filter(x=>x.itemCode&&x.stockNumber);
+    // Match the stored WebService identity byte-for-byte. Some authoritative
+    // Shaygan ItemCodes contain trailing whitespace in both the source row and
+    // the existing inventory row; trimming only the lookup made every cycle
+    // misclassify those stable rows as newly inserted.
+    const keys = arr.map(x => ({ itemCode:String(x.itemCode||''), stockNumber:String(x.stockNumber||'') })).filter(x=>x.itemCode.trim()&&x.stockNumber.trim());
     const existing = await db.collection('itemInventoryCatalog').find({ $or:keys.slice(0,150).map(k=>({ itemCode:k.itemCode, stockNumber:k.stockNumber })) }, { projection:{ itemCode:1, stockNumber:1, quantity:1, pendingShayganConfirm:1, lastLocalSaleDeductAt:1, inventoryAuthority:1, lastAuthoritativeExactAt:1 } }).toArray().catch(()=>[]);
     existing.forEach(row => existingByKey.set(`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`, row));
     const blocked = new Set();
