@@ -49,6 +49,15 @@ function shouldProtectExactFromBroad(existing = {}, incoming = {}) {
   return Number(existing.quantity || 0) !== Number(incoming.quantity ?? incoming.Quantity1 ?? 0);
 }
 
+function classifyBroadQuantityDirection(existing, incoming = {}) {
+  if (!existing) return 'newRows';
+  const current = Number(existing.quantity || 0);
+  const next = Number(incoming.quantity ?? incoming.Quantity1 ?? 0);
+  if (next > current) return 'increases';
+  if (next < current) return 'decreases';
+  return 'unchanged';
+}
+
 function retryDelayMs(attemptCount = 1, baseMs = 60000, maxMs = 15 * 60 * 1000) {
   const exponent = Math.max(0, Math.min(6, Number(attemptCount || 1) - 1));
   return Math.min(Math.max(1000, Number(maxMs || 0)), Math.max(1000, Number(baseMs || 0)) * (2 ** exponent));
@@ -89,6 +98,7 @@ module.exports = {
   eligibleAtFilter,
   staleEligibleAtFilter,
   shouldProtectExactFromBroad,
+  classifyBroadQuantityDirection,
   retryDelayMs,
   boundedBudget,
   budgetAllowsAttempt,

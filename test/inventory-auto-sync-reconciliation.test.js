@@ -54,6 +54,14 @@ test('weaker broad mismatch cannot overwrite an exact authoritative quantity', (
   assert.equal(policy.shouldProtectExactFromBroad({ inventoryAuthority:'exact-getremain', quantity:1 }, { quantity:1 }), false);
 });
 
+test('broad positive source classifies every supported quantity direction', () => {
+  assert.equal(policy.classifyBroadQuantityDirection(null, { quantity:1 }), 'newRows');
+  assert.equal(policy.classifyBroadQuantityDirection({ quantity:0 }, { quantity:2 }), 'increases');
+  assert.equal(policy.classifyBroadQuantityDirection({ quantity:1 }, { quantity:3 }), 'increases');
+  assert.equal(policy.classifyBroadQuantityDirection({ quantity:5 }, { quantity:2 }), 'decreases');
+  assert.equal(policy.classifyBroadQuantityDirection({ quantity:2 }, { quantity:2 }), 'unchanged');
+});
+
 test('bounded exact-verification budget stops on item count without draining backlog', () => {
   const budget = policy.boundedBudget({ maxItems:30, budgetMs:90000, startedAt:Date.now() });
   assert.equal(policy.budgetAllowsAttempt(budget, 29), true);
@@ -128,4 +136,6 @@ test('automatic reconciliation completes positive stock reads before bounded exa
   assert.match(reconcile, /newIdentityAttempted/);
   assert.match(reconcile, /stalePositiveAttempted/);
   assert.match(reconcile, /oldestQueueAge/);
+  assert.match(reconcile, /broadQuantityDirections/);
+  assert.match(reconcile, /quantityDirections:r\.quantityDirections/);
 });

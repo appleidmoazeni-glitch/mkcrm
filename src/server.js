@@ -892,6 +892,7 @@ async function upsertInventoryRows(db, rows, meta = {}) {
   const sourceProbe = String(meta.source || arr[0]?.syncSource || arr[0]?.refreshSource || arr[0]?.source || '').toLowerCase();
   const isAutoPositiveSource = /auto|global|getremain|stock-filter|reconciliation|inventory-stock/.test(sourceProbe) && !/live|exact|item-refresh|kardex|debug/.test(sourceProbe);
   const existingByKey = new Map();
+  const quantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
   if (isAutoPositiveSource && arr.length) {
     const keys = arr.map(x => ({ itemCode:String(x.itemCode||'').trim(), stockNumber:String(x.stockNumber||'').trim() })).filter(x=>x.itemCode&&x.stockNumber);
     const existing = await db.collection('itemInventoryCatalog').find({ $or:keys.slice(0,150).map(k=>({ itemCode:k.itemCode, stockNumber:k.stockNumber })) }, { projection:{ itemCode:1, stockNumber:1, quantity:1, pendingShayganConfirm:1, lastLocalSaleDeductAt:1, inventoryAuthority:1, lastAuthoritativeExactAt:1 } }).toArray().catch(()=>[]);
@@ -905,12 +906,21 @@ async function upsertInventoryRows(db, rows, meta = {}) {
     if (blocked.size) {
       const before = arr.length;
       arr = arr.filter(x => !blocked.has(`${String(x.itemCode||'').trim()}::${String(x.stockNumber||'').trim()}`));
+      quantityDirections.localSaleProtected = before-arr.length;
       await db.collection('appLogs').insertOne({ type:'inventory_auto_positive_skipped_after_local_sale_deduct', skipped:before-arr.length, source:sourceProbe, at:now }).catch(()=>{});
     }
     const precedenceConflicts = arr.filter(row => inventoryAutoSyncPolicy.shouldProtectExactFromBroad(
       existingByKey.get(`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`) || {},
       row
     ));
+    quantityDirections.precedenceConflicts = precedenceConflicts.length;
+    const precedenceKeys = new Set(precedenceConflicts.map(row=>`${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`));
+    for (const row of arr) {
+      const key = `${String(row.itemCode||'').trim()}::${String(row.stockNumber||'').trim()}`;
+      if (precedenceKeys.has(key)) continue;
+      const existingRow = existingByKey.get(key);
+      quantityDirections[inventoryAutoSyncPolicy.classifyBroadQuantityDirection(existingRow, row)]++;
+    }
     if (precedenceConflicts.length) {
       const conflictOps = precedenceConflicts.map(row => ({ updateOne:{
         filter:{ itemCode:String(row.itemCode||'').trim(), stockNumber:String(row.stockNumber||'').trim() },
@@ -961,6 +971,7 @@ async function upsertInventoryRows(db, rows, meta = {}) {
   const itemOps = [...itemMap.values()].map(x => ({ updateOne: { filter: { itemCode: x.itemCode }, update: { $set: { itemCode:x.itemCode, itemDescription:x.itemDescription, itemGuid:x.itemGuid, searchText: normalizeFa(`${x.itemCode} ${x.itemDescription}`), syncedAt: now, updatedAt: now } }, upsert:true } }));
   if (itemOps.length) await db.collection('itemCatalog').bulkWrite(itemOps, { ordered:false }).catch(()=>{});
   if (arr.length) await canonicalItemCatalog.ensureCatalogItems(db, arr, { source:meta.source || sourceProbe || 'inventory-getremain' });
+  return { acceptedRows:arr.length, quantityDirections, source:sourceProbe || meta.source || 'inventory-positive-evidence' };
 }
 
 
@@ -1841,6 +1852,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
   const startedAt = new Date();
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, lastStockNumber:st, lastStartedAt:startedAt, lastError:'', lastResult:null });
   let total = 0, page = 0, endedNaturally = false;
+  const quantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
   const jobControl=opts.jobControl;
   try {
     for (let rowStart = 0; page < safePages; page++, rowStart += 100) {
@@ -1856,7 +1868,8 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       if (!res.list.length) { endedNaturally = true; break; }
       jobControl?.checkCancellation?.();
       const rows = (res.list || []).map(x => ({ ...x, stockNumber:String(x.stockNumber || st), syncBatchId:batchId, syncStockNumber:st, syncSource:opts.source || 'stock-filter-positive-sync' }));
-      await upsertInventoryRows(db, rows);
+      const persisted = await upsertInventoryRows(db, rows, { source:opts.source || 'stock-filter-positive-sync' });
+      for (const key of Object.keys(quantityDirections)) quantityDirections[key] += Number(persisted?.quantityDirections?.[key] || 0);
       total += rows.length;
       jobControl?.progress?.({phase:'Persist inventory',current:page+1,total:safePages,message:`Persisted warehouse ${st}, page ${page+1}`});
       jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
@@ -1883,7 +1896,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       queuedForLiveVerify = Number(remaining.modifiedCount||0);
       liveMissingVerify = { deferred:true, checked:0, zeroedCount:0, failed:0, remainingQueued:queuedForLiveVerify, results:[] };
     }
-    const result = { ok:true, stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
+    const result = { ok:true, stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, quantityDirections, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
     await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', stockNumber:st, total, pages:page, completed, endedNaturally, removedStale, batchId, at:new Date(), source:opts.source || 'manual', durationMs:result.durationMs }).catch(()=>{});
     await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:'' });
     return result;
@@ -2011,6 +2024,7 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   let stockTotal = 0;
   let stockCompleted = 0;
   let protectedFromStale = 0;
+  const broadQuantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
   for (let warehouseIndex=0; warehouseIndex<(active||[]).length; warehouseIndex++) {
     const st=active[warehouseIndex];
     jobControl?.progress?.({phase:'Reading warehouses',current:warehouseIndex,total:active.length,message:`Starting warehouse ${st}`});
@@ -2020,7 +2034,8 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
     stockTotal += Number(r.total || 0);
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
-    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, error:r.error||'' });
+    for (const key of Object.keys(broadQuantityDirections)) broadQuantityDirections[key] += Number(r.quantityDirections?.[key] || 0);
+    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, pages:r.pages||0, completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, quantityDirections:r.quantityDirections||null, error:r.error||'' });
     jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);
@@ -2040,7 +2055,7 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   const oldestQueueAge = Math.max(Number(newItemVerification.queueAfter?.oldestAgeMs||0), Number(missingVerification.queueAfter?.oldestAgeMs||0));
   const result = {
     ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active,
-    stockRows:stockTotal, stockCompleted, protectedFromStale,
+    stockRows:stockTotal, stockCompleted, protectedFromStale, broadQuantityDirections,
     stockSyncDurationMs, broadSyncDuration:stockSyncDurationMs,
     exactVerificationDurationMs, exactVerificationDuration:exactVerificationDurationMs,
     newIdentityAttempted:Number(newItemVerification.checked||0),
