@@ -15,12 +15,19 @@ test('missing-row verification is oldest-first so a successful exact read rotate
 
 test('reserved queue classes make new identity and stale-positive progress independently', () => {
   assert.deepEqual(policy.QUEUE_CLASSES, { NEW_IDENTITY:'NEW_IDENTITY', STALE_POSITIVE:'STALE_POSITIVE' });
-  const newBudget = policy.boundedBudget({ maxItems:5, budgetMs:15000, startedAt:Date.now() });
+  const newBudget = policy.boundedBudget({ maxItems:20, budgetMs:45000, startedAt:Date.now() });
   const staleBudget = policy.boundedBudget({ maxItems:30, budgetMs:90000, startedAt:Date.now() });
   assert.equal(policy.budgetAllowsAttempt(newBudget, 0), true);
   assert.equal(policy.budgetAllowsAttempt(staleBudget, 0), true);
-  assert.equal(policy.budgetAllowsAttempt(newBudget, 5), false);
+  assert.equal(policy.budgetAllowsAttempt(newBudget, 20), false);
   assert.equal(policy.budgetAllowsAttempt(staleBudget, 30), false);
+});
+
+test('new identity defaults remain bounded below the five-minute Staging cadence', () => {
+  const configSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'config.js'), 'utf8');
+  assert.match(configSource, /inventoryNewItemVerifyCycleLimit: Number\(process\.env\.INVENTORY_NEW_ITEM_VERIFY_CYCLE_LIMIT \|\| 20\)/);
+  assert.match(configSource, /inventoryNewItemVerifyBudgetMs: Number\(process\.env\.INVENTORY_NEW_ITEM_VERIFY_BUDGET_MS \|\| 45000\)/);
+  assert.ok(45000 < 300000);
 });
 
 test('261 stale candidates all receive a turn under the 30-item rotating budget', () => {
