@@ -44,6 +44,14 @@ function staleEligibleAtFilter(now = new Date()) {
   return { $or:[{ nextLiveVerifyEligibleAt:{ $exists:false } }, { nextLiveVerifyEligibleAt:null }, { nextLiveVerifyEligibleAt:{ $lte:now } }] };
 }
 
+function broadMissingEligibleFilter(recheckBefore = new Date()) {
+  return { $or:[
+    { lastAuthoritativeExactAt:{ $exists:false } },
+    { lastAuthoritativeExactAt:null },
+    { lastAuthoritativeExactAt:{ $lte:recheckBefore } }
+  ] };
+}
+
 function shouldProtectExactFromBroad(existing = {}, incoming = {}) {
   const exact = existing.inventoryAuthority === 'exact-getremain' || Boolean(existing.lastAuthoritativeExactAt);
   if (!exact) return false;
@@ -191,6 +199,7 @@ module.exports = {
   discoveryVerificationSort,
   eligibleAtFilter,
   staleEligibleAtFilter,
+  broadMissingEligibleFilter,
   shouldProtectExactFromBroad,
   classifyBroadQuantityDirection,
   extractTotalRecords,

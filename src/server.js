@@ -1105,8 +1105,10 @@ async function authoritativeLiveReconcileItem(db, itemCode, reason = 'authoritat
 async function verifyMissingStockRowsLive(db, stockNumber, batchId, reason = 'stock-sync-missing-live-verify') {
   const st = String(stockNumber || '').trim();
   const limit = Math.max(1, Number(process.env.INVENTORY_MISSING_LIVE_VERIFY_LIMIT || 100));
+  const exactRecheckBefore = new Date(Date.now() - Math.max(0, Number(config.inventoryExactPositiveRecheckMs || 900000)));
+  const broadMissingEligible = inventoryAutoSyncPolicy.broadMissingEligibleFilter(exactRecheckBefore);
   const candidates = await db.collection('itemInventoryCatalog').find(
-    { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId } },
+    { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId }, ...broadMissingEligible },
     { projection:{ itemCode:1 } }
   ).sort(inventoryAutoSyncPolicy.missingVerificationSort()).limit(limit).toArray().catch(()=>[]);
   const codes = [...new Set(candidates.map(x=>String(x.itemCode||'').trim()).filter(Boolean))];
@@ -1116,7 +1118,7 @@ async function verifyMissingStockRowsLive(db, stockNumber, batchId, reason = 'st
     results.push({ itemCode:code, ok:!!r.ok, zeroedCount:Number(r.zeroedCount||0), missingStocks:r.missingStocks||[], error:r.error||'' });
   }
   const remaining = await db.collection('itemInventoryCatalog').updateMany(
-    { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId } },
+    { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId }, ...broadMissingEligible },
     { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, verificationQueueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.STALE_POSITIVE, verificationReason:'broad-missing-crm-positive', lastMissingInStockAt:new Date(), lastQueuedAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
   ).catch(()=>({ modifiedCount:0 }));
   return { checked:codes.length, zeroedCount:results.reduce((s,x)=>s+Number(x.zeroedCount||0),0), failed:results.filter(x=>!x.ok).length, remainingQueued:Number(remaining.modifiedCount||0), results };
@@ -1916,8 +1918,9 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       removedStale = Number(liveMissingVerify.zeroedCount || 0);
       queuedForLiveVerify = Number(liveMissingVerify.remainingQueued || 0);
     } else if (completed) {
+      const exactRecheckBefore = new Date(Date.now() - Math.max(0, Number(config.inventoryExactPositiveRecheckMs || 900000)));
       const remaining = await db.collection('itemInventoryCatalog').updateMany(
-        { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId } },
+        { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId }, ...inventoryAutoSyncPolicy.broadMissingEligibleFilter(exactRecheckBefore) },
         { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, verificationQueueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.STALE_POSITIVE, verificationReason:'broad-missing-crm-positive', lastMissingInStockAt:new Date(), lastQueuedAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
       ).catch(()=>({ modifiedCount:0 }));
       queuedForLiveVerify = Number(remaining.modifiedCount||0);

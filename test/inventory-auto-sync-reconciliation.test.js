@@ -30,6 +30,17 @@ test('new identity defaults remain bounded below the five-minute Staging cadence
   assert.ok(45000 < 300000);
 });
 
+test('recent exact-positive evidence is not immediately requeued by a weaker broad omission', () => {
+  const cutoff = new Date('2026-08-23T10:00:00.000Z');
+  assert.deepEqual(policy.broadMissingEligibleFilter(cutoff), { $or:[
+    { lastAuthoritativeExactAt:{ $exists:false } },
+    { lastAuthoritativeExactAt:null },
+    { lastAuthoritativeExactAt:{ $lte:cutoff } }
+  ] });
+  const configSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'config.js'), 'utf8');
+  assert.match(configSource, /inventoryExactPositiveRecheckMs: Number\(process\.env\.INVENTORY_EXACT_POSITIVE_RECHECK_MS \|\| 900000\)/);
+});
+
 test('261 stale candidates all receive a turn under the 30-item rotating budget', () => {
   const rows = Array.from({ length:261 }, (_, index) => ({
     itemCode:`ITEM-${String(index).padStart(3, '0')}`,
