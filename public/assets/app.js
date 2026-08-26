@@ -690,6 +690,7 @@ const uiPageLifecycle=(()=>{
   const PAGE='fifo-shadow-validation';
   const q=selector=>document.querySelector(selector);
   let selectedDatasetId='';
+  let allocationGeneration=0;
   function safe(value){return esc(value==null?'':String(value));}
   function number(value){
     const n=Number(value);
@@ -788,6 +789,7 @@ const uiPageLifecycle=(()=>{
   }
   async function loadAllocations(){
     const box=q('#fifoAllocations');if(!box)return;
+    const generation=++allocationGeneration;
     const response=await json('/api/accounting/fifo-shadow/allocations?'+query({
       datasetId:selectedDatasetId,
       invoiceNo:q('#fifoInvoice')?.value||'',
@@ -795,6 +797,7 @@ const uiPageLifecycle=(()=>{
       sourceType:q('#fifoSource')?.value||'',
       pageSize:200
     }));
+    if(generation!==allocationGeneration||!box.isConnected)return;
     const rows=response.list||[];
     const amount=value=>value==null?null:Number(value);
     const costEffect=row=>amount(row.allocatedCostAmountExact??row.allocatedCostAmount);

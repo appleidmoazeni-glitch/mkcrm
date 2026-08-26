@@ -146,6 +146,8 @@ test('FIFO Candidate UI explains sale, return, cost source and net effect withou
   assert.match(view,/اثر خالص/);
   assert.match(view,/originalAllocationId/);
   assert.match(view,/returnLinkageSource/);
+  assert.match(view,/generation!==allocationGeneration/);
+  assert.match(view,/!box\.isConnected/);
   assert.doesNotMatch(view,/JSON\.stringify/);
   const finalRegistry=ui.slice(ui.indexOf('Financial operations navigation — final, single registry.'));
   assert.match(finalRegistry,/\{id:'fifo-shadow-validation',label:'اعتبارسنجی FIFO Shadow'\}/);
