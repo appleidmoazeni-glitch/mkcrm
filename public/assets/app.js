@@ -778,7 +778,7 @@ const uiPageLifecycle=(()=>{
           <h5>Purchase Returns</h5><div class="info">کل: ${number(summary.purchaseReturns?.total)} | unresolved: ${number(summary.purchaseReturns?.unresolved)}</div>
         </div></div>
         <div class="card"><div class="card-header"><h5>Allocation Drill-down</h5></div><div class="card-body">
-          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Official</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
+          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Official</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
           <div id="fifoAllocations"></div>
         </div></div>
         <div class="info">Build: ${number(dataset.performance?.durationMs)} ms | Mongo read: ${number(dataset.performance?.mongoReadMs)} ms | Allocate: ${number(dataset.performance?.allocationMs)} ms | Mongo write: ${number(dataset.performance?.mongoWriteMs)} ms | Peak observed heap: ${number((dataset.performance?.peakObservedHeapBytes||0)/1024/1024)} MiB</div>`;
@@ -795,13 +795,30 @@ const uiPageLifecycle=(()=>{
       sourceType:q('#fifoSource')?.value||'',
       pageSize:200
     }));
-    box.innerHTML=`<div class="small">Rows: ${number(response.total)}</div><table class="table"><thead><tr><th>Sale</th><th>Item</th><th>Qty</th><th>Source</th><th>Purchase / Manual</th><th>Unit Cost</th><th>Layer Remaining</th><th>Reason</th></tr></thead><tbody>${(response.list||[]).map(row=>`<tr>
-      <td>${safe(row.saleInvoiceNo)} / ${safe(row.saleDate)}<br><small>${safe(row.saleLineId)}</small></td>
-      <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}</small></td>
-      <td>${number(row.allocatedQty||row.unknownQty)}</td><td>${safe(row.sourceType)}</td>
-      <td><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small></td>
-      <td>${row.unitCost==null?'UNKNOWN':number(row.unitCost)}</td><td>${row.layerRemainingQuantity==null?'—':number(row.layerRemainingQuantity)}</td><td>${safe(row.unknownReason)}</td>
-    </tr>`).join('')||'<tr><td colspan="8">رکوردی وجود ندارد.</td></tr>'}</tbody></table>`;
+    const rows=response.list||[];
+    const amount=value=>value==null?null:Number(value);
+    const costEffect=row=>amount(row.allocatedCostAmountExact??row.allocatedCostAmount);
+    const saleEffect=row=>amount(row.allocatedSaleValueExact??row.allocatedSaleValue);
+    const knownRows=rows.filter(row=>costEffect(row)!=null);
+    const netSale=rows.reduce((sum,row)=>sum+(saleEffect(row)||0),0);
+    const provenSale=knownRows.reduce((sum,row)=>sum+(saleEffect(row)||0),0);
+    const netCost=knownRows.reduce((sum,row)=>sum+costEffect(row),0);
+    const sourceLabel=row=>row.sourceType==='sale_return_reversal'
+      ? `برگشت از فروش ← فروش ${safe(row.originSaleInvoiceNo||'—')}`
+      : row.sourceType==='official_purchase_layer'?'فروش — مأخذ خرید رسمی'
+      : row.sourceType==='unknown_cost'?'فروش — مأخذ هزینه نامشخص'
+      : `فروش — ${safe(row.sourceType)}`;
+    const provenance=row=>row.sourceType==='sale_return_reversal'
+      ? `فاکتور خرید ${safe(row.purchaseInvoiceNo||'—')}<br><small>تخصیص معکوس: ${safe(row.originalAllocationId||'—')}<br>${safe(row.returnLinkageSource||'')} ${safe(row.returnLinkageReference||'')}</small>`
+      : `فاکتور خرید ${safe(row.purchaseInvoiceNo||'—')}<br><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small>`;
+    box.innerHTML=`<div class="small">Rows: ${number(response.total)}</div>
+      <div class="info"><b>اثر خالص ردیف‌های نمایش‌داده‌شده</b><br>فروش/برگشت: ${number(netSale)} ریال | هزینه FIFO اثبات‌شده: ${number(netCost)} ریال | سود خالص فقط ردیف‌های اثبات‌شده: ${number(provenSale-netCost)} ریال${knownRows.length!==rows.length?' | ردیف هزینه‌نامشخص در سود اثبات‌شده محاسبه نشده است.':''}</div>
+      <table class="table"><thead><tr><th>فروش / برگشت از فروش</th><th>کالا / فروشنده</th><th>تعداد</th><th>مأخذ هزینه</th><th>اثر فروش</th><th>اثر هزینه</th><th>اثر خالص</th><th>وضعیت</th></tr></thead><tbody>${rows.map(row=>{const sale=saleEffect(row),cost=costEffect(row);return `<tr>
+      <td><b>${sourceLabel(row)}</b><br>فاکتور ${safe(row.saleInvoiceNo)} / ${safe(row.saleDate)}<br><small>${safe(row.saleLineId)}</small></td>
+      <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}<br>${safe(row.sellerName||row.sellerAccountNumber||'')}</small></td>
+      <td>${number(row.allocatedQty||row.unknownQty)}</td><td>${provenance(row)}</td>
+      <td>${number(sale||0)}</td><td>${cost==null?'UNKNOWN':number(cost)}</td><td>${cost==null?'UNKNOWN':number((sale||0)-cost)}</td><td>${safe(row.returnEffect||row.unknownReason||'اثبات‌شده')}</td>
+    </tr>`;}).join('')||'<tr><td colspan="8">رکوردی وجود ندارد.</td></tr>'}</tbody></table>`;
   }
   async function startBuild(resumeDatasetId=''){
     const message=q('#fifoJob');message.innerHTML='<div class="info">در حال ثبت Job...</div>';

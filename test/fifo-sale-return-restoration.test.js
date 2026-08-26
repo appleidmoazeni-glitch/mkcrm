@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
 const fifo = require('../src/lib/fifo-shadow-engine');
 
 function sale(overrides={}){
@@ -60,6 +62,16 @@ test('FIFO-RET-01 restores the exact Purchase 101 cost after Return 51 for Sale 
   assert.equal(originalFact.fifoCostExact,'0.00');
   assert.equal(originalFact.fifoProfitExact,'0.00');
   assert.equal(originalFact.sellerIdentity,'11701129');
+  assert.equal(originalFact.costSourceType,'OFFICIAL_PURCHASE_LAYER');
+  const returnSource=originalFact.provenanceSources.find(row=>row.returnProvenance);
+  assert.equal(returnSource.returnProvenance.returnInvoiceNumber,51);
+  assert.equal(returnSource.returnProvenance.originSaleInvoiceNumber,1892);
+  assert.equal(returnSource.returnProvenance.originSaleLineId,'SL-2-1892-001-10M8150930');
+  assert.equal(returnSource.returnProvenance.reversedAllocationId,first[0].allocationId);
+  assert.equal(returnSource.returnProvenance.linkageSource,'SOURCE_GENERAL_REF');
+  assert.equal(returnSource.returnProvenance.linkageReference,'1892');
+  assert.equal(returnSource.returnProvenance.restoredQuantityExact,'1.000000');
+  assert.equal(returnSource.returnProvenance.restoredCostAmountExact,'2391986526.70');
   assert.equal(laterFact.fifoCostExact,'2391986526.70');
   assert.equal(laterFact.fifoProfitExact,'1008013473.30');
   assert.equal(laterFact.sellerIdentity,'11701150');
@@ -122,4 +134,17 @@ test('unlinked return and return of unknown original cost never restore a fake c
   assert.equal(result.allocations.find(row=>row.saleLineId==='RETURN-UNKNOWN').unknownQty,-1);
   assert.equal(result.allocations.find(row=>row.saleLineId==='SALE-LATER').sourceType,'unknown_cost');
   assert.equal(result.allocations.some(row=>row.saleLineId==='RETURN-UNLINKED'),false);
+});
+
+test('FIFO Candidate UI explains sale, return, cost source and net effect without raw JSON',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  const start=ui.indexOf('async function loadAllocations()');
+  const end=ui.indexOf('async function startBuild',start);
+  const view=ui.slice(start,end);
+  assert.match(view,/فروش \/ برگشت از فروش/);
+  assert.match(view,/مأخذ هزینه/);
+  assert.match(view,/اثر خالص/);
+  assert.match(view,/originalAllocationId/);
+  assert.match(view,/returnLinkageSource/);
+  assert.doesNotMatch(view,/JSON\.stringify/);
 });
