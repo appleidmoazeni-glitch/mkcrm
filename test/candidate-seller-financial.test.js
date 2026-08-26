@@ -14,6 +14,7 @@ test('Candidate Seller Financial UI is Persian-first, candidate-scoped and expos
   for(const contract of ['CANDIDATE / NON-ACTIVE / NON-PAYROLL','فروش ناخالص','برگشت از فروش','فروش خالص مالی','سود FIFO اثبات‌شده','پوشش مبلغ فروش','Product Category رسمی','csfSeller','csfCategory','csfItem','csfInvoice','csfProvenance','csfSupplier','csfSaleMin','csfProfitMin','csfMarginMin'])assert.match(phase,new RegExp(contract));
   assert.match(phase,/runId:q\('#csfRun'\)/);assert.match(phase,/requestGeneration|generation/);assert.match(phase,/current!==generation/);assert.match(phase,/current!==drillGeneration/);
   assert.match(phase,/seller-financial-performance\/category-totals/);assert.doesNotMatch(phase,/csfRun'\)\.onchange=\(\)=>render/);
+  assert.match(phase,/clearCandidateDrill/);assert.match(phase,/event\.target\?\.id==='csfApply'/);
 });
 
 test('Candidate financial build route materializes canonical FIFO facts and never activates FIFO or payroll',()=>{
