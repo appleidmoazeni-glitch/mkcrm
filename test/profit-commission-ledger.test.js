@@ -65,6 +65,13 @@ test('immutable FIFO facts aggregate partial allocations and keep unknown cost n
   const replay=await ledger.materializeFifoProfitFacts(db,{},accountant);assert.equal(replay.duplicate,true);assert.equal(replay.factsFingerprint,result.factsFingerprint);assert.equal(db.collection(ledger.FIFO_FACTS).rows.length,3);
 });
 
+test('validated FIFO candidate materializes immutable candidate-only Profit Facts without activation',async()=>{
+  const db=seedDb(),dataset=db.collection('fifoDatasets').rows[0];dataset.activationStatus='validated-candidate';dataset.candidateFingerprint='b'.repeat(64);db.collection('fifoDatasetState').rows=[];
+  const result=await ledger.materializeFifoProfitFacts(db,{fifoDatasetId:'FIFO-APPROVED',candidateOnly:true},accountant);
+  assert.match(result.profitFactsDatasetId,/^PFACT-/);assert.equal(result.candidateOnly,true);assert.equal(result.active,false);assert.equal(result.nonPayable,true);
+  const fact=db.collection(ledger.FIFO_FACTS).rows[0];assert.equal(fact.profitFactsDatasetId,result.profitFactsDatasetId);assert.equal(fact.sourceRole,'CANDIDATE');assert.equal(fact.active,false);assert.equal(fact.nonPayable,true);assert.ok(Array.isArray(fact.fifoAllocationIds));assert.ok(Array.isArray(fact.sourcePurchaseInvoiceNumbers));
+});
+
 test('saved-profit credit preserves company FIFO profit and changes only commissionable profit',async()=>{
   const{db}=await materialized();
   const created=await ledger.createAdjustment(db,{fifoDatasetId:'FIFO-APPROVED',saleLineIdentity:'SL-2-4691-001-NB',adjustmentType:'saved_profit_credit',categoryPool:'NOTEBOOK',proposedAmountExact:'100',effectivePeriod:'140504',reasonCode:'HIGH_PROFIT',reasonText:'management decision'},accountant);

@@ -4155,7 +4155,15 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await sellerFinancialPerformance.status(db,config.sellerFinancialReadModelEnabled,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_STATUS_FAILED');}
     }
-    if(pathname.startsWith(sellerFinancialPrefix)&&!config.sellerFinancialReadModelEnabled){
+    if(pathname===`${sellerFinancialPrefix}/candidate-build`&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();const fifoDatasetId=String(body.fifoDatasetId||'').trim().slice(0,100);
+      try{
+        const facts=await profitCommissionLedger.materializeFifoProfitFacts(db,{fifoDatasetId,candidateOnly:true},currentUser(req));
+        const request={fifoDatasetId,candidateOnly:true,batchSize:Number(body.batchSize||500),maxAttempts:Number(body.maxAttempts||3)};
+        const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request,createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now,candidateOnly:true,nonPayable:true});startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,facts,status:'queued',candidateOnly:true,active:false,nonPayable:true});
+      }catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_CANDIDATE_BUILD_FAILED');}
+    }
+    if(pathname.startsWith(sellerFinancialPrefix)&&!config.sellerFinancialReadModelEnabled&&!query.runId){
       return sendJson(res,503,{ok:false,code:'SELLER_FINANCIAL_READ_MODEL_DISABLED',error:'Seller Financial Performance Read Model is disabled by feature flag.'});
     }
     if(pathname===`${sellerFinancialPrefix}/runs`&&req.method==='GET'){
@@ -4164,7 +4172,7 @@ async function handleApi(req, res, pathname, query) {
     }
     if(pathname===`${sellerFinancialPrefix}/filters`&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
-      try{return sendJson(res,200,await sellerFinancialPerformance.filterOptions(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FILTERS_FAILED');}
+      try{return sendJson(res,200,await sellerFinancialPerformance.filterOptions(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_FILTERS_FAILED');}
     }
     if(pathname===`${sellerFinancialPrefix}/freshness`&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
@@ -4199,6 +4207,10 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await sellerFinancialPerformance.totals(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_TOTALS_FAILED');}
     }
+    if(pathname===`${sellerFinancialPrefix}/category-totals`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.categoryTotals(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_CATEGORY_TOTALS_FAILED');}
+    }
     if(pathname===`${sellerFinancialPrefix}/invoices`&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await sellerFinancialPerformance.listInvoices(db,query,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_INVOICES_FAILED');}
@@ -4215,7 +4227,7 @@ async function handleApi(req, res, pathname, query) {
     const sellerFinancialDrilldown=pathname.match(/^\/api\/accounting\/seller-financial-performance\/lines\/(.+)\/drilldown$/);
     if(sellerFinancialDrilldown&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
-      try{return sendJson(res,200,await sellerFinancialPerformance.lineDrilldown(db,decodeURIComponent(sellerFinancialDrilldown[1]),currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_DRILLDOWN_FAILED');}
+      try{return sendJson(res,200,await sellerFinancialPerformance.lineDrilldown(db,decodeURIComponent(sellerFinancialDrilldown[1]),currentUser(req),query));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_DRILLDOWN_FAILED');}
     }
     const sellerFinancialFifo=pathname.match(/^\/api\/accounting\/seller-financial-performance\/lines\/(.+)\/fifo$/);
     if(sellerFinancialFifo&&req.method==='GET'){
@@ -4233,8 +4245,8 @@ async function handleApi(req, res, pathname, query) {
     if([`${sellerFinancialPrefix}/rebuild`,`${sellerFinancialPrefix}/resume`].includes(pathname)&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
       if(sellerFinancialJobManager.isRunning('seller-financial-performance')){const running=sellerFinancialJobManager.getRunning('seller-financial-performance');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Seller Financial Performance job is already running',jobId:running?.id||''});}
-      const request={...body};if(pathname.endsWith('/resume')&&!request.runId)return sendJson(res,400,{ok:false,code:'SELLER_FINANCIAL_RUN_ID_REQUIRED',error:'runId is required for resume'});
-      const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request:{runId:String(request.runId||'').trim().slice(0,100),batchSize:Number(request.batchSize||500),maxAttempts:Number(request.maxAttempts||3)},createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now});
+      const request={...body,candidateOnly:body.candidateOnly===true,fifoDatasetId:String(body.fifoDatasetId||'').trim().slice(0,100)};if(pathname.endsWith('/resume')&&!request.runId)return sendJson(res,400,{ok:false,code:'SELLER_FINANCIAL_RUN_ID_REQUIRED',error:'runId is required for resume'});
+      const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request:{runId:String(request.runId||'').trim().slice(0,100),fifoDatasetId:request.fifoDatasetId,candidateOnly:request.candidateOnly,batchSize:Number(request.batchSize||500),maxAttempts:Number(request.maxAttempts||3)},createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now});
       try{startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,status:'queued',runId:request.runId||'',nonPayable:true});}catch(error){await db.collection('appJobs').updateOne({jobId},{$set:{status:'failed',error:String(error.message||error),updatedAt:new Date()}}).catch(()=>{});return sendLedgerError(error,'SELLER_FINANCIAL_BUILD_FAILED');}
     }
     if(pathname==='/api/accounting/profit-ledger/init'&&req.method==='POST'){

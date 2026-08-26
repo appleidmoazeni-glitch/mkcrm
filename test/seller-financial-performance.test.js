@@ -130,6 +130,17 @@ test('seller is denied and projection source contract has no forbidden write int
   const db=dbSeed();await assert.rejects(service.status(db,true,seller),error=>error.code==='SELLER_FINANCIAL_FORBIDDEN');const source=fs.readFileSync(path.join(__dirname,'../src/lib/seller-financial-performance.js'),'utf8');for(const forbidden of ['Invoice/Put','PutSaleInvoice','PutBuyInvoice','supplierPurchaseLayers.update','fifoProfitFacts.update','saleSnapshotDatasetLines.update','itemInventoryCatalog.update'])assert.equal(source.includes(forbidden),false,forbidden);
 });
 
+test('validated FIFO candidate builds a non-active non-payroll Seller Financial candidate selectable by runId',async()=>{
+  const db=dbSeed();db.collection('fifoDatasets').rows[0].activationStatus='validated-candidate';db.collection('fifoDatasets').rows[0].candidateFingerprint='a'.repeat(64);db.collection('fifoDatasetState').rows=[];for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
+  const built=await service.buildReadModel(db,{fifoDatasetId:'FIFO-A',candidateOnly:true},accounting);
+  assert.equal(built.candidateOnly,true);assert.equal(built.active,false);assert.equal(built.activationStatus,'validated-candidate');assert.equal(await service.activeRun(db),null);
+  const run=db.collection(service.RUNS).rows.find(row=>row.runId===built.runId);assert.equal(run.active,false);assert.equal(run.nonPayable,true);assert.equal(run.sourceProfitFactsDatasetId,'PFACT-CANDIDATE');
+  const report=await service.listLines(db,{runId:built.runId,provenanceStatus:'PROVEN'},manager);assert.equal(report.total,1);assert.equal(report.candidateOnly,true);assert.equal(report.list[0].purchaseInvoiceNumbers[0],7001);
+  const totals=await service.totals(db,{runId:built.runId},manager);assert.equal(totals.active,false);assert.equal(totals.nonPayroll,true);assert.equal(totals.unknownExposureLineCount,1);
+  const categories=await service.categoryTotals(db,{runId:built.runId,provenanceStatus:'PROVEN',category:'NOTEBOOK'},manager);assert.equal(categories.total,1);assert.equal(categories.list[0].officialProductCategoryName,'NOTEBOOK');assert.equal(categories.list[0].unknownOrPartialSaleValueExact,'0.00');
+  const drill=await service.lineDrilldown(db,'LINE-1',manager,{runId:built.runId});assert.equal(drill.candidateOnly,true);assert.equal(drill.source.costProvenance[0].purchaseInvoiceNumber,7001);
+});
+
 test('existing seller-profit UI is upgraded without a duplicate page and keeps financial safety labels',()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
   assert.match(phase,/const PAGE='seller-profit'/);assert.match(phase,/عملکرد مالی فروشندگان/);assert.match(phase,/officialProductCategoryName/);assert.match(phase,/commissionRatePool/);assert.match(phase,/PRELIMINARY \/ NON-PAYABLE/);assert.match(phase,/invoiceAmountMin/);assert.match(phase,/fifoProfitMin/);assert.match(phase,/mkcrm-seller-financial-presets/);assert.match(phase,/ALLOWED=\['admin','accounting','manager','purchase'\]/);assert.doesNotMatch(phase,/ALLOWED=.*seller/);

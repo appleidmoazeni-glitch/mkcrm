@@ -229,14 +229,19 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
     ? { datasetId:clean(input.fifoDatasetId, 100), dataset:await db.collection(fifoShadow.DATASETS).findOne({ datasetId:clean(input.fifoDatasetId, 100) }) }
     : await fifoShadow.activeDataset(db);
   const dataset = active?.dataset;
-  if (!dataset || dataset.status !== 'completed' || dataset.activationStatus !== 'validated-shadow' || dataset.validation?.valid === false) {
-    fail('FIFO_FACT_SOURCE_NOT_APPROVED', 'فقط FIFO Shadow کامل و validated-shadow می‌تواند منبع Fact باشد.', 409);
+  const candidateOnly = input.candidateOnly === true;
+  const allowedActivation = candidateOnly ? 'validated-candidate' : 'validated-shadow';
+  if (!dataset || dataset.status !== 'completed' || dataset.activationStatus !== allowedActivation || dataset.validation?.valid === false) {
+    fail('FIFO_FACT_SOURCE_NOT_APPROVED', candidateOnly
+      ? 'فقط FIFO Candidate کامل و validated-candidate می‌تواند منبع Candidate Fact باشد.'
+      : 'فقط FIFO Shadow کامل و validated-shadow می‌تواند منبع Fact باشد.', 409);
   }
+  const profitFactsDatasetId = `PFACT-${sha256(`${dataset.datasetId}|${dataset.candidateFingerprint||dataset.sourceFingerprint||''}|${dataset.allocationFingerprint||''}`).slice(0,24)}`;
   const existing = await count(db.collection(FIFO_FACTS), { fifoDatasetId:dataset.datasetId });
   if (existing) {
     const facts = await db.collection(FIFO_FACTS).find({ fifoDatasetId:dataset.datasetId }).toArray();
     const fingerprint = sha256(stable(facts.map(factImmutableProjection).sort((a,b)=>a.saleLineIdentity.localeCompare(b.saleLineIdentity))));
-    return { ok:true, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint:fingerprint, duplicate:true, immutable:true };
+    return { ok:true, profitFactsDatasetId:facts[0]?.profitFactsDatasetId||profitFactsDatasetId, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint:fingerprint, duplicate:true, immutable:true, candidateOnly:Boolean(facts[0]?.candidateOnly),active:false,nonPayable:true };
   }
   const allocations = await db.collection(fifoShadow.ALLOCATIONS).find({ datasetId:dataset.datasetId }).sort({ globalSequence:1 }).toArray();
   const approvedManualCosts = await db.collection(manualCostResolution.COLLECTION).find({ status:'approved', deleted:{ $ne:true } }).toArray();
@@ -272,13 +277,18 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
     const knownQtyExact = add(knownQuantity, decimal.QUANTITY_SCALE);
     const fifoCostExact = provenance.profitProvenanceStatus==='PROVEN' ? provenance.provenanceReconciliation.allocatedCostExact : null;
     const actualFifoProfitExact = provenance.profitProvenanceStatus==='PROVEN' ? provenance.provenanceReconciliation.fifoProfitExact : null;
+    const fifoMarginExact = actualFifoProfitExact!=null&&compare(saleAmountExact,'0')!==0
+      ? decimal.format(decimal.divideRounded(decimal.parse(actualFifoProfitExact,decimal.MONEY_SCALE)*100000000n,decimal.parse(saleAmountExact,decimal.MONEY_SCALE)),8)
+      : null;
     const originalQuantity = exact(first.soldQuantity || saleLine.qty || quantityExact, decimal.QUANTITY_SCALE);
     const coverage = unknown
       ? (compare(knownQtyExact, '0', decimal.QUANTITY_SCALE) > 0 ? 'partial' : 'unknown')
       : (compare(quantityExact, originalQuantity, decimal.QUANTITY_SCALE) === 0 ? 'complete' : 'partial');
     const officialLineDiscount = saleLine.lineDiscountAmount;
     const invoiceDiscountExact = officialLineDiscount == null ? null : exact(officialLineDiscount);
+    const returnSource=provenance.provenanceSources.find(row=>row.returnProvenance)?.returnProvenance||null;
     const immutable = {
+      profitFactsDatasetId,candidateOnly,active:false,nonPayable:true,sourceRole:candidateOnly?'CANDIDATE':'VALIDATED_SHADOW',
       fifoDatasetId:dataset.datasetId,
       fifoAlgorithmVersion:dataset.algorithmVersion || first.algorithmVersion || '',
       saleSnapshotId:dataset.sourceSaleSnapshotId,
@@ -299,19 +309,24 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
       categoryMappingId:category.mappingId, categoryResolutionStatus:category.status,
       quantityExact, saleAmountExact, invoiceDiscountExact,
       invoiceDiscountAttributionStatus:officialLineDiscount == null && Number(header.discountAmount || 0) > 0 ? 'unresolved-invoice-level' : 'official-line-or-zero',
-      fifoCostExact, actualFifoProfitExact, costCoverageStatus:coverage,
+      fifoCostExact, actualFifoProfitExact, fifoMarginExact, costCoverageStatus:coverage,
       profitProvenanceStatus:provenance.profitProvenanceStatus,
       costSourceType:provenance.costSourceType,
       provenanceSources:provenance.provenanceSources,
       provenanceReconciliation:provenance.provenanceReconciliation,
       provenanceFingerprint:provenance.provenanceFingerprint,
-      sourceFingerprint:dataset.sourceFingerprint || '', allocationFingerprint:dataset.allocationFingerprint || ''
+      sourcePurchaseInvoiceNumbers:[...new Set(provenance.provenanceSources.map(row=>Number(row.purchaseInvoiceNumber||0)).filter(Boolean))].sort((a,b)=>a-b),
+      sourceSupplierIdentities:[...new Set(provenance.provenanceSources.map(row=>clean(row.supplierIdentity,100)).filter(Boolean))].sort(),
+      sourceSupplierNames:[...new Set(provenance.provenanceSources.map(row=>clean(row.supplierName,200)).filter(Boolean))].sort(),
+      fifoAllocationIds:provenance.provenanceSources.map(row=>clean(row.allocationId,100)).filter(Boolean).sort(),
+      returnLinkage:returnSource?{originSaleInvoiceNumber:returnSource.originSaleInvoiceNumber,originSaleLineIdentity:returnSource.originSaleLineId,returnInvoiceNumber:returnSource.returnInvoiceNumber,returnLineIdentity:saleLineIdentity,returnedQuantityExact:returnSource.restoredQuantityExact,reversedCostExact:returnSource.restoredCostAmountExact,reversedProfitExact:actualFifoProfitExact,linkageClass:returnSource.linkageQuality,linkageSource:returnSource.linkageSource,linkageReference:returnSource.linkageReference,restoredAllocationId:returnSource.reversedAllocationId}:null,
+      sourceFingerprint:dataset.sourceFingerprint || '', allocationFingerprint:dataset.allocationFingerprint || '',candidateFingerprint:dataset.candidateFingerprint||''
     };
     facts.push({ factId:deterministicId('PF', `${dataset.datasetId}|${saleLineIdentity}`), schemaVersion:SCHEMA_VERSION, ...immutable, factContentHash:sha256(stable(immutable)), immutable:true, createdBy:current, createdAt:now });
   }
   await insertMany(db.collection(FIFO_FACTS), facts);
   const factsFingerprint = sha256(stable(facts.map(factImmutableProjection).sort((a,b)=>a.saleLineIdentity.localeCompare(b.saleLineIdentity))));
-  return { ok:true, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint, duplicate:false, immutable:true, unknownCostCount:facts.filter(row=>row.costCoverageStatus!=='complete').length };
+  return { ok:true, profitFactsDatasetId, fifoDatasetId:dataset.datasetId, factCount:facts.length, factsFingerprint, duplicate:false, immutable:true, candidateOnly,active:false,nonPayable:true,unknownCostCount:facts.filter(row=>row.costCoverageStatus!=='complete').length };
 }
 function factImmutableProjection(row) {
   const copy = { ...row }; delete copy._id; delete copy.createdAt; delete copy.createdBy; return copy;
