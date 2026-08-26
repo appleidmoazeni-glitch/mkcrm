@@ -4163,7 +4163,8 @@ async function handleApi(req, res, pathname, query) {
         const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request,createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now,candidateOnly:true,nonPayable:true});startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,facts,status:'queued',candidateOnly:true,active:false,nonPayable:true});
       }catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_CANDIDATE_BUILD_FAILED');}
     }
-    if(pathname.startsWith(sellerFinancialPrefix)&&!config.sellerFinancialReadModelEnabled&&!query.runId){
+    const candidateRunListRequest=pathname===`${sellerFinancialPrefix}/runs`;
+    if(pathname.startsWith(sellerFinancialPrefix)&&!config.sellerFinancialReadModelEnabled&&!query.runId&&!candidateRunListRequest){
       return sendJson(res,503,{ok:false,code:'SELLER_FINANCIAL_READ_MODEL_DISABLED',error:'Seller Financial Performance Read Model is disabled by feature flag.'});
     }
     if(pathname===`${sellerFinancialPrefix}/runs`&&req.method==='GET'){

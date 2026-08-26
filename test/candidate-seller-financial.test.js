@@ -19,6 +19,8 @@ test('Candidate Seller Financial UI is Persian-first, candidate-scoped and expos
 test('Candidate financial build route materializes canonical FIFO facts and never activates FIFO or payroll',()=>{
   const server=read('src/server.js'),service=read('src/lib/seller-financial-performance.js');
   assert.match(server,/sellerFinancialPrefix}\/candidate-build/);assert.match(server,/materializeFifoProfitFacts\(db,\{fifoDatasetId,candidateOnly:true\}/);
+  assert.match(server,/candidateRunListRequest=pathname===`\$\{sellerFinancialPrefix\}\/runs`/);
+  assert.match(server,/!query\.runId&&!candidateRunListRequest/);
   assert.match(service,/if\(candidateOnly\).*Seller Financial Candidate is ready for human validation/);
   assert.match(service,/active:false,candidateOnly:true,activationStatus:'validated-candidate'/);
   for(const forbidden of ['Invoice/Put','PutSaleInvoice','PutBuyInvoice','itemInventoryCatalog.update','supplierPurchaseLayers.update'])assert.equal(service.includes(forbidden),false,forbidden);
