@@ -27,9 +27,9 @@ const STATE = 'sellerFinancialPerformanceState';
 const LOCKS = 'sellerFinancialPerformanceLocks';
 const VERIFICATIONS = 'sellerFinancialPerformanceVerificationRuns';
 const SCOPE_KEY = 'seller-financial-performance-v1';
-const SCHEMA_VERSION = 2;
-const ALGORITHM_VERSION = 'seller-financial-performance-v2-canonical-fingerprints';
-const MODULE_VERSION = 'seller-financial-performance-1.1.0';
+const SCHEMA_VERSION = 3;
+const ALGORITHM_VERSION = 'seller-financial-performance-v3-canonical-seller-identity';
+const MODULE_VERSION = 'seller-financial-performance-1.2.0';
 const READ_ROLES = Object.freeze(['admin', 'accounting', 'manager', 'purchase']);
 const BUILD_ROLES = Object.freeze(['admin', 'accounting']);
 const COLLECTIONS = Object.freeze([RUNS, LINES, SUMMARIES, STATE, LOCKS, VERIFICATIONS]);
@@ -156,7 +156,7 @@ async function sourceBundle(db,input={}) {
     db.collection(ledger.DISCOUNT_FACTS).find({saleSnapshotId}).toArray(),
     db.collection(ledger.ADJUSTMENTS).find({fifoDatasetId,status:'approved'}).toArray(),
     db.collection(ledger.SAVED_LEDGER).find({}).toArray(),
-    db.collection('saleSnapshotDatasetHeaders').find({snapshotId:saleSnapshotId},{projection:{_id:0,invTyp:1,invNo:1,saleInvoiceType:1,saleInvoiceNumber:1,storeName:1,StockName:1,stockName:1,storeIdentity:1,StockNo:1,stockNumber:1,sellerAccountNumber:1,invDate:1}}).toArray(),
+    db.collection('saleSnapshotDatasetHeaders').find({snapshotId:saleSnapshotId},{projection:{_id:0,invTyp:1,invNo:1,saleInvoiceType:1,saleInvoiceNumber:1,storeName:1,StockName:1,stockName:1,storeIdentity:1,StockNo:1,stockNumber:1,sellerAccountNumber:1,sellerAccountName:1,sellerName:1,sellerUsername:1,sellerMappingStatus:1,sellerMappingSource:1,cashboxAccountNumber:1,cashboxAccountName:1,mappedCashboxAccountNumber:1,mappedCashboxAccountName:1,invDate:1}}).toArray(),
     db.collection('userShayganMappings').find({isActive:{$ne:false}}).toArray(),
     db.collection('users').find({isActive:{$ne:false}}).toArray(),
     db.collection(fifo.ALLOCATIONS).find({datasetId:fifoDatasetId},{projection:{_id:0}}).toArray()
@@ -235,10 +235,38 @@ function adjustmentEffect(row) {
   if(['saved_profit_subsidy','accounting_correction','management_adjustment'].includes(row.adjustmentType))return exact(amount);
   return '0.00';
 }
-function sourceActorMap(userMappings,users) {
-  const userByName=new Map(users.map(row=>[clean(row.username,100),row])); const output=new Map();
-  for(const mapping of userMappings){const identity=clean(mapping.employeeAccountNumber||mapping.sellerAccountNumber,100);if(!identity)continue;const user=userByName.get(clean(mapping.username,100));output.set(identity,{username:clean(mapping.username,100),displayName:clean(user?.fullName||mapping.fullName,200),storeName:clean(mapping.storeName,200),storeIdentity:clean(mapping.storeNumber||mapping.storeName,200)});}
-  return output;
+function sourceActorMaps(userMappings,users) {
+  const userByName=new Map(users.map(row=>[clean(row.username,100),row]));
+  const byEmployee=new Map(),byCashbox=new Map(),byUsername=new Map();
+  for(const mapping of userMappings){
+    const employeeIdentity=clean(mapping.employeeAccountNumber||mapping.sellerAccountNumber,100);
+    const cashboxIdentity=clean(mapping.cashboxAccountNumber,100);
+    const username=clean(mapping.username,100);
+    if(!employeeIdentity)continue;
+    const user=userByName.get(username);
+    const actor={canonicalSellerIdentity:employeeIdentity,username,displayName:clean(user?.fullName||mapping.fullName||mapping.employeeAccountName,200),storeName:clean(mapping.storeName,200),storeIdentity:clean(mapping.storeNumber||mapping.storeName,200)};
+    byEmployee.set(employeeIdentity,actor);
+    if(cashboxIdentity)byCashbox.set(cashboxIdentity,actor);
+    if(username)byUsername.set(username,actor);
+  }
+  return {byEmployee,byCashbox,byUsername};
+}
+function canonicalSeller(fact,header,actorMaps) {
+  const sourceSellerIdentity=clean(fact.sellerIdentity,100);
+  const sourceSellerName=clean(fact.sellerName,200);
+  const direct=actorMaps.byEmployee.get(sourceSellerIdentity);
+  const username=clean(header.sellerUsername,100);
+  const byUsername=username?actorMaps.byUsername.get(username):null;
+  const cashboxIdentity=clean(header.mappedCashboxAccountNumber||header.cashboxAccountNumber,100);
+  const byCashbox=cashboxIdentity?actorMaps.byCashbox.get(cashboxIdentity):null;
+  if(header.sellerMappingSource==='cashboxAccountNumber'){
+    if(byUsername)return {...byUsername,sourceSellerIdentity,sourceSellerName,resolutionSource:'sale-snapshot-mapped-username'};
+    if(byCashbox)return {...byCashbox,sourceSellerIdentity,sourceSellerName,resolutionSource:'sale-snapshot-cashbox-mapping'};
+  }
+  if(direct)return {...direct,sourceSellerIdentity,sourceSellerName,resolutionSource:'employee-account-number'};
+  if(byUsername)return {...byUsername,sourceSellerIdentity,sourceSellerName,resolutionSource:'sale-snapshot-mapped-username'};
+  if(byCashbox)return {...byCashbox,sourceSellerIdentity,sourceSellerName,resolutionSource:'sale-snapshot-cashbox-mapping'};
+  return {canonicalSellerIdentity:sourceSellerIdentity,username:'',displayName:clean(header.sellerName||sourceSellerName,200),storeName:'',storeIdentity:'',sourceSellerIdentity,sourceSellerName,resolutionSource:'sale-source-unmapped'};
 }
 function headerMaps(headers) {
   return new Map(headers.map(row=>[`${Number(row.invTyp??row.saleInvoiceType)}:${Number(row.invNo??row.saleInvoiceNumber)}`,row]));
@@ -268,7 +296,7 @@ function buildProjectedLines(bundle,runId,calculatedAt) {
   for(const row of bundle.savedEntries){if(row.sourceSaleLineIdentity){if(!savedSource.has(row.sourceSaleLineIdentity))savedSource.set(row.sourceSaleLineIdentity,[]);savedSource.get(row.sourceSaleLineIdentity).push(row);}if(row.beneficiarySaleLineIdentity){if(!savedBeneficiary.has(row.beneficiarySaleLineIdentity))savedBeneficiary.set(row.beneficiarySaleLineIdentity,[]);savedBeneficiary.get(row.beneficiarySaleLineIdentity).push(row);}}
   const invoiceFacts=new Map();for(const fact of bundle.facts){if(!invoiceFacts.has(fact.saleInvoiceIdentity))invoiceFacts.set(fact.saleInvoiceIdentity,[]);invoiceFacts.get(fact.saleInvoiceIdentity).push(fact);}
   const allocationsByLine=new Map();for(const row of bundle.allocations){if(!allocationsByLine.has(row.saleLineId))allocationsByLine.set(row.saleLineId,[]);allocationsByLine.get(row.saleLineId).push(row);}
-  const headerByInvoice=headerMaps(bundle.headers),sellerActors=sourceActorMap(bundle.userMappings,bundle.users);
+  const headerByInvoice=headerMaps(bundle.headers),sellerActors=sourceActorMaps(bundle.userMappings,bundle.users);
   const lines=[];
   for(const fact of bundle.facts){
     const blockers=[];const warningFlags=[];const assignment=assignmentByGuid.get(clean(fact.itemGuid,100))||assignmentByCode.get(clean(fact.itemCode,100));
@@ -278,8 +306,9 @@ function buildProjectedLines(bundle,runId,calculatedAt) {
     const classification=ledger._resolveCategoryFromMappings(policyMappings,enriched,fact.saleDate);
     if(!classification.officialProductCategoryIdentity)blockers.push('official-product-category-missing');
     if(classification.status!=='resolved'||classification.commissionRatePool==='UNRESOLVED')blockers.push(`category-${classification.status||'unresolved'}`);
+    const header=headerByInvoice.get(fact.saleInvoiceIdentity)||{};const sellerActor=canonicalSeller(fact,header,sellerActors);const sellerIdentity=sellerActor.canonicalSellerIdentity||clean(fact.sellerIdentity,100);
     const rateClassification={...classification,policyVersionId:policy?.policyVersionId||''};
-    const rate=ledger._resolveRateFromRows(policy?bundle.governedRates.filter(row=>row.policyVersionId===policy.policyVersionId):[],fact.sellerIdentity,rateClassification,fact.saleDate);
+    const rate=ledger._resolveRateFromRows(policy?bundle.governedRates.filter(row=>row.policyVersionId===policy.policyVersionId):[],sellerIdentity,rateClassification,fact.saleDate);
     if(rate.status!=='resolved')blockers.push(`rate-${rate.status}`);
     if(fact.costCoverageStatus!=='complete'||fact.actualFifoProfitExact==null)blockers.push(`cost-${fact.costCoverageStatus||'unknown'}`);
     const invoiceDiscount=discounts.get(fact.saleInvoiceIdentity);const discountStatus=discountState(fact,invoiceDiscount);let allocatedInvoiceDiscountExact=null;let discountAvailability='unavailable';
@@ -298,7 +327,6 @@ function buildProjectedLines(bundle,runId,calculatedAt) {
     const savedProfitCreditExact=add(savedCredits.map(row=>row.creditAmountExact||0));const savedProfitSubsidyExact=add(savedSubsidies.map(row=>row.debitAmountExact||0));
     const commissionableProfitExact=fact.actualFifoProfitExact==null?null:add([fact.actualFifoProfitExact,approvedAdjustmentAmountExact]);
     const preliminaryCommissionExact=commissionableProfitExact!=null&&rate.status==='resolved'&&!blockers.length?ledger._multiplyMoneyRate(commissionableProfitExact,rate.rateVersion.rate):null;
-    const header=headerByInvoice.get(fact.saleInvoiceIdentity)||{};const sellerActor=sellerActors.get(clean(fact.sellerIdentity,100))||{};
     const invoiceRows=invoiceFacts.get(fact.saleInvoiceIdentity)||[];const invoiceGrossSaleAmountExact=add(invoiceRows.map(row=>row.saleAmountExact||0));
     const storeName=clean(header.storeName||header.StockName||header.stockName||sellerActor.storeName,200);const storeIdentity=clean(header.storeIdentity||header.StockNo||header.stockNumber||sellerActor.storeIdentity||storeName,200);
     const policyAvailability=policyState.status==='resolved'?'available':'unavailable';const categoryAvailability=classification.status==='resolved'&&classification.commissionRatePool!=='UNRESOLVED'?'available':'unavailable';const rateAvailability=rate.status==='resolved'?'available':'unavailable';const profitProvenanceStatus=clean(fact.profitProvenanceStatus||((fact.actualFifoProfitExact!=null&&fact.costCoverageStatus==='complete')?'PROVEN':fact.costCoverageStatus==='partial'?'PARTIAL':'UNKNOWN'),20);const profitAvailability=fact.actualFifoProfitExact!=null&&fact.costCoverageStatus==='complete'&&profitProvenanceStatus==='PROVEN'?'available':'unavailable';const commissionAvailability=preliminaryCommissionExact!=null&&!blockers.length?'available':'unavailable';
@@ -316,7 +344,8 @@ function buildProjectedLines(bundle,runId,calculatedAt) {
       runId,schemaVersion:SCHEMA_VERSION,algorithmVersion:ALGORITHM_VERSION,sourceFingerprint:bundle.sourceFingerprint,
       candidateOnly:Boolean(bundle.candidateOnly),active:false,nonPayroll:true,profitFactsDatasetId:clean(fact.profitFactsDatasetId,100),fifoDatasetId:bundle.fifoDatasetId,saleSnapshotId:bundle.saleSnapshotId,officialCatalogRunId:bundle.catalogMaps.run?.catalogRunId||'',
       saleLineIdentity:fact.saleLineIdentity,saleInvoiceIdentity:fact.saleInvoiceIdentity,saleInvoiceType:Number(fact.saleInvoiceType),saleInvoiceNumber:Number(fact.saleInvoiceNumber),saleInvoiceNo:Number(fact.saleInvoiceNumber),saleDate:fact.saleDate,saleDateJalali:fact.saleDate,saleDateRaw:clean(fact.saleDateRaw||fact.saleDate,100),accountingMonth:monthOf(fact.saleDate),
-      sellerIdentity:clean(fact.sellerIdentity,100),sellerName:clean(fact.sellerName||sellerActor.displayName,200),sellerDisplayName:clean(fact.sellerName||sellerActor.displayName,200),sellerUsername:sellerActor.username||'',storeIdentity,storeName,
+      sellerIdentity,sellerName:clean(sellerActor.displayName||header.sellerName||fact.sellerName,200),sellerDisplayName:clean(sellerActor.displayName||header.sellerName||fact.sellerName,200),sellerUsername:sellerActor.username||'',storeIdentity,storeName,
+      sourceSellerIdentity:sellerActor.sourceSellerIdentity,sourceSellerName:sellerActor.sourceSellerName,sellerIdentityResolutionSource:sellerActor.resolutionSource,
       itemGuid:clean(fact.itemGuid,100),itemCode:clean(fact.itemCode,100),itemDescription:clean(fact.itemDescription,500),quantityExact:exact(fact.quantityExact||0,6),
       officialMainGroupGuid:classification.officialProductCategoryGuid||'',officialProductCategoryIdentity:classification.officialProductCategoryIdentity||'',officialProductCategoryGuid:classification.officialProductCategoryGuid||'',officialProductCategoryNumber:classification.officialProductCategoryNumber||'',officialProductCategoryName:classification.officialProductCategoryName||'UNRESOLVED',
       commissionRatePool:classification.commissionRatePool||'UNRESOLVED',categoryMappingId:classification.mappingId||'',categoryResolutionStatus:classification.status,categoryStatus:classification.status,

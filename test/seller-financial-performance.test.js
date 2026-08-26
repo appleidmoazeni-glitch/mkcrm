@@ -72,6 +72,38 @@ test('server-side filters support Tir, seller, category, invoice value and FIFO 
   const marginFiltered=await service.listLines(db,{marginMin:'0.15',marginMax:'0.17'},manager);assert.equal(marginFiltered.total,1);assert.equal(marginFiltered.list[0].fifoMarginExact,'0.16000000');
 });
 
+test('cashbox-mapped source identities collapse to the canonical employee seller without name deduplication',async()=>{
+  const db=dbSeed();
+  const facts=db.collection('fifoProfitFacts').rows;
+  facts[0].sellerIdentity='11009999';facts[0].sellerName='نام نمایشی مشترک';
+  facts[1].sellerIdentity='11709998';facts[1].sellerName='نام نمایشی مشترک';
+  Object.assign(db.collection('saleSnapshotDatasetHeaders').rows[0],{sellerAccountNumber:'11009999',sellerName:'فروشنده واقعی',sellerUsername:'seller-user',sellerMappingStatus:'mapped',sellerMappingSource:'cashboxAccountNumber',cashboxAccountNumber:'11009999'});
+  Object.assign(db.collection('saleSnapshotDatasetHeaders').rows[1],{sellerAccountNumber:'11709998',sellerName:'فروشنده واقعی',sellerUsername:'seller-user',sellerMappingStatus:'mapped',sellerMappingSource:'cashboxAccountNumber',cashboxAccountNumber:'11009999'});
+  db.collection('userShayganMappings').rows[0].cashboxAccountNumber='11009999';
+  db.collection('userShayganMappings').rows.push({username:'other-user',employeeAccountNumber:'11709998',cashboxAccountNumber:'11008888',isActive:true});
+  db.collection('users').rows.push({username:'other-user',fullName:'شخص دیگر',role:'seller',isActive:true});
+  const built=await service.buildReadModel(db,{},accounting);
+  const lines=db.collection(service.LINES).rows.filter(row=>row.runId===built.runId);
+  assert.deepEqual([...new Set(lines.map(row=>row.sellerIdentity))],['11701013']);
+  assert.deepEqual(lines.map(row=>row.sourceSellerIdentity).sort(),['11009999','11709998']);
+  assert.ok(lines.every(row=>row.sellerIdentityResolutionSource==='sale-snapshot-mapped-username'));
+  const options=await service.filterOptions(db,{},manager);
+  assert.deepEqual(options.sellers,[{identity:'11701013',name:'امیر ممیزی'}]);
+  const sellerSummary=db.collection(service.SUMMARIES).rows.find(row=>row.dimension==='seller-month');
+  assert.equal(sellerSummary.sellerIdentity,'11701013');assert.equal(sellerSummary.lineCount,2);
+});
+
+test('two real sellers with the same display name remain separate selector identities',async()=>{
+  const db=dbSeed();
+  const duplicate={...db.collection('fifoProfitFacts').rows[0],factId:'F3',factContentHash:'HF3',saleLineIdentity:'LINE-3',saleInvoiceIdentity:'2:4693',saleInvoiceNumber:4693,sellerIdentity:'11701099',sellerName:'امیر ممیزی'};
+  db.collection('fifoProfitFacts').rows.push(duplicate);
+  db.collection('saleSnapshotDatasetHeaders').rows.push({snapshotId:'SALE-A',invTyp:2,invNo:4693,sellerAccountNumber:'11701099',sellerName:'امیر ممیزی'});
+  db.collection('invoiceDiscountFacts').rows.push({discountFactId:'D3',saleSnapshotId:'SALE-A',saleInvoiceIdentity:'2:4693',invoiceDiscountExact:'0.00',categoryAttributionStatus:'not-applicable',contentHash:'HD3'});
+  await service.buildReadModel(db,{},accounting);
+  const options=await service.filterOptions(db,{},manager);
+  assert.deepEqual(options.sellers.map(row=>row.identity).sort(),['11701013','11701099']);
+});
+
 test('invoice with incomplete lines exposes known profit separately and never labels it total actual profit',async()=>{
   const db=dbSeed();Object.assign(db.collection('fifoProfitFacts').rows[1],{saleInvoiceIdentity:'2:4691',saleInvoiceNumber:4691});await service.buildReadModel(db,{},accounting);const result=await service.listInvoices(db,{},manager);assert.equal(result.total,1);assert.equal(result.list[0].knownFifoProfitExact,'400000000.00');assert.equal(result.list[0].actualFifoProfitExact,null);assert.equal(result.list[0].profitCoverageComplete,false);
 });
