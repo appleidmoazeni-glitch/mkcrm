@@ -65,9 +65,10 @@ test('build creates an isolated active projection with exact values and explicit
   assert.equal(db.collection('fifoProfitFacts').rows[0].actualFifoProfitExact,'400000000.00');
 });
 
-test('server-side filters support Tir, seller, category, invoice value and FIFO profit thresholds',async()=>{
-  const db=dbSeed();await service.buildReadModel(db,{},accounting);const report=await service.listLines(db,{dateFrom:'۱۴۰۵/۰۴/۰۱',dateTo:'1405-04-31',sellerIdentity:'11701013',category:'NOTEBOOK',invoiceAmountMin:'2000000000',fifoProfitMin:'300000000',pageSize:10},manager);assert.equal(report.total,1);assert.equal(report.list[0].saleInvoiceNumber,4691);assert.equal(report.serverSide,true);
-  const below=await service.listLines(db,{category:'NOTEBOOK',fifoProfitMax:'50000000'},purchase);assert.equal(below.total,0);
+test('server-side filters support Tir, canonical seller/category identity, invoice value and FIFO profit thresholds',async()=>{
+  const db=dbSeed();await service.buildReadModel(db,{},accounting);const report=await service.listLines(db,{dateFrom:'۱۴۰۵/۰۴/۰۱',dateTo:'1405-04-31',sellerIdentity:'11701013',categoryGuid:'NB',invoiceAmountMin:'2000000000',fifoProfitMin:'300000000',pageSize:10},manager);assert.equal(report.total,1);assert.equal(report.list[0].saleInvoiceNumber,4691);assert.equal(report.list[0].canonicalSellerId,'11701013');assert.equal(report.list[0].canonicalCategoryGuid,'NB');assert.equal(report.serverSide,true);
+  const below=await service.listLines(db,{categoryGuid:'NB',fifoProfitMax:'50000000'},purchase);assert.equal(below.total,0);
+  await assert.rejects(service.listLines(db,{category:'NOTEBOOK'},manager),error=>error.code==='SELLER_FINANCIAL_CATEGORY_GUID_REQUIRED');
   const sourceFiltered=await service.listLines(db,{purchaseInvoiceNumber:7001,supplier:'Supplier One'},manager);assert.equal(sourceFiltered.total,1);
   const marginFiltered=await service.listLines(db,{marginMin:'0.15',marginMax:'0.17'},manager);assert.equal(marginFiltered.total,1);assert.equal(marginFiltered.list[0].fifoMarginExact,'0.16000000');
 });
@@ -102,6 +103,20 @@ test('two real sellers with the same display name remain separate selector ident
   await service.buildReadModel(db,{},accounting);
   const options=await service.filterOptions(db,{},manager);
   assert.deepEqual(options.sellers.map(row=>row.identity).sort(),['11701013','11701099']);
+});
+
+test('category selector is unique by official GUID and disambiguates equal names without name authority',async()=>{
+  const db=dbSeed();
+  const duplicate={...db.collection('fifoProfitFacts').rows[0],factId:'F3',factContentHash:'HF3',saleLineIdentity:'LINE-3',saleInvoiceIdentity:'2:4693',saleInvoiceNumber:4693,itemGuid:'ITEM-NB-OTHER',itemCode:'NB-OTHER'};
+  db.collection('fifoProfitFacts').rows.push(duplicate);
+  db.collection('accountingOfficialItemGroupAssignments').rows.push({catalogRunId:'CAT-A',itemGuid:'ITEM-NB-OTHER',itemCode:'NB-OTHER',isOfficialEvidence:true,resolvedMainGroupIdentity:'guid:NB-OTHER',resolvedMainGroupGuid:'NB-OTHER',resolvedMainGroupNumber:'99',resolvedMainGroupName:'NOTEBOOK'});
+  db.collection('commissionCategoryMappings').rows.push({mappingId:'MAP-NB-OTHER',policyVersionId:'POL-TIR',status:'approved',identityType:'itemGuid',identityValue:'ITEM-NB-OTHER',officialProductCategoryIdentity:'guid:NB-OTHER',officialProductCategoryGuid:'NB-OTHER',officialProductCategoryNumber:'99',officialProductCategoryName:'NOTEBOOK',commissionRatePool:'NOTEBOOK',effectiveFrom:'14050401',effectiveTo:'14050431'});
+  db.collection('saleSnapshotDatasetHeaders').rows.push({snapshotId:'SALE-A',invTyp:2,invNo:4693,storeName:'مشهد کالا',stockNumber:'1'});
+  db.collection('invoiceDiscountFacts').rows.push({discountFactId:'D3',saleSnapshotId:'SALE-A',saleInvoiceIdentity:'2:4693',invoiceDiscountExact:'0.00',categoryAttributionStatus:'not-applicable',contentHash:'HD3'});
+  await service.buildReadModel(db,{},accounting);
+  const options=await service.filterOptions(db,{},manager);const notebooks=options.categories.filter(row=>row.name==='NOTEBOOK');
+  assert.equal(notebooks.length,2);assert.deepEqual(notebooks.map(row=>row.guid).sort(),['NB','NB-OTHER']);assert.ok(notebooks.every(row=>row.label.includes('—')));assert.equal(options.categoryAuthority,'official-shaygan-category-guid');
+  const first=await service.listLines(db,{categoryGuid:'NB'},manager),second=await service.listLines(db,{categoryGuid:'NB-OTHER'},manager);assert.equal(first.total,1);assert.equal(second.total,1);
 });
 
 test('invoice with incomplete lines exposes known profit separately and never labels it total actual profit',async()=>{
@@ -169,11 +184,17 @@ test('validated FIFO candidate builds a non-active non-payroll Seller Financial 
   const run=db.collection(service.RUNS).rows.find(row=>row.runId===built.runId);assert.equal(run.active,false);assert.equal(run.nonPayable,true);assert.equal(run.sourceProfitFactsDatasetId,'PFACT-CANDIDATE');
   const report=await service.listLines(db,{runId:built.runId,provenanceStatus:'PROVEN'},manager);assert.equal(report.total,1);assert.equal(report.candidateOnly,true);assert.equal(report.list[0].purchaseInvoiceNumbers[0],7001);
   const totals=await service.totals(db,{runId:built.runId},manager);assert.equal(totals.active,false);assert.equal(totals.nonPayroll,true);assert.equal(totals.unknownExposureLineCount,1);
-  const categories=await service.categoryTotals(db,{runId:built.runId,provenanceStatus:'PROVEN',category:'NOTEBOOK'},manager);assert.equal(categories.total,1);assert.equal(categories.list[0].officialProductCategoryName,'NOTEBOOK');assert.equal(categories.list[0].unknownOrPartialSaleValueExact,'0.00');
+  const categories=await service.categoryTotals(db,{runId:built.runId,provenanceStatus:'PROVEN',categoryGuid:'NB'},manager);assert.equal(categories.total,1);assert.equal(categories.list[0].officialProductCategoryName,'NOTEBOOK');assert.equal(categories.list[0].canonicalCategoryGuid,'NB');assert.equal(categories.list[0].unknownOrPartialSaleValueExact,'0.00');
   const drill=await service.lineDrilldown(db,'LINE-1',manager,{runId:built.runId});assert.equal(drill.candidateOnly,true);assert.equal(drill.source.costProvenance[0].purchaseInvoiceNumber,7001);
 });
 
 test('existing seller-profit UI is upgraded without a duplicate page and keeps financial safety labels',()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
   assert.match(phase,/const PAGE='seller-profit'/);assert.match(phase,/عملکرد مالی فروشندگان/);assert.match(phase,/officialProductCategoryName/);assert.match(phase,/commissionRatePool/);assert.match(phase,/PRELIMINARY \/ NON-PAYABLE/);assert.match(phase,/invoiceAmountMin/);assert.match(phase,/fifoProfitMin/);assert.match(phase,/mkcrm-seller-financial-presets/);assert.match(phase,/ALLOWED=\['admin','accounting','manager','purchase'\]/);assert.doesNotMatch(phase,/ALLOWED=.*seller/);
+});
+
+test('seller financial UI uses stable category GUID and idempotent selector rendering',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  assert.match(ui,/categoryGuid:q\('#csfCategory'\)/);assert.match(ui,/categoryGuid:selected\('#sfCategory'\)/);assert.match(ui,/optionRows\(r\.categories,'guid','label'\)/);
+  assert.doesNotMatch(ui,/csfCategory'\)\.innerHTML\+=/);assert.doesNotMatch(ui,/csfSeller'\)\.innerHTML\+=/);
 });
