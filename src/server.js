@@ -11,6 +11,7 @@ const stockSleep = require('./lib/stock-sleep');
 const purchaseSleep = require('./lib/purchase-sleep');
 const purchaseLayerDataset = require('./lib/purchase-layer-dataset');
 const manualCostResolution = require('./lib/manual-cost-resolution');
+const openingAccountingCostBasis = require('./lib/opening-accounting-cost-basis');
 const fifoShadowEngine = require('./lib/fifo-shadow-engine');
 const accountingEvidenceConfidence = require('./lib/accounting-evidence-confidence');
 const accountingOperationalReview = require('./lib/accounting-operational-review');
@@ -3973,6 +3974,26 @@ async function handleApi(req, res, pathname, query) {
     if(pathname==='/api/manual-cost-resolutions/assisted/suggestion'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await manualCostResolution.assistedSuggestion(db,query,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_SUGGESTION_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/accounting/opening-accounting-evidence/candidates'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      return sendJson(res,200,await openingAccountingCostBasis.listCandidates(db,query));
+    }
+    if(pathname==='/api/accounting/opening-accounting-evidence/candidates'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req),db=await connectMongo();
+      try{
+        let items=Array.isArray(body.items)?body.items:[];
+        if(!items.length){
+          const first=await manualCostResolution.missingQueue(db,{coverage:'unknown',page:1,pageSize:500,sort:'saleAmount',direction:'desc'});items=[...(first.list||[])];
+          for(let page=2;items.length<Number(first.total||0);page++){const next=await manualCostResolution.missingQueue(db,{coverage:'unknown',page,pageSize:500,sort:'saleAmount',direction:'desc'});if(!(next.list||[]).length)break;items.push(...next.list);}
+        }
+        return sendJson(res,201,await openingAccountingCostBasis.buildCandidate(db,{...body,items,createdBy:currentUser(req)}));
+      }catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_BUILD_FAILED',error:String(error.message||error)});}
+    }
+    const openingCandidateMatch=pathname.match(/^\/api\/accounting\/opening-accounting-evidence\/candidates\/([^/]+)$/);
+    if(openingCandidateMatch&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      const result=await openingAccountingCostBasis.candidateDetail(db,decodeURIComponent(openingCandidateMatch[1]),query);return sendJson(res,result.ok?200:404,result);
     }
     if(pathname==='/api/manual-cost-resolutions/assisted/decisions'&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting','purchase']))return;const body=await collectBody(req),db=await connectMongo();

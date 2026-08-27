@@ -665,13 +665,13 @@ function suggestionFromLayers(rows=[], target={}, applicableDate='', affectedQua
   return {available:true,method:'WEIGHTED_AVERAGE_HISTORICAL_OFFICIAL_PURCHASES',suggestedCostExact:accountingDecimal.format(weighted,accountingDecimal.UNIT_COST_SCALE),purchaseCount:evidence.length,eligiblePurchaseCount:evidence.length,quantityBasisExact:accountingDecimal.format(quantity,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affected,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affected-covered,accountingDecimal.QUANTITY_SCALE),evidenceQuality:'BROAD_ITEM_LEVEL_HISTORICAL_AVERAGE',dateFrom:evidence[0].purchaseInvoiceDate,dateTo:latest.purchaseInvoiceDate,minPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a<b?a:b),accountingDecimal.UNIT_COST_SCALE),maxPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a>b?a:b),accountingDecimal.UNIT_COST_SCALE),latestPurchaseCostExact:latest.unitCostExact,sourcePurchaseIds:[...new Set(evidence.map(row=>String(row.purchaseInvoiceNumber)))],sourceFingerprint:fingerprint,evidence,...excluded};
 }
 function openingSuggestion(row,target={},applicableDate='',affectedQuantityExact='') {
-  if(!row||row.status!=='available'||row.extractionComplete!==true)return null;
+  if(!row||!['available','VALIDATED_CANDIDATE'].includes(row.status)||row.extractionComplete!==true)return null;
   if(!identityMatches(row,target)||!row.effectiveOpeningDate||row.effectiveOpeningDate>applicableDate)return null;
   const openingQty=accountingDecimal.parse(row.openingQuantityExact,accountingDecimal.QUANTITY_SCALE);
   const affectedQty=affectedQuantityExact?accountingDecimal.parse(affectedQuantityExact,accountingDecimal.QUANTITY_SCALE):openingQty;
   if(openingQty<=0n||affectedQty<=0n)return null;
   const covered=affectedQty<openingQty?affectedQty:openingQty;
-  return {available:true,sourceClass:'OPENING_ACCOUNTING_COST',method:'SHAYGAN_BEGIN_DURATION_REMAIN_ACCOUNTING_COST',itemGuid:clean(row.itemGuid,100),itemCode:clean(row.itemCode,100),suggestedCostExact:clean(row.openingUnitCostExact,100),quantityBasisExact:accountingDecimal.format(openingQty,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affectedQty,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affectedQty-covered,accountingDecimal.QUANTITY_SCALE),effectiveOpeningDate:clean(row.effectiveOpeningDate,8),openingQuantityExact:clean(row.openingQuantityExact,100),openingUnitCostExact:clean(row.openingUnitCostExact,100),openingTotalValueExact:clean(row.openingTotalValueExact,100),sourceFields:row.sourceFields||{},sourceFingerprint:clean(row.sourceFingerprint,64),evidenceQuality:clean(row.evidenceQuality,100),evidenceId:clean(row.evidenceId,100),extractedAt:row.extractedAt||row.updatedAt||null,partialTarget:affectedQty>openingQty};
+  return {available:true,sourceClass:'OPENING_ACCOUNTING_COST',method:'SHAYGAN_BEGIN_DURATION_REMAIN_ACCOUNTING_COST',itemGuid:clean(row.itemGuid,100),itemCode:clean(row.itemCode,100),suggestedCostExact:clean(row.openingUnitCostExact,100),quantityBasisExact:accountingDecimal.format(openingQty,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affectedQty,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affectedQty-covered,accountingDecimal.QUANTITY_SCALE),effectiveOpeningDate:clean(row.effectiveOpeningDate,8),openingQuantityExact:clean(row.openingQuantityExact,100),openingUnitCostExact:clean(row.openingUnitCostExact,100),openingTotalValueExact:clean(row.openingTotalValueExact,100),sourceFields:row.sourceFields||{},sourceFingerprint:clean(row.sourceFingerprint,64),recordFingerprint:clean(row.recordFingerprint,64),evidenceQuality:clean(row.evidenceQuality,100),evidenceId:clean(row.evidenceId,100),openingEvidenceDatasetId:clean(row.datasetId,100),warehouseEvidence:Array.isArray(row.warehouseEvidence)?row.warehouseEvidence.map(value=>({warehouseNumber:clean(value.warehouseNumber,100),openingQuantityExact:clean(value.openingQuantityExact,100),openingTotalValueExact:clean(value.openingTotalValueExact,100),openingUnitCostExact:clean(value.openingUnitCostExact,100),evidenceQuality:clean(value.evidenceQuality,100),extractionComplete:value.extractionComplete===true})):[],queriedWarehouseCount:Number(row.queriedWarehouseCount||0),warehouseCount:Number(row.warehouseCount||0),approvalStatus:clean(row.approvalStatus,50),extractedAt:row.extractedAt||row.updatedAt||null,partialTarget:affectedQty>openingQty};
 }
 function openingConflict(opening,governedRows=[]) {
   if(!opening)return null;
@@ -695,7 +695,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const layerQuery=canonicalLayerContract.canonicalLayerQuery({datasetId,purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})});
   const [layers,openingRows,governedOpening]=await Promise.all([
     db.collection(purchaseLayerDataset.LAYERS).find(layerQuery).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(5001).toArray(),
-    db.collection(openingCostBasis.COLLECTION).find({...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:applicableDate}}).sort({effectiveOpeningDate:-1,updatedAt:-1}).limit(10).toArray(),
+    db.collection(openingCostBasis.COLLECTION).find({status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true,...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:applicableDate}}).sort({effectiveOpeningDate:-1,createdAt:-1,updatedAt:-1}).limit(10).toArray(),
     db.collection('openingInventoryEvidence').find({status:'approved',...(identityParts.length===1?identityParts[0]:{$or:identityParts})}).limit(20).toArray()
   ]);
   if(layers.length>5000)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target:{itemGuid,itemCode},available:false,method:'EVIDENCE_LIMIT_EXCEEDED',suggestedCostExact:null,purchaseCount:layers.length,evidenceComplete:false,limit:5000};
@@ -890,7 +890,7 @@ async function cleanCaseCandidates(db, filters = {}) {
   const [manualRows,openingRows,basisRows]=await Promise.all([
     allRows(db.collection(COLLECTION),{}),
     allRows(db.collection('openingInventoryEvidence'),{}),
-    allRows(db.collection(openingCostBasis.COLLECTION),{status:'available',extractionComplete:true})
+    allRows(db.collection(openingCostBasis.COLLECTION),{status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true})
   ]);
   const contaminated=rows=>new Set(rows.flatMap(row=>[key(row.itemGuid),key(row.itemCode)].filter(Boolean)));
   const manualKeys=contaminated(manualRows),openingKeys=contaminated(openingRows);
@@ -907,7 +907,7 @@ async function cleanCaseCandidates(db, filters = {}) {
 }
 async function sourceReclassificationReport(db, filters = {}) {
   const queue=await missingQueue(db,{...filters,coverage:'unknown',page:1,pageSize:5000,export:true});
-  const [basisRows,catalogRows]=await Promise.all([allRows(db.collection(openingCostBasis.COLLECTION),{status:'available',extractionComplete:true}),allRows(db.collection(canonicalItemCatalog.CATALOG),{})]);
+  const [basisRows,catalogRows]=await Promise.all([allRows(db.collection(openingCostBasis.COLLECTION),{status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true}),allRows(db.collection(canonicalItemCatalog.CATALOG),{})]);
   const byIdentity=new Map();for(const row of basisRows)for(const identity of [key(row.itemGuid),key(row.itemCode)].filter(Boolean))byIdentity.set(identity,row);
   const catalogByIdentity=new Map();for(const row of catalogRows)for(const identity of [key(row.itemGuid),key(row.itemCode)].filter(Boolean))catalogByIdentity.set(identity,row);
   const buckets={SOURCE_HISTORY_INCOMPLETE:[],OPENING_ACCOUNTING_COST:[],TRUE_NO_VALID_COST_BASIS:[],OTHER_UNRESOLVED:[]};
