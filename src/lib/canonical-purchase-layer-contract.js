@@ -7,6 +7,11 @@ const CLASSIFICATION = Object.freeze({
 });
 
 function clean(value) { return String(value == null ? '' : value).trim(); }
+function normalizeOriginReference(value) {
+  const reference = clean(value);
+  if (!reference || /^[+-]?0+(?:\.0+)?$/.test(reference)) return '';
+  return reference;
+}
 function isCanonicalPurchaseLayer(row = {}) {
   return Boolean(
     clean(row.datasetId) &&
@@ -42,5 +47,6 @@ module.exports = {
   classifyPurchaseLayer,
   canonicalLayerQuery,
   canonicalPurchaseQuery,
-  canonicalPurchaseReturnQuery
+  canonicalPurchaseReturnQuery,
+  normalizeOriginReference
 };

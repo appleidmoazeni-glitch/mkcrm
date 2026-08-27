@@ -260,10 +260,7 @@ async function reconcilePurchaseReturns(db, datasetId) {
   const returns = await collection.find(canonicalLayerContract.canonicalPurchaseReturnQuery({ datasetId })).toArray();
   const purchasesByHeaderItem = new Map();
   const purchasesByInvoiceSupplierItem = new Map();
-  const normalizedReference = value => {
-    const result=clean(value);
-    return result && result !== '0' ? result : '';
-  };
+  const normalizedReference = canonicalLayerContract.normalizeOriginReference;
   const identityKey = row => clean(row.itemCode) ? `C:${clean(row.itemCode).toLowerCase()}` : `G:${clean(row.itemGuid).toLowerCase()}`;
   const supplierKey = row => clean(row.supplierAccountNumber) ? `A:${clean(row.supplierAccountNumber).toLowerCase()}` : `G:${clean(row.supplierGuid).toLowerCase()}`;
   const add = (map,key,row) => { if(!key)return;if(!map.has(key))map.set(key,[]);map.get(key).push(row); };
