@@ -24,6 +24,7 @@ const financialSourceControl = require('./lib/financial-source-control');
 const saleSnapshot = require('./lib/sale-snapshot');
 const canonicalItemCatalog = require('./lib/canonical-item-catalog');
 const inventoryAutoSyncPolicy = require('./lib/inventory-auto-sync-policy');
+const boardStockOutLifecycle = require('./lib/board-stock-out-lifecycle');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
@@ -674,6 +675,12 @@ async function applyFiscalDatabaseSetting() {
 
 async function ensureInit() {
   try { await initMongo(); } catch (e) { console.error('Mongo init warning:', e.message); }
+  // Board lifecycle indexes are safety-critical and must not be skipped when an
+  // unrelated legacy index later/earlier in the general initializer fails.
+  try {
+    const db = await connectMongo();
+    await boardStockOutLifecycle.ensureBoardLifecycleIndexes(db);
+  } catch (e) { console.error('Board lifecycle index warning:', e.message); }
   await applyFiscalDatabaseSetting();
 }
 
@@ -3347,8 +3354,9 @@ async function createStockOutBoardEventsAfterSale({ db, body, result, mapping, u
   for (const it of (Array.isArray(body?.items) ? body.items : [])) {
     const code = String(it.itemCode || it.ItemCode || it.ItemNumber || it.itemNumber || '').trim();
     if (!code) continue;
-    const prev = itemHints.get(code) || { itemDescription:'', soldByStock:new Map() };
+    const prev = itemHints.get(code) || { itemDescription:'', itemGuid:'', soldByStock:new Map() };
     prev.itemDescription = prev.itemDescription || String(it.itemDescription || it.ItemDescription || it.ItemDesc || '').trim();
+    prev.itemGuid = prev.itemGuid || String(it.itemGuid || it.ItemGuId || it.ItemGuid || '').trim();
     const stockNumber = String(it.stockNumber || it.STNumber || it.stNumber || '').trim();
     const soldQty = Number(it.quantity || it.Quan || 0);
     if (stockNumber && soldQty > 0) prev.soldByStock.set(stockNumber, (prev.soldByStock.get(stockNumber) || 0) + soldQty);
@@ -3359,7 +3367,7 @@ async function createStockOutBoardEventsAfterSale({ db, body, result, mapping, u
   for (const ln of deductLines) {
     const code = String(ln.itemCode || '').trim();
     if (!code) continue;
-    const prev = itemHints.get(code) || { itemDescription:'', soldByStock:new Map() };
+    const prev = itemHints.get(code) || { itemDescription:'', itemGuid:'', soldByStock:new Map() };
     const stockNumber = String(ln.stockNumber || '').trim();
     if (stockNumber) {
       prev.soldByStock.set(stockNumber, Number(ln.soldQty || prev.soldByStock.get(stockNumber) || 0));
@@ -3457,11 +3465,23 @@ async function createStockOutBoardEventsAfterSale({ db, body, result, mapping, u
       continue;
     }
 
-    const openExisting = await db.collection('boardEvents').findOne({ type:'stock_out', itemCode, status:{ $in:['new','seen','site_updated'] } }).catch(()=>null);
-    if (openExisting) {
-      const row = { itemCode, skipped:true, reason:'open-event-exists', existingId:String(openExisting._id || ''), eventKey:String(openExisting.eventKey || '') };
+    const resolvedIdentity = await boardStockOutLifecycle.resolveCanonicalIdentity(db, { itemCode, itemGuid:hint.itemGuid });
+    const soldQty = [...hint.soldByStock.values()].reduce((sum, value) => sum + Number(value || 0), 0);
+    const transition = boardStockOutLifecycle.buildStockOutTransition({
+      itemCode,
+      itemGuid:resolvedIdentity.itemGuid || hint.itemGuid,
+      canonicalItemGuid:resolvedIdentity.canonicalItemGuid,
+      canonicalIdentity:resolvedIdentity.canonicalIdentity,
+      invoiceNumber:invoiceNumber || result?.Number,
+      invoiceGuid:invoiceGuid || result?.GuId,
+      saleIssueKey,
+      soldQty,
+      totalQtyAfter:totalQty
+    });
+    if (!transition.ok) {
+      const row = { itemCode, skipped:true, reason:'invalid-positive-to-zero-transition', code:transition.code };
       out.push(row);
-      await db.collection('appLogs').insertOne({ type:'sale_issue_post_board_stock_out', ...decision, skipped:true, reason:'open-event-exists', existingId:row.existingId, eventKey:row.eventKey }).catch(()=>{});
+      await db.collection('appLogs').insertOne({ type:'sale_issue_post_board_stock_out', ...decision, skipped:true, reason:row.reason, code:transition.code }).catch(()=>{});
       continue;
     }
 
@@ -3474,7 +3494,14 @@ async function createStockOutBoardEventsAfterSale({ db, body, result, mapping, u
       activeWarehouseNumbers,
       reconciledRows,
       source,
-      eventKey:`stock_out:${itemCode}:sale:${invoiceNumber || result?.Number || saleIssueKey || Date.now()}`,
+      eventKey:transition.eventKey,
+      transitionId:transition.transitionId,
+      transitionContractVersion:transition.contractVersion,
+      transitionAuthority:transition.transitionAuthority,
+      canonicalItemIdentity:transition.canonicalItemIdentity,
+      canonicalItemGuid:transition.canonicalItemGuid,
+      soldQty:transition.soldQty,
+      totalQtyBefore:transition.totalQtyBefore,
       invoiceNo:String(invoiceNumber || result?.Number || result?.InvNo || ''),
       invoiceGuid:String(invoiceGuid || result?.GuId || ''),
       saleIssueKey:String(saleIssueKey||''),
@@ -3485,7 +3512,7 @@ async function createStockOutBoardEventsAfterSale({ db, body, result, mapping, u
       status:'new'
     });
     out.push({ itemCode, ...ev });
-    await db.collection('appLogs').insertOne({ type:'sale_issue_post_board_stock_out', ...decision, created:Boolean(ev.inserted || ev.ok), eventKey:ev.eventKey || '', error:ev.error || '' }).catch(()=>{});
+    await db.collection('appLogs').insertOne({ type:'sale_issue_post_board_stock_out', ...decision, created:Boolean(ev.inserted), idempotentReplay:Boolean(ev.ok && !ev.inserted), eventKey:ev.eventKey || '', transitionId:transition.transitionId, error:ev.error || '' }).catch(()=>{});
   }
 
   if (!out.length) {
