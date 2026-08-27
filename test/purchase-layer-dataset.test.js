@@ -139,7 +139,7 @@ test('TotalRecords tolerates a short middle page and zero-record invoice type',a
   assert.equal(result.validation.allTypesReachedEnd,true);
 });
 
-test('full backfill retries, represents returns, validates quantities, and activates atomically',async()=>{
+test('full backfill retries, represents returns, validates quantities, and remains a candidate',async()=>{
   const db=new MemoryDb();
   const purchase=invoice(3,10,[line(11,'A',5,100)]);
   const returned=invoice(7,20,[line(21,'A',2,100)],{RelatedInvHeaderId:'HEADER-3-10'});
@@ -147,7 +147,7 @@ test('full backfill retries, represents returns, validates quantities, and activ
   const result=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:api,mode:'full',reset:true,dateFrom:'14050101',pageSize:20,maxPages:3,maxPageAttempts:3});
   assert.equal(result.ok,true);
   assert.equal(result.status,'completed');
-  assert.equal(result.activationStatus,'active');
+  assert.equal(result.activationStatus,'validated-candidate');
   assert.equal(result.retryCount,1);
   assert.equal(result.duplicateCount,0);
   assert.equal(result.validation.quantityInvariantErrors,0);
@@ -158,8 +158,10 @@ test('full backfill retries, represents returns, validates quantities, and activ
   assert.equal(purchaseRow.returnedQuantity,2);
   assert.equal(purchaseRow.netPurchasedQuantity,3);
   assert.equal(returnRow.matchedPurchaseLineIdentity,purchaseRow.purchaseLineIdentity);
-  const active=await purchaseLayers.activeDataset(db);
-  assert.equal(active.datasetId,result.datasetId);
+  assert.equal(await purchaseLayers.activeDataset(db),null);
+  const activation=await purchaseLayers.activateDataset(db,{datasetId:result.datasetId,candidateFingerprint:result.candidateFingerprint,reason:'Management test approval'},{username:'manager',role:'manager'});
+  assert.equal(activation.activeDatasetId,result.datasetId);
+  assert.equal((await purchaseLayers.activeDataset(db)).datasetId,result.datasetId);
 });
 
 test('bounded candidate remains inactive then resumes the same dataset without duplicates',async()=>{
@@ -177,7 +179,7 @@ test('bounded candidate remains inactive then resumes the same dataset without d
   assert.equal(resumed.resumeCount,1);
   assert.equal(resumed.duplicateCount,0);
   assert.equal(await db.collection('supplierPurchaseLayers').estimatedDocumentCount(),1);
-  assert.equal((await purchaseLayers.activeDataset(db)).datasetId,bounded.datasetId);
+  assert.equal(await purchaseLayers.activeDataset(db),null);
 });
 
 test('an interrupted running candidate can safely replay from page zero with the same id',async()=>{
@@ -212,6 +214,7 @@ test('failed candidate never replaces a prior active dataset',async()=>{
   const goodApi=apiFor({'3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[]},'7':{0:[]}});
   const good=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:goodApi,mode:'full',reset:true,dateFrom:'14050101',maxPages:3});
   assert.equal(good.ok,true);
+  await purchaseLayers.activateDataset(db,{datasetId:good.datasetId,candidateFingerprint:good.candidateFingerprint,reason:'Management test approval'},{username:'admin',role:'admin'});
   const badApi={getInvoicePageByTypeNumberRange:async()=>({ok:false,error:'permanent failure'})};
   const bad=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:badApi,mode:'full',reset:true,dateFrom:'14050101',maxPages:3,maxPageAttempts:1});
   assert.equal(bad.ok,false);
@@ -225,6 +228,7 @@ test('incremental clone preserves legacy rows and coverage never activates FIFO 
   });
   const fullApi=apiFor({'3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[]},'7':{0:[]}});
   const full=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:fullApi,mode:'full',reset:true,dateFrom:'14050101',maxPages:3});
+  await purchaseLayers.activateDataset(db,{datasetId:full.datasetId,candidateFingerprint:full.candidateFingerprint,reason:'Management test approval'},{username:'admin',role:'admin'});
   const incrementalApi=apiFor({'3':{0:[invoice(3,11,[line(12,'B',1,200)])],20:[]},'7':{0:[]}});
   const incremental=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:incrementalApi,mode:'incremental',dateFrom:'14050101',maxPages:3});
   assert.equal(incremental.ok,true);
@@ -237,7 +241,7 @@ test('incremental clone preserves legacy rows and coverage never activates FIFO 
   assert.equal(coverage.saleItemsWithPurchaseLayer,1);
   assert.equal(coverage.saleValueEligiblePercent,100);
   assert.equal(coverage.fifoReadiness.deterministicAllocationEligible,false);
-  assert.equal((await purchaseLayers.activeDataset(db)).datasetId,incremental.datasetId);
+  assert.equal((await purchaseLayers.activeDataset(db)).datasetId,full.datasetId);
   assert.notEqual(full.datasetId,incremental.datasetId);
 });
 
@@ -259,6 +263,7 @@ test('incremental remediation candidate preserves active dataset and records det
   const db=new MemoryDb();
   const activeApi=apiFor({'3':{0:[invoice(3,1230,[line(1,'OLD',2,100)])],20:[]},'7':{0:[]}});
   const active=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:activeApi,mode:'full',reset:true,dateFrom:'14050101',maxPages:3});
+  await purchaseLayers.activateDataset(db,{datasetId:active.datasetId,candidateFingerprint:active.candidateFingerprint,reason:'Management test approval'},{username:'admin',role:'admin'});
   const candidateApi=apiFor({
     '3':{0:[
       invoice(3,1231,[line(10,'12D3209250',5,1479820000)],{InvDate:'14050507'}),
@@ -281,4 +286,63 @@ test('incremental remediation candidate preserves active dataset and records det
   assert.equal(rows.length,4);
   assert.ok(rows.every(row=>/^[a-f0-9]{64}$/.test(row.sourceHash)));
   assert.deepEqual([...new Set(rows.filter(row=>[1231,1235].includes(row.purchaseInvoiceNo)).map(row=>row.purchaseInvoiceNo))],[1231,1235]);
+});
+
+test('GeneralRef links exact purchase origin and multiple partial returns reduce only that layer',async()=>{
+  const db=new MemoryDb();
+  const api=apiFor({
+    '3':{0:[invoice(3,10,[line(11,'A',10,100)])],20:[]},
+    '7':{0:[invoice(7,20,[line(21,'A',2,100)],{InvHeaderId:'',GeneralRef:'10'}),invoice(7,21,[line(22,'A',3,100)],{InvHeaderId:'',GeneralRef:'10'})],20:[]}
+  });
+  const result=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:api,mode:'full',reset:true,dateFrom:'14050101',maxPages:3});
+  assert.equal(result.ok,true);
+  assert.equal(result.returnAudit.exactOriginLinkCount,2);
+  const purchase=await db.collection('supplierPurchaseLayers').findOne({datasetId:result.datasetId,layerKind:'purchase'});
+  assert.equal(purchase.originalQuantity,10);
+  assert.equal(purchase.returnedQuantity,5);
+  assert.equal(purchase.netPurchasedQuantity,5);
+  assert.equal(purchase.linkedReturnIdentities.length,2);
+  const returns=db.collection('supplierPurchaseLayers').rows.filter(row=>row.datasetId===result.datasetId&&row.layerKind==='purchase-return');
+  assert.ok(returns.every(row=>row.returnLinkageClass==='EXACT_ORIGIN_LINK'&&row.returnMatchStatus==='matched'));
+});
+
+test('return without authoritative origin remains explicit quarantine without reducing a purchase',async()=>{
+  const db=new MemoryDb();
+  const api=apiFor({'3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[]},'7':{0:[invoice(7,20,[line(21,'A',2,100)],{InvHeaderId:'',RelatedInvHeaderId:0,InvHeaderIdRoot:0,GeneralRef:''})],20:[]}});
+  const result=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:api,mode:'full',reset:true,dateFrom:'14050101',maxPages:3});
+  assert.equal(result.ok,true);
+  assert.equal(result.sourceCompleteness,'PURCHASE_SOURCE_COMPLETE_WITH_EXPLICIT_QUARANTINE');
+  assert.equal(result.returnAudit.unmatchedReturnCount,1);
+  const purchase=await db.collection('supplierPurchaseLayers').findOne({datasetId:result.datasetId,layerKind:'purchase'});
+  const returned=await db.collection('supplierPurchaseLayers').findOne({datasetId:result.datasetId,layerKind:'purchase-return'});
+  assert.equal(purchase.netPurchasedQuantity,5);
+  assert.equal(returned.returnLinkageClass,'UNLINKED_RETURN');
+});
+
+test('raw non-empty page never becomes terminal because type normalization filtered every row',async()=>{
+  const db=new MemoryDb();
+  const api=apiFor({'3':{0:[invoice(7,1,[line(1,'IGNORED',1,1)])],20:[invoice(3,10,[line(11,'TARGET',1,100)])],40:[]},'7':{0:[]}});
+  const result=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:api,mode:'full',reset:true,dateFrom:'14050101',maxPages:5});
+  assert.equal(result.ok,true);
+  assert.deepEqual(api.calls.filter(call=>call.type===3).map(call=>call.rowStart),[0,20,40]);
+  assert.equal(db.collection('supplierPurchaseLayers').rows.some(row=>row.datasetId===result.datasetId&&row.itemCode==='TARGET'),true);
+  const stored=await db.collection('purchaseLayerDatasets').findOne({datasetId:result.datasetId});
+  assert.equal(stored.pageDiagnostics[0].rawRows,1);
+  assert.equal(stored.pageDiagnostics[0].sourceRows,0);
+});
+
+test('activation is an explicit fingerprint-guarded Management metadata transition',async()=>{
+  const db=new MemoryDb();
+  const api=apiFor({'3':{0:[invoice(3,10,[line(11,'A',5,100)])],20:[]},'7':{0:[]}});
+  const candidate=await purchaseLayers.buildPurchaseLayerDataset(db,{shaygan:api,mode:'full',reset:true,dateFrom:'14050101',maxPages:3,activate:true});
+  assert.equal(candidate.activationPerformed,false);
+  assert.equal(await purchaseLayers.activeDataset(db),null);
+  await assert.rejects(purchaseLayers.activateDataset(db,{datasetId:candidate.datasetId,candidateFingerprint:candidate.candidateFingerprint,reason:'x'},{username:'accounting',role:'accounting'}),error=>error.code==='PURCHASE_DATASET_ACTIVATION_FORBIDDEN');
+  await assert.rejects(purchaseLayers.activateDataset(db,{datasetId:candidate.datasetId,candidateFingerprint:'stale',reason:'x'},{username:'admin',role:'admin'}),error=>error.code==='PURCHASE_DATASET_ACTIVATION_STALE');
+  const activated=await purchaseLayers.activateDataset(db,{datasetId:candidate.datasetId,candidateFingerprint:candidate.candidateFingerprint,reason:'Approved by Management'},{username:'admin',role:'admin'});
+  assert.equal(activated.activationPerformed,true);
+  const state=db.collection('purchaseLayerDatasetState').rows[0];
+  assert.equal(state.activeDatasetId,candidate.datasetId);
+  assert.equal(state.authorityAuditLog[0].actor.username,'admin');
+  assert.equal(db.collection('supplierPurchaseLayers').rows.length,1);
 });

@@ -632,6 +632,7 @@ function identityMatches(row, target) {
 }
 function eligibleSuggestionLayer(row, target, applicableDate) {
   if(!identityMatches(row,target)||row.layerKind!=='purchase')return false;
+  if(clean(row.costStatus).toLowerCase()==='pending-purchase-price-correction')return false;
   if(['rejected','invalid'].includes(clean(row.validationStatus).toLowerCase()))return false;
   if(row.returnMatchStatus&&['ambiguous','quantity-exceeds-purchase','unmatched'].includes(clean(row.returnMatchStatus)))return false;
   const purchaseDate=clean(row.purchaseInvoiceDate,8);
@@ -644,7 +645,11 @@ function eligibleSuggestionLayer(row, target, applicableDate) {
 }
 function suggestionFromLayers(rows=[], target={}, applicableDate='', affectedQuantityExact='') {
   const eligible=rows.filter(row=>eligibleSuggestionLayer(row,target,applicableDate));
-  if(!eligible.length)return {available:false,method:'NO_VALID_HISTORICAL_PURCHASE',suggestedCostExact:null,purchaseCount:0,quantityBasisExact:'0.000000',sourcePurchaseIds:[],sourceFingerprint:crypto.createHash('sha256').update('[]').digest('hex'),evidence:[]};
+  const excludedPending=rows.filter(row=>identityMatches(row,target)&&row.layerKind==='purchase'&&clean(row.purchaseInvoiceDate,8)<=applicableDate&&clean(row.costStatus).toLowerCase()==='pending-purchase-price-correction');
+  const excludedEvidence=excludedPending.map(row=>({purchaseLineIdentity:clean(row.purchaseLineIdentity,500),purchaseInvoiceNumber:Number(row.purchaseInvoiceNo||0),purchaseInvoiceDate:clean(row.purchaseInvoiceDate,8),quantityExact:clean(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,100),unitCostExact:clean(row.netUnitCostExact??row.netUnitCost??row.grossUnitCostExact??row.grossUnitCost,100),costStatus:clean(row.costStatus),sourceHash:clean(row.sourceHash,128)}));
+  const excludedQuantity=excludedPending.reduce((sum,row)=>{try{return sum+accountingDecimal.parse(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,accountingDecimal.QUANTITY_SCALE);}catch(_){return sum;}},0n);
+  const excluded={excludedPendingCount:excludedEvidence.length,excludedPendingQuantityExact:accountingDecimal.format(excludedQuantity,accountingDecimal.QUANTITY_SCALE),excludedPurchaseIds:[...new Set(excludedEvidence.map(row=>String(row.purchaseInvoiceNumber)))],excludedEvidence};
+  if(!eligible.length)return {available:false,method:'NO_VALID_HISTORICAL_PURCHASE',suggestedCostExact:null,purchaseCount:0,eligiblePurchaseCount:0,quantityBasisExact:'0.000000',sourcePurchaseIds:[],sourceFingerprint:crypto.createHash('sha256').update('[]').digest('hex'),evidence:[],...excluded};
   let quantity=0n,totalCost=0n;
   const evidence=eligible.map(row=>{
     const q=accountingDecimal.parse(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,accountingDecimal.QUANTITY_SCALE);
@@ -657,7 +662,7 @@ function suggestionFromLayers(rows=[], target={}, applicableDate='', affectedQua
   const latest=evidence[evidence.length-1];
   const fingerprint=crypto.createHash('sha256').update(stable(evidence.map(row=>[row.purchaseLineIdentity,row.sourceHash,row.quantityExact,row.unitCostExact]))).digest('hex');
   const affected=affectedQuantityExact?accountingDecimal.parse(affectedQuantityExact,accountingDecimal.QUANTITY_SCALE):quantity,covered=affected<quantity?affected:quantity;
-  return {available:true,method:'WEIGHTED_AVERAGE_HISTORICAL_OFFICIAL_PURCHASES',suggestedCostExact:accountingDecimal.format(weighted,accountingDecimal.UNIT_COST_SCALE),purchaseCount:evidence.length,quantityBasisExact:accountingDecimal.format(quantity,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affected,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affected-covered,accountingDecimal.QUANTITY_SCALE),evidenceQuality:'BROAD_ITEM_LEVEL_HISTORICAL_AVERAGE',dateFrom:evidence[0].purchaseInvoiceDate,dateTo:latest.purchaseInvoiceDate,minPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a<b?a:b),accountingDecimal.UNIT_COST_SCALE),maxPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a>b?a:b),accountingDecimal.UNIT_COST_SCALE),latestPurchaseCostExact:latest.unitCostExact,sourcePurchaseIds:[...new Set(evidence.map(row=>String(row.purchaseInvoiceNumber)))],sourceFingerprint:fingerprint,evidence};
+  return {available:true,method:'WEIGHTED_AVERAGE_HISTORICAL_OFFICIAL_PURCHASES',suggestedCostExact:accountingDecimal.format(weighted,accountingDecimal.UNIT_COST_SCALE),purchaseCount:evidence.length,eligiblePurchaseCount:evidence.length,quantityBasisExact:accountingDecimal.format(quantity,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affected,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affected-covered,accountingDecimal.QUANTITY_SCALE),evidenceQuality:'BROAD_ITEM_LEVEL_HISTORICAL_AVERAGE',dateFrom:evidence[0].purchaseInvoiceDate,dateTo:latest.purchaseInvoiceDate,minPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a<b?a:b),accountingDecimal.UNIT_COST_SCALE),maxPurchaseCostExact:accountingDecimal.format(costs.reduce((a,b)=>a>b?a:b),accountingDecimal.UNIT_COST_SCALE),latestPurchaseCostExact:latest.unitCostExact,sourcePurchaseIds:[...new Set(evidence.map(row=>String(row.purchaseInvoiceNumber)))],sourceFingerprint:fingerprint,evidence,...excluded};
 }
 function openingSuggestion(row,target={},applicableDate='',affectedQuantityExact='') {
   if(!row||row.status!=='available'||row.extractionComplete!==true)return null;
@@ -687,7 +692,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const dataset=await db.collection(purchaseLayerDataset.DATASETS).findOne({datasetId});
   if(!dataset||dataset.status!=='completed')fail('PURCHASE_DATASET_NOT_CANONICAL','فقط Dataset ساخته‌شده توسط Purchase Engine رسمی مجاز است.',409);
   const identityParts=[];if(itemGuid)identityParts.push({itemGuid});if(itemCode)identityParts.push({itemCode});
-  const layerQuery=canonicalLayerContract.canonicalPurchaseQuery({datasetId,purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})});
+  const layerQuery=canonicalLayerContract.canonicalLayerQuery({datasetId,purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})});
   const [layers,openingRows,governedOpening]=await Promise.all([
     db.collection(purchaseLayerDataset.LAYERS).find(layerQuery).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(5001).toArray(),
     db.collection(openingCostBasis.COLLECTION).find({...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:applicableDate}}).sort({effectiveOpeningDate:-1,updatedAt:-1}).limit(10).toArray(),
@@ -695,6 +700,8 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   ]);
   if(layers.length>5000)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target:{itemGuid,itemCode},available:false,method:'EVIDENCE_LIMIT_EXCEEDED',suggestedCostExact:null,purchaseCount:layers.length,evidenceComplete:false,limit:5000};
   const target={itemGuid,itemCode};
+  const unresolvedReturns=layers.filter(row=>row.layerKind==='purchase-return'&&row.returnMatchStatus!=='matched');
+  if(unresolvedReturns.length)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,available:false,manualCostRequired:false,sourceClass:'PURCHASE_RETURN_CONFLICT',method:'PURCHASE_RETURN_REQUIRES_GOVERNED_LINKAGE',suggestedCostExact:null,returnCount:unresolvedReturns.length,returnEvidence:unresolvedReturns.map(row=>({purchaseLineIdentity:clean(row.purchaseLineIdentity,500),returnInvoiceNumber:Number(row.purchaseInvoiceNo||0),returnDate:clean(row.purchaseInvoiceDate,8),quantityExact:clean(row.returnedQuantityExact??row.returnedQuantity,100),returnMatchStatus:clean(row.returnMatchStatus),returnLinkageClass:clean(row.returnLinkageClass)})),remediation:'REVIEW_CANONICAL_PURCHASE_RETURN_LINKAGE'};
   const exactIdentity=clean(input.purchaseLineIdentity,500);
   const exact=exactIdentity?layers.find(row=>clean(row.purchaseLineIdentity,500)===exactIdentity&&eligibleSuggestionLayer(row,target,applicableDate)):null;
   if(exact)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,available:false,manualCostRequired:false,sourceClass:'EXACT_OFFICIAL_PURCHASE_LAYER',method:'EXACT_OFFICIAL_PURCHASE_LAYER',suggestedCostExact:clean(exact.netUnitCostExact??exact.netUnitCost??exact.grossUnitCostExact??exact.grossUnitCost,100),purchaseLineIdentity:exactIdentity,remediation:'USE_CANONICAL_PURCHASE_LAYER'};
@@ -704,6 +711,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...opening};
   const historical=suggestionFromLayers(layers,target,applicableDate,clean(input.affectedQuantityExact,100));
   if(historical.available)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'HISTORICAL_PURCHASE_AVERAGE',...historical};
+  if(historical.excludedPendingCount)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'PENDING_PURCHASE_PRICE',available:false,manualCostRequired:false,method:'PENDING_PURCHASE_PRICE_QUARANTINE',suggestedCostExact:null,...historical,remediation:'WAIT_FOR_CANONICAL_PURCHASE_PRICE_CORRECTION'};
   const history=await canonicalItemCatalog.historyStatus(db,target);
   if(!history.complete)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:false,historyCompleteness:history.state,sourceClass:'SOURCE_HISTORY_INCOMPLETE',available:false,manualCostRequired:false,method:'BOUNDED_PURCHASE_HISTORY_RECOVERY_REQUIRED',suggestedCostExact:null,purchaseCount:0,quantityBasisExact:'0.000000',sourceFingerprint:crypto.createHash('sha256').update(stable({target,historyState:history.state})).digest('hex'),remediation:'QUEUE_CANONICAL_PURCHASE_HISTORY_RECOVERY'};
   return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'NO_VALID_COST_BASIS',...historical};
@@ -720,6 +728,8 @@ async function assistedDecision(db,input={},requestedBy={}) {
   if(decision!=='APPROVE_SUGGESTED'&&decision!=='APPROVE_OVERRIDE')fail('MANUAL_COST_DECISION_INVALID','تصمیم حسابداری معتبر نیست.');
   if(suggestion.sourceClass==='EXACT_OFFICIAL_PURCHASE_LAYER')fail('MANUAL_COST_NOT_REQUIRED','لایه خرید رسمی معتبر وجود دارد؛ مسیر اصلاح Dataset را استفاده کنید.',409);
   if(suggestion.sourceClass==='SOURCE_HISTORY_INCOMPLETE')fail('MANUAL_COST_SOURCE_HISTORY_INCOMPLETE','تا پیش از تکمیل Recovery تاریخچه رسمی، ثبت هزینه دستی مجاز نیست.',409);
+  if(suggestion.sourceClass==='PENDING_PURCHASE_PRICE')fail('MANUAL_COST_PENDING_PURCHASE_PRICE','قیمت خرید هنوز موقت است و نمی‌تواند مأخذ هزینه باشد.',409);
+  if(suggestion.sourceClass==='PURCHASE_RETURN_CONFLICT')fail('MANUAL_COST_PURCHASE_RETURN_CONFLICT','برگشت خرید حل‌نشده باید ابتدا در Purchase Engine رسمی تعیین تکلیف شود.',409);
   if(suggestion.sourceClass==='CONFLICT_REQUIRES_REVIEW')fail('MANUAL_COST_SOURCE_CONFLICT','مأخذهای هزینه با یکدیگر تعارض دارند و نیازمند بررسی انسانی‌اند.',409);
   const finalInput=decision==='APPROVE_SUGGESTED'?suggestion.suggestedCostExact:input.finalCost;
   if(decision==='APPROVE_SUGGESTED'&&!suggestion.available)fail('MANUAL_COST_SUGGESTION_UNAVAILABLE','قیمت پیشنهادی معتبر وجود ندارد.',409);

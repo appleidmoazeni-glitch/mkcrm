@@ -55,6 +55,7 @@ function amount(line) { return nonNegative(line.Amount ?? line.TotalAmount ?? li
 function price(line) { return nonNegative(line.Price ?? line.UnitPrice); }
 function sourceHeaderId(invoice) { return clean(invoice.InvHeaderId || invoice.HeaderId || invoice.InvHeaderID); }
 function returnHeaderReference(invoice) { return clean(invoice.RelatedInvHeaderId || invoice.InvHeaderIdRoot); }
+function returnInvoiceNumberReference(invoice) { return clean(invoice.GeneralRef); }
 function lineIdentity(invoice, line, row) {
   const guid = invoiceGuid(invoice);
   const lineId = clean(line.LineItemId || line.LineId);
@@ -73,7 +74,8 @@ function sourceProjection(row = {}) {
     grossUnitCost:row.grossUnitCost == null ? null : Number(row.grossUnitCost),
     discountAmount:row.discountAmount == null ? null : Number(row.discountAmount),
     netUnitCost:row.netUnitCost == null ? null : Number(row.netUnitCost),
-    returnInvHeaderReference:clean(row.returnInvHeaderReference)
+    returnInvHeaderReference:clean(row.returnInvHeaderReference),
+    returnPurchaseInvoiceNoReference:clean(row.returnPurchaseInvoiceNoReference)
   };
 }
 function sourceHash(row = {}) { return sha256(stable(sourceProjection(row))); }
@@ -83,7 +85,9 @@ function datasetFingerprints(rows = []) {
     sourceHash:clean(row.sourceHash) || sourceHash(row),
     netPurchasedQuantity:row.netPurchasedQuantity == null ? null : Number(row.netPurchasedQuantity),
     returnMatchStatus:clean(row.returnMatchStatus),
-    matchedPurchaseLineIdentity:clean(row.matchedPurchaseLineIdentity)
+    returnLinkageClass:clean(row.returnLinkageClass),
+    matchedPurchaseLineIdentity:clean(row.matchedPurchaseLineIdentity),
+    linkedReturnIdentities:Array.isArray(row.linkedReturnIdentities) ? [...row.linkedReturnIdentities].map(clean).sort() : []
   })).sort((a,b)=>a.purchaseLineIdentity.localeCompare(b.purchaseLineIdentity, 'en'));
   const layerFingerprint = sha256(stable(ordered));
   const sourceFingerprint = sha256(stable(ordered.map(row => [row.purchaseLineIdentity, row.sourceHash])));
@@ -109,6 +113,15 @@ function responseTotalRecords(response) {
     if (Number.isSafeInteger(value) && value >= 0) return value;
   }
   return null;
+}
+function invoiceGapRanges(values=[]) {
+  const numbers=[...new Set(values.map(Number).filter(value=>Number.isSafeInteger(value)&&value>0))].sort((a,b)=>a-b);
+  const ranges=[];
+  for(let index=1;index<numbers.length;index++){
+    if(numbers[index]===numbers[index-1]+1)continue;
+    ranges.push({from:numbers[index-1]+1,to:numbers[index]-1,count:numbers[index]-numbers[index-1]-1});
+  }
+  return ranges;
 }
 function wait(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
 
@@ -138,7 +151,7 @@ async function activeDataset(db) {
   const state = await db.collection(STATE).findOne({ scopeKey:SCOPE_KEY }).catch(() => null);
   if (!state?.activeDatasetId) return null;
   const dataset = await db.collection(DATASETS).findOne({ datasetId:state.activeDatasetId }).catch(() => null);
-  if (!dataset || dataset.status !== 'completed' || dataset.activationStatus !== 'active') return null;
+  if (!dataset || dataset.status !== 'completed') return null;
   return { datasetId:dataset.datasetId, state, dataset };
 }
 
@@ -179,6 +192,7 @@ function mapSourceLine(invoice, line, row, datasetId) {
     purchaseInvoiceDate:invoiceDate(invoice),
     sourceInvHeaderId:sourceHeaderId(invoice),
     returnInvHeaderReference:returnHeaderReference(invoice),
+    returnPurchaseInvoiceNoReference:returnInvoiceNumberReference(invoice),
     supplierGuid:clean(invoice.AccountGuId || invoice.SupplierGuid),
     supplierAccountNumber,
     supplierName:clean(invoice.AccountName || invoice.SupplierName),
@@ -204,6 +218,7 @@ function mapSourceLine(invoice, line, row, datasetId) {
       ? (purchasePricePendingCorrection ? 'pending-purchase-price-correction' : (costKnown ? 'known-from-shaygan-line' : 'unknown'))
       : 'not-applicable-return-row',
     returnMatchStatus:sourceIsPurchase ? 'not-applicable' : 'unmatched',
+    returnLinkageClass:sourceIsPurchase ? 'NOT_APPLICABLE' : 'UNLINKED_RETURN',
     source:'shaygan-webservice-invoice-get',
     createdAt:now,
     updatedAt:now
@@ -240,56 +255,85 @@ async function reconcilePurchaseReturns(db, datasetId) {
   const purchases = await collection.find(canonicalLayerContract.canonicalPurchaseQuery({ datasetId })).toArray();
   const returns = await collection.find(canonicalLayerContract.canonicalPurchaseReturnQuery({ datasetId })).toArray();
   const purchasesByHeaderItem = new Map();
+  const purchasesByInvoiceSupplierItem = new Map();
+  const normalizedReference = value => {
+    const result=clean(value);
+    return result && result !== '0' ? result : '';
+  };
+  const identityKey = row => clean(row.itemCode) ? `C:${clean(row.itemCode).toLowerCase()}` : `G:${clean(row.itemGuid).toLowerCase()}`;
+  const supplierKey = row => clean(row.supplierAccountNumber) ? `A:${clean(row.supplierAccountNumber).toLowerCase()}` : `G:${clean(row.supplierGuid).toLowerCase()}`;
+  const add = (map,key,row) => { if(!key)return;if(!map.has(key))map.set(key,[]);map.get(key).push(row); };
   for (const purchase of purchases) {
-    const header = clean(purchase.sourceInvHeaderId || purchase.purchaseInvoiceGuid);
-    const item = clean(purchase.itemCode || purchase.itemGuid);
-    const key = `${header}|${item}`;
-    if (!purchasesByHeaderItem.has(key)) purchasesByHeaderItem.set(key, []);
-    purchasesByHeaderItem.get(key).push(purchase);
+    const item=identityKey(purchase);
+    for(const header of [purchase.sourceInvHeaderId,purchase.purchaseInvoiceGuid].map(normalizedReference).filter(Boolean))add(purchasesByHeaderItem,`${header}|${item}`,purchase);
+    add(purchasesByInvoiceSupplierItem,`${Number(purchase.purchaseInvoiceNo||0)}|${supplierKey(purchase)}|${item}`,purchase);
     await collection.updateOne(
       { datasetId, purchaseLineIdentity:purchase.purchaseLineIdentity },
-      { $set:{ returnedQuantity:0, netPurchasedQuantity:purchase.originalQuantity, remainingQuantity:purchase.originalQuantity, returnMatchStatus:'not-applicable', updatedAt:new Date() } }
+      { $set:{ returnedQuantity:0, netPurchasedQuantity:purchase.originalQuantity, remainingQuantity:purchase.originalQuantity, returnMatchStatus:'not-applicable', returnLinkageClass:'NOT_APPLICABLE', linkedReturnIdentities:[], updatedAt:new Date() } }
     );
   }
-  let matchedReturnCount = 0;
+  let exactOriginLinkCount = 0;
+  let deterministicLinkCount = 0;
   let unmatchedReturnCount = 0;
   let ambiguousReturnCount = 0;
+  let overReturnCount = 0;
+  let duplicateReturnCount = 0;
   let quantityInvariantErrors = 0;
+  const assignments=new Map();
   for (const returnRow of returns) {
-    const reference = clean(returnRow.returnInvHeaderReference);
-    const item = clean(returnRow.itemCode || returnRow.itemGuid);
-    const candidates = reference ? (purchasesByHeaderItem.get(`${reference}|${item}`) || []) : [];
+    const headerReference=normalizedReference(returnRow.returnInvHeaderReference);
+    const invoiceReference=normalizedReference(returnRow.returnPurchaseInvoiceNoReference);
+    const item=identityKey(returnRow);
+    let candidates=headerReference ? (purchasesByHeaderItem.get(`${headerReference}|${item}`)||[]) : [];
+    let linkageClass=candidates.length ? 'EXACT_ORIGIN_LINK' : '';
+    if(!candidates.length&&invoiceReference){
+      candidates=purchasesByInvoiceSupplierItem.get(`${Number(invoiceReference)}|${supplierKey(returnRow)}|${item}`)||[];
+      linkageClass=candidates.length ? 'EXACT_ORIGIN_LINK' : '';
+    }
     if (candidates.length !== 1) {
       const status = candidates.length > 1 ? 'ambiguous' : 'unmatched';
+      const classification=candidates.length>1?'AMBIGUOUS_RETURN':'UNLINKED_RETURN';
       if (status === 'ambiguous') ambiguousReturnCount++; else unmatchedReturnCount++;
       await collection.updateOne(
         { datasetId, purchaseLineIdentity:returnRow.purchaseLineIdentity },
-        { $set:{ returnMatchStatus:status, validationStatus:'warning', validationWarnings:[...(returnRow.validationWarnings || []), `purchase-return-${status}`], updatedAt:new Date() } }
+        { $set:{ returnMatchStatus:status, returnLinkageClass:classification, matchedPurchaseLineIdentity:'', validationStatus:'warning', validationWarnings:[...new Set([...(returnRow.validationWarnings || []), `purchase-return-${status}`])], updatedAt:new Date() } }
       );
       continue;
     }
-    const purchase = await collection.findOne({ datasetId, purchaseLineIdentity:candidates[0].purchaseLineIdentity });
-    const returnedQuantity = Number(purchase.returnedQuantity || 0) + Number(returnRow.returnedQuantity || 0);
-    const netPurchasedQuantity = Number(purchase.originalQuantity || 0) - returnedQuantity;
-    if (netPurchasedQuantity < -0.000001) {
-      quantityInvariantErrors++;
-      await collection.updateOne(
-        { datasetId, purchaseLineIdentity:returnRow.purchaseLineIdentity },
-        { $set:{ returnMatchStatus:'quantity-exceeds-purchase', validationStatus:'rejected', validationWarnings:[...(returnRow.validationWarnings || []), 'purchase-return-exceeds-purchase'], updatedAt:new Date() } }
-      );
+    const purchase=candidates[0],id=clean(purchase.purchaseLineIdentity);
+    if(!assignments.has(id))assignments.set(id,{purchase,returns:[]});
+    assignments.get(id).returns.push({row:returnRow,linkageClass});
+  }
+  for(const {purchase,returns:linked} of assignments.values()){
+    const identityCounts=new Map();
+    for(const link of linked)identityCounts.set(clean(link.row.purchaseLineIdentity),(identityCounts.get(clean(link.row.purchaseLineIdentity))||0)+1);
+    const duplicates=linked.filter(link=>identityCounts.get(clean(link.row.purchaseLineIdentity))>1);
+    if(duplicates.length){
+      duplicateReturnCount+=duplicates.length;
+      for(const {row} of duplicates)await collection.updateOne({datasetId,purchaseLineIdentity:row.purchaseLineIdentity},{$set:{returnMatchStatus:'duplicate',returnLinkageClass:'DUPLICATE_RETURN',validationStatus:'rejected',validationWarnings:[...new Set([...(row.validationWarnings||[]),'purchase-return-duplicate'])],updatedAt:new Date()}});
       continue;
     }
-    matchedReturnCount++;
+    const returnedQuantity=linked.reduce((sum,link)=>sum+Number(link.row.returnedQuantity||0),0);
+    const originalQuantity=Number(purchase.originalQuantity||0);
+    const netPurchasedQuantity=originalQuantity-returnedQuantity;
+    if(netPurchasedQuantity < -0.000001){
+      overReturnCount+=linked.length;quantityInvariantErrors++;
+      for(const {row} of linked)await collection.updateOne({datasetId,purchaseLineIdentity:row.purchaseLineIdentity},{$set:{returnMatchStatus:'over-return',returnLinkageClass:'OVER_RETURN',validationStatus:'rejected',validationWarnings:[...new Set([...(row.validationWarnings||[]),'purchase-return-exceeds-purchase'])],updatedAt:new Date()}});
+      continue;
+    }
+    const linkedReturnIdentities=linked.map(link=>clean(link.row.purchaseLineIdentity)).sort();
     await collection.updateOne(
       { datasetId, purchaseLineIdentity:purchase.purchaseLineIdentity },
-      { $set:{ returnedQuantity, netPurchasedQuantity, remainingQuantity:netPurchasedQuantity, returnMatchStatus:'matched', updatedAt:new Date() } }
+      { $set:{ returnedQuantity, netPurchasedQuantity, remainingQuantity:netPurchasedQuantity, returnMatchStatus:'matched', returnLinkageClass:'EXACT_ORIGIN_LINK', linkedReturnIdentities, updatedAt:new Date() } }
     );
-    await collection.updateOne(
-      { datasetId, purchaseLineIdentity:returnRow.purchaseLineIdentity },
-      { $set:{ matchedPurchaseLineIdentity:purchase.purchaseLineIdentity, returnMatchStatus:'matched', validationStatus:returnRow.validationWarnings?.length ? 'warning' : 'valid', updatedAt:new Date() } }
-    );
+    for(const {row,linkageClass} of linked){
+      if(linkageClass==='EXACT_ORIGIN_LINK')exactOriginLinkCount++;else deterministicLinkCount++;
+      await collection.updateOne({datasetId,purchaseLineIdentity:row.purchaseLineIdentity},{$set:{matchedPurchaseLineIdentity:purchase.purchaseLineIdentity,returnMatchStatus:'matched',returnLinkageClass:linkageClass,validationStatus:row.validationWarnings?.length?'warning':'valid',updatedAt:new Date()}});
+    }
   }
-  return { purchaseReturnCount:returns.length, matchedReturnCount, unmatchedReturnCount, ambiguousReturnCount, quantityInvariantErrors, purchaseReturnsAccountedFor:returns.length === matchedReturnCount + unmatchedReturnCount + ambiguousReturnCount + quantityInvariantErrors };
+  const matchedReturnCount=exactOriginLinkCount+deterministicLinkCount;
+  const explicitQuarantineCount=unmatchedReturnCount+ambiguousReturnCount+overReturnCount+duplicateReturnCount;
+  return {purchaseReturnCount:returns.length,matchedReturnCount,exactOriginLinkCount,deterministicLinkCount,unmatchedReturnCount,ambiguousReturnCount,overReturnCount,duplicateReturnCount,explicitQuarantineCount,quantityInvariantErrors,purchaseReturnsAccountedFor:returns.length===matchedReturnCount+explicitQuarantineCount};
 }
 
 async function validateDataset(db, datasetId, reachedEndByType, errors) {
@@ -353,9 +397,9 @@ async function buildPurchaseLayerDataset(db, options = {}) {
   const maxPageAttempts = Math.max(1, Math.min(Number(options.maxPageAttempts || resumed?.maxPageAttempts || 3), 5));
   const full = resumed ? resumed.mode === 'full' : options.reset === true || options.mode === 'full';
   const mode = full ? 'full' : 'incremental';
-  const activationRequested = resumed
-    ? resumed.activationRequested !== false
-    : options.activate !== false;
+  // Candidate materialization and authority selection are intentionally separate.
+  // No build or resume operation may activate a Purchase Dataset.
+  const activationRequested = false;
   const previousActive = await activeDataset(db);
   const now = new Date();
   const startedAtMs = Date.now();
@@ -425,7 +469,8 @@ async function buildPurchaseLayerDataset(db, options = {}) {
           nextRowStartByType[key] = rowStart;
           break;
         }
-        const sourceRows = Array.isArray(response.result) ? response.result.filter(row => invoiceType(row) === type) : [];
+        const rawRows=Array.isArray(response.result)?response.result:[];
+        const sourceRows=rawRows.filter(row => invoiceType(row) === type);
         const totalRecords=responseTotalRecords(response);
         if(totalRecords!=null){
           pagingByType[key]={
@@ -436,8 +481,8 @@ async function buildPurchaseLayerDataset(db, options = {}) {
           };
         }
         pagingByType[key].pagesRead=Number(pagingByType[key].pagesRead||0)+1;
-        pageDiagnostics.push({ type, page, rowStart, rows:sourceRows.length, attempts, at:new Date() });
-        if (!sourceRows.length) {
+        pageDiagnostics.push({type,page,rowStart,rawRows:rawRows.length,sourceRows:sourceRows.length,attempts,terminalCondition:rawRows.length?'continue':'empty-raw-page',at:new Date()});
+        if (!rawRows.length) {
           reachedEndByType[key] = true;
           break;
         }
@@ -484,6 +529,8 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     const purchaseRows = rows.filter(row => row.layerKind === 'purchase');
     const purchaseInvoiceKeys = new Set(purchaseRows.map(row => row.purchaseInvoiceNo));
     const purchaseReturnInvoiceKeys = new Set(rows.filter(row=>row.layerKind==='purchase-return').map(row=>row.purchaseInvoiceNo));
+    const purchaseInvoiceNumbers=[...purchaseInvoiceKeys].map(Number).filter(Number.isFinite).sort((a,b)=>a-b);
+    const purchaseReturnInvoiceNumbers=[...purchaseReturnInvoiceKeys].map(Number).filter(Number.isFinite).sort((a,b)=>a-b);
     const itemKeys = new Set(purchaseRows.map(row => clean(row.itemCode || row.itemGuid)).filter(Boolean));
     const suppliers = new Set(purchaseRows.map(row => clean(row.supplierAccountNumber || row.supplierGuid)).filter(Boolean));
     const costUnknownCount = purchaseRows.filter(row => row.costStatus === 'unknown').length;
@@ -495,13 +542,16 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     const finalTypeIndex=SOURCE_TYPES.findIndex(type=>reachedEndByType[String(type)]!==true);
     const summary = {
       status:successful ? 'completed' : 'completed_with_errors',
-      activationStatus:successful ? (activationRequested ? 'validated' : 'validated-candidate') : 'rejected',
+      activationStatus:successful ? 'validated-candidate' : 'rejected',
       completedAt, updatedAt:completedAt, durationMs:Date.now() - startedAtMs,
       pageCount, retryCount, resumeCount:Number(resumed?.resumeCount||0)+(resumed?1:0),
       replayFromStartCount:Number(resumed?.replayFromStartCount||0)+(replayFromStart?1:0),
       checkpoint:{ typeIndex:finalTypeIndex<0?SOURCE_TYPES.length:finalTypeIndex, nextRowStartByType, reachedEndByType },
       pagingByType, lastInvoiceNoByType, clonedLayerCount, purchaseInvoiceCount:purchaseInvoiceKeys.size,
       purchaseReturnInvoiceCount:purchaseReturnInvoiceKeys.size,
+      firstInvoiceNoByType:{'3':purchaseInvoiceNumbers[0]||0,'7':purchaseReturnInvoiceNumbers[0]||0},
+      sourceInvoiceGapRangesByType:{'3':invoiceGapRanges(purchaseInvoiceNumbers),'7':invoiceGapRanges(purchaseReturnInvoiceNumbers)},
+      sourceCompleteness:successful?(returnAudit.explicitQuarantineCount?'PURCHASE_SOURCE_COMPLETE_WITH_EXPLICIT_QUARANTINE':'PURCHASE_SOURCE_COMPLETE'):'PURCHASE_SOURCE_INCOMPLETE',
       purchaseLineCount:purchaseRows.length, purchaseReturnLineCount:rows.length - purchaseRows.length,
       layerCount:rows.length, itemCount:itemKeys.size, supplierCount:suppliers.size,
       duplicateCount:validation.duplicateCount, rejectedRowCount:validation.rejectedRowCount,
@@ -516,33 +566,16 @@ async function buildPurchaseLayerDataset(db, options = {}) {
       baseDatasetId:resumed?.baseDatasetId||(!full?previousActive?.datasetId||'':'')
     };
     await db.collection(DATASETS).updateOne({ datasetId }, { $set:summary });
-    if (successful && activationRequested) {
-      const activatedAt = new Date();
-      await db.collection(STATE).updateOne({ scopeKey:SCOPE_KEY }, { $set:{
-        scopeKey:SCOPE_KEY, activeDatasetId:datasetId, previousActiveDatasetId,
-        activatedAt, updatedAt:activatedAt, activeDatasetStatus:'completed',
-        lastInvoiceNoByType, invoiceTypes:{ purchase:3, purchaseReturn:7 }
-      } }, { upsert:true });
-      await db.collection(DATASETS).updateOne({ datasetId }, { $set:{ activationStatus:'active', activatedAt, updatedAt:activatedAt } });
-      if (previousActiveDatasetId && previousActiveDatasetId !== datasetId) {
-        await db.collection(DATASETS).updateOne(
-          { datasetId:previousActiveDatasetId, activationStatus:'active' },
-          { $set:{ activationStatus:'superseded', supersededAt:activatedAt, supersededByDatasetId:datasetId, updatedAt:activatedAt } }
-        );
-      }
-    }
     const coverageMetrics=await coverage(db,datasetId);
     await db.collection(DATASETS).updateOne({datasetId},{$set:{coverage:coverageMetrics,updatedAt:new Date()}});
     const result = {
       ok:successful,
-      code:successful
-        ? (activationRequested ? 'PURCHASE_LAYER_DATASET_ACTIVATED' : 'PURCHASE_LAYER_DATASET_CANDIDATE_READY')
-        : 'PURCHASE_LAYER_DATASET_INCOMPLETE',
+      code:successful?'PURCHASE_LAYER_DATASET_CANDIDATE_READY':'PURCHASE_LAYER_DATASET_INCOMPLETE',
       datasetId,
-      activeDatasetId:successful && activationRequested ? datasetId : previousActiveDatasetId,
+      activeDatasetId:previousActiveDatasetId,
       ...summary,
       coverage:coverageMetrics,
-      activationStatus:successful ? (activationRequested ? 'active' : 'validated-candidate') : 'rejected'
+      activationStatus:successful?'validated-candidate':'rejected',activationPerformed:false
     };
     await db.collection(DIAGNOSTICS).insertOne({ ...result, at:new Date(), applicationVersion:APP_VERSION });
     return result;
@@ -634,6 +667,32 @@ async function buildRecoveryCandidate(db, options = {}) {
   return {ok:validation.valid,datasetId,status:validation.valid?'completed':'completed_with_errors',activationStatus:validation.valid?'validated-candidate':'rejected',activeDatasetId:previousActive.datasetId,clonedLayerCount,recoveredLayerCount:reviewed.length,validation,...fingerprints,activationPerformed:false};
 }
 
+async function activateDataset(db,input={},requestedBy={}){
+  await ensureIndexes(db);
+  const role=clean(requestedBy.role).toLowerCase();
+  if(!['admin','manager'].includes(role))throw Object.assign(new Error('Independent Management authorization is required'),{code:'PURCHASE_DATASET_ACTIVATION_FORBIDDEN',statusCode:403});
+  const datasetId=clean(input.datasetId),reason=clean(input.reason);
+  if(!datasetId||!reason)throw Object.assign(new Error('datasetId and activation reason are required'),{code:'PURCHASE_DATASET_ACTIVATION_INPUT_REQUIRED',statusCode:400});
+  const dataset=await db.collection(DATASETS).findOne({datasetId});
+  if(!dataset||dataset.status!=='completed'||!['validated-candidate','active','superseded'].includes(clean(dataset.activationStatus)))throw Object.assign(new Error('Only a completed validated immutable Purchase Candidate may become authoritative'),{code:'PURCHASE_DATASET_NOT_ACTIVATABLE',statusCode:409});
+  if(!['PURCHASE_SOURCE_COMPLETE','PURCHASE_SOURCE_COMPLETE_WITH_EXPLICIT_QUARANTINE'].includes(clean(dataset.sourceCompleteness)))throw Object.assign(new Error('Purchase source completeness is not proven'),{code:'PURCHASE_SOURCE_INCOMPLETE',statusCode:409});
+  const rows=await db.collection(LAYERS).find(canonicalLayerContract.canonicalLayerQuery({datasetId})).toArray();
+  const fingerprints=datasetFingerprints(rows);
+  if(fingerprints.layerFingerprint!==clean(dataset.layerFingerprint)||fingerprints.sourceFingerprint!==clean(dataset.sourceFingerprint))throw Object.assign(new Error('Candidate fingerprint changed after validation'),{code:'PURCHASE_DATASET_FINGERPRINT_MISMATCH',statusCode:409});
+  const expected=clean(input.candidateFingerprint);
+  if(!expected||expected!==clean(dataset.candidateFingerprint))throw Object.assign(new Error('Expected candidate fingerprint is required and must match'),{code:'PURCHASE_DATASET_ACTIVATION_STALE',statusCode:409});
+  const previousState=await db.collection(STATE).findOne({scopeKey:SCOPE_KEY});
+  const previousActiveDatasetId=clean(previousState?.activeDatasetId),activatedAt=new Date();
+  const actor={userId:clean(requestedBy.userId||requestedBy.id),username:clean(requestedBy.username),role};
+  const event={eventId:`PACT-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,eventType:previousActiveDatasetId&&previousActiveDatasetId!==datasetId?'PURCHASE_DATASET_AUTHORITY_CHANGED':'PURCHASE_DATASET_ACTIVATED',datasetId,previousActiveDatasetId,actor,at:activatedAt,reason,candidateFingerprint:clean(dataset.candidateFingerprint),sourceFingerprint:fingerprints.sourceFingerprint,layerFingerprint:fingerprints.layerFingerprint};
+  const authorityAuditLog=[...(Array.isArray(previousState?.authorityAuditLog)?previousState.authorityAuditLog:[]),event].slice(-100);
+  await db.collection(STATE).updateOne({scopeKey:SCOPE_KEY},{$set:{scopeKey:SCOPE_KEY,activeDatasetId:datasetId,previousActiveDatasetId,activatedAt,updatedAt:activatedAt,activeDatasetStatus:'completed',authorityAuditLog,lastAuthorityEvent:event}},{upsert:true});
+  await db.collection(DATASETS).updateOne({datasetId},{$set:{activationStatus:'active',activatedAt,activatedBy:actor,activationReason:reason,updatedAt:activatedAt}});
+  if(previousActiveDatasetId&&previousActiveDatasetId!==datasetId)await db.collection(DATASETS).updateOne({datasetId:previousActiveDatasetId},{$set:{activationStatus:'superseded',supersededAt:activatedAt,supersededByDatasetId:datasetId,updatedAt:activatedAt}});
+  await db.collection(DIAGNOSTICS).insertOne({...event,immutable:true,applicationVersion:APP_VERSION});
+  return {ok:true,activationPerformed:true,datasetId,previousActiveDatasetId,activeDatasetId:datasetId,event};
+}
+
 async function listDatasets(db, limit = 20) {
   await ensureIndexes(db);
   const active = await activeDataset(db);
@@ -687,7 +746,7 @@ async function populationDiagnostics(db) {
 
 module.exports = {
   DATASETS, STATE, LAYERS, DIAGNOSTICS, SCOPE_KEY, SCHEMA_VERSION, SOURCE_TYPES,
-  ensureIndexes, activeDataset, buildPurchaseLayerDataset, buildRecoveryCandidate, coverage, listDatasets, status, listLayers, populationDiagnostics,
+  ensureIndexes, activeDataset, buildPurchaseLayerDataset, buildRecoveryCandidate, activateDataset, coverage, listDatasets, status, listLayers, populationDiagnostics,
   _mapSourceLine:mapSourceLine, _lineIdentity:lineIdentity, _reconcilePurchaseReturns:reconcilePurchaseReturns,
   _validateDataset:validateDataset, _safeError:safeError, _layerUpsertUpdate:layerUpsertUpdate,
   _responseTotalRecords:responseTotalRecords, _sourceHash:sourceHash,

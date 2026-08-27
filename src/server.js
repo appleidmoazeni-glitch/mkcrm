@@ -4909,6 +4909,12 @@ async function handleApi(req, res, pathname, query) {
       }
       return sendJson(res,200,{ok:true,jobId,status:'queued',type:'purchase-layer-dataset',profitActivationAllowed:false});
     }
+    if(pathname==='/api/purchase-layer-datasets/activate'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','manager']))return;
+      const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,200,await purchaseLayerDataset.activateDataset(db,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'PURCHASE_DATASET_ACTIVATION_FAILED',error:String(error.message||error)});}
+    }
     if (pathname === '/api/purchase-layer-datasets' && req.method === 'GET') {
       if (!requireRole(req,res,['admin','accounting'])) return;
       const db=await connectMongo();
