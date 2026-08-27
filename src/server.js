@@ -4059,6 +4059,22 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
       try{return sendJson(res,200,await financialSourceControl.purchaseDelta(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_PURCHASE_DELTA_FAILED');}
     }
+    if(pathname==='/api/accounting/financial-source-control/purchase/datasets'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.purchaseAuditDatasets(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_PURCHASE_DATASETS_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/purchase/rows'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.purchaseAuditRows(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_PURCHASE_ROWS_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/purchase/detail'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.purchaseAuditDetail(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_PURCHASE_DETAIL_FAILED');}
+    }
+    if(pathname==='/api/accounting/financial-source-control/purchase/item-summary'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await financialSourceControl.purchaseAuditItemSummary(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_PURCHASE_ITEM_SUMMARY_FAILED');}
+    }
     if(pathname==='/api/accounting/financial-source-control/gaps'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
       try{return sendJson(res,200,await financialSourceControl.sourceGaps(db,query,currentUser(req)));}catch(error){return financialSourceError(error,'FINANCIAL_SOURCE_GAPS_FAILED');}
