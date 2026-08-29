@@ -187,6 +187,7 @@ function classifyFailure(result,error){
   const message=clean(error?.message||result?.error||result?.message,500).toLowerCase();
   if(/timeout|timed out|abort/.test(message))return 'TRANSIENT_TIMEOUT';
   if(result?.meta?.reachedLimit)return 'PAGE_TRUNCATION';
+  if(/kardex page \d+ failed/.test(message))return 'HTTP_FAILURE';
   if(/http|status\s*[45]\d\d|econn|socket|network/.test(message))return 'HTTP_FAILURE';
   if(/parse|json|syntax/.test(message))return 'PARSER_FAILURE';
   if(/empty|no response/.test(message))return 'EMPTY_UNEXPECTED_RESPONSE';
@@ -208,7 +209,7 @@ async function seedProgress(db,datasetId,items,warehouses,openingDate,now){
 }
 async function attemptWarehouse(db,progress,warehouseState,options={}){
   const api=options.shaygan||shaygan,maxRows=Math.max(1,Math.min(Number(options.maxRows||200),500)),timeoutMs=Math.max(500,Math.min(Number(options.timeoutMs||15000),30000));
-  const maxAttempts=Math.max(1,Math.min(Number(options.maxAttempts||3),5)),backoffMs=Math.max(0,Math.min(Number(options.backoffMs??250),5000));
+  const maxAttempts=Math.max(1,Math.min(Number(options.maxAttempts||3),5)),backoffMs=Math.max(0,Math.min(Number(options.backoffMs??2000),10000));
   let state={...warehouseState,attempts:Array.isArray(warehouseState.attempts)?warehouseState.attempts:[]};
   const firstAttempt=state.attemptCount,stopAt=firstAttempt+maxAttempts;
   for(let n=firstAttempt;n<stopAt&&!terminalWarehouse(state.status);n++){
@@ -235,7 +236,7 @@ async function processProgress(db,progress,options={}){
     if(terminalWarehouse(warehouse.status))continue;
     const updated=await attemptWarehouse(db,progress,warehouse,options);
     progress.warehouseStates=progress.warehouseStates.map(row=>row.warehouseNumber===updated.warehouseNumber?updated:row);
-    const interval=Math.max(0,Math.min(Number(options.requestIntervalMs||0),5000));if(interval)await delay(interval);
+    const interval=Math.max(0,Math.min(Number(options.requestIntervalMs??100),5000));if(interval)await delay(interval);
   }
   const complete=progress.warehouseStates.every(row=>terminalWarehouse(row.status));
   const entries=progress.warehouseStates.filter(row=>terminalWarehouse(row.status)).map(row=>({warehouseNumber:row.warehouseNumber,result:row.result,included:true}));
