@@ -5318,6 +5318,7 @@ async function pageSellerProfit(){
   let selectedResolutionId='';
   let selectedResolutionRevision=0;
   let suggestionRequest=0;
+  let reviewLineageMeta={openingDatasetId:'',openingApprovalStatus:''};
   async function json(url,options={}){
     const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
     const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
@@ -5355,7 +5356,7 @@ async function pageSellerProfit(){
         coverageCard('پوشش Manual تأییدشده',report.manual,'warn')+
         coverageCard('بعد از Manual',report.afterManual,'success')+
         coverageCard('هزینه نامشخص',report.unknown,'error');
-      q('#mcDatasetMeta').textContent=`Sale Snapshot: ${report.activeSnapshotId||'ندارد'} | Purchase Dataset: ${report.activePurchaseLayerDatasetId||'ندارد'} | سود و FIFO: غیرفعال`;
+      q('#mcDatasetMeta').textContent=`Sale Snapshot: ${report.activeSnapshotId||'ندارد'} | Purchase Dataset: ${report.activePurchaseLayerDatasetId||'ندارد'} | Opening Dataset: ${reviewLineageMeta.openingDatasetId||'ندارد'} | Opening Approval: ${reviewLineageMeta.openingApprovalStatus||'ندارد'} | سود و FIFO: غیرفعال`;
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
   function reasonLabel(reason){
@@ -5375,6 +5376,7 @@ async function pageSellerProfit(){
     box.innerHTML='<div class="info">در حال ساخت صف از Snapshot فعال...</div>';
     try{
       const report=await json('/api/accounting/missing-purchase-costs?'+queryString());
+      reviewLineageMeta={openingDatasetId:report.openingDatasetId||'',openingApprovalStatus:report.openingApprovalStatus||''};
       const rows=(report.list||[]).map(row=>`<tr>
         <td><b>${safe(row.itemCode)}</b><br><small>${safe(row.itemGuid||'بدون GUID')}</small></td>
         <td style="white-space:normal">${safe(row.itemDescription)}</td>
