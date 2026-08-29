@@ -726,7 +726,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const layerQuery=canonicalLayerContract.canonicalLayerQuery({datasetId,purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})});
   const [layers,openingRows,governedOpening]=await Promise.all([
     db.collection(purchaseLayerDataset.LAYERS).find(layerQuery).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(5001).toArray(),
-    db.collection(openingCostBasis.COLLECTION).find({status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true,...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:reviewDateTo}}).sort({effectiveOpeningDate:-1,createdAt:-1,updatedAt:-1}).limit(10).toArray(),
+    db.collection(openingCostBasis.COLLECTION).find({status:{$in:['available','VALIDATED_CANDIDATE','NO_OPENING_STOCK']},extractionComplete:true,...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:reviewDateTo}}).sort({effectiveOpeningDate:-1,createdAt:-1,updatedAt:-1}).limit(10).toArray(),
     db.collection('openingInventoryEvidence').find({status:'approved',...(identityParts.length===1?identityParts[0]:{$or:identityParts})}).limit(20).toArray()
   ]);
   if(layers.length>5000)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target:{itemGuid,itemCode},available:false,method:'EVIDENCE_LIMIT_EXCEEDED',suggestedCostExact:null,purchaseCount:layers.length,evidenceComplete:false,limit:5000};
@@ -741,18 +741,20 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
     openingDataset=await db.collection(openingCostBasis.DATASETS).findOne({datasetId:openingRow.datasetId});
     openingRow={...openingRow,approvalStatus:clean(openingDataset?.approvalStatus,50)};
   }
+  const openingReviewContext=openingDataset?{reviewLineage:await openingReviewLineage(db,datasetId,openingDataset),openingReviewEvidence:{status:clean(openingRow?.status,100),evidenceId:clean(openingRow?.evidenceId,100),datasetId:clean(openingDataset.datasetId,100),approvalStatus:clean(openingDataset.approvalStatus,50),openingQuantityExact:clean(openingRow?.openingQuantityExact,100),openingUnitCostExact:clean(openingRow?.openingUnitCostExact,100),openingTotalValueExact:clean(openingRow?.openingTotalValueExact,100),queriedWarehouseCount:Number(openingRow?.queriedWarehouseCount||0),extractionComplete:openingRow?.extractionComplete===true}}:{};
   let opening=openingSuggestion(openingRow,target,reviewDateTo,clean(input.affectedQuantityExact,100));
   const eligibility=opening?await openingEligibilitySummary(db,openingRow,target):null;
   if(opening&&eligibility)opening={...opening,totalRequiredQuantityExact:eligibility.totalRequiredQuantityExact,eligibleTargetQuantityExact:eligibility.eligibleTargetQuantityExact,remainingUnknownQuantityExact:eligibility.remainingUnknownQuantityExact,eligibilityPreview:eligibility};
   const conflict=openingConflict(opening,governedOpening);
-  if(conflict)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...conflict};
-  if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,reviewDateTo,target,evidenceComplete:true,reviewLineage:await openingReviewLineage(db,datasetId,openingDataset),...opening};
+  if(conflict)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...openingReviewContext,...conflict};
+  if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,reviewDateTo,target,evidenceComplete:true,...openingReviewContext,...opening};
   const historical=suggestionFromLayers(layers,target,applicableDate,clean(input.affectedQuantityExact,100));
-  if(historical.available)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'HISTORICAL_PURCHASE_AVERAGE',...historical};
-  if(historical.excludedPendingCount)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'PENDING_PURCHASE_PRICE',available:false,manualCostRequired:false,method:'PENDING_PURCHASE_PRICE_QUARANTINE',suggestedCostExact:null,...historical,remediation:'WAIT_FOR_CANONICAL_PURCHASE_PRICE_CORRECTION'};
+  if(historical.available)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...openingReviewContext,sourceClass:'HISTORICAL_PURCHASE_AVERAGE',...historical};
+  if(historical.excludedPendingCount)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...openingReviewContext,sourceClass:'PENDING_PURCHASE_PRICE',available:false,manualCostRequired:false,method:'PENDING_PURCHASE_PRICE_QUARANTINE',suggestedCostExact:null,...historical,remediation:'WAIT_FOR_CANONICAL_PURCHASE_PRICE_CORRECTION'};
   const history=await canonicalItemCatalog.historyStatus(db,target);
-  if(!history.complete)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:false,historyCompleteness:history.state,sourceClass:'SOURCE_HISTORY_INCOMPLETE',available:false,manualCostRequired:false,method:'BOUNDED_PURCHASE_HISTORY_RECOVERY_REQUIRED',suggestedCostExact:null,purchaseCount:0,quantityBasisExact:'0.000000',sourceFingerprint:crypto.createHash('sha256').update(stable({target,historyState:history.state})).digest('hex'),remediation:'QUEUE_CANONICAL_PURCHASE_HISTORY_RECOVERY'};
-  return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'NO_VALID_COST_BASIS',...historical};
+  const requiredExact=clean(input.affectedQuantityExact,100)?accountingDecimal.format(accountingDecimal.parse(input.affectedQuantityExact,accountingDecimal.QUANTITY_SCALE),accountingDecimal.QUANTITY_SCALE):'0.000000';
+  if(!history.complete)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:false,...openingReviewContext,historyCompleteness:history.state,sourceClass:'SOURCE_HISTORY_INCOMPLETE',available:false,manualCostRequired:false,method:'BOUNDED_PURCHASE_HISTORY_RECOVERY_REQUIRED',suggestedCostExact:null,purchaseCount:0,quantityBasisExact:'0.000000',totalRequiredQuantityExact:requiredExact,eligibleTargetQuantityExact:'0.000000',remainingUnknownQuantityExact:requiredExact,sourceFingerprint:crypto.createHash('sha256').update(stable({target,historyState:history.state})).digest('hex'),remediation:'QUEUE_CANONICAL_PURCHASE_HISTORY_RECOVERY'};
+  return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...openingReviewContext,sourceClass:'NO_VALID_COST_BASIS',...historical};
 }
 async function assistedDecision(db,input={},requestedBy={}) {
   assertRole(requestedBy?.role,ASSISTED_FINALIZE_ROLES);
