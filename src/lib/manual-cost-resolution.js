@@ -666,6 +666,9 @@ function suggestionFromLayers(rows=[], target={}, applicableDate='', affectedQua
 }
 function openingSuggestion(row,target={},applicableDate='',affectedQuantityExact='') {
   if(!row||!['available','VALIDATED_CANDIDATE'].includes(row.status)||row.extractionComplete!==true)return null;
+  // Dataset evidence is reviewable before approval but is not cost authority.
+  // Standalone legacy evidence has no datasetId and retains its old contract.
+  if(clean(row.datasetId,100)&&clean(row.approvalStatus,50)!=='approved')return null;
   if(!identityMatches(row,target)||!row.effectiveOpeningDate||row.effectiveOpeningDate>applicableDate)return null;
   const openingQty=accountingDecimal.parse(row.openingQuantityExact,accountingDecimal.QUANTITY_SCALE);
   const affectedQty=affectedQuantityExact?accountingDecimal.parse(affectedQuantityExact,accountingDecimal.QUANTITY_SCALE):openingQty;
@@ -705,7 +708,12 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const exactIdentity=clean(input.purchaseLineIdentity,500);
   const exact=exactIdentity?layers.find(row=>clean(row.purchaseLineIdentity,500)===exactIdentity&&eligibleSuggestionLayer(row,target,applicableDate)):null;
   if(exact)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,available:false,manualCostRequired:false,sourceClass:'EXACT_OFFICIAL_PURCHASE_LAYER',method:'EXACT_OFFICIAL_PURCHASE_LAYER',suggestedCostExact:clean(exact.netUnitCostExact??exact.netUnitCost??exact.grossUnitCostExact??exact.grossUnitCost,100),purchaseLineIdentity:exactIdentity,remediation:'USE_CANONICAL_PURCHASE_LAYER'};
-  const opening=openingSuggestion(openingRows[0],target,applicableDate,clean(input.affectedQuantityExact,100));
+  let openingRow=openingRows[0];
+  if(openingRow?.datasetId){
+    const openingDataset=await db.collection(openingCostBasis.DATASETS).findOne({datasetId:openingRow.datasetId});
+    openingRow={...openingRow,approvalStatus:clean(openingDataset?.approvalStatus,50)};
+  }
+  const opening=openingSuggestion(openingRow,target,applicableDate,clean(input.affectedQuantityExact,100));
   const conflict=openingConflict(opening,governedOpening);
   if(conflict)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...conflict};
   if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...opening};
