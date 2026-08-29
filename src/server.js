@@ -3990,14 +3990,14 @@ async function handleApi(req, res, pathname, query) {
         return sendJson(res,201,await openingAccountingCostBasis.buildCandidate(db,{...body,items,createdBy:currentUser(req)}));
       }catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_BUILD_FAILED',error:String(error.message||error)});}
     }
-    const openingCandidateMatch=pathname.match(/^\/api\/accounting\/opening-accounting-evidence\/candidates\/([^/]+)(?:\/(resume|submit|approve|reject|defer))?$/);
+    const openingCandidateMatch=pathname.match(/^\/api\/accounting\/opening-accounting-evidence\/candidates\/([^/]+)(?:\/(resume|refresh-preview|submit|approve|reject|defer))?$/);
     if(openingCandidateMatch&&req.method==='GET'&&!openingCandidateMatch[2]){
       if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();
       const result=await openingAccountingCostBasis.candidateDetail(db,decodeURIComponent(openingCandidateMatch[1]),query);return sendJson(res,result.ok?200:404,result);
     }
     if(openingCandidateMatch&&req.method==='POST'&&openingCandidateMatch[2]){
-      const action=openingCandidateMatch[2],roles=action==='resume'?['admin','accounting']:action==='submit'?['admin','accounting']:['admin','manager'];if(!requireRole(req,res,roles))return;const body=await collectBody(req),db=await connectMongo(),id=decodeURIComponent(openingCandidateMatch[1]);
-      try{const fn={resume:'resumeCandidate',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate'}[action];return sendJson(res,200,await openingAccountingCostBasis[fn](db,id,body,currentUser(req)));}
+      const action=openingCandidateMatch[2],roles=['resume','refresh-preview','submit'].includes(action)?['admin','accounting']:['admin','manager'];if(!requireRole(req,res,roles))return;const body=await collectBody(req),db=await connectMongo(),id=decodeURIComponent(openingCandidateMatch[1]);
+      try{const fn={resume:'resumeCandidate','refresh-preview':'refreshEligibilityPreview',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate'}[action];return sendJson(res,200,await openingAccountingCostBasis[fn](db,id,body,currentUser(req)));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_ACTION_FAILED',error:String(error.message||error)});}
     }
     if(pathname==='/api/manual-cost-resolutions/assisted/decisions'&&req.method==='POST'){
