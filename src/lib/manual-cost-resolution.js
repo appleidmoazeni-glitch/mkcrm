@@ -666,15 +666,32 @@ function suggestionFromLayers(rows=[], target={}, applicableDate='', affectedQua
 }
 function openingSuggestion(row,target={},applicableDate='',affectedQuantityExact='') {
   if(!row||!['available','VALIDATED_CANDIDATE'].includes(row.status)||row.extractionComplete!==true)return null;
-  // Dataset evidence is reviewable before approval but is not cost authority.
-  // Standalone legacy evidence has no datasetId and retains its old contract.
-  if(clean(row.datasetId,100)&&clean(row.approvalStatus,50)!=='approved')return null;
   if(!identityMatches(row,target)||!row.effectiveOpeningDate||row.effectiveOpeningDate>applicableDate)return null;
   const openingQty=accountingDecimal.parse(row.openingQuantityExact,accountingDecimal.QUANTITY_SCALE);
   const affectedQty=affectedQuantityExact?accountingDecimal.parse(affectedQuantityExact,accountingDecimal.QUANTITY_SCALE):openingQty;
   if(openingQty<=0n||affectedQty<=0n)return null;
   const covered=affectedQty<openingQty?affectedQty:openingQty;
-  return {available:true,sourceClass:'OPENING_ACCOUNTING_COST',method:'SHAYGAN_BEGIN_DURATION_REMAIN_ACCOUNTING_COST',itemGuid:clean(row.itemGuid,100),itemCode:clean(row.itemCode,100),suggestedCostExact:clean(row.openingUnitCostExact,100),quantityBasisExact:accountingDecimal.format(openingQty,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affectedQty,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affectedQty-covered,accountingDecimal.QUANTITY_SCALE),effectiveOpeningDate:clean(row.effectiveOpeningDate,8),openingQuantityExact:clean(row.openingQuantityExact,100),openingUnitCostExact:clean(row.openingUnitCostExact,100),openingTotalValueExact:clean(row.openingTotalValueExact,100),sourceFields:row.sourceFields||{},sourceFingerprint:clean(row.sourceFingerprint,64),recordFingerprint:clean(row.recordFingerprint,64),evidenceQuality:clean(row.evidenceQuality,100),evidenceId:clean(row.evidenceId,100),openingEvidenceDatasetId:clean(row.datasetId,100),warehouseEvidence:Array.isArray(row.warehouseEvidence)?row.warehouseEvidence.map(value=>({warehouseNumber:clean(value.warehouseNumber,100),openingQuantityExact:clean(value.openingQuantityExact,100),openingTotalValueExact:clean(value.openingTotalValueExact,100),openingUnitCostExact:clean(value.openingUnitCostExact,100),evidenceQuality:clean(value.evidenceQuality,100),extractionComplete:value.extractionComplete===true})):[],queriedWarehouseCount:Number(row.queriedWarehouseCount||0),warehouseCount:Number(row.warehouseCount||0),approvalStatus:clean(row.approvalStatus,50),extractedAt:row.extractedAt||row.updatedAt||null,partialTarget:affectedQty>openingQty};
+  const datasetId=clean(row.datasetId,100),approvalStatus=clean(row.approvalStatus,50);
+  const reviewOnly=Boolean(datasetId)&&approvalStatus!=='approved';
+  return {available:true,sourceClass:'OPENING_ACCOUNTING_COST',method:'SHAYGAN_BEGIN_DURATION_REMAIN_ACCOUNTING_COST',itemGuid:clean(row.itemGuid,100),itemCode:clean(row.itemCode,100),suggestedCostExact:clean(row.openingUnitCostExact,100),quantityBasisExact:accountingDecimal.format(openingQty,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),totalRequiredQuantityExact:accountingDecimal.format(affectedQty,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(affectedQty-covered,accountingDecimal.QUANTITY_SCALE),effectiveOpeningDate:clean(row.effectiveOpeningDate,8),openingQuantityExact:clean(row.openingQuantityExact,100),openingUnitCostExact:clean(row.openingUnitCostExact,100),openingTotalValueExact:clean(row.openingTotalValueExact,100),sourceFields:row.sourceFields||{},sourceFingerprint:clean(row.sourceFingerprint,64),recordFingerprint:clean(row.recordFingerprint,64),evidenceQuality:clean(row.evidenceQuality,100),evidenceId:clean(row.evidenceId,100),openingEvidenceDatasetId:datasetId,warehouseEvidence:Array.isArray(row.warehouseEvidence)?row.warehouseEvidence.map(value=>({warehouseNumber:clean(value.warehouseNumber,100),openingQuantityExact:clean(value.openingQuantityExact,100),openingTotalValueExact:clean(value.openingTotalValueExact,100),openingUnitCostExact:clean(value.openingUnitCostExact,100),evidenceQuality:clean(value.evidenceQuality,100),extractionComplete:value.extractionComplete===true})):[],queriedWarehouseCount:Number(row.queriedWarehouseCount||0),warehouseCount:Number(row.warehouseCount||0),approvalStatus,authorityStatus:reviewOnly?'VALIDATED_NOT_APPROVED':'APPROVED',reviewOnly,financialAuthority:!reviewOnly,extractedAt:row.extractedAt||row.updatedAt||null,partialTarget:affectedQty>openingQty};
+}
+
+async function latestOpeningReviewDataset(db){
+  return db.collection(openingCostBasis.DATASETS).findOne(
+    {status:'completed',approvalStatus:{$in:['validated','pending','approved']}},
+    {sort:{completedAt:-1,createdAt:-1,updatedAt:-1}}
+  ).catch(()=>null);
+}
+
+async function openingReviewLineage(db,purchaseDatasetId,openingDataset){
+  const fifoDatasetId=clean(openingDataset?.eligibilityPreview?.fifoDatasetId,100);
+  const fifoDataset=fifoDatasetId?await db.collection('fifoDatasets').findOne({datasetId:fifoDatasetId}).catch(()=>null):null;
+  let saleSnapshotId=clean(fifoDataset?.sourceSaleSnapshotId||fifoDataset?.saleSnapshotId,100);
+  if(!saleSnapshotId){
+    const saleState=await db.collection('saleSnapshotState').findOne({activeSnapshotId:{$exists:true,$ne:''}},{sort:{activatedAt:-1,updatedAt:-1}}).catch(()=>null);
+    saleSnapshotId=clean(saleState?.activeSnapshotId,100);
+  }
+  return {saleSnapshotId,purchaseDatasetId:clean(purchaseDatasetId,100),openingDatasetId:clean(openingDataset?.datasetId,100),openingApprovalStatus:clean(openingDataset?.approvalStatus,50),openingEligibilityFifoDatasetId:fifoDatasetId,openingEligibilitySaleSnapshotId:clean(fifoDataset?.sourceSaleSnapshotId||fifoDataset?.saleSnapshotId,100)};
 }
 function openingConflict(opening,governedRows=[]) {
   if(!opening)return null;
@@ -708,15 +725,15 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const exactIdentity=clean(input.purchaseLineIdentity,500);
   const exact=exactIdentity?layers.find(row=>clean(row.purchaseLineIdentity,500)===exactIdentity&&eligibleSuggestionLayer(row,target,applicableDate)):null;
   if(exact)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,available:false,manualCostRequired:false,sourceClass:'EXACT_OFFICIAL_PURCHASE_LAYER',method:'EXACT_OFFICIAL_PURCHASE_LAYER',suggestedCostExact:clean(exact.netUnitCostExact??exact.netUnitCost??exact.grossUnitCostExact??exact.grossUnitCost,100),purchaseLineIdentity:exactIdentity,remediation:'USE_CANONICAL_PURCHASE_LAYER'};
-  let openingRow=openingRows[0];
+  let openingRow=openingRows[0],openingDataset=null;
   if(openingRow?.datasetId){
-    const openingDataset=await db.collection(openingCostBasis.DATASETS).findOne({datasetId:openingRow.datasetId});
+    openingDataset=await db.collection(openingCostBasis.DATASETS).findOne({datasetId:openingRow.datasetId});
     openingRow={...openingRow,approvalStatus:clean(openingDataset?.approvalStatus,50)};
   }
   const opening=openingSuggestion(openingRow,target,applicableDate,clean(input.affectedQuantityExact,100));
   const conflict=openingConflict(opening,governedOpening);
   if(conflict)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...conflict};
-  if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...opening};
+  if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,reviewLineage:await openingReviewLineage(db,datasetId,openingDataset),...opening};
   const historical=suggestionFromLayers(layers,target,applicableDate,clean(input.affectedQuantityExact,100));
   if(historical.available)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'HISTORICAL_PURCHASE_AVERAGE',...historical};
   if(historical.excludedPendingCount)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'PENDING_PURCHASE_PRICE',available:false,manualCostRequired:false,method:'PENDING_PURCHASE_PRICE_QUARANTINE',suggestedCostExact:null,...historical,remediation:'WAIT_FOR_CANONICAL_PURCHASE_PRICE_CORRECTION'};
@@ -727,6 +744,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
 async function assistedDecision(db,input={},requestedBy={}) {
   assertRole(requestedBy?.role,ASSISTED_FINALIZE_ROLES);
   const suggestion=await assistedSuggestion(db,input,requestedBy);
+  if(suggestion.reviewOnly===true||suggestion.financialAuthority===false)fail('OPENING_EVIDENCE_NOT_APPROVED','شواهد Opening فقط برای بازبینی معتبر است و تا تأیید مستقل، مجاز به ایجاد هزینه یا ورود به FIFO نیست.',409);
   const decision=clean(input.decision,50).toUpperCase();
   if(['DEFERRED','REJECTED'].includes(decision)) {
     const reason=clean(input.reason,1000);if(!reason)fail('MANUAL_COST_DECISION_REASON_REQUIRED','دلیل تصمیم الزامی است.');
@@ -804,7 +822,7 @@ function queueSort(rows, sort, direction) {
 }
 async function missingQueue(db, filters = {}) {
   const dates = normalizeJalaliRange({ dateFrom:filters.dateFrom || '', dateTo:filters.dateTo || '' });
-  const context = await loadReadinessContext(db);
+  const [context,openingDataset] = await Promise.all([loadReadinessContext(db),latestOpeningReviewDataset(db)]);
   const inventoryRows = await allRows(db.collection('itemInventoryCatalog'), {});
   const inventory = new Map();
   for (const row of inventoryRows) {
@@ -884,6 +902,8 @@ async function missingQueue(db, filters = {}) {
     source:'active-sale-snapshot-plus-active-purchase-layer-dataset-plus-approved-manual-cost',
     activeSnapshotId:context.saleActive.snapshotId || '',
     activePurchaseLayerDatasetId:context.purchaseActive?.datasetId || '',
+    openingDatasetId:clean(openingDataset?.datasetId,100),
+    openingApprovalStatus:clean(openingDataset?.approvalStatus,50),
     total,
     page,
     pageSize,
