@@ -263,7 +263,11 @@ async function buildEligibilityPreview(db,dataset,input={}){
   const [evidence,allocations,purchaseLayers]=await Promise.all([db.collection(COLLECTION).find({datasetId:dataset.datasetId,status:'VALIDATED_CANDIDATE'}).toArray(),db.collection('fifoAllocations').find({datasetId:fifoDatasetId}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1,allocationSequence:1}).toArray(),purchaseDatasetId?db.collection('supplierPurchaseLayers').find({datasetId:purchaseDatasetId,layerKind:'purchase'}).toArray():[]]);
   const rows=[];
   for(const opening of evidence){
-    const matching=allocations.filter(row=>(opening.itemGuid&&clean(row.itemGuid,100)===opening.itemGuid)||(!opening.itemGuid&&clean(row.itemCode,100)===opening.itemCode));
+    const matching=allocations.filter(row=>{
+      const openingGuid=clean(opening.itemGuid,100),allocationGuid=clean(row.itemGuid,100);
+      if(openingGuid&&allocationGuid)return openingGuid===allocationGuid;
+      return clean(row.itemCode,100)===clean(opening.itemCode,100);
+    });
     const groups=new Map();for(const row of matching){const id=clean(row.saleLineId,500)||`${row.saleInvoiceType}:${row.saleInvoiceNo}:${row.saleRow||row.row}`;if(!groups.has(id))groups.set(id,[]);groups.get(id).push(row);}
     let remaining=decimal.parse(opening.openingQuantityExact,decimal.QUANTITY_SCALE);
     for(const [saleLineIdentity,lineRows] of [...groups].sort((a,b)=>String(a[1][0]?.saleDate||'').localeCompare(String(b[1][0]?.saleDate||''))||Number(a[1][0]?.saleInvoiceNo||0)-Number(b[1][0]?.saleInvoiceNo||0))){
@@ -273,7 +277,11 @@ async function buildEligibilityPreview(db,dataset,input={}){
       if(saleDate<dataset.openingDate)classification='PRE_OPENING_PERIOD';
       else if(remaining<=0n)classification='OPENING_CAPACITY_EXHAUSTED';
       else{eligible=unknownQty<remaining?unknownQty:remaining;remaining-=eligible;classification=eligible===unknownQty?'OPENING_ELIGIBLE':'OPENING_PARTIAL';}
-      const itemPurchases=purchaseLayers.filter(layer=>(opening.itemGuid&&clean(layer.itemGuid,100)===opening.itemGuid)||(!opening.itemGuid&&clean(layer.itemCode,100)===opening.itemCode)).filter(layer=>clean(layer.costStatus,100)!=='pending-purchase-price-correction'&&!['rejected','invalid'].includes(clean(layer.validationStatus,100)));
+      const itemPurchases=purchaseLayers.filter(layer=>{
+        const openingGuid=clean(opening.itemGuid,100),layerGuid=clean(layer.itemGuid,100);
+        if(openingGuid&&layerGuid)return openingGuid===layerGuid;
+        return clean(layer.itemCode,100)===clean(opening.itemCode,100);
+      }).filter(layer=>clean(layer.costStatus,100)!=='pending-purchase-price-correction'&&!['rejected','invalid'].includes(clean(layer.validationStatus,100)));
       const earlier=itemPurchases.filter(layer=>clean(layer.purchaseInvoiceDate,8)<=saleDate),later=itemPurchases.filter(layer=>clean(layer.purchaseInvoiceDate,8)>saleDate);
       const saleExposureExact=lineRows.reduce((sum,row)=>sum+decimal.parse(row.allocatedSaleValueExact||row.allocatedSaleValue||0,decimal.MONEY_SCALE),0n);
       rows.push({previewId:`OEL-${hash(`${dataset.datasetId}|${saleLineIdentity}`).slice(0,24)}`,datasetId:dataset.datasetId,fifoDatasetId,purchaseDatasetId,saleLineIdentity,saleInvoiceNo:Number(first.saleInvoiceNo||0),saleRow:Number(first.saleRow||first.row||0),saleDate,itemGuid:opening.itemGuid,itemCode:opening.itemCode,unknownQuantityExact:decimal.format(unknownQty,decimal.QUANTITY_SCALE),openingEligibleQuantityExact:decimal.format(eligible,decimal.QUANTITY_SCALE),remainingUnknownQuantityExact:decimal.format(unknownQty-eligible,decimal.QUANTITY_SCALE),saleExposureExact:decimal.format(saleExposureExact,decimal.MONEY_SCALE),earlierOfficialPurchaseAvailable:earlier.length>0,earlierOfficialPurchaseCount:earlier.length,laterPurchaseAvailable:later.length>0,laterPurchaseCount:later.length,officialPurchaseAllocationPreserved:lineRows.some(row=>row.sourceType!=='unknown_cost'),classification,openingEvidenceId:opening.evidenceId,openingSourceFingerprint:opening.sourceFingerprint,approvalStatus:'draft',readOnlyPreview:true,createdAt:now});
