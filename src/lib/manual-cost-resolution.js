@@ -693,6 +693,16 @@ async function openingReviewLineage(db,purchaseDatasetId,openingDataset){
   }
   return {saleSnapshotId,purchaseDatasetId:clean(purchaseDatasetId,100),openingDatasetId:clean(openingDataset?.datasetId,100),openingApprovalStatus:clean(openingDataset?.approvalStatus,50),openingEligibilityFifoDatasetId:fifoDatasetId,openingEligibilitySaleSnapshotId:clean(fifoDataset?.sourceSaleSnapshotId||fifoDataset?.saleSnapshotId,100)};
 }
+
+async function openingEligibilitySummary(db,openingRow,target){
+  const datasetId=clean(openingRow?.datasetId,100);if(!datasetId)return null;
+  const identityParts=[];if(clean(target.itemGuid,100))identityParts.push({itemGuid:clean(target.itemGuid,100)});if(clean(target.itemCode,100))identityParts.push({itemCode:clean(target.itemCode,100)});
+  const rows=await db.collection(openingCostBasis.ELIGIBILITY).find({datasetId,...(identityParts.length===1?identityParts[0]:{$or:identityParts})}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1}).limit(5000).toArray();
+  if(!rows.length)return null;
+  let required=0n,covered=0n,remaining=0n;
+  for(const row of rows){required+=accountingDecimal.parse(row.unknownQuantityExact||0,accountingDecimal.QUANTITY_SCALE);covered+=accountingDecimal.parse(row.openingEligibleQuantityExact||0,accountingDecimal.QUANTITY_SCALE);remaining+=accountingDecimal.parse(row.remainingUnknownQuantityExact||0,accountingDecimal.QUANTITY_SCALE);}
+  return {totalRequiredQuantityExact:accountingDecimal.format(required,accountingDecimal.QUANTITY_SCALE),eligibleTargetQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),remainingUnknownQuantityExact:accountingDecimal.format(remaining,accountingDecimal.QUANTITY_SCALE),mixedTimeline:rows.some(row=>row.classification==='PRE_OPENING_PERIOD')&&rows.some(row=>Number(row.openingEligibleQuantityExact)>0),rows:rows.map(row=>({saleLineIdentity:clean(row.saleLineIdentity,500),saleInvoiceNo:Number(row.saleInvoiceNo||0),saleRow:Number(row.saleRow||0),saleDate:clean(row.saleDate,8),unknownQuantityExact:clean(row.unknownQuantityExact,100),openingEligibleQuantityExact:clean(row.openingEligibleQuantityExact,100),remainingUnknownQuantityExact:clean(row.remainingUnknownQuantityExact,100),classification:clean(row.classification,100),earlierOfficialPurchaseAvailable:row.earlierOfficialPurchaseAvailable===true,laterPurchaseAvailable:row.laterPurchaseAvailable===true}))};
+}
 function openingConflict(opening,governedRows=[]) {
   if(!opening)return null;
   const conflicts=governedRows.filter(row=>row.status==='approved'&&identityMatches(row,opening)).filter(row=>{
@@ -706,6 +716,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const itemGuid=clean(input.itemGuid,100),itemCode=clean(input.itemCode,100);
   if(!itemGuid&&!itemCode)fail('MANUAL_COST_TARGET_REQUIRED','هویت هدف هزینه الزامی است.');
   const applicableDate=date8(input.applicableDate,'applicableDate');
+  const reviewDateTo=clean(input.reviewDateTo,100)?date8(input.reviewDateTo,'reviewDateTo'):applicableDate;
   const active=await purchaseLayerDataset.activeDataset(db);
   const datasetId=clean(input.purchaseDatasetId||active?.datasetId,100);
   if(!datasetId)fail('PURCHASE_DATASET_REQUIRED','Purchase Dataset رسمی در دسترس نیست.',409);
@@ -715,7 +726,7 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const layerQuery=canonicalLayerContract.canonicalLayerQuery({datasetId,purchaseInvoiceDate:{$lte:applicableDate},...(identityParts.length===1?identityParts[0]:{$or:identityParts})});
   const [layers,openingRows,governedOpening]=await Promise.all([
     db.collection(purchaseLayerDataset.LAYERS).find(layerQuery).sort({purchaseInvoiceDate:1,purchaseInvoiceNo:1,sourceRow:1}).limit(5001).toArray(),
-    db.collection(openingCostBasis.COLLECTION).find({status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true,...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:applicableDate}}).sort({effectiveOpeningDate:-1,createdAt:-1,updatedAt:-1}).limit(10).toArray(),
+    db.collection(openingCostBasis.COLLECTION).find({status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true,...(identityParts.length===1?identityParts[0]:{$or:identityParts}),effectiveOpeningDate:{$lte:reviewDateTo}}).sort({effectiveOpeningDate:-1,createdAt:-1,updatedAt:-1}).limit(10).toArray(),
     db.collection('openingInventoryEvidence').find({status:'approved',...(identityParts.length===1?identityParts[0]:{$or:identityParts})}).limit(20).toArray()
   ]);
   if(layers.length>5000)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target:{itemGuid,itemCode},available:false,method:'EVIDENCE_LIMIT_EXCEEDED',suggestedCostExact:null,purchaseCount:layers.length,evidenceComplete:false,limit:5000};
@@ -730,10 +741,12 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
     openingDataset=await db.collection(openingCostBasis.DATASETS).findOne({datasetId:openingRow.datasetId});
     openingRow={...openingRow,approvalStatus:clean(openingDataset?.approvalStatus,50)};
   }
-  const opening=openingSuggestion(openingRow,target,applicableDate,clean(input.affectedQuantityExact,100));
+  let opening=openingSuggestion(openingRow,target,reviewDateTo,clean(input.affectedQuantityExact,100));
+  const eligibility=opening?await openingEligibilitySummary(db,openingRow,target):null;
+  if(opening&&eligibility)opening={...opening,totalRequiredQuantityExact:eligibility.totalRequiredQuantityExact,eligibleTargetQuantityExact:eligibility.eligibleTargetQuantityExact,remainingUnknownQuantityExact:eligibility.remainingUnknownQuantityExact,eligibilityPreview:eligibility};
   const conflict=openingConflict(opening,governedOpening);
   if(conflict)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...conflict};
-  if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,reviewLineage:await openingReviewLineage(db,datasetId,openingDataset),...opening};
+  if(opening)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,reviewDateTo,target,evidenceComplete:true,reviewLineage:await openingReviewLineage(db,datasetId,openingDataset),...opening};
   const historical=suggestionFromLayers(layers,target,applicableDate,clean(input.affectedQuantityExact,100));
   if(historical.available)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'HISTORICAL_PURCHASE_AVERAGE',...historical};
   if(historical.excludedPendingCount)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,sourceClass:'PENDING_PURCHASE_PRICE',available:false,manualCostRequired:false,method:'PENDING_PURCHASE_PRICE_QUARANTINE',suggestedCostExact:null,...historical,remediation:'WAIT_FOR_CANONICAL_PURCHASE_PRICE_CORRECTION'};
