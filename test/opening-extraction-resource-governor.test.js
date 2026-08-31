@@ -11,6 +11,8 @@ const shaygan=require('../src/lib/shaygan');
 
 function dbSeed(extra={}){return new MemoryDb({settings:[{key:'inventory.autoSyncStatus',value:{running:false,lastError:'',lastCycle:{timeouts:0}}}],...extra});}
 function testOptions(extra={}){return {testMode:true,minimumDelayMs:0,callsPerMinute:60000,cooldownMs:30000,sleep:async()=>{},...extra};}
+function healthyAutoSync(startedAt=new Date(),overrides={}){return {running:false,lastStartedAt:startedAt,lastRunAt:new Date(new Date(startedAt).getTime()+1000),lastError:'',lastResult:{ok:true,stockCompleted:19,timeouts:0,exactTimeouts:0,durationMs:1000},...overrides};}
+async function setAutoSync(db,value){await db.collection('settings').updateOne({key:'inventory.autoSyncStatus'},{$set:{value}});}
 
 test('execution window parser distinguishes disabled, valid and fail-closed configurations without numeric coercion',()=>{
   for(const pair of [[null,null],[undefined,undefined],['',''],['   ','\t']]){
@@ -89,16 +91,47 @@ test('cooldown fails closed and controlled half-open needs its bounded healthy p
   now=new Date(now.getTime()+30001);const probe=governorModule.createGovernor(db,'OACD-HALF',testOptions({ownerId:'probe',now:()=>now,cooldownMs:30000,halfOpenCalls:2}));await probe.acquire();await probe.preflight();assert.equal(probe.breakerState,'half-open');await probe.beforeCall();await probe.afterCall({success:true,durationMs:10});assert.equal(probe.breakerState,'half-open');await probe.beforeCall();await probe.afterCall({success:true,durationMs:10});assert.equal(probe.breakerState,'closed');
 });
 
-test('Opening yields while AutoSync is running and never calls Shaygan',async()=>{
-  const db=dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:true,lastStartedAt:new Date()}}]});let calls=0;
-  const result=await opening.buildCandidate(db,{openingDate:'14050110',createdBy:{username:'khedmati',role:'accounting'},items:[{itemGuid:'G-A',itemCode:'A'}],stockNumbers:['01']},{...testOptions(),shaygan:{getKardexByItemCode:async()=>{calls++;return{ok:true};}}});
-  assert.equal(result.status,'paused');assert.equal(result.pauseReason,'OPENING_YIELD_AUTOSYNC_RUNNING');assert.equal(calls,0);assert.equal(db.collection(opening.COLLECTION).rows.length,0);
+test('Opening cooperatively waits for a healthy AutoSync before its first Shaygan call',async()=>{
+  const startedAt=new Date(),db=dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:true,lastStartedAt:startedAt}}]});let calls=0;
+  const sleep=async()=>{const row=await db.collection('settings').findOne({key:'inventory.autoSyncStatus'});if(row.value.running)await setAutoSync(db,healthyAutoSync(startedAt));};
+  const result=await opening.buildCandidate(db,{openingDate:'14050110',createdBy:{username:'khedmati',role:'accounting'},items:[{itemGuid:'G-A',itemCode:'A'}],stockNumbers:['01']},{...testOptions({sleep}),shaygan:{getKardexByItemCode:async()=>{calls++;return{ok:true,item:{itemGuid:'G-A',itemCode:'A'},openingBasis:null,rows:[],meta:{reachedLimit:false}};}}});
+  assert.equal(result.status,'completed');assert.equal(calls,1);const events=db.collection(governorModule.EVENTS).rows.map(row=>row.type);assert.ok(events.includes('COOPERATIVE_YIELD_STARTED'));assert.ok(events.includes('COOPERATIVE_RESUME'));
 });
 
-test('Opening yields immediately when AutoSync starts between source calls',async()=>{
-  const db=dbSeed(),g=governorModule.createGovernor(db,'OACD-AUTOSYNC-OVERLAP',testOptions({ownerId:'overlap'}));await g.acquire();await g.preflight();await g.beforeCall();await g.afterCall({success:true,durationMs:100});
-  await db.collection('settings').updateOne({key:'inventory.autoSyncStatus'},{$set:{value:{running:true,lastStartedAt:new Date()}}});
-  await assert.rejects(g.beforeCall(),error=>error.code==='OPENING_YIELD_AUTOSYNC_RUNNING');const status=await governorModule.runtimeStatus(db,'OACD-AUTOSYNC-OVERLAP');assert.equal(status.runtime.pauseReason,'OPENING_YIELD_AUTOSYNC_RUNNING');assert.equal(status.runtime.rolling.calls,1);
+test('Opening cooperatively yields when AutoSync starts between source calls and keeps its lease',async()=>{
+  const db=dbSeed(),startedAt=new Date(),sleep=async()=>{const row=await db.collection('settings').findOne({key:'inventory.autoSyncStatus'});if(row.value.running)await setAutoSync(db,healthyAutoSync(startedAt));},g=governorModule.createGovernor(db,'OACD-AUTOSYNC-OVERLAP',testOptions({ownerId:'overlap',sleep}));await g.acquire();await g.preflight();await g.beforeCall();await g.afterCall({success:true,durationMs:100});
+  await setAutoSync(db,{running:true,lastStartedAt:startedAt});await g.beforeCall();const status=await governorModule.runtimeStatus(db,'OACD-AUTOSYNC-OVERLAP');assert.equal(status.runtime.breakerState,'closed');assert.equal(status.runtime.state,'running');assert.equal(status.lease.ownerId,'overlap');assert.equal(status.runtime.rolling.calls,1);
+});
+
+test('completed warehouse checkpoints survive a healthy AutoSync overlap and resume at warehouse 03',async()=>{
+  const startedAt=new Date(),db=dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:false,lastError:''}},{key:'inventory.activeWarehouseNumbers',value:['01','02','03']}]}),calls=[];
+  const sleep=async()=>{const row=await db.collection('settings').findOne({key:'inventory.autoSyncStatus'});if(row.value.running)await setAutoSync(db,healthyAutoSync(startedAt));};
+  const api={getKardexByItemCode:async(code,stock,opts)=>{await opts.beforeSourceCall({itemCode:code,stockNumber:stock});calls.push(`${code}:${stock}`);await opts.afterSourceCall({success:true,durationMs:10});if(stock==='02')await setAutoSync(db,{running:true,lastStartedAt:startedAt});return{ok:true,item:{itemGuid:'G-A',itemCode:'A'},openingBasis:null,rows:[],meta:{reachedLimit:false}};}};
+  const result=await opening.buildCandidate(db,{openingDate:'14050110',createdBy:{username:'khedmati',role:'accounting'},items:[{itemGuid:'G-A',itemCode:'A'}]},{...testOptions({sleep}),shaygan:api});
+  assert.equal(result.status,'completed');assert.deepEqual(calls,['A:01','A:02','A:03']);const progress=db.collection(opening.PROGRESS).rows[0];assert.deepEqual(progress.warehouseStates.map(row=>row.attemptCount),[1,1,1]);assert.equal(progress.status,'NO_OPENING_STOCK');
+});
+
+test('repeated healthy AutoSync overlaps remain cooperative under the same lease',async()=>{
+  const firstStart=new Date(),secondStart=new Date(firstStart.getTime()+2000),db=dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:true,lastStartedAt:firstStart}}]});let phase=0;
+  const sleep=async()=>{const row=await db.collection('settings').findOne({key:'inventory.autoSyncStatus'});if(phase===0&&row.value.running){phase=1;await setAutoSync(db,healthyAutoSync(firstStart));}else if(phase===1&&!row.value.running){phase=2;await setAutoSync(db,{running:true,lastStartedAt:secondStart});}else if(phase===2&&row.value.running){phase=3;await setAutoSync(db,healthyAutoSync(secondStart));}};
+  const g=governorModule.createGovernor(db,'OACD-REPEATED',testOptions({ownerId:'same-worker',sleep}));await g.acquire();await g.preflight();const status=await governorModule.runtimeStatus(db,'OACD-REPEATED');assert.equal(status.runtime.breakerState,'closed');assert.equal(status.lease.ownerId,'same-worker');assert.equal(status.runtime.cooperativeYield.yieldCount,2);assert.equal(db.collection(governorModule.EVENTS).rows.filter(row=>row.type==='COOPERATIVE_YIELD_REENTERED').length,1);
+});
+
+test('unhealthy AutoSync completion converts cooperative yield to the safety breaker',async()=>{
+  const startedAt=new Date(),db=dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:true,lastStartedAt:startedAt}}]});const sleep=async()=>setAutoSync(db,healthyAutoSync(startedAt,{lastError:'warehouse timeout',lastResult:{ok:false,stockCompleted:18,timeouts:1}}));
+  const g=governorModule.createGovernor(db,'OACD-AUTOSYNC-UNHEALTHY',testOptions({ownerId:'unhealthy',sleep}));await g.acquire();await assert.rejects(g.preflight(),error=>error.code==='OPENING_YIELD_AUTOSYNC_UNHEALTHY');const status=await governorModule.runtimeStatus(db,'OACD-AUTOSYNC-UNHEALTHY');assert.equal(status.runtime.breakerState,'open');assert.ok(status.runtime.nextEligibleResume);
+});
+
+test('operational SLA degradation after healthy AutoSync opens the safety breaker before resume',async()=>{
+  const startedAt=new Date(),db=dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:true,lastStartedAt:startedAt}}]}),healthy={classes:{P1_SEARCH:{count:3,p95Ms:100,errorRate:0}}},degraded={classes:{P1_SEARCH:{count:3,p95Ms:2000,errorRate:0}}};let probe=healthy;
+  const sleep=async()=>{const row=await db.collection('settings').findOne({key:'inventory.autoSyncStatus'});if(row.value.running)await setAutoSync(db,healthyAutoSync(startedAt));else probe=degraded;};
+  const g=governorModule.createGovernor(db,'OACD-AUTOSYNC-SLA',testOptions({ownerId:'sla',sleep,operationalHealthProbe:()=>probe,maxOperationalP95Ms:1500}));await g.acquire();await assert.rejects(g.preflight(),error=>error.code==='OPENING_YIELD_OPERATIONAL_SLA');const status=await governorModule.runtimeStatus(db,'OACD-AUTOSYNC-SLA');assert.equal(status.runtime.breakerState,'open');
+});
+
+test('worker crash while cooperatively yielded preserves single-owner lease recovery and in-progress selection',async()=>{
+  let now=new Date('2026-08-31T00:00:00Z');const datasetId='OACD-YIELD-CRASH',row={progressId:`${datasetId}:code:A`,datasetId,item:{itemCode:'A'},status:'pending',selectionState:'in_progress',selectionStartedAt:now,firstQueuedAt:now,nextEligibleAt:now,createdAt:now,updatedAt:now},db=dbSeed({[opening.PROGRESS]:[row]});
+  const crashed=governorModule.createGovernor(db,datasetId,testOptions({ownerId:'crashed-worker',now:()=>now,leaseMs:30000}));await crashed.acquire();await crashed.persist({state:'YIELDED_AUTOSYNC',cooperativeYield:{status:'waiting'}});
+  const replacement=governorModule.createGovernor(db,datasetId,testOptions({ownerId:'replacement',now:()=>now,leaseMs:30000}));await assert.rejects(replacement.acquire(),error=>error.code==='OPENING_EXTRACTION_LEASE_HELD');now=new Date(now.getTime()+30001);await replacement.acquire();const selected=await opening._selectResumeProgress(db,datasetId,{},1,now);assert.equal(selected[0].progressId,row.progressId);assert.equal(selected[0].selectionState,'in_progress');
 });
 
 test('integrated failure breaker stops Opening before another warehouse request',async()=>{

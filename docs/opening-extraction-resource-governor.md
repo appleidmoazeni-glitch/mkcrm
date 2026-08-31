@@ -15,6 +15,8 @@ Opening accounting extraction is P3 background traffic. It must always yield to 
 - Batches per explicit run: 1
 - Lease: 120 seconds, renewed before each source call and batch checkpoint
 - Breaker cooldown: 5 minutes
+- AutoSync cooperative poll: 5 seconds
+- Post-AutoSync stabilization: 5 seconds
 
 Configuration is provided through `OPENING_EXTRACTION_*` environment variables, but code clamps unsafe values. Concurrency cannot be raised above one by configuration.
 
@@ -26,7 +28,9 @@ For `start < end`, the daytime window is start-inclusive and end-exclusive. For 
 
 ## Circuit breaker
 
-Opening pauses when AutoSync is running/unhealthy, operational P0/P1 p95 exceeds 1,500 ms, operational errors exceed 10%, two consecutive source calls fail, rolling source error rate reaches 20% with at least five samples, or rolling Shaygan p95 reaches 2,500 ms with at least five samples. The worker issues no new Opening call while the breaker is open. After cooldown, an explicit resume enters a two-call half-open state; it does not immediately auto-resume.
+Healthy AutoSync overlap is cooperative rather than a fault. The single Opening worker retains and heartbeats its durable lease, enters `YIELDED_AUTOSYNC`, issues no new source call, and waits for the same AutoSync cycle to finish. It resumes only after evidence proves 19 successful warehouses, no timeout/error, an empty `lastError`, the stabilization delay, and a fresh P0/P1 health check. Repeated healthy overlaps repeat the same yield contract without changing worker ownership or checkpoints.
+
+Opening opens its safety breaker when AutoSync finishes unhealthy, operational P0/P1 p95 exceeds 1,500 ms, operational errors exceed 10%, two consecutive source calls fail, rolling source error rate reaches 20% with at least five samples, or rolling Shaygan p95 reaches 2,500 ms with at least five samples. The worker issues no new Opening call while the breaker is open. After cooldown, an explicit resume enters a two-call half-open state; it does not immediately auto-resume.
 
 ## Checkpoints and repeat bound
 

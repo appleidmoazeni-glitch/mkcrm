@@ -46,6 +46,8 @@ function governedConfig(input={}){
     maxSourceP95Ms:clamp(input.maxSourceP95Ms,500,30000,2500),
     maxOperationalP95Ms:clamp(input.maxOperationalP95Ms,250,10000,1500),
     halfOpenCalls:clamp(input.halfOpenCalls,1,3,2),
+    autoSyncPollMs:clamp(input.autoSyncPollMs,testMode?0:1000,60000,testMode?0:5000),
+    autoSyncStabilizationMs:clamp(input.autoSyncStabilizationMs,testMode?0:1000,60000,testMode?0:5000),
     ...window
   });
 }
@@ -84,10 +86,47 @@ class OpeningResourceGovernor{
     const start=this.config.configuredStartHour,end=this.config.configuredEndHour,allowed=this.config.mode==='daytime'?(hour>=start&&hour<end):(hour>=start||hour<end);
     return {...base,windowEvaluation:allowed?'INSIDE_EXECUTION_WINDOW':'OUTSIDE_EXECUTION_WINDOW',allowed};
   }
+  async autoSyncStatus(){
+    const row=await this.db.collection('settings').findOne({key:'inventory.autoSyncStatus'}).catch(()=>null);
+    return row?.value||{};
+  }
+  autoSyncCompletion(value={},expectedStartedAt=null){
+    const result=value.lastCycle||value.lastResult||{},stockResults=Array.isArray(result.stockResults)?result.stockResults:[];
+    const stockCompleted=Number(result.stockCompleted||stockResults.filter(row=>row?.ok===true).length||0),timeouts=Number(result.timeouts||result.exactTimeouts||0),failedWarehouses=stockResults.filter(row=>row?.ok!==true||clean(row?.error,500)).length;
+    const lastStartedAt=value.lastStartedAt?new Date(value.lastStartedAt):null,lastRunAt=value.lastRunAt?new Date(value.lastRunAt):null,expected=expectedStartedAt?new Date(expectedStartedAt):null;
+    const freshCompletion=!expected||(lastRunAt&&Number.isFinite(lastRunAt.getTime())&&lastRunAt.getTime()>=expected.getTime());
+    const evidence={running:value.running===true,lastStartedAt,lastRunAt,lastError:clean(value.lastError,500),ok:result.ok===true,stockCompleted,timeouts,failedWarehouses,durationMs:Number(result.durationMs||0),freshCompletion};
+    return {ok:value.running!==true&&evidence.ok&&stockCompleted===19&&!evidence.lastError&&timeouts===0&&failedWarehouses===0&&freshCompletion,evidence};
+  }
+  async cooperativeYield(initialHealth={}){
+    const yieldedAt=this.now();let expectedStartedAt=initialHealth.autoSync?.lastStartedAt||yieldedAt,yieldCount=1;
+    await this.persist({state:'YIELDED_AUTOSYNC',pauseReason:'',cooperativeYield:{yieldedAt,expectedStartedAt,yieldCount,status:'waiting'}});
+    await this.event('COOPERATIVE_YIELD_STARTED',{reason:'AUTOSYNC_RUNNING',expectedStartedAt});
+    while(true){
+      await this.heartbeat();const value=await this.autoSyncStatus();
+      if(value.running===true){expectedStartedAt=value.lastStartedAt||expectedStartedAt;await this.sleep(this.config.autoSyncPollMs);continue;}
+      const completion=this.autoSyncCompletion(value,expectedStartedAt);
+      if(!completion.ok){await this.event('COOPERATIVE_YIELD_FAILED',{reason:'OPENING_YIELD_AUTOSYNC_UNHEALTHY',completion:completion.evidence});await this.openBreaker('OPENING_YIELD_AUTOSYNC_UNHEALTHY',{autoSync:completion.evidence});throw pauseError('OPENING_YIELD_AUTOSYNC_UNHEALTHY','AutoSync completed without the required healthy 19-warehouse evidence.');}
+      const stabilizationStartedAt=this.now();await this.persist({state:'STABILIZING_AUTOSYNC',pauseReason:'',cooperativeYield:{yieldedAt,expectedStartedAt,yieldCount,status:'stabilizing',completion:completion.evidence,stabilizationStartedAt}});
+      await this.sleep(this.config.autoSyncStabilizationMs);await this.heartbeat();
+      const health=await this.health();
+      if(health.code==='OPENING_YIELD_AUTOSYNC_RUNNING'){
+        yieldCount++;expectedStartedAt=health.autoSync?.lastStartedAt||this.now();await this.persist({state:'YIELDED_AUTOSYNC',pauseReason:'',cooperativeYield:{yieldedAt,expectedStartedAt,yieldCount,status:'waiting'}});await this.event('COOPERATIVE_YIELD_REENTERED',{reason:'AUTOSYNC_RUNNING',expectedStartedAt,yieldCount});continue;
+      }
+      if(!health.ok){await this.openBreaker(health.code,health);throw pauseError(health.code,'Opening extraction yielded to a safety condition after AutoSync.');}
+      const resumedAt=this.now(),detail={yieldedAt,resumedAt,yieldCount,completion:completion.evidence,stabilizationMs:this.config.autoSyncStabilizationMs};
+      await this.persist({state:'running',pauseReason:'',health,cooperativeYield:{...detail,status:'resumed'}});await this.event('COOPERATIVE_RESUME',{...detail,operational:health.operational||null});return health;
+    }
+  }
+  async enforceHealth(health){
+    if(health.ok)return health;
+    if(health.code==='OPENING_YIELD_AUTOSYNC_RUNNING')return this.cooperativeYield(health);
+    await this.openBreaker(health.code,health);throw pauseError(health.code,'Opening extraction yielded to a safety condition.');
+  }
   async health(){
     const now=this.now(),window=this.evaluateWindow(now);if(!this.config.valid)return {ok:false,code:'OPENING_INVALID_WINDOW_CONFIGURATION',window};if(!window.allowed)return {ok:false,code:'OPENING_OUTSIDE_ALLOWED_WINDOW',window};
-    const auto=await this.db.collection('settings').findOne({key:'inventory.autoSyncStatus'}).catch(()=>null),value=auto?.value||{};
-    if(value.running===true)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_RUNNING',window,autoSync:{running:true,lastStartedAt:value.lastStartedAt||null,currentStockNumber:value.currentStockNumber||''}};
+    const value=await this.autoSyncStatus();
+    if(value.running===true)return {ok:false,kind:'COOPERATIVE_YIELD',code:'OPENING_YIELD_AUTOSYNC_RUNNING',window,autoSync:{running:true,lastStartedAt:value.lastStartedAt||null,currentStockNumber:value.currentStockNumber||''}};
     const last=value.lastCycle||value.lastResult||{};
     if(clean(value.lastError,500)||Number(last.timeouts||last.exactTimeouts||0)>0)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_UNHEALTHY',window,autoSync:{running:false,lastError:clean(value.lastError,500),timeouts:Number(last.timeouts||last.exactTimeouts||0)}};
     const operational=typeof this.operationalHealthProbe==='function'?await this.operationalHealthProbe():null;
@@ -99,7 +138,7 @@ class OpeningResourceGovernor{
     if(runtime?.breakerState==='open'){this.breakerState='open';this.nextEligibleResume=runtime.nextEligibleResume?new Date(runtime.nextEligibleResume):null;}
     if(this.breakerState==='open'&&new Date(this.nextEligibleResume||0)>now)throw pauseError('OPENING_BREAKER_COOLDOWN',`Opening extraction cooldown is active until ${new Date(this.nextEligibleResume).toISOString()}`);
     if(this.breakerState==='open'){this.breakerState='half-open';this.halfOpenRemaining=this.config.halfOpenCalls;}
-    const health=await this.health();if(!health.ok){await this.openBreaker(health.code,health);throw pauseError(health.code,'Opening extraction yielded to operational traffic.');}
+    const health=await this.enforceHealth(await this.health());
     await this.persist({state:'running',pauseReason:'',health});return health;
   }
   rolling(){const rows=this.calls.slice(-this.config.rollingWindowCalls),durations=rows.map(row=>row.durationMs),failures=rows.filter(row=>!row.success).length;return {sampleCount:rows.length,calls:this.calls.length,successes:this.calls.filter(row=>row.success).length,failures:this.calls.filter(row=>!row.success).length,errorRate:rows.length?failures/rows.length:0,p50Ms:percentile(durations,0.5),p95Ms:percentile(durations,0.95),lastSuccessfulCall:this.calls.filter(row=>row.success).at(-1)?.completedAt||null,lastFailure:this.calls.filter(row=>!row.success).at(-1)||null};}
@@ -108,7 +147,7 @@ class OpeningResourceGovernor{
   async beforeCall(context={}){
     await this.heartbeat();
     if(this.breakerState==='open')throw pauseError('OPENING_BREAKER_OPEN','Opening extraction circuit breaker is open.');
-    const health=await this.health();if(!health.ok){await this.openBreaker(health.code,health);throw pauseError(health.code,'Opening extraction yielded to operational traffic.');}
+    const health=await this.enforceHealth(await this.health());
     if(this.breakerState==='half-open'&&this.halfOpenRemaining<=0)throw pauseError('OPENING_HALF_OPEN_LIMIT','Opening half-open probe limit reached.');
     const interval=Math.max(this.config.minimumDelayMs,Math.ceil(60000/this.config.callsPerMinute)),wait=Math.max(0,this.lastCallAt+interval-Date.now());if(wait)await this.sleep(wait);
     await this.heartbeat();this.lastCallAt=Date.now();return {startedAt:this.now(),context};

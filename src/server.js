@@ -86,6 +86,8 @@ function openingGovernorOptions(input={}){
     maxBatchesPerRun:input.maxBatchesPerRun??config.openingExtractionMaxBatchesPerRun,
     leaseMs:input.leaseMs??config.openingExtractionLeaseMs,
     cooldownMs:input.cooldownMs??config.openingExtractionCooldownMs,
+    autoSyncPollMs:config.openingExtractionAutoSyncPollMs,
+    autoSyncStabilizationMs:config.openingExtractionAutoSyncStabilizationMs,
     allowedStartHour:(requestHasStart||requestHasEnd)?input.allowedStartHour:config.openingExtractionAllowedStartHour,
     allowedEndHour:(requestHasStart||requestHasEnd)?input.allowedEndHour:config.openingExtractionAllowedEndHour,
     windowConfigurationSource:(requestHasStart||requestHasEnd)?'REQUEST':(envHasStart||envHasEnd)?'ENVIRONMENT':'NONE',
