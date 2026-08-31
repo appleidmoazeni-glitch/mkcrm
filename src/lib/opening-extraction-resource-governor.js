@@ -104,6 +104,7 @@ class OpeningResourceGovernor{
 }
 
 async function runtimeStatus(db,datasetId=''){const query=clean(datasetId,100)?{datasetId:clean(datasetId,100)}:{};const runtime=await db.collection(RUNTIME).findOne(query,{sort:{updatedAt:-1}}),lease=await db.collection(LEASES).findOne({scopeKey:SCOPE_KEY});return {ok:true,readOnly:true,runtime,lease};}
+async function ensureIndexes(db){const names=[];names.push(await db.collection(LEASES).createIndex({scopeKey:1},{unique:true,name:'opening_extraction_scope_unique'}));names.push(await db.collection(LEASES).createIndex({expiresAt:1},{name:'opening_extraction_lease_expiry'}));names.push(await db.collection(RUNTIME).createIndex({datasetId:1},{unique:true,name:'opening_extraction_runtime_dataset_unique'}));names.push(await db.collection(RUNTIME).createIndex({state:1,updatedAt:-1},{name:'opening_extraction_runtime_state'}));names.push(await db.collection(EVENTS).createIndex({eventId:1},{unique:true,name:'opening_extraction_event_unique'}));names.push(await db.collection(EVENTS).createIndex({datasetId:1,at:-1},{name:'opening_extraction_event_timeline'}));return names;}
 function createGovernor(db,datasetId,options={}){return new OpeningResourceGovernor(db,datasetId,options);}
 
-module.exports={LEASES,RUNTIME,EVENTS,SCOPE_KEY,governedConfig,createGovernor,runtimeStatus,OpeningResourceGovernor,_pauseError:pauseError};
+module.exports={LEASES,RUNTIME,EVENTS,SCOPE_KEY,governedConfig,createGovernor,runtimeStatus,ensureIndexes,OpeningResourceGovernor,_pauseError:pauseError};

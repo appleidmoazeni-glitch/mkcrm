@@ -89,3 +89,5 @@ test('GetKardex invokes governor hooks for every authoritative page including te
 test('runtime endpoint contract is read-only and financial collections remain untouched',async()=>{
   const db=dbSeed({supplierPurchaseLayers:[{id:'P'}],fifoAllocations:[{id:'F'}],manualCostResolutions:[]}),g=governorModule.createGovernor(db,'OACD-SAFE',testOptions({ownerId:'safe'}));await g.acquire();await g.preflight();await g.release('paused','test');const status=await governorModule.runtimeStatus(db,'OACD-SAFE');assert.equal(status.readOnly,true);assert.equal(db.collection('supplierPurchaseLayers').rows.length,1);assert.equal(db.collection('fifoAllocations').rows.length,1);assert.equal(db.collection('manualCostResolutions').rows.length,0);
 });
+
+test('safety-critical Governor indexes bootstrap independently',async()=>{const db=dbSeed();const names=await governorModule.ensureIndexes(db);assert.ok(names.includes('opening_extraction_scope_unique'));const leaseIndex=(await db.collection(governorModule.LEASES).indexes()).find(row=>row.name==='opening_extraction_scope_unique');assert.equal(leaseIndex.unique,true);});

@@ -697,6 +697,12 @@ async function ensureInit() {
     const db = await connectMongo();
     await boardStockOutLifecycle.ensureBoardLifecycleIndexes(db);
   } catch (e) { console.error('Board lifecycle index warning:', e.message); }
+  // Opening ownership is safety-critical. Bootstrap it independently so a
+  // legacy/unrelated index warning cannot disable the single-worker lease.
+  try {
+    const db=await connectMongo();
+    await openingAccountingCostBasis.ensureResourceGovernorIndexes(db);
+  } catch(e) { console.error('Opening resource governor index warning:', e.message); }
   await applyFiscalDatabaseSetting();
 }
 
