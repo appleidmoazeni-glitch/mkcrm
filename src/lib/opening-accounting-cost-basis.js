@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const shaygan = require('./shaygan');
 const decimal = require('./accounting-decimal');
 const { canonicalSaleDate } = require('./jalali-date');
+const openingResourceGovernor = require('./opening-extraction-resource-governor');
 
 const COLLECTION = 'openingAccountingCostBasis';
 const DATASETS = 'openingAccountingEvidenceDatasets';
@@ -215,8 +216,8 @@ async function attemptWarehouse(db,progress,warehouseState,options={}){
   for(let n=firstAttempt;n<stopAt&&!terminalWarehouse(state.status);n++){
     if(n>firstAttempt&&backoffMs)await delay(backoffMs*(2**Math.min(n-firstAttempt-1,3)));
     const startedAt=new Date(),started=Date.now();let result,error;
-    try{result=await api.getKardexByItemCode(progress.item.itemCode,state.warehouseNumber,{maxRows,hardMaxRows:maxRows,timeoutMs,dateFrom:progress.openingDate});}
-    catch(caught){error=caught;result={ok:false,error:clean(caught?.message||caught,500),meta:{}};}
+    try{result=await api.getKardexByItemCode(progress.item.itemCode,state.warehouseNumber,{maxRows,hardMaxRows:maxRows,timeoutMs,dateFrom:progress.openingDate,beforeSourceCall:options.resourceGovernor?context=>options.resourceGovernor.beforeCall({...context,progressId:progress.progressId}):undefined,afterSourceCall:options.resourceGovernor?observation=>options.resourceGovernor.afterCall(observation):undefined});}
+    catch(caught){if(caught?.openingPaused)throw caught;error=caught;result={ok:false,error:clean(caught?.message||caught,500),meta:{}};}
     result.meta={...(result.meta||{}),stockNumber:state.warehouseNumber,openingDate:progress.openingDate};
     const basis=result?.openingBasis,success=result?.ok===true&&!result?.meta?.reachedLimit;
     const status=success&&(basis&&Number(basis.openingQuantity)>0&&Number(basis.openingTotalValue)>0)?'SUCCESS_POSITIVE':success?'SUCCESS_ZERO':'failed';
@@ -225,6 +226,7 @@ async function attemptWarehouse(db,progress,warehouseState,options={}){
     state={...state,status:success?status:failureClass,attemptCount:n+1,lastAttemptAt:attempt.completedAt,nextEligibleRetry:success?null:new Date(Date.now()+backoffMs*(2**Math.min(n-firstAttempt,3))),lastFailureClass:failureClass,lastError:attempt.error,attempts:[...state.attempts,attempt],result:success?compactKardexResult(result):undefined};
     await db.collection(PROGRESS).updateOne({progressId:progress.progressId},{$set:{warehouseStates:progress.warehouseStates.map(row=>row.warehouseNumber===state.warehouseNumber?state:row),updatedAt:new Date()},$inc:{sourceCallCount:1}});
     progress.warehouseStates=progress.warehouseStates.map(row=>row.warehouseNumber===state.warehouseNumber?state:row);
+    if(options.resourceGovernor?.breakerState==='open')throw openingResourceGovernor._pauseError('OPENING_BREAKER_OPEN','Opening extraction circuit breaker is open.');
     if(success)break;
   }
   if(!terminalWarehouse(state.status))state={...state,status:'INCOMPLETE_SOURCE'};
@@ -308,9 +310,31 @@ async function finalizeDataset(db,dataset,options={}){
   return {ok:true,datasetId:dataset.datasetId,status,approvalStatus,active:false,itemCount:records.length,statusCounts,sourceCallCount:refreshed.reduce((sum,row)=>sum+Number(row.sourceCallCount||0),0),datasetFingerprint,eligibilityPreview:eligibility,purchaseLayerWrites:0,fifoWrites:0,manualCostWrites:0};
 }
 async function runCandidate(db,dataset,options={}){
-  const rows=await db.collection(PROGRESS).find({datasetId:dataset.datasetId}).sort({createdAt:1}).toArray(),concurrency=Math.max(1,Math.min(Number(options.concurrency||1),2));let cursor=0;
-  async function worker(){while(true){const index=cursor++;if(index>=rows.length)return;if(['VALIDATED_CANDIDATE','NO_OPENING_STOCK'].includes(rows[index].status))continue;await processProgress(db,rows[index],options);}}
-  await Promise.all(Array.from({length:Math.min(concurrency,rows.length)},worker));return finalizeDataset(db,dataset,options);
+  const governorOptions={...options,testMode:options.testMode===true||Boolean(options.shaygan&&options.shaygan!==shaygan)};
+  const resourceGovernor=options.resourceGovernor||openingResourceGovernor.createGovernor(db,dataset.datasetId,governorOptions),config=resourceGovernor.config;
+  await resourceGovernor.acquire();
+  try{
+    await resourceGovernor.preflight();
+    if(options.incrementResume===true){const resumedAt=new Date();await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId},{$set:{status:'building',lastResumedBy:actor(options.resumeRequestedBy),lastResumedAt:resumedAt,updatedAt:resumedAt},$inc:{resumeCount:1}});}
+    let batches=0,processed=0;
+    while(batches<config.maxBatchesPerRun){
+      const pending=await db.collection(PROGRESS).find({datasetId:dataset.datasetId,status:{$in:['pending','INCOMPLETE_SOURCE']}}).sort({updatedAt:1,createdAt:1}).limit(config.batchSize).toArray();
+      if(!pending.length)break;
+      for(const row of pending){await processProgress(db,row,{...options,concurrency:1,resourceGovernor});processed++;}
+      batches++;const [pendingItems,incompleteItems,completedItems]=await Promise.all([db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:'pending'}),db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:'INCOMPLETE_SOURCE'}),db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:{$in:['VALIDATED_CANDIDATE','NO_OPENING_STOCK']}})]);
+      await resourceGovernor.batchCheckpoint({batchNumber:batches,batchSize:pending.length,processedItems:processed,pendingItems,incompleteItems,completedItems,worstCaseRepeatedWork:'one in-flight warehouse Kardex path; completed warehouse checkpoints are never repeated'});
+      if(pendingItems===0)break;
+    }
+    const pendingItems=await db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:'pending'});
+    if(pendingItems>0){const now=new Date(),progress=await db.collection(PROGRESS).find({datasetId:dataset.datasetId}).toArray(),statusCounts=progress.reduce((map,row)=>(map[row.status]=(map[row.status]||0)+1,map),{});await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId},{$set:{status:'paused',approvalStatus:'draft',active:false,pauseReason:'BATCH_LIMIT_REACHED',statusCounts,updatedAt:now}});await resourceGovernor.persist({state:'paused',pauseReason:'BATCH_LIMIT_REACHED',batchProgress:{batches,processedItems:processed,pendingItems}});return {ok:true,datasetId:dataset.datasetId,status:'paused',approvalStatus:'draft',active:false,pauseReason:'BATCH_LIMIT_REACHED',processedItems:processed,pendingItems,resourceGovernor:{config,ownerId:resourceGovernor.ownerId},purchaseLayerWrites:0,fifoWrites:0,manualCostWrites:0};}
+    return finalizeDataset(db,dataset,options);
+  }catch(error){
+    if(!error?.openingPaused)throw error;
+    const now=new Date(),progress=await db.collection(PROGRESS).find({datasetId:dataset.datasetId}).toArray(),statusCounts=progress.reduce((map,row)=>(map[row.status]=(map[row.status]||0)+1,map),{});
+    await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId},{$set:{status:'paused',approvalStatus:'draft',active:false,pauseReason:clean(error.code||'OPENING_RESOURCE_GOVERNOR_PAUSED',200),statusCounts,updatedAt:now}});
+    await resourceGovernor.persist({state:'paused',pauseReason:clean(error.code||'OPENING_RESOURCE_GOVERNOR_PAUSED',200)});
+    return {ok:true,datasetId:dataset.datasetId,status:'paused',approvalStatus:'draft',active:false,pauseReason:clean(error.code||'OPENING_RESOURCE_GOVERNOR_PAUSED',200),resourceGovernor:{config,ownerId:resourceGovernor.ownerId},purchaseLayerWrites:0,fifoWrites:0,manualCostWrites:0};
+  }finally{await resourceGovernor.release('paused','run-ended');}
 }
 async function buildCandidate(db,input={},options={}){
   const openingDate=sourceDate(input.openingDate),items=(Array.isArray(input.items)?input.items:[]).map(normalizeItem).filter(item=>item.itemCode);if(!items.length)fail('OPENING_CANDIDATE_ITEMS_REQUIRED','opening candidate items required');
@@ -319,8 +343,8 @@ async function buildCandidate(db,input={},options={}){
   await db.collection(DATASETS).insertOne(dataset);await seedProgress(db,datasetId,items,warehouses,openingDate,now);return runCandidate(db,dataset,options);
 }
 async function resumeCandidate(db,datasetId,input={},requestedBy={},options={}){
-  const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)fail('OPENING_CANDIDATE_NOT_FOUND','Opening Candidate یافت نشد.',404);if(dataset.status==='completed')fail('OPENING_CANDIDATE_IMMUTABLE','Candidate کامل و immutable است.',409);if(!['building','incomplete','failed'].includes(dataset.status))fail('OPENING_CANDIDATE_NOT_RESUMABLE','وضعیت Candidate قابل Resume نیست.',409);
-  await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId},{$set:{status:'building',lastResumedBy:actor(requestedBy),lastResumedAt:new Date(),updatedAt:new Date()},$inc:{resumeCount:1}});return runCandidate(db,{...dataset,status:'building'},{...options,...input});
+  const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)fail('OPENING_CANDIDATE_NOT_FOUND','Opening Candidate یافت نشد.',404);if(dataset.status==='completed')fail('OPENING_CANDIDATE_IMMUTABLE','Candidate کامل و immutable است.',409);if(!['building','paused','incomplete','failed'].includes(dataset.status))fail('OPENING_CANDIDATE_NOT_RESUMABLE','وضعیت Candidate قابل Resume نیست.',409);
+  return runCandidate(db,{...dataset,status:'building'},{...options,...input,incrementResume:true,resumeRequestedBy:requestedBy});
 }
 async function refreshEligibilityPreview(db,datasetId,input={},requestedBy={}){
   const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)fail('OPENING_CANDIDATE_NOT_FOUND','Opening Candidate یافت نشد.',404);
@@ -345,4 +369,4 @@ async function approvalAction(db,datasetId,action,input={},requestedBy={}){
 async function listCandidates(db,input={}){const limit=Math.max(1,Math.min(Number(input.limit||20),100));const list=await db.collection(DATASETS).find({}).sort({createdAt:-1}).limit(limit).toArray();return {ok:true,readOnly:true,list};}
 async function candidateDetail(db,datasetId,input={}){const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)return {ok:false,code:'OPENING_CANDIDATE_NOT_FOUND'};const item=clean(input.item,100),query={datasetId:dataset.datasetId};if(clean(input.status,50))query.status=clean(input.status,50);if(item)query.$or=[{itemCode:item},{itemGuid:item}];const [rows,progress,approvalHistory,eligibility]=await Promise.all([db.collection(COLLECTION).find(query).sort({saleExposure:-1,itemCode:1}).limit(5000).toArray(),db.collection(PROGRESS).find(item?{datasetId:dataset.datasetId,$or:[{'item.itemCode':item},{'item.itemGuid':item}]}:{datasetId:dataset.datasetId}).limit(5000).toArray(),db.collection(APPROVALS).find({datasetId:dataset.datasetId}).sort({at:1}).toArray(),db.collection(ELIGIBILITY).find(item?{datasetId:dataset.datasetId,$or:[{itemCode:item},{itemGuid:item}]}:{datasetId:dataset.datasetId}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1}).limit(5000).toArray()]);let resolvableQuantity=0n,saleExposure=0n,remaining=0n;for(const row of eligibility){resolvableQuantity+=decimal.parse(row.openingEligibleQuantityExact||0,decimal.QUANTITY_SCALE);remaining+=decimal.parse(row.remainingUnknownQuantityExact||0,decimal.QUANTITY_SCALE);saleExposure+=decimal.parse(row.saleExposureExact||0,decimal.MONEY_SCALE);}const impactPreview={authorityClass:dataset.approvalStatus==='approved'?'APPROVED':dataset.status==='completed'?'VALIDATED_NOT_APPROVED':'INCOMPLETE',resolvableLines:eligibility.filter(row=>Number(row.openingEligibleQuantityExact)>0).length,resolvableQuantityExact:decimal.format(resolvableQuantity,decimal.QUANTITY_SCALE),remainingUnknownQuantityExact:decimal.format(remaining,decimal.QUANTITY_SCALE),saleExposureExact:decimal.format(saleExposure,decimal.MONEY_SCALE),fifoWrites:0};return {ok:true,readOnly:true,dataset,rows,progress,approvalHistory,eligibility,impactPreview};}
 
-module.exports={COLLECTION,DATASETS,STATE,PROGRESS,APPROVALS,ELIGIBILITY,MODULE_VERSION,SCHEMA_VERSION,SOURCE_CLASS,fromKardex,aggregateWarehouseKardex,materialize,buildCandidate,resumeCandidate,refreshEligibilityPreview,submitCandidate:(db,id,input,user)=>approvalAction(db,id,'submit',input,user),approveCandidate:(db,id,input,user)=>approvalAction(db,id,'approve',input,user),rejectCandidate:(db,id,input,user)=>approvalAction(db,id,'reject',input,user),deferCandidate:(db,id,input,user)=>approvalAction(db,id,'defer',input,user),listCandidates,candidateDetail,buildEligibilityPreview,_extractItem:extractItem,_classifyFailure:classifyFailure,_compactKardexResult:compactKardexResult,_hash:hash,_legacyBuildCandidate:buildCandidateLegacy};
+module.exports={COLLECTION,DATASETS,STATE,PROGRESS,APPROVALS,ELIGIBILITY,MODULE_VERSION,SCHEMA_VERSION,SOURCE_CLASS,fromKardex,aggregateWarehouseKardex,materialize,buildCandidate,resumeCandidate,refreshEligibilityPreview,submitCandidate:(db,id,input,user)=>approvalAction(db,id,'submit',input,user),approveCandidate:(db,id,input,user)=>approvalAction(db,id,'approve',input,user),rejectCandidate:(db,id,input,user)=>approvalAction(db,id,'reject',input,user),deferCandidate:(db,id,input,user)=>approvalAction(db,id,'defer',input,user),listCandidates,candidateDetail,buildEligibilityPreview,runtimeStatus:openingResourceGovernor.runtimeStatus,_extractItem:extractItem,_classifyFailure:classifyFailure,_compactKardexResult:compactKardexResult,_hash:hash,_legacyBuildCandidate:buildCandidateLegacy};

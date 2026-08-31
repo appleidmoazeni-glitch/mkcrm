@@ -69,7 +69,15 @@ const config = {
   inventoryExactPositiveRecheckMs: Number(process.env.INVENTORY_EXACT_POSITIVE_RECHECK_MS || 900000),
   inventoryNewItemVerifyCycleLimit: Number(process.env.INVENTORY_NEW_ITEM_VERIFY_CYCLE_LIMIT || 20),
   inventoryNewItemVerifyBudgetMs: Number(process.env.INVENTORY_NEW_ITEM_VERIFY_BUDGET_MS || 45000),
-  saleInventorySnapshotMaxAgeMinutes: Number(process.env.SALE_INVENTORY_SNAPSHOT_MAX_AGE_MINUTES || 30)
+  saleInventorySnapshotMaxAgeMinutes: Number(process.env.SALE_INVENTORY_SNAPSHOT_MAX_AGE_MINUTES || 30),
+  openingExtractionMinimumDelayMs:Number(process.env.OPENING_EXTRACTION_MINIMUM_DELAY_MS || 3000),
+  openingExtractionCallsPerMinute:Number(process.env.OPENING_EXTRACTION_CALLS_PER_MINUTE || 20),
+  openingExtractionBatchSize:Number(process.env.OPENING_EXTRACTION_BATCH_SIZE || 1),
+  openingExtractionMaxBatchesPerRun:Number(process.env.OPENING_EXTRACTION_MAX_BATCHES_PER_RUN || 1),
+  openingExtractionLeaseMs:Number(process.env.OPENING_EXTRACTION_LEASE_MS || 120000),
+  openingExtractionCooldownMs:Number(process.env.OPENING_EXTRACTION_COOLDOWN_MS || 300000),
+  openingExtractionAllowedStartHour:process.env.OPENING_EXTRACTION_ALLOWED_START_HOUR==null?null:Number(process.env.OPENING_EXTRACTION_ALLOWED_START_HOUR),
+  openingExtractionAllowedEndHour:process.env.OPENING_EXTRACTION_ALLOWED_END_HOUR==null?null:Number(process.env.OPENING_EXTRACTION_ALLOWED_END_HOUR)
 };
 
 module.exports = { config };

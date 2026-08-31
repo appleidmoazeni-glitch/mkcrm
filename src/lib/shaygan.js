@@ -337,7 +337,16 @@ async function getKardexByItemCode(itemCode, stockNumber = '', opts = {}) {
   let fetchedPages = 0;
 
   for (let rowStart = 0; rowStart < maxRows; rowStart++) {
-    const res = await post('/api/Item/GetKardex', domain, rowStart, 1, { maxRowCount: 1, timeoutMs: opts.timeoutMs || config.kardexRequestTimeoutMs || Math.min(config.shayganTimeoutMs || 15000, 6000) });
+    const callContext={endpoint:'Item/GetKardex',itemCode,stockNumber,rowStart};
+    if(typeof opts.beforeSourceCall==='function')await opts.beforeSourceCall(callContext);
+    const sourceStarted=Date.now();let res;
+    try{
+      res = await post('/api/Item/GetKardex', domain, rowStart, 1, { maxRowCount: 1, timeoutMs: opts.timeoutMs || config.kardexRequestTimeoutMs || Math.min(config.shayganTimeoutMs || 15000, 6000) });
+    }catch(error){
+      if(typeof opts.afterSourceCall==='function')await opts.afterSourceCall({...callContext,durationMs:Date.now()-sourceStarted,success:false,error:String(error?.message||error)});
+      throw error;
+    }
+    if(typeof opts.afterSourceCall==='function')await opts.afterSourceCall({...callContext,durationMs:Date.now()-sourceStarted,success:res?.ok===true,statusCode:Number(res?.status||res?.statusCode||0),error:res?.ok===true?'':String(res?.error||'source-request-failed')});
     if (!firstRes) firstRes = res;
     fetchedPages++;
     if (!res.ok) { error = res.error || `Kardex page ${rowStart} failed`; break; }

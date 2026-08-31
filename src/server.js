@@ -26,6 +26,7 @@ const saleSnapshot = require('./lib/sale-snapshot');
 const canonicalItemCatalog = require('./lib/canonical-item-catalog');
 const inventoryAutoSyncPolicy = require('./lib/inventory-auto-sync-policy');
 const boardStockOutLifecycle = require('./lib/board-stock-out-lifecycle');
+const operationalTrafficHealth = require('./lib/operational-traffic-health');
 const mongoBackup = require('./lib/mongo-backup');
 const invoiceTypes = require('../public/assets/invoice-types');
 const {createInvoiceResolver}=require('./lib/invoice-resolution');
@@ -74,6 +75,20 @@ mongoBackupJobRegistry.register({name:'mongo-backup',version:1,factory:input=>ne
 const mongoBackupJobManager=new JobManager(mongoBackupJobRegistry);
 let mongoBackupLastResult=null;
 const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan.getInvoice(invNo,invType),supportedTypes:invoiceTypes.supportedTypes});
+
+function openingGovernorOptions(input={}){
+  return {
+    minimumDelayMs:input.minimumDelayMs??config.openingExtractionMinimumDelayMs,
+    callsPerMinute:input.callsPerMinute??config.openingExtractionCallsPerMinute,
+    batchSize:input.batchSize??config.openingExtractionBatchSize,
+    maxBatchesPerRun:input.maxBatchesPerRun??config.openingExtractionMaxBatchesPerRun,
+    leaseMs:input.leaseMs??config.openingExtractionLeaseMs,
+    cooldownMs:input.cooldownMs??config.openingExtractionCooldownMs,
+    allowedStartHour:input.allowedStartHour??config.openingExtractionAllowedStartHour,
+    allowedEndHour:input.allowedEndHour??config.openingExtractionAllowedEndHour,
+    operationalHealthProbe:()=>operationalTrafficHealth.snapshot()
+  };
+}
 
 function searchPerfNow() {
   return Number(process.hrtime.bigint()) / 1e6;
@@ -3987,8 +4002,11 @@ async function handleApi(req, res, pathname, query) {
           const first=await manualCostResolution.missingQueue(db,{coverage:'unknown',page:1,pageSize:500,sort:'saleAmount',direction:'desc'});items=[...(first.list||[])];
           for(let page=2;items.length<Number(first.total||0);page++){const next=await manualCostResolution.missingQueue(db,{coverage:'unknown',page,pageSize:500,sort:'saleAmount',direction:'desc'});if(!(next.list||[]).length)break;items.push(...next.list);}
         }
-        return sendJson(res,201,await openingAccountingCostBasis.buildCandidate(db,{...body,items,createdBy:currentUser(req)}));
+        return sendJson(res,201,await openingAccountingCostBasis.buildCandidate(db,{...body,items,createdBy:currentUser(req)},openingGovernorOptions(body)));
       }catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_BUILD_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/accounting/opening-accounting-evidence/runtime'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;const db=await connectMongo();return sendJson(res,200,await openingAccountingCostBasis.runtimeStatus(db,query.datasetId));
     }
     const openingCandidateMatch=pathname.match(/^\/api\/accounting\/opening-accounting-evidence\/candidates\/([^/]+)(?:\/(resume|refresh-preview|submit|approve|reject|defer))?$/);
     if(openingCandidateMatch&&req.method==='GET'&&!openingCandidateMatch[2]){
@@ -3997,7 +4015,7 @@ async function handleApi(req, res, pathname, query) {
     }
     if(openingCandidateMatch&&req.method==='POST'&&openingCandidateMatch[2]){
       const action=openingCandidateMatch[2],roles=['resume','refresh-preview','submit'].includes(action)?['admin','accounting']:['admin','manager'];if(!requireRole(req,res,roles))return;const body=await collectBody(req),db=await connectMongo(),id=decodeURIComponent(openingCandidateMatch[1]);
-      try{const fn={resume:'resumeCandidate','refresh-preview':'refreshEligibilityPreview',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate'}[action];return sendJson(res,200,await openingAccountingCostBasis[fn](db,id,body,currentUser(req)));}
+      try{const fn={resume:'resumeCandidate','refresh-preview':'refreshEligibilityPreview',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate'}[action];const result=action==='resume'?await openingAccountingCostBasis[fn](db,id,body,currentUser(req),openingGovernorOptions(body)):await openingAccountingCostBasis[fn](db,id,body,currentUser(req));return sendJson(res,200,result);}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_ACTION_FAILED',error:String(error.message||error)});}
     }
     if(pathname==='/api/manual-cost-resolutions/assisted/decisions'&&req.method==='POST'){
@@ -6740,6 +6758,8 @@ async function serveStatic(req, res, pathname) {
 
 const server = http.createServer(async (req, res) => {
   const { pathname, query } = extractQuery(req.url);
+  const requestStarted=Date.now();
+  res.once('finish',()=>operationalTrafficHealth.observe(pathname,Date.now()-requestStarted,res.statusCode));
   if (pathname === '/health' || pathname.startsWith('/api/') || pathname.startsWith('/admin/')) {
     const handled = await handleApi(req, res, pathname, query);
     if (handled === false) sendJson(res, 404, { ok: false, error: 'API not found', pathname });
