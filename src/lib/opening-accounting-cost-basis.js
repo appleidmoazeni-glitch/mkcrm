@@ -205,8 +205,37 @@ function progressId(datasetId,item){return `${datasetId}:${itemIdentity(item)}`;
 async function seedProgress(db,datasetId,items,warehouses,openingDate,now){
   for(const item of items){
     const id=progressId(datasetId,item),existing=await db.collection(PROGRESS).findOne({progressId:id});if(existing)continue;
-    await db.collection(PROGRESS).insertOne({progressId:id,datasetId,canonicalIdentity:itemIdentity(item),item,openingDate,status:'pending',warehouseStates:warehouses.map(warehouseNumber=>({warehouseNumber,status:'pending',attemptCount:0,attempts:[]})),sourceCallCount:0,createdAt:now,updatedAt:now});
+    await db.collection(PROGRESS).insertOne({progressId:id,datasetId,canonicalIdentity:itemIdentity(item),item,openingDate,status:'pending',selectionState:'queued',firstQueuedAt:now,nextEligibleAt:now,warehouseStates:warehouses.map(warehouseNumber=>({warehouseNumber,status:'pending',attemptCount:0,attempts:[]})),sourceCallCount:0,createdAt:now,updatedAt:now});
   }
+}
+
+const RESUMABLE_PROGRESS_STATUSES = ['pending','INCOMPLETE_SOURCE'];
+const DETERMINISTIC_PROGRESS_SORT = {nextEligibleAt:1,firstQueuedAt:1,createdAt:1,progressId:1};
+const RECOVERY_PROGRESS_SORT = {selectionStartedAt:1,firstQueuedAt:1,createdAt:1,progressId:1};
+function progressEligibility(datasetId,now=new Date()){
+  return {datasetId,status:{$in:RESUMABLE_PROGRESS_STATUSES},$and:[{$or:[{nextEligibleAt:{$exists:false}},{nextEligibleAt:null},{nextEligibleAt:{$lte:now}}]}]};
+}
+function explicitResumeSelector(options={}){
+  const fields=[['progressId',clean(options.targetProgressId,250)],['canonicalIdentity',clean(options.targetCanonicalIdentity,200)],['item.itemCode',clean(options.targetItemCode,100)]].filter(([,value])=>value);
+  if(fields.length>1)fail('OPENING_RESUME_TARGET_SELECTOR_INVALID','Only one explicit Opening target selector is allowed.');
+  return fields[0]||null;
+}
+async function selectResumeProgress(db,datasetId,options={},limit=1,now=new Date()){
+  const eligible=progressEligibility(datasetId,now),selector=explicitResumeSelector(options);
+  if(selector){
+    const [field,value]=selector,query={...eligible,[field]:value};
+    const rows=await db.collection(PROGRESS).find(query).sort(DETERMINISTIC_PROGRESS_SORT).limit(2).toArray();
+    if(rows.length!==1)fail(rows.length?'OPENING_RESUME_TARGET_AMBIGUOUS':'OPENING_RESUME_TARGET_NOT_ELIGIBLE',rows.length?'Explicit Opening target is ambiguous.':'Explicit Opening target is not part of this Dataset or is not currently eligible.',409);
+    return rows;
+  }
+  const recovering=await db.collection(PROGRESS).find({...eligible,selectionState:'in_progress'}).sort(RECOVERY_PROGRESS_SORT).limit(1).toArray();
+  if(recovering.length)return recovering;
+  return db.collection(PROGRESS).find({...eligible,selectionState:{$ne:'in_progress'}}).sort(DETERMINISTIC_PROGRESS_SORT).limit(limit).toArray();
+}
+async function markProgressInFlight(db,row,ownerId,now=new Date()){
+  const result=await db.collection(PROGRESS).updateOne({progressId:row.progressId,datasetId:row.datasetId,status:{$in:RESUMABLE_PROGRESS_STATUSES}},{$set:{selectionState:'in_progress',selectionOwnerId:clean(ownerId,200),selectionStartedAt:row.selectionState==='in_progress'?(row.selectionStartedAt||now):now,updatedAt:now}});
+  if(!result.matchedCount)fail('OPENING_RESUME_PROGRESS_CLAIM_CONFLICT','Opening progress changed before it could be claimed.',409);
+  return {...row,selectionState:'in_progress',selectionOwnerId:clean(ownerId,200),selectionStartedAt:row.selectionState==='in_progress'?(row.selectionStartedAt||now):now,updatedAt:now};
 }
 async function attemptWarehouse(db,progress,warehouseState,options={}){
   const api=options.shaygan||shaygan,maxRows=Math.max(1,Math.min(Number(options.maxRows||200),500)),timeoutMs=Math.max(500,Math.min(Number(options.timeoutMs||15000),30000));
@@ -244,7 +273,8 @@ async function processProgress(db,progress,options={}){
   const entries=progress.warehouseStates.filter(row=>terminalWarehouse(row.status)).map(row=>({warehouseNumber:row.warehouseNumber,result:row.result,included:true}));
   const aggregate=complete?aggregateWarehouseKardex(entries,new Date()):null;
   const status=!complete?'INCOMPLETE_SOURCE':aggregate?.status==='NO_OPENING_STOCK'?'NO_OPENING_STOCK':aggregate?.ok===false?'INCOMPLETE_SOURCE':'VALIDATED_CANDIDATE';
-  await db.collection(PROGRESS).updateOne({progressId:progress.progressId},{$set:{warehouseStates:progress.warehouseStates,status,completedWarehouseCount:progress.warehouseStates.filter(row=>terminalWarehouse(row.status)).length,incompleteWarehouseCount:progress.warehouseStates.filter(row=>!terminalWarehouse(row.status)).length,lastRunDurationMs:Date.now()-started,updatedAt:new Date()}});
+  const incompleteRetries=progress.warehouseStates.filter(row=>!terminalWarehouse(row.status)&&row.nextEligibleRetry).map(row=>new Date(row.nextEligibleRetry)).sort((a,b)=>a-b),updatedAt=new Date();
+  await db.collection(PROGRESS).updateOne({progressId:progress.progressId},{$set:{warehouseStates:progress.warehouseStates,status,selectionState:status==='INCOMPLETE_SOURCE'?'queued':'completed',selectionOwnerId:'',selectionCompletedAt:updatedAt,nextEligibleAt:status==='INCOMPLETE_SOURCE'?(incompleteRetries[0]||updatedAt):null,completedWarehouseCount:progress.warehouseStates.filter(row=>terminalWarehouse(row.status)).length,incompleteWarehouseCount:progress.warehouseStates.filter(row=>!terminalWarehouse(row.status)).length,lastRunDurationMs:Date.now()-started,updatedAt}});
   return {status,aggregate};
 }
 function evidenceRecord(dataset,progress,aggregate,now){
@@ -315,15 +345,18 @@ async function runCandidate(db,dataset,options={}){
   await resourceGovernor.acquire();
   try{
     await resourceGovernor.preflight();
+    const targetSelector=explicitResumeSelector(options);
+    if(targetSelector&&(config.batchSize!==1||config.maxBatchesPerRun!==1||config.maxConcurrency!==1))fail('OPENING_RESUME_TARGET_REQUIRES_SINGLE_ITEM_GOVERNOR','Explicit Opening target requires concurrency=1, batchSize=1 and maxBatchesPerRun=1.',409);
+    let explicitPending=targetSelector?await selectResumeProgress(db,dataset.datasetId,options,1):null;
     if(options.incrementResume===true){const resumedAt=new Date();await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId},{$set:{status:'building',lastResumedBy:actor(options.resumeRequestedBy),lastResumedAt:resumedAt,updatedAt:resumedAt},$inc:{resumeCount:1}});}
     let batches=0,processed=0;
     while(batches<config.maxBatchesPerRun){
-      const pending=await db.collection(PROGRESS).find({datasetId:dataset.datasetId,status:{$in:['pending','INCOMPLETE_SOURCE']}}).sort({updatedAt:1,createdAt:1}).limit(config.batchSize).toArray();
+      const pending=explicitPending||await selectResumeProgress(db,dataset.datasetId,options,config.batchSize);explicitPending=null;
       if(!pending.length)break;
-      for(const row of pending){await processProgress(db,row,{...options,concurrency:1,resourceGovernor});processed++;}
+      for(const row of pending){const claimed=await markProgressInFlight(db,row,resourceGovernor.ownerId);await processProgress(db,claimed,{...options,concurrency:1,resourceGovernor});processed++;}
       batches++;const [pendingItems,incompleteItems,completedItems]=await Promise.all([db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:'pending'}),db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:'INCOMPLETE_SOURCE'}),db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:{$in:['VALIDATED_CANDIDATE','NO_OPENING_STOCK']}})]);
       await resourceGovernor.batchCheckpoint({batchNumber:batches,batchSize:pending.length,processedItems:processed,pendingItems,incompleteItems,completedItems,worstCaseRepeatedWork:'one in-flight warehouse Kardex path; completed warehouse checkpoints are never repeated'});
-      if(pendingItems===0)break;
+      if(targetSelector||pendingItems===0)break;
     }
     const pendingItems=await db.collection(PROGRESS).countDocuments({datasetId:dataset.datasetId,status:'pending'});
     if(pendingItems>0){const now=new Date(),progress=await db.collection(PROGRESS).find({datasetId:dataset.datasetId}).toArray(),statusCounts=progress.reduce((map,row)=>(map[row.status]=(map[row.status]||0)+1,map),{});await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId},{$set:{status:'paused',approvalStatus:'draft',active:false,pauseReason:'BATCH_LIMIT_REACHED',statusCounts,updatedAt:now}});await resourceGovernor.persist({state:'paused',pauseReason:'BATCH_LIMIT_REACHED',batchProgress:{batches,processedItems:processed,pendingItems}});return {ok:true,datasetId:dataset.datasetId,status:'paused',approvalStatus:'draft',active:false,pauseReason:'BATCH_LIMIT_REACHED',processedItems:processed,pendingItems,resourceGovernor:{config,ownerId:resourceGovernor.ownerId},purchaseLayerWrites:0,fifoWrites:0,manualCostWrites:0};}
@@ -369,4 +402,4 @@ async function approvalAction(db,datasetId,action,input={},requestedBy={}){
 async function listCandidates(db,input={}){const limit=Math.max(1,Math.min(Number(input.limit||20),100));const list=await db.collection(DATASETS).find({}).sort({createdAt:-1}).limit(limit).toArray();return {ok:true,readOnly:true,list};}
 async function candidateDetail(db,datasetId,input={}){const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)return {ok:false,code:'OPENING_CANDIDATE_NOT_FOUND'};const item=clean(input.item,100),query={datasetId:dataset.datasetId};if(clean(input.status,50))query.status=clean(input.status,50);if(item)query.$or=[{itemCode:item},{itemGuid:item}];const [rows,progress,approvalHistory,eligibility]=await Promise.all([db.collection(COLLECTION).find(query).sort({saleExposure:-1,itemCode:1}).limit(5000).toArray(),db.collection(PROGRESS).find(item?{datasetId:dataset.datasetId,$or:[{'item.itemCode':item},{'item.itemGuid':item}]}:{datasetId:dataset.datasetId}).limit(5000).toArray(),db.collection(APPROVALS).find({datasetId:dataset.datasetId}).sort({at:1}).toArray(),db.collection(ELIGIBILITY).find(item?{datasetId:dataset.datasetId,$or:[{itemCode:item},{itemGuid:item}]}:{datasetId:dataset.datasetId}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1}).limit(5000).toArray()]);let resolvableQuantity=0n,saleExposure=0n,remaining=0n;for(const row of eligibility){resolvableQuantity+=decimal.parse(row.openingEligibleQuantityExact||0,decimal.QUANTITY_SCALE);remaining+=decimal.parse(row.remainingUnknownQuantityExact||0,decimal.QUANTITY_SCALE);saleExposure+=decimal.parse(row.saleExposureExact||0,decimal.MONEY_SCALE);}const impactPreview={authorityClass:dataset.approvalStatus==='approved'?'APPROVED':dataset.status==='completed'?'VALIDATED_NOT_APPROVED':'INCOMPLETE',resolvableLines:eligibility.filter(row=>Number(row.openingEligibleQuantityExact)>0).length,resolvableQuantityExact:decimal.format(resolvableQuantity,decimal.QUANTITY_SCALE),remainingUnknownQuantityExact:decimal.format(remaining,decimal.QUANTITY_SCALE),saleExposureExact:decimal.format(saleExposure,decimal.MONEY_SCALE),fifoWrites:0};return {ok:true,readOnly:true,dataset,rows,progress,approvalHistory,eligibility,impactPreview};}
 
-module.exports={COLLECTION,DATASETS,STATE,PROGRESS,APPROVALS,ELIGIBILITY,MODULE_VERSION,SCHEMA_VERSION,SOURCE_CLASS,fromKardex,aggregateWarehouseKardex,materialize,buildCandidate,resumeCandidate,refreshEligibilityPreview,submitCandidate:(db,id,input,user)=>approvalAction(db,id,'submit',input,user),approveCandidate:(db,id,input,user)=>approvalAction(db,id,'approve',input,user),rejectCandidate:(db,id,input,user)=>approvalAction(db,id,'reject',input,user),deferCandidate:(db,id,input,user)=>approvalAction(db,id,'defer',input,user),listCandidates,candidateDetail,buildEligibilityPreview,runtimeStatus:openingResourceGovernor.runtimeStatus,ensureResourceGovernorIndexes:openingResourceGovernor.ensureIndexes,_extractItem:extractItem,_classifyFailure:classifyFailure,_compactKardexResult:compactKardexResult,_hash:hash,_legacyBuildCandidate:buildCandidateLegacy};
+module.exports={COLLECTION,DATASETS,STATE,PROGRESS,APPROVALS,ELIGIBILITY,MODULE_VERSION,SCHEMA_VERSION,SOURCE_CLASS,fromKardex,aggregateWarehouseKardex,materialize,buildCandidate,resumeCandidate,refreshEligibilityPreview,submitCandidate:(db,id,input,user)=>approvalAction(db,id,'submit',input,user),approveCandidate:(db,id,input,user)=>approvalAction(db,id,'approve',input,user),rejectCandidate:(db,id,input,user)=>approvalAction(db,id,'reject',input,user),deferCandidate:(db,id,input,user)=>approvalAction(db,id,'defer',input,user),listCandidates,candidateDetail,buildEligibilityPreview,runtimeStatus:openingResourceGovernor.runtimeStatus,ensureResourceGovernorIndexes:openingResourceGovernor.ensureIndexes,_extractItem:extractItem,_classifyFailure:classifyFailure,_compactKardexResult:compactKardexResult,_hash:hash,_legacyBuildCandidate:buildCandidateLegacy,_selectResumeProgress:selectResumeProgress,_markProgressInFlight:markProgressInFlight,_deterministicProgressSort:()=>({...DETERMINISTIC_PROGRESS_SORT})};

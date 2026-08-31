@@ -4024,6 +4024,8 @@ async function handleApi(req, res, pathname, query) {
     }
     if(openingCandidateMatch&&req.method==='POST'&&openingCandidateMatch[2]){
       const action=openingCandidateMatch[2],roles=['resume','refresh-preview','submit'].includes(action)?['admin','accounting']:['admin','manager'];if(!requireRole(req,res,roles))return;const body=await collectBody(req),db=await connectMongo(),id=decodeURIComponent(openingCandidateMatch[1]);
+      const hasExplicitOpeningTarget=action==='resume'&&['targetProgressId','targetCanonicalIdentity','targetItemCode'].some(field=>String(body[field]||'').trim());
+      if(hasExplicitOpeningTarget&&!requireRole(req,res,['admin']))return;
       try{const fn={resume:'resumeCandidate','refresh-preview':'refreshEligibilityPreview',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate'}[action];const result=action==='resume'?await openingAccountingCostBasis[fn](db,id,body,currentUser(req),openingGovernorOptions(body)):await openingAccountingCostBasis[fn](db,id,body,currentUser(req));return sendJson(res,200,result);}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_ACTION_FAILED',error:String(error.message||error)});}
     }

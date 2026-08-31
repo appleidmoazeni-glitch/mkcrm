@@ -104,6 +104,7 @@ async function initMongo() {
   await database.collection('openingAccountingEvidenceState').createIndex({ scopeKey:1 }, { unique:true });
   await database.collection('openingAccountingEvidenceProgress').createIndex({ progressId:1 }, { unique:true });
   await database.collection('openingAccountingEvidenceProgress').createIndex({ datasetId:1, status:1, updatedAt:1 });
+  await database.collection('openingAccountingEvidenceProgress').createIndex({ datasetId:1, status:1, selectionState:1, nextEligibleAt:1, firstQueuedAt:1, createdAt:1, progressId:1 }, { name:'opening_resume_deterministic_selection' });
   await database.collection('openingAccountingEvidenceApprovals').createIndex({ approvalEventId:1 }, { unique:true });
   await database.collection('openingAccountingEvidenceApprovals').createIndex({ datasetId:1, at:1 });
   await database.collection('openingAccountingEligibilityPreview').createIndex({ previewId:1 }, { unique:true });

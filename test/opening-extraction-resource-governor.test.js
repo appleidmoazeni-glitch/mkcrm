@@ -125,6 +125,51 @@ test('small batch pauses and same dataset resumes only remaining item without du
   assert.equal(second.status,'completed');assert.deepEqual(calls,['A:01','B:01']);assert.equal(db.collection(opening.COLLECTION).rows.length,2);assert.equal(new Set(db.collection(opening.COLLECTION).rows.map(row=>row.canonicalIdentity)).size,2);
 });
 
+test('equal-timestamp Opening progress has a total stable order and unchanged queries return the same record',async()=>{
+  const at=new Date('2026-08-31T00:00:00Z'),datasetId='OACD-ORDER',rows=['C','A','B'].map(code=>({progressId:`${datasetId}:code:${code}`,datasetId,canonicalIdentity:`code:${code}`,item:{itemCode:code},status:'pending',selectionState:'queued',firstQueuedAt:at,nextEligibleAt:at,createdAt:at,updatedAt:at})),db=dbSeed({[opening.PROGRESS]:rows});
+  assert.deepEqual(opening._deterministicProgressSort(),{nextEligibleAt:1,firstQueuedAt:1,createdAt:1,progressId:1});
+  const first=await opening._selectResumeProgress(db,datasetId,{},1,new Date('2026-08-31T00:01:00Z'));
+  const repeated=await opening._selectResumeProgress(db,datasetId,{},1,new Date('2026-08-31T00:01:00Z'));
+  assert.equal(first[0].item.itemCode,'A');assert.equal(repeated[0].progressId,first[0].progressId);
+  await db.collection(opening.PROGRESS).updateOne({progressId:first[0].progressId},{$set:{status:'VALIDATED_CANDIDATE',selectionState:'completed'}});
+  const second=await opening._selectResumeProgress(db,datasetId,{},1,new Date('2026-08-31T00:01:00Z'));assert.equal(second[0].item.itemCode,'B');
+});
+
+test('crashed in-progress Opening record is recovered before queued peers despite a newer updatedAt',async()=>{
+  const at=new Date('2026-08-31T00:00:00Z'),datasetId='OACD-CRASH',db=dbSeed({[opening.PROGRESS]:[
+    {progressId:`${datasetId}:code:A`,datasetId,item:{itemCode:'A'},status:'pending',selectionState:'queued',firstQueuedAt:at,nextEligibleAt:at,createdAt:at,updatedAt:at},
+    {progressId:`${datasetId}:code:B`,datasetId,item:{itemCode:'B'},status:'pending',selectionState:'queued',firstQueuedAt:at,nextEligibleAt:at,createdAt:at,updatedAt:at}
+  ]});
+  const selected=(await opening._selectResumeProgress(db,datasetId,{},1,new Date('2026-08-31T00:01:00Z')))[0];
+  await opening._markProgressInFlight(db,selected,'worker-before-crash',new Date('2026-08-31T00:02:00Z'));
+  const recovered=await opening._selectResumeProgress(db,datasetId,{},1,new Date('2026-08-31T00:03:00Z'));
+  assert.equal(recovered[0].item.itemCode,'A');assert.equal(recovered[0].selectionState,'in_progress');
+});
+
+function explicitTargetFixture(targetEligible=true){
+  const at=new Date('2026-08-31T00:00:00Z'),datasetId='OACD-TARGET',progress=['A','B','C'].map(code=>({progressId:`${datasetId}:code:${code}`,datasetId,canonicalIdentity:`code:${code}`,item:{itemGuid:`G-${code}`,itemCode:code},openingDate:'14050110',status:'pending',selectionState:'queued',firstQueuedAt:at,nextEligibleAt:code==='C'&&!targetEligible?new Date('2099-01-01T00:00:00Z'):at,warehouseStates:[{warehouseNumber:'01',status:'pending',attemptCount:0,attempts:[]}],sourceCallCount:0,createdAt:at,updatedAt:at}));
+  return {datasetId,db:dbSeed({settings:[{key:'inventory.autoSyncStatus',value:{running:false,lastError:''}},{key:'inventory.activeWarehouseNumbers',value:['01']}],[opening.DATASETS]:[{datasetId,status:'paused',approvalStatus:'draft',active:false,openingDate:'14050110',governedWarehouses:['01'],revision:1,createdAt:at,updatedAt:at}],[opening.PROGRESS]:progress})};
+}
+
+test('explicit canary target processes only C and never falls back to A or B',async()=>{
+  const {db,datasetId}=explicitTargetFixture(),calls=[],api={getKardexByItemCode:async code=>{calls.push(code);return{ok:true,item:{itemGuid:`G-${code}`,itemCode:code},openingBasis:{openingQuantity:1,openingTotalValue:100,sourceFields:{}},rows:[{date:'2026-03-30'}],meta:{reachedLimit:false}};}};
+  const result=await opening.resumeCandidate(db,datasetId,{targetItemCode:'C'},{username:'admin',role:'admin'},{...testOptions({batchSize:1,maxBatchesPerRun:1}),shaygan:api});
+  assert.equal(result.status,'paused');assert.deepEqual(calls,['C']);
+  const rows=db.collection(opening.PROGRESS).rows;assert.equal(rows.find(row=>row.item.itemCode==='C').status,'VALIDATED_CANDIDATE');assert.equal(rows.find(row=>row.item.itemCode==='A').status,'pending');assert.equal(rows.find(row=>row.item.itemCode==='B').status,'pending');
+});
+
+test('explicit canary target fails closed when target is ineligible and performs no source call or fallback',async()=>{
+  const {db,datasetId}=explicitTargetFixture(false);let calls=0;
+  await assert.rejects(opening.resumeCandidate(db,datasetId,{targetItemCode:'C'},{username:'admin',role:'admin'},{...testOptions({batchSize:1,maxBatchesPerRun:1}),shaygan:{getKardexByItemCode:async()=>{calls++;return{ok:true};}}}),error=>error.code==='OPENING_RESUME_TARGET_NOT_ELIGIBLE');
+  assert.equal(calls,0);assert.equal(db.collection(opening.DATASETS).rows[0].resumeCount,undefined);assert.ok(db.collection(opening.PROGRESS).rows.every(row=>row.status==='pending'));
+});
+
+test('explicit Opening target is an Admin-only diagnostic control on the existing Resume endpoint',()=>{
+  const fs=require('node:fs'),path=require('node:path'),source=fs.readFileSync(path.join(__dirname,'../src/server.js'),'utf8');
+  assert.match(source,/hasExplicitOpeningTarget=action==='resume'/);assert.match(source,/hasExplicitOpeningTarget&&!requireRole\(req,res,\['admin'\]\)/);
+  assert.doesNotMatch(source,/req\.query\.(?:targetProgressId|targetCanonicalIdentity|targetItemCode)/);
+});
+
 test('GetKardex invokes governor hooks for every authoritative page including terminal page',async()=>{
   const prior=global.fetch,calls=[],hooks=[];global.fetch=async(url)=>{const rowStart=Number(new URL(url).searchParams.get('RowStart'));calls.push(rowStart);return{ok:true,status:200,json:async()=>({Result:rowStart===0?[{ItemCode:'A',ItemKardex:[]}]:[]})};};
   try{const result=await shaygan.getKardexByItemCode('A','01',{maxRows:2,hardMaxRows:2,timeoutMs:1000,beforeSourceCall:context=>hooks.push(`before:${context.rowStart}`),afterSourceCall:context=>hooks.push(`after:${context.rowStart}:${context.success}`)});assert.equal(result.ok,true);assert.deepEqual(calls,[0,1]);assert.deepEqual(hooks,['before:0','after:0:true','before:1','after:1:true']);}finally{global.fetch=prior;}
