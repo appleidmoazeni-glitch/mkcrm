@@ -76,8 +76,8 @@ const config = {
   openingExtractionMaxBatchesPerRun:Number(process.env.OPENING_EXTRACTION_MAX_BATCHES_PER_RUN || 1),
   openingExtractionLeaseMs:Number(process.env.OPENING_EXTRACTION_LEASE_MS || 120000),
   openingExtractionCooldownMs:Number(process.env.OPENING_EXTRACTION_COOLDOWN_MS || 300000),
-  openingExtractionAllowedStartHour:process.env.OPENING_EXTRACTION_ALLOWED_START_HOUR==null?null:Number(process.env.OPENING_EXTRACTION_ALLOWED_START_HOUR),
-  openingExtractionAllowedEndHour:process.env.OPENING_EXTRACTION_ALLOWED_END_HOUR==null?null:Number(process.env.OPENING_EXTRACTION_ALLOWED_END_HOUR)
+  openingExtractionAllowedStartHour:process.env.OPENING_EXTRACTION_ALLOWED_START_HOUR??null,
+  openingExtractionAllowedEndHour:process.env.OPENING_EXTRACTION_ALLOWED_END_HOUR??null
 };
 
 module.exports = { config };

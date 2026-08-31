@@ -13,9 +13,24 @@ function clamp(value,min,max,fallback){const n=Number(value);return Number.isFin
 function percentile(values,ratio){if(!values.length)return 0;const ordered=values.slice().sort((a,b)=>a-b);return ordered[Math.min(ordered.length-1,Math.max(0,Math.ceil(ordered.length*ratio)-1))];}
 function pauseError(code,message,statusCode=409){return Object.assign(new Error(message),{code,statusCode,openingPaused:true});}
 function ownerIdentity(datasetId,provided=''){return clean(provided,200)||`${os.hostname()}:${process.pid}:${datasetId}:${crypto.randomBytes(6).toString('hex')}`;}
+function missingWindowValue(value){return value==null||(typeof value==='string'&&value.trim()==='');}
+function parseHour(value){
+  if(typeof value==='number')return Number.isInteger(value)&&value>=0&&value<=23?value:null;
+  const text=String(value).trim();return /^(?:0?[0-9]|1[0-9]|2[0-3])$/.test(text)?Number(text):null;
+}
+function executionWindowConfig(startValue,endValue,configurationSource='NONE'){
+  const startMissing=missingWindowValue(startValue),endMissing=missingWindowValue(endValue),source=clean(configurationSource,80)||'NONE';
+  if(startMissing&&endMissing)return Object.freeze({valid:true,windowRestrictionEnabled:false,configuredStartHour:null,configuredEndHour:null,mode:'disabled',configurationSource:source==='NONE'?'NONE':source});
+  if(startMissing!==endMissing)return Object.freeze({valid:false,windowRestrictionEnabled:true,configuredStartHour:startMissing?null:parseHour(startValue),configuredEndHour:endMissing?null:parseHour(endValue),mode:'invalid',configurationSource:source,error:'OPENING_WINDOW_ENDPOINT_PAIR_REQUIRED'});
+  const start=parseHour(startValue),end=parseHour(endValue);
+  if(start==null||end==null)return Object.freeze({valid:false,windowRestrictionEnabled:true,configuredStartHour:start,configuredEndHour:end,mode:'invalid',configurationSource:source,error:'OPENING_WINDOW_HOUR_INVALID'});
+  if(start===end)return Object.freeze({valid:false,windowRestrictionEnabled:true,configuredStartHour:start,configuredEndHour:end,mode:'invalid',configurationSource:source,error:'OPENING_WINDOW_EMPTY_RANGE'});
+  return Object.freeze({valid:true,windowRestrictionEnabled:true,configuredStartHour:start,configuredEndHour:end,mode:start<end?'daytime':'overnight',configurationSource:source});
+}
 
 function governedConfig(input={}){
   const testMode=input.testMode===true;
+  const window=executionWindowConfig(input.allowedStartHour,input.allowedEndHour,input.windowConfigurationSource);
   return Object.freeze({
     maxConcurrency:1,
     minimumDelayMs:clamp(input.minimumDelayMs,testMode?0:1000,60000,testMode?0:3000),
@@ -31,8 +46,7 @@ function governedConfig(input={}){
     maxSourceP95Ms:clamp(input.maxSourceP95Ms,500,30000,2500),
     maxOperationalP95Ms:clamp(input.maxOperationalP95Ms,250,10000,1500),
     halfOpenCalls:clamp(input.halfOpenCalls,1,3,2),
-    allowedStartHour:Number.isInteger(Number(input.allowedStartHour))?clamp(input.allowedStartHour,0,23,0):null,
-    allowedEndHour:Number.isInteger(Number(input.allowedEndHour))?clamp(input.allowedEndHour,0,23,23):null
+    ...window
   });
 }
 
@@ -62,16 +76,23 @@ class OpeningResourceGovernor{
     await this.db.collection(LEASES).updateOne({scopeKey:SCOPE_KEY,ownerId:this.ownerId,datasetId:this.datasetId},{$set:{state,releaseReason:clean(reason,200),releasedAt:now,expiresAt:now,heartbeatAt:now,updatedAt:now},$unset:{ownerId:'',pid:'',processIdentity:''}});
     this.acquired=false;await this.persist({state,pauseReason:clean(reason,200)});await this.event('LEASE_RELEASED',{state,reason:clean(reason,200)});
   }
-  withinWindow(now){if(this.config.allowedStartHour==null||this.config.allowedEndHour==null)return true;const hour=Number(new Intl.DateTimeFormat('en-US',{timeZone:'Asia/Tehran',hour:'2-digit',hourCycle:'h23'}).format(now));const start=this.config.allowedStartHour,end=this.config.allowedEndHour;return start<=end?(hour>=start&&hour<end):(hour>=start||hour<end);}
+  evaluateWindow(now){
+    const timezone='Asia/Tehran',currentLocalTime=new Intl.DateTimeFormat('en-CA',{timeZone:timezone,year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',second:'2-digit',hourCycle:'h23'}).format(now),hour=Number(new Intl.DateTimeFormat('en-US',{timeZone:timezone,hour:'2-digit',hourCycle:'h23'}).format(now));
+    const base={windowRestrictionEnabled:this.config.windowRestrictionEnabled,configuredStartHour:this.config.configuredStartHour,configuredEndHour:this.config.configuredEndHour,currentLocalTime,timezone,configurationSource:this.config.configurationSource,mode:this.config.mode};
+    if(!this.config.valid)return {...base,windowEvaluation:'INVALID_CONFIGURATION',allowed:false,error:this.config.error};
+    if(!this.config.windowRestrictionEnabled)return {...base,windowEvaluation:'NO_EXECUTION_WINDOW_RESTRICTION',allowed:true};
+    const start=this.config.configuredStartHour,end=this.config.configuredEndHour,allowed=this.config.mode==='daytime'?(hour>=start&&hour<end):(hour>=start||hour<end);
+    return {...base,windowEvaluation:allowed?'INSIDE_EXECUTION_WINDOW':'OUTSIDE_EXECUTION_WINDOW',allowed};
+  }
   async health(){
-    const now=this.now();if(!this.withinWindow(now))return {ok:false,code:'OPENING_OUTSIDE_ALLOWED_WINDOW'};
+    const now=this.now(),window=this.evaluateWindow(now);if(!this.config.valid)return {ok:false,code:'OPENING_INVALID_WINDOW_CONFIGURATION',window};if(!window.allowed)return {ok:false,code:'OPENING_OUTSIDE_ALLOWED_WINDOW',window};
     const auto=await this.db.collection('settings').findOne({key:'inventory.autoSyncStatus'}).catch(()=>null),value=auto?.value||{};
-    if(value.running===true)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_RUNNING',autoSync:{running:true,lastStartedAt:value.lastStartedAt||null,currentStockNumber:value.currentStockNumber||''}};
+    if(value.running===true)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_RUNNING',window,autoSync:{running:true,lastStartedAt:value.lastStartedAt||null,currentStockNumber:value.currentStockNumber||''}};
     const last=value.lastCycle||value.lastResult||{};
-    if(clean(value.lastError,500)||Number(last.timeouts||last.exactTimeouts||0)>0)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_UNHEALTHY',autoSync:{running:false,lastError:clean(value.lastError,500),timeouts:Number(last.timeouts||last.exactTimeouts||0)}};
+    if(clean(value.lastError,500)||Number(last.timeouts||last.exactTimeouts||0)>0)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_UNHEALTHY',window,autoSync:{running:false,lastError:clean(value.lastError,500),timeouts:Number(last.timeouts||last.exactTimeouts||0)}};
     const operational=typeof this.operationalHealthProbe==='function'?await this.operationalHealthProbe():null;
-    if(operational?.classes){for(const [trafficClass,metric] of Object.entries(operational.classes)){if(Number(metric.count||0)>=3&&(Number(metric.p95Ms||0)>this.config.maxOperationalP95Ms||Number(metric.errorRate||0)>0.1))return {ok:false,code:'OPENING_YIELD_OPERATIONAL_SLA',trafficClass,metric};}}
-    return {ok:true,autoSync:{running:false,lastRunAt:value.lastRunAt||value.updatedAt||null},operational};
+    if(operational?.classes){for(const [trafficClass,metric] of Object.entries(operational.classes)){if(Number(metric.count||0)>=3&&(Number(metric.p95Ms||0)>this.config.maxOperationalP95Ms||Number(metric.errorRate||0)>0.1))return {ok:false,code:'OPENING_YIELD_OPERATIONAL_SLA',window,trafficClass,metric};}}
+    return {ok:true,window,autoSync:{running:false,lastRunAt:value.lastRunAt||value.updatedAt||null},operational};
   }
   async preflight(){
     const runtime=await this.db.collection(RUNTIME).findOne({datasetId:this.datasetId}),now=this.now();
@@ -107,4 +128,4 @@ async function runtimeStatus(db,datasetId=''){const query=clean(datasetId,100)?{
 async function ensureIndexes(db){const names=[];names.push(await db.collection(LEASES).createIndex({scopeKey:1},{unique:true,name:'opening_extraction_scope_unique'}));names.push(await db.collection(LEASES).createIndex({expiresAt:1},{name:'opening_extraction_lease_expiry'}));names.push(await db.collection(RUNTIME).createIndex({datasetId:1},{unique:true,name:'opening_extraction_runtime_dataset_unique'}));names.push(await db.collection(RUNTIME).createIndex({state:1,updatedAt:-1},{name:'opening_extraction_runtime_state'}));names.push(await db.collection(EVENTS).createIndex({eventId:1},{unique:true,name:'opening_extraction_event_unique'}));names.push(await db.collection(EVENTS).createIndex({datasetId:1,at:-1},{name:'opening_extraction_event_timeline'}));return names;}
 function createGovernor(db,datasetId,options={}){return new OpeningResourceGovernor(db,datasetId,options);}
 
-module.exports={LEASES,RUNTIME,EVENTS,SCOPE_KEY,governedConfig,createGovernor,runtimeStatus,ensureIndexes,OpeningResourceGovernor,_pauseError:pauseError};
+module.exports={LEASES,RUNTIME,EVENTS,SCOPE_KEY,governedConfig,executionWindowConfig,createGovernor,runtimeStatus,ensureIndexes,OpeningResourceGovernor,_pauseError:pauseError};

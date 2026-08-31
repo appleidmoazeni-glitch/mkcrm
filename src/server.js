@@ -77,6 +77,8 @@ let mongoBackupLastResult=null;
 const invoiceResolver=createInvoiceResolver({getInvoice:(invNo,invType)=>shaygan.getInvoice(invNo,invType),supportedTypes:invoiceTypes.supportedTypes});
 
 function openingGovernorOptions(input={}){
+  const requestHasStart=Object.prototype.hasOwnProperty.call(input,'allowedStartHour'),requestHasEnd=Object.prototype.hasOwnProperty.call(input,'allowedEndHour');
+  const envHasStart=config.openingExtractionAllowedStartHour!=null,envHasEnd=config.openingExtractionAllowedEndHour!=null;
   return {
     minimumDelayMs:input.minimumDelayMs??config.openingExtractionMinimumDelayMs,
     callsPerMinute:input.callsPerMinute??config.openingExtractionCallsPerMinute,
@@ -84,8 +86,9 @@ function openingGovernorOptions(input={}){
     maxBatchesPerRun:input.maxBatchesPerRun??config.openingExtractionMaxBatchesPerRun,
     leaseMs:input.leaseMs??config.openingExtractionLeaseMs,
     cooldownMs:input.cooldownMs??config.openingExtractionCooldownMs,
-    allowedStartHour:input.allowedStartHour??config.openingExtractionAllowedStartHour,
-    allowedEndHour:input.allowedEndHour??config.openingExtractionAllowedEndHour,
+    allowedStartHour:(requestHasStart||requestHasEnd)?input.allowedStartHour:config.openingExtractionAllowedStartHour,
+    allowedEndHour:(requestHasStart||requestHasEnd)?input.allowedEndHour:config.openingExtractionAllowedEndHour,
+    windowConfigurationSource:(requestHasStart||requestHasEnd)?'REQUEST':(envHasStart||envHasEnd)?'ENVIRONMENT':'NONE',
     operationalHealthProbe:()=>operationalTrafficHealth.snapshot()
   };
 }

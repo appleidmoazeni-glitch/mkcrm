@@ -2,6 +2,7 @@
 
 const test=require('node:test');
 const assert=require('node:assert/strict');
+const {execFileSync}=require('node:child_process');
 const {MemoryDb}=require('./helpers/memory-mongo');
 const governorModule=require('../src/lib/opening-extraction-resource-governor');
 const opening=require('../src/lib/opening-accounting-cost-basis');
@@ -10,6 +11,49 @@ const shaygan=require('../src/lib/shaygan');
 
 function dbSeed(extra={}){return new MemoryDb({settings:[{key:'inventory.autoSyncStatus',value:{running:false,lastError:'',lastCycle:{timeouts:0}}}],...extra});}
 function testOptions(extra={}){return {testMode:true,minimumDelayMs:0,callsPerMinute:60000,cooldownMs:30000,sleep:async()=>{},...extra};}
+
+test('execution window parser distinguishes disabled, valid and fail-closed configurations without numeric coercion',()=>{
+  for(const pair of [[null,null],[undefined,undefined],['',''],['   ','\t']]){
+    const parsed=governorModule.executionWindowConfig(pair[0],pair[1],'TEST');assert.equal(parsed.valid,true);assert.equal(parsed.windowRestrictionEnabled,false);assert.equal(parsed.configuredStartHour,null);assert.equal(parsed.configuredEndHour,null);
+  }
+  for(const pair of [[8,undefined],[undefined,12],['8',''],['','12'],['bad','12'],['8','noon'],[-1,12],[8,24],[8.5,12],[8,8]]){
+    const parsed=governorModule.executionWindowConfig(pair[0],pair[1],'TEST');assert.equal(parsed.valid,false,`expected invalid window ${JSON.stringify(pair)}`);assert.equal(parsed.windowRestrictionEnabled,true);
+  }
+  const daytime=governorModule.executionWindowConfig('08','12','ENVIRONMENT');assert.deepEqual({valid:daytime.valid,start:daytime.configuredStartHour,end:daytime.configuredEndHour,mode:daytime.mode,source:daytime.configurationSource},{valid:true,start:8,end:12,mode:'daytime',source:'ENVIRONMENT'});
+  const overnight=governorModule.executionWindowConfig(22,6,'REQUEST');assert.deepEqual({valid:overnight.valid,start:overnight.configuredStartHour,end:overnight.configuredEndHour,mode:overnight.mode},{valid:true,start:22,end:6,mode:'overnight'});
+});
+
+test('environment configuration preserves absent and empty window endpoints for explicit parsing',()=>{
+  const code=`const {config}=require('./src/lib/config');process.stdout.write(JSON.stringify([config.openingExtractionAllowedStartHour,config.openingExtractionAllowedEndHour]))`;
+  const absentEnv={...process.env};delete absentEnv.OPENING_EXTRACTION_ALLOWED_START_HOUR;delete absentEnv.OPENING_EXTRACTION_ALLOWED_END_HOUR;
+  assert.deepEqual(JSON.parse(execFileSync(process.execPath,['-e',code],{cwd:require('node:path').resolve(__dirname,'..'),env:absentEnv,encoding:'utf8'})),[null,null]);
+  const emptyEnv={...process.env,OPENING_EXTRACTION_ALLOWED_START_HOUR:'',OPENING_EXTRACTION_ALLOWED_END_HOUR:''};
+  assert.deepEqual(JSON.parse(execFileSync(process.execPath,['-e',code],{cwd:require('node:path').resolve(__dirname,'..'),env:emptyEnv,encoding:'utf8'})),['','']);
+});
+
+test('disabled execution window is explicit in telemetry and never raises outside-window pause',async()=>{
+  const db=dbSeed(),g=governorModule.createGovernor(db,'OACD-NO-WINDOW',testOptions({ownerId:'no-window',allowedStartHour:null,allowedEndHour:null,windowConfigurationSource:'NONE',now:()=>new Date('2026-08-31T04:30:00Z')}));await g.acquire();const health=await g.preflight();
+  assert.equal(health.ok,true);assert.equal(health.window.windowRestrictionEnabled,false);assert.equal(health.window.windowEvaluation,'NO_EXECUTION_WINDOW_RESTRICTION');assert.equal(health.window.configuredStartHour,null);assert.equal(health.window.configuredEndHour,null);assert.equal(health.window.timezone,'Asia/Tehran');assert.equal(health.window.configurationSource,'NONE');
+  const status=await governorModule.runtimeStatus(db,'OACD-NO-WINDOW');assert.equal(status.runtime.health.window.windowEvaluation,'NO_EXECUTION_WINDOW_RESTRICTION');
+});
+
+test('daytime and overnight windows use inclusive start and exclusive end boundaries',async()=>{
+  const evaluate=(date,start,end)=>governorModule.createGovernor(dbSeed(),'OACD-WINDOW-'+date,testOptions({allowedStartHour:start,allowedEndHour:end,windowConfigurationSource:'TEST'})).evaluateWindow(new Date(date));
+  assert.equal(evaluate('2026-08-31T04:30:00Z',8,12).allowed,true,'daytime start is inclusive');
+  assert.equal(evaluate('2026-08-31T08:29:59Z',8,12).allowed,true,'daytime before end is inside');
+  assert.equal(evaluate('2026-08-31T08:30:00Z',8,12).allowed,false,'daytime end is exclusive');
+  assert.equal(evaluate('2026-08-31T19:30:00Z',22,6).allowed,true,'overnight start is inclusive');
+  assert.equal(evaluate('2026-08-31T01:30:00Z',22,6).allowed,true,'overnight after midnight is inside');
+  assert.equal(evaluate('2026-08-31T02:30:00Z',22,6).allowed,false,'overnight end is exclusive');
+  assert.equal(evaluate('2026-08-31T08:30:00Z',22,6).allowed,false,'overnight daytime is outside');
+});
+
+test('invalid or outside execution windows fail closed before any source call',async()=>{
+  for(const options of [{allowedStartHour:8,allowedEndHour:null},{allowedStartHour:'bad',allowedEndHour:12},{allowedStartHour:8,allowedEndHour:8}]){
+    const db=dbSeed(),g=governorModule.createGovernor(db,'OACD-INVALID-'+String(options.allowedStartHour),testOptions({...options,ownerId:JSON.stringify(options)}));await g.acquire();await assert.rejects(g.preflight(),error=>error.code==='OPENING_INVALID_WINDOW_CONFIGURATION');
+  }
+  const db=dbSeed(),outside=governorModule.createGovernor(db,'OACD-OUTSIDE',testOptions({ownerId:'outside',allowedStartHour:8,allowedEndHour:12,now:()=>new Date('2026-08-31T08:30:00Z')}));await outside.acquire();await assert.rejects(outside.preflight(),error=>error.code==='OPENING_OUTSIDE_ALLOWED_WINDOW');
+});
 
 test('single durable lease fails closed for a duplicate owner and may be reclaimed only after expiry',async()=>{
   let now=new Date('2026-08-31T00:00:00Z');const db=dbSeed();
