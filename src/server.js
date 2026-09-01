@@ -708,6 +708,10 @@ async function ensureInit() {
     const db=await connectMongo();
     await openingAccountingCostBasis.ensureResourceGovernorIndexes(db);
   } catch(e) { console.error('Opening resource governor index warning:', e.message); }
+  try {
+    const db=await connectMongo();
+    await operationalTrafficHealth.ensureIndexes(db);
+  } catch(e) { console.error('Operational traffic telemetry index warning:', e.message); }
   await applyFiscalDatabaseSetting();
 }
 
@@ -6158,12 +6162,14 @@ async function handleApi(req, res, pathname, query) {
         issuanceState:{$in:saleIssuance.LOCKED_STATES},
         $or:[{mappingUsername:username},{'requestedBy.username':username}]
       },{sort:{updatedAt:-1}});
+      req.operationalTelemetry={attemptId:String(attempt?._id||'')};
       return sendJson(res,200,{ok:true,issuance:attempt?saleIssuance.publicAttempt(attempt):null});
     }
     const saleIssuanceStatusMatch=pathname.match(/^\/api\/sales\/issuance\/([^/]+)$/);
     if(saleIssuanceStatusMatch&&req.method==='GET'){
       if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
       const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceStatusMatch[1]);
+      req.operationalTelemetry={attemptId};
       const attempt=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:attemptId});
       if(!attempt)return sendJson(res,404,{ok:false,code:'ISSUANCE_ATTEMPT_NOT_FOUND',error:'درخواست صدور پیدا نشد.'});
       const user=currentUser(req)||{};
@@ -6174,6 +6180,7 @@ async function handleApi(req, res, pathname, query) {
     if(saleIssuanceRetryMatch&&req.method==='POST'){
       if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
       const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceRetryMatch[1]),user=currentUser(req)||{};
+      req.operationalTelemetry={attemptId};
       const existing=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:attemptId});
       if(!existing)return sendJson(res,404,{ok:false,code:'ISSUANCE_ATTEMPT_NOT_FOUND',error:'درخواست صدور پیدا نشد.'});
       if(['seller','seller_buyer'].includes(user.role)&&String(existing.mappingUsername)!==String(user.username))return deny(res,'این درخواست صدور متعلق به کاربر دیگری است.');
@@ -6187,6 +6194,7 @@ async function handleApi(req, res, pathname, query) {
     if(saleIssuanceReconcileMatch&&req.method==='POST'){
       if(!requireRole(req,res,['accounting']))return;
       const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceReconcileMatch[1]),user=currentUser(req)||{},body=await collectBody(req);
+      req.operationalTelemetry={attemptId};
       if(String(body.action||'')!=='confirm_no_invoice')return sendJson(res,400,{ok:false,code:'ISSUANCE_RECONCILIATION_ACTION_INVALID',error:'فقط تأیید صریح عدم وجود فاکتور مجاز است.'});
       try{const attempt=await saleIssuance.confirmNoInvoice(db,attemptId,body,user);return sendJson(res,200,{ok:true,issuance:saleIssuance.publicAttempt(attempt),invoiceWriteCount:0,shayganWriteCount:0});}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'ISSUANCE_RECONCILIATION_FAILED',error:String(error.message||error)});}
@@ -6195,6 +6203,7 @@ async function handleApi(req, res, pathname, query) {
     if(saleIssuanceReleaseMatch&&req.method==='POST'){
       if(!requireRole(req,res,['seller','seller_buyer','accounting']))return;
       const db=await connectMongo(),attemptId=decodeURIComponent(saleIssuanceReleaseMatch[1]),user=currentUser(req)||{},body=await collectBody(req);
+      req.operationalTelemetry={attemptId};
       const existing=await db.collection(saleIssuance.ATTEMPTS).findOne({_id:attemptId});
       if(!existing)return sendJson(res,404,{ok:false,code:'ISSUANCE_ATTEMPT_NOT_FOUND',error:'درخواست صدور پیدا نشد.'});
       if(['seller','seller_buyer'].includes(user.role)&&String(existing.mappingUsername)!==String(user.username))return deny(res,'این درخواست صدور متعلق به کاربر دیگری است.');
@@ -6204,6 +6213,7 @@ async function handleApi(req, res, pathname, query) {
 
     if ((pathname === '/api/sales/issue' || pathname === '/admin/accounting/putInvoice') && req.method === 'POST') {
       if (!canUseSalesFlow(req, res)) return;
+      const invoiceWriteStartedAt=Date.now();
       const body = await collectBody(req); const db = await connectMongo();
       body.generalRef = String(body.generalRef || body.GeneralRef || '').trim().slice(0, 80);
       body.invoiceExtras = await validateSaleInvoiceExtras(db, body.invoiceExtras || body.expenses || body.extras || []);
@@ -6221,6 +6231,7 @@ async function handleApi(req, res, pathname, query) {
       const release=versionPayload();
       const prepared=await saleIssuance.beginAttempt(db,{attemptId:body.issuanceAttemptId||body.saleIssueKey,body,mapping,user,applicationVersion:APP_VERSION,gitSha:release.gitSha||''});
       const saleIssueKey=prepared.attempt._id;
+      req.operationalTelemetry={attemptId:saleIssueKey,componentTimings:{}};
       body.issuanceAttemptId=saleIssueKey;
       await db.collection(saleIssuance.ATTEMPTS).updateOne({_id:saleIssueKey},{$set:{leadManual}}).catch(()=>{});
       if(!prepared.mayPut){
@@ -6246,6 +6257,7 @@ async function handleApi(req, res, pathname, query) {
         body.crmId = body.crmId || saleIssueKey;
         body.invoiceNumber = 0;
         const timing = { startAt:new Date() };
+        req.operationalTelemetry.componentTimings.prePutMs=issueStartedAt-invoiceWriteStartedAt;
         await saleIssuance.markPutInProgress(db,saleIssueKey,user,new Date(issueStartedAt));
         const putStarted = Date.now();
         const r = await shaygan.putSaleInvoice({
@@ -6255,6 +6267,7 @@ async function handleApi(req, res, pathname, query) {
           username: mapping.fullName || body.username || mapping.username || 'CRM'
         });
         timing.putMs = Date.now() - putStarted;
+        req.operationalTelemetry.componentTimings.putMs=timing.putMs;
         const issuedMeta = extractIssuedInvoiceMeta(r);
         const identifiers=issuedResponseIdentifiers(r);
         if(!r.ok){
@@ -6273,6 +6286,7 @@ async function handleApi(req, res, pathname, query) {
           try{resolvedIssued=await resolveIssuedInvoiceAfterPut({issueResponse:r,body,mapping,invoiceType:2,crmId:body.crmId||saleIssueKey,issuedAt:issueStartedAt});}
           catch(error){resolvedIssued={ok:false,code:'POST_PUT_RESOLVE_FAILED',error:String(error.message||error),failureStage:'resolution-read-error',attempts:[]};}
           timing.resolveMs=Date.now()-resolveStarted;
+          req.operationalTelemetry.componentTimings.resolveMs=timing.resolveMs;
         }
         await saleIssuance.technicalAudit(db,{attemptId:saleIssueKey,stage:'invoice-put-and-resolve',state:resolvedIssued.ok?saleIssuance.STATES.RESOLVED:saleIssuance.STATES.MANUAL_RECONCILIATION_REQUIRED,response:{status:r.status,raw:r.raw,error:r.error,identifiers},resolution:resolvedIssued,user});
         if(!resolvedIssued.ok){
@@ -6283,6 +6297,7 @@ async function handleApi(req, res, pathname, query) {
         const result={...(resolvedIssued.result||issuedMeta.result||{}),Number:finalInvoiceNumber};if(finalInvoiceGuid&&!result.GuId)result.GuId=finalInvoiceGuid;
         const resolvedAttempt=await finalizeResolvedSaleIssue({db,attemptId:saleIssueKey,body,result,invoiceNumber:finalInvoiceNumber,invoiceGuid:finalInvoiceGuid,mapping,leadManual,user,resolution:resolvedIssued});
         timing.totalBeforeResponseMs=Date.now()-issueStartedAt;
+        req.operationalTelemetry.componentTimings.totalBeforeResponseMs=Date.now()-invoiceWriteStartedAt;
         const mappingView=resolvedAttempt.mapping||{};
         return sendJson(res,200,{ok:true,result,invoiceNumber:finalInvoiceNumber,invoiceGuid:finalInvoiceGuid,printUrl:invoicePrintUrl(finalInvoiceNumber),mapping:mappingView,error:'',warning:r.warning||'',saleIssueKey,issuance:saleIssuance.publicAttempt(resolvedAttempt),postProcessing:'queued',timing});
       } catch (e) {
@@ -6771,8 +6786,12 @@ async function serveStatic(req, res, pathname) {
 
 const server = http.createServer(async (req, res) => {
   const { pathname, query } = extractQuery(req.url);
-  const requestStarted=Date.now();
-  res.once('finish',()=>operationalTrafficHealth.observe(pathname,Date.now()-requestStarted,res.statusCode));
+  const requestStarted=Date.now(),suppliedRequestId=req.headers['x-request-id']||req.headers['x-correlation-id']||'',requestId=String(suppliedRequestId||`opreq-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`).trim().slice(0,120),actorUsername=String(currentUser(req)?.username||'').trim().slice(0,100);
+  if(!res.headersSent)res.setHeader('X-Request-ID',requestId);
+  res.once('finish',()=>{
+    const metadata=req.operationalTelemetry||{},row=operationalTrafficHealth.observe(pathname,Date.now()-requestStarted,res.statusCode,new Date(),{method:req.method,requestId,actorUsername,attemptId:metadata.attemptId,componentTimings:metadata.componentTimings});
+    if(row)connectMongo().then(db=>operationalTrafficHealth.persist(db,row)).catch(error=>console.error('Operational traffic telemetry persistence warning:',String(error?.message||error)));
+  });
   if (pathname === '/health' || pathname.startsWith('/api/') || pathname.startsWith('/admin/')) {
     const handled = await handleApi(req, res, pathname, query);
     if (handled === false) sendJson(res, 404, { ok: false, error: 'API not found', pathname });

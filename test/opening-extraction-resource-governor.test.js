@@ -146,7 +146,25 @@ test('P0/P1 operational traffic never waits on Opening and degraded p95 blocks P
   const snapshot=traffic.snapshot();assert.equal(snapshot.classes.P1_SEARCH.count,3);assert.equal(snapshot.classes.P1_SEARCH.p95Ms,2000);
   const db=dbSeed(),g=governorModule.createGovernor(db,'OACD-OPS',testOptions({ownerId:'ops',operationalHealthProbe:()=>snapshot,maxOperationalP95Ms:1500}));await g.acquire();
   await assert.rejects(g.preflight(),error=>error.code==='OPENING_YIELD_OPERATIONAL_SLA');
-  assert.equal(traffic.trafficClass('/api/sales/issue'),'P0_INVOICE');assert.equal(traffic.trafficClass('/api/inventory/search'),'P1_INVENTORY');
+  assert.equal(traffic.trafficClass('/api/sales/issue','POST'),'P0_INVOICE_WRITE');assert.equal(traffic.trafficClass('/api/inventory/search','GET'),'P1_INVENTORY');
+});
+
+test('invoice write and resolution latency are observable without inheriting the fast-read 1500ms breaker',async()=>{
+  traffic._reset();
+  for(const latency of [10000,10761,12000])traffic.observe('/api/sales/issue',latency,200,new Date(),{method:'POST'});
+  for(let i=0;i<3;i++)traffic.observe('/api/sales/issuance/active',100,200,new Date(),{method:'GET'});
+  for(let i=0;i<3;i++)traffic.observe('/api/items/search',120,200,new Date(),{method:'GET'});
+  const snapshot=traffic.snapshot();
+  assert.equal(snapshot.classes.P0_INVOICE_WRITE.p95Ms,12000);assert.equal(snapshot.classes.P0_INVOICE_WRITE.latencyPolicy,'observe-only');
+  assert.equal(snapshot.classes.P0_INVOICE_READ.p95Ms,100);assert.equal(snapshot.classes.P0_INVOICE_READ.latencyPolicy,'fast-path-threshold');
+  const db=dbSeed(),g=governorModule.createGovernor(db,'OACD-INVOICE-BASELINE',testOptions({ownerId:'invoice-baseline',operationalHealthProbe:()=>snapshot,maxOperationalP95Ms:1500}));await g.acquire();const health=await g.preflight();assert.equal(health.ok,true);
+});
+
+test('invoice 5xx and genuine fast invoice-read degradation still stop Opening',async()=>{
+  const failure=governorModule.operationalSafetyBreach({P0_INVOICE_WRITE:{count:1,failures:1,errorRate:1,p95Ms:11000}},1500);
+  assert.deepEqual({trafficClass:failure.trafficClass,reason:failure.reason},{trafficClass:'P0_INVOICE_WRITE',reason:'INVOICE_FAILURE'});
+  const slowRead=governorModule.operationalSafetyBreach({P0_INVOICE_READ:{count:3,failures:0,errorRate:0,p95Ms:2000}},1500);
+  assert.deepEqual({trafficClass:slowRead.trafficClass,reason:slowRead.reason},{trafficClass:'P0_INVOICE_READ',reason:'FAST_PATH_LATENCY'});
 });
 
 test('small batch pauses and same dataset resumes only remaining item without duplicate evidence',async()=>{

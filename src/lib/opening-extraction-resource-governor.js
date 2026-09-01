@@ -7,6 +7,8 @@ const LEASES='openingAccountingExtractionLeases';
 const RUNTIME='openingAccountingExtractionRuntime';
 const EVENTS='openingAccountingExtractionEvents';
 const SCOPE_KEY='opening-accounting-extraction';
+const FAST_OPERATIONAL_LATENCY_CLASSES=new Set(['P0_INVOICE_READ','P1_SEARCH','P1_INVENTORY','P1_KARDEX']);
+const INVOICE_MUTATION_CLASSES=new Set(['P0_INVOICE_WRITE','P0_INVOICE_RESOLUTION']);
 
 function clean(value,max=500){return String(value==null?'':value).trim().slice(0,max);}
 function clamp(value,min,max,fallback){const n=Number(value);return Number.isFinite(n)?Math.max(min,Math.min(max,n)):fallback;}
@@ -26,6 +28,18 @@ function executionWindowConfig(startValue,endValue,configurationSource='NONE'){
   if(start==null||end==null)return Object.freeze({valid:false,windowRestrictionEnabled:true,configuredStartHour:start,configuredEndHour:end,mode:'invalid',configurationSource:source,error:'OPENING_WINDOW_HOUR_INVALID'});
   if(start===end)return Object.freeze({valid:false,windowRestrictionEnabled:true,configuredStartHour:start,configuredEndHour:end,mode:'invalid',configurationSource:source,error:'OPENING_WINDOW_EMPTY_RANGE'});
   return Object.freeze({valid:true,windowRestrictionEnabled:true,configuredStartHour:start,configuredEndHour:end,mode:start<end?'daytime':'overnight',configurationSource:source});
+}
+
+function operationalSafetyBreach(classes={},maxOperationalP95Ms=1500){
+  for(const [trafficClass,metric] of Object.entries(classes||{})){
+    const count=Number(metric?.count||0),failures=Number(metric?.failures||0),errorRate=Number(metric?.errorRate||0),p95Ms=Number(metric?.p95Ms||0);
+    // A failed invoice mutation/recovery remains safety-significant even while
+    // its successful latency is observation-only pending a governed baseline.
+    if(INVOICE_MUTATION_CLASSES.has(trafficClass)&&failures>0)return {trafficClass,metric,reason:'INVOICE_FAILURE'};
+    if(count>=3&&errorRate>0.1)return {trafficClass,metric,reason:'ERROR_RATE'};
+    if(FAST_OPERATIONAL_LATENCY_CLASSES.has(trafficClass)&&count>=3&&p95Ms>maxOperationalP95Ms)return {trafficClass,metric,reason:'FAST_PATH_LATENCY'};
+  }
+  return null;
 }
 
 function governedConfig(input={}){
@@ -130,7 +144,7 @@ class OpeningResourceGovernor{
     const last=value.lastCycle||value.lastResult||{};
     if(clean(value.lastError,500)||Number(last.timeouts||last.exactTimeouts||0)>0)return {ok:false,code:'OPENING_YIELD_AUTOSYNC_UNHEALTHY',window,autoSync:{running:false,lastError:clean(value.lastError,500),timeouts:Number(last.timeouts||last.exactTimeouts||0)}};
     const operational=typeof this.operationalHealthProbe==='function'?await this.operationalHealthProbe():null;
-    if(operational?.classes){for(const [trafficClass,metric] of Object.entries(operational.classes)){if(Number(metric.count||0)>=3&&(Number(metric.p95Ms||0)>this.config.maxOperationalP95Ms||Number(metric.errorRate||0)>0.1))return {ok:false,code:'OPENING_YIELD_OPERATIONAL_SLA',window,trafficClass,metric};}}
+    if(operational?.classes){const breach=operationalSafetyBreach(operational.classes,this.config.maxOperationalP95Ms);if(breach)return {ok:false,code:'OPENING_YIELD_OPERATIONAL_SLA',window,...breach};}
     return {ok:true,window,autoSync:{running:false,lastRunAt:value.lastRunAt||value.updatedAt||null},operational};
   }
   async preflight(){
@@ -167,4 +181,4 @@ async function runtimeStatus(db,datasetId=''){const query=clean(datasetId,100)?{
 async function ensureIndexes(db){const names=[];names.push(await db.collection(LEASES).createIndex({scopeKey:1},{unique:true,name:'opening_extraction_scope_unique'}));names.push(await db.collection(LEASES).createIndex({expiresAt:1},{name:'opening_extraction_lease_expiry'}));names.push(await db.collection(RUNTIME).createIndex({datasetId:1},{unique:true,name:'opening_extraction_runtime_dataset_unique'}));names.push(await db.collection(RUNTIME).createIndex({state:1,updatedAt:-1},{name:'opening_extraction_runtime_state'}));names.push(await db.collection(EVENTS).createIndex({eventId:1},{unique:true,name:'opening_extraction_event_unique'}));names.push(await db.collection(EVENTS).createIndex({datasetId:1,at:-1},{name:'opening_extraction_event_timeline'}));return names;}
 function createGovernor(db,datasetId,options={}){return new OpeningResourceGovernor(db,datasetId,options);}
 
-module.exports={LEASES,RUNTIME,EVENTS,SCOPE_KEY,governedConfig,executionWindowConfig,createGovernor,runtimeStatus,ensureIndexes,OpeningResourceGovernor,_pauseError:pauseError};
+module.exports={LEASES,RUNTIME,EVENTS,SCOPE_KEY,governedConfig,executionWindowConfig,operationalSafetyBreach,createGovernor,runtimeStatus,ensureIndexes,OpeningResourceGovernor,_pauseError:pauseError};
