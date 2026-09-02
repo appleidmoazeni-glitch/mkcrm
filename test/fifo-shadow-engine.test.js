@@ -322,10 +322,34 @@ test('route, schema and UI contracts remain isolated from official datasets and 
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/allocations/);
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/exceptions/);
   assert.match(uiSource,/SHADOW MODE — NOT ACCOUNTING APPROVED/);
+  assert.match(uiSource,/id="fifoClear"/);
+  assert.match(uiSource,/normalizedItemCodeInput/);
+  assert.match(uiSource,/فیلترهای اعمال‌شده/);
   assert.doesNotMatch(moduleSource,/collection\(purchaseLayerDataset\.LAYERS\)\.(?:insert|update|delete|bulkWrite)/);
   assert.doesNotMatch(moduleSource,/collection\(['"]saleSnapshotDatasetLines['"]\)\.(?:insert|update|delete|bulkWrite)/);
   assert.doesNotMatch(moduleSource,/PutSaleInvoice|Invoice\/Put|putInvoice/);
   assert.match(moduleSource,/profitActivationAllowed:false/);
   assert.match(moduleSource,/profitCalculated:false/);
   assert.match(moduleSource,/commissionCalculated:false/);
+});
+
+test('allocation read path binds the requested candidate and normalizes ItemCode without hiding combined filters', async () => {
+  const db=seedDb();
+  const result=await engine.buildShadowDataset(db,{},accountant);
+  const exact=await engine.listAllocations(db,{datasetId:result.datasetId,itemCode:'A'});
+  const lower=await engine.listAllocations(db,{datasetId:result.datasetId,itemCode:'a'});
+  const padded=await engine.listAllocations(db,{datasetId:result.datasetId,itemCode:'  a  '});
+  assert.equal(exact.total,lower.total);
+  assert.equal(lower.total,padded.total);
+  assert.equal(lower.appliedFilters.datasetId,result.datasetId);
+  assert.equal(lower.appliedFilters.itemCode,'A');
+  const invoiceOnly=await engine.listAllocations(db,{datasetId:result.datasetId,invoiceNo:'2'});
+  const combined=await engine.listAllocations(db,{datasetId:result.datasetId,invoiceNo:'2',itemCode:'b'});
+  assert.equal(invoiceOnly.total,1);
+  assert.equal(combined.total,1);
+  assert.equal(combined.appliedFilters.invoiceNo,'2');
+  assert.equal(combined.appliedFilters.itemCode,'B');
+  const wrongCandidate=await engine.listAllocations(db,{datasetId:'FIFO-NOT-SELECTED',itemCode:'a'});
+  assert.equal(wrongCandidate.total,0);
+  assert.equal(wrongCandidate.datasetId,'FIFO-NOT-SELECTED');
 });

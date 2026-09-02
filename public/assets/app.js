@@ -721,6 +721,7 @@ const uiPageLifecycle=(()=>{
   function query(parameters={}){
     return new URLSearchParams(Object.entries(parameters).filter(([,value])=>value!==''&&value!=null)).toString();
   }
+  function normalizedItemCodeInput(value){return String(value??'').trim().toLocaleUpperCase('en-US');}
   async function json(url,options={}){
     const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
     const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
@@ -804,21 +805,27 @@ const uiPageLifecycle=(()=>{
           <h5>Purchase Returns</h5><div class="info">کل: ${number(summary.purchaseReturns?.total)} | unresolved: ${number(summary.purchaseReturns?.unresolved)}</div>
         </div></div>
         <div class="card"><div class="card-header"><h5>Allocation Drill-down</h5></div><div class="card-body">
-          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Purchase رسمی</option><option value="approved_opening_accounting_cost">Opening مصوب</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
+          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Purchase رسمی</option><option value="approved_opening_accounting_cost">Opening مصوب</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button> <button class="mini" id="fifoClear">پاک‌کردن فیلترها</button></div></div>
+          <div class="small">فیلترهای Invoice، ItemCode و Source هم‌زمان اعمال می‌شوند؛ برای جست‌وجوی ItemCode-only ابتدا «پاک‌کردن فیلترها» را بزنید.</div>
           <div id="fifoAllocations"></div>
         </div></div>
         <div class="info">Build: ${number(dataset.performance?.durationMs)} ms | Mongo read: ${number(dataset.performance?.mongoReadMs)} ms | Allocate: ${number(dataset.performance?.allocationMs)} ms | Mongo write: ${number(dataset.performance?.mongoWriteMs)} ms | Peak observed heap: ${number((dataset.performance?.peakObservedHeapBytes||0)/1024/1024)} MiB</div>`;
       q('#fifoDrill').onclick=loadAllocations;
+      q('#fifoClear').onclick=async()=>{q('#fifoInvoice').value='';q('#fifoItem').value='';q('#fifoSource').value='';await loadAllocations();};
+      [q('#fifoInvoice'),q('#fifoItem')].forEach(input=>input.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();loadAllocations();}});
       await loadAllocations();
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
   async function loadAllocations(){
     const box=q('#fifoAllocations');if(!box)return;
     const generation=++allocationGeneration;
+    const itemInput=q('#fifoItem');
+    const normalizedItemCode=normalizedItemCodeInput(itemInput?.value||'');
+    if(itemInput)itemInput.value=normalizedItemCode;
     const response=await json('/api/accounting/fifo-shadow/allocations?'+query({
       datasetId:selectedDatasetId,
       invoiceNo:q('#fifoInvoice')?.value||'',
-      itemCode:q('#fifoItem')?.value||'',
+      itemCode:normalizedItemCode,
       sourceType:q('#fifoSource')?.value||'',
       pageSize:200
     }));
@@ -842,7 +849,8 @@ const uiPageLifecycle=(()=>{
       : row.sourceType==='approved_opening_accounting_cost'
       ? `Opening Dataset ${safe(row.openingDatasetId||'—')}<br><small>Evidence: ${safe(row.openingEvidenceId||'—')}<br>Base date: ${safe(row.openingBaseDate||'—')}<br>Original: ${safe(row.openingOriginalQuantityExact||'—')} | Remaining: ${safe(row.openingRemainingQuantityExact||'—')}<br>Unit cost: ${safe(row.openingUnitCostExact||row.unitCostExact||'—')}<br>Approval: ${safe(row.openingApprovalStatus||'—')} / revision ${safe(row.openingApprovalRevision||'—')}<br>Fingerprint: ${safe(row.openingRecordFingerprint||'—')}</small>`
       : `فاکتور خرید ${safe(row.purchaseInvoiceNo||'—')}<br><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small>`;
-    box.innerHTML=`<div class="small">Rows: ${number(response.total)}</div>
+    const applied=response.appliedFilters||{};
+    box.innerHTML=`<div class="small"><b>Dataset:</b> ${safe(response.datasetId||selectedDatasetId)} | <b>فیلترهای اعمال‌شده:</b> Invoice ${safe(applied.invoiceNo||'همه')} | ItemCode ${safe(applied.itemCode||'همه')} | Source ${safe(applied.sourceType||'همه')} | <b>Rows:</b> ${number(response.total)}</div>
       <div class="info"><b>اثر خالص ردیف‌های نمایش‌داده‌شده</b><br>فروش/برگشت: ${number(netSale)} ریال | هزینه FIFO اثبات‌شده: ${number(netCost)} ریال | سود خالص فقط ردیف‌های اثبات‌شده: ${number(provenSale-netCost)} ریال${knownRows.length!==rows.length?' | ردیف هزینه‌نامشخص در سود اثبات‌شده محاسبه نشده است.':''}</div>
       <table class="table"><thead><tr><th>فروش / برگشت از فروش</th><th>کالا / فروشنده</th><th>تعداد</th><th>مأخذ هزینه</th><th>اثر فروش</th><th>اثر هزینه</th><th>اثر خالص</th><th>وضعیت</th></tr></thead><tbody>${rows.map(row=>{const sale=saleEffect(row),cost=costEffect(row);return `<tr>
       <td><b>${sourceLabel(row)}</b><br>فاکتور ${safe(row.saleInvoiceNo)} / ${safe(row.saleDate)}<br><small>${safe(row.saleLineId)}</small></td>

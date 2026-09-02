@@ -8,6 +8,7 @@ const openingAccountingCostBasis = require('./opening-accounting-cost-basis');
 const saleSnapshot = require('./sale-snapshot');
 const accountingDecimal = require('./accounting-decimal');
 const profitProvenance = require('./fifo-profit-provenance');
+const canonicalItemCatalog = require('./canonical-item-catalog');
 const { APP_VERSION } = require('./app-version');
 const { normalizeJalaliRange } = require('./jalali-date');
 
@@ -1644,19 +1645,27 @@ async function listAllocations(db, filters = {}) {
   await ensureIndexes(db);
   const active = filters.datasetId ? null : await activeDataset(db);
   const datasetId = clean(filters.datasetId || active?.datasetId, 100);
-  if (!datasetId) return { ok:true, datasetId:'', total:0, page:1, pageSize:100, list:[] };
+  if (!datasetId) return { ok:true, datasetId:'', total:0, page:1, pageSize:100, list:[], appliedFilters:{ datasetId:'', invoiceNo:'', itemCode:'', sourceType:'' } };
   const query = { datasetId };
-  if (filters.saleLineId) query.saleLineId = clean(filters.saleLineId, 500);
-  if (filters.invoiceNo) query.saleInvoiceNo = Number(filters.invoiceNo);
-  if (filters.itemCode) query.itemCode = clean(filters.itemCode, 100);
-  if (filters.sourceType) query.sourceType = clean(filters.sourceType, 100);
+  const saleLineId = clean(filters.saleLineId, 500);
+  const invoiceNo = clean(filters.invoiceNo, 100);
+  const itemCode = canonicalItemCatalog.normalizedItemCode(filters.itemCode);
+  const sourceType = clean(filters.sourceType, 100);
+  if (saleLineId) query.saleLineId = saleLineId;
+  if (invoiceNo) query.saleInvoiceNo = Number(invoiceNo);
+  if (itemCode) query.itemCode = itemCode;
+  if (sourceType) query.sourceType = sourceType;
   const page = Math.max(1, Number(filters.page || 1));
   const pageSize = Math.max(1, Math.min(Number(filters.pageSize || 100), 1000));
   const total = await count(db.collection(ALLOCATIONS), query);
   const list = await db.collection(ALLOCATIONS).find(query)
     .sort({ saleDate:1, saleInvoiceNo:1, saleRow:1, allocationSequence:1 })
     .skip((page - 1) * pageSize).limit(pageSize).toArray();
-  return { ok:true, datasetId, total, page, pageSize, list, shadowMode:true, accountingApproved:false };
+  return {
+    ok:true,datasetId,total,page,pageSize,list,
+    appliedFilters:{ datasetId, invoiceNo, itemCode, sourceType, saleLineId },
+    shadowMode:true,accountingApproved:false
+  };
 }
 async function listExceptions(db, filters = {}) {
   await ensureIndexes(db);
