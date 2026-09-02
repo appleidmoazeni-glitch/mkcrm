@@ -4869,6 +4869,10 @@ async function handleApi(req, res, pathname, query) {
         reviewSessionId,
         saleSnapshotId:String(body.saleSnapshotId||query.saleSnapshotId||'').trim(),
         purchaseDatasetId:String(body.purchaseDatasetId||query.purchaseDatasetId||'').trim(),
+        openingDatasetId:String(body.openingDatasetId||query.openingDatasetId||'').trim(),
+        openingDatasetFingerprint:String(body.openingDatasetFingerprint||query.openingDatasetFingerprint||'').trim(),
+        openingSourceFingerprint:String(body.openingSourceFingerprint||query.openingSourceFingerprint||'').trim(),
+        openingEligibilityFingerprint:String(body.openingEligibilityFingerprint||query.openingEligibilityFingerprint||'').trim(),
         maxAttempts:Math.max(1,Math.min(Number(body.maxAttempts||query.maxAttempts||3),5))
       };
       const db=await connectMongo();

@@ -748,6 +748,7 @@ const uiPageLifecycle=(()=>{
   function coverageCards(summary={}){
     return [
       ['Official',summary.official?.quantityPercent,summary.official?.quantity],
+      ['Opening مصوب',summary.opening?.quantityPercent,summary.opening?.quantity],
       ['Manual',summary.manual?.quantityPercent,summary.manual?.quantity],
       ['Unknown',summary.unknown?.quantityPercent,summary.unknown?.quantity]
     ].map(([label,percent,quantity])=>`<div class="info"><b>${safe(label)}</b><br>${pct(percent)}<br>${number(quantity)} واحد</div>`).join('');
@@ -759,6 +760,8 @@ const uiPageLifecycle=(()=>{
       ['Layer Over-consumption',Number(validation.layerOverConsumptionCount||0)===0],
       ['Orphan Layer',Number(validation.orphanLayerCount||0)===0],
       ['Negative Remaining',Number(validation.negativeRemainingCount||0)===0],
+      ['Opening Over-consumption',Number(validation.openingOverConsumptionCount||0)===0],
+      ['Duplicate Opening Layer',Number(validation.duplicateOpeningLayerCount||0)===0],
       ['Inactive Source',Number(validation.inactiveSourceCount||0)===0]
     ];
     return `<table class="table"><thead><tr><th>کنترل</th><th>نتیجه</th></tr></thead><tbody>${checks.map(([label,ok])=>`<tr><td>${safe(label)}</td><td>${ok?'<span class="success">PASS</span>':'<span class="error">FAIL</span>'}</td></tr>`).join('')}</tbody></table>`;
@@ -770,7 +773,7 @@ const uiPageLifecycle=(()=>{
     q('#fifoDatasets').innerHTML=`<table class="table"><thead><tr><th>Dataset</th><th>Status</th><th>Sources</th><th>Allocation</th><th>Confidence</th><th>Build</th><th></th></tr></thead><tbody>${list.map(row=>`<tr>
       <td><small>${safe(row.datasetId)}</small>${row.isActive?'<br><span class="success">ACTIVE SHADOW</span>':''}</td>
       <td>${safe(row.status)} / ${safe(row.activationStatus)}</td>
-      <td><small>Sale: ${safe(row.sourceSaleSnapshotId)}<br>Purchase: ${safe(row.sourcePurchaseDatasetId)}</small></td>
+      <td><small>Sale: ${safe(row.sourceSaleSnapshotId)}<br>Purchase: ${safe(row.sourcePurchaseDatasetId)}<br>Opening: ${safe(row.sourceOpeningDatasetId||'—')}</small></td>
       <td>${number(row.allocationCount)}</td><td>${number(row.summary?.confidenceScore)} — ${safe(row.summary?.confidence)}</td>
       <td>${number(row.performance?.durationMs)} ms</td>
       <td><button class="mini fifo-select" data-id="${safe(row.datasetId)}">مشاهده</button>${['failed','cancelled','completed_with_errors'].includes(row.status)&&['admin','accounting'].includes(userRole())?` <button class="mini fifo-resume" data-id="${safe(row.datasetId)}">Resume</button>`:''}</td>
@@ -785,7 +788,8 @@ const uiPageLifecycle=(()=>{
       const report=await json('/api/accounting/fifo-shadow/report?'+query({datasetId:selectedDatasetId}));
       const dataset=report.dataset||{}, summary=dataset.summary||{}, business=report.businessValidation||{};
       box.innerHTML=`
-        <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>هیچ سود، ROI یا پورسانتی از این Dataset فعال نیست.</div>
+        <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>هیچ سود، ROI یا پورسانتی از این Dataset فعال نیست.${dataset.finalFinancialActivationEligibility==='blocked'?`<br><b>NOT ELIGIBLE FOR FINAL FINANCIAL ACTIVATION</b>: ${safe((dataset.finalFinancialActivationBlockers||[]).join('، '))}`:''}</div>
+        <div class="info"><b>Financial lineage</b><br>Sale Snapshot: ${safe(dataset.sourceSaleSnapshotId)}<br>Purchase Dataset: ${safe(dataset.sourcePurchaseDatasetId)}<br>Opening Dataset: ${safe(dataset.sourceOpeningDatasetId||'—')} — ${safe(dataset.openingApprovalStatus||'not-used')} / revision ${number(dataset.openingApprovalRevision||0)}<br><small>Opening dataset: ${safe(dataset.openingDatasetFingerprint||'—')}<br>Opening source: ${safe(dataset.openingSourceFingerprint||'—')}<br>Opening eligibility: ${safe(dataset.openingEligibilityFingerprint||'—')}</small></div>
         <div class="row four">
           <div class="info"><b>Dataset</b><br><small>${safe(dataset.datasetId)}</small><br>${safe(dataset.status)} / ${safe(dataset.activationStatus)}</div>
           <div class="info"><b>Coverage</b><br>${coverageCards(summary)}</div>
@@ -800,7 +804,7 @@ const uiPageLifecycle=(()=>{
           <h5>Purchase Returns</h5><div class="info">کل: ${number(summary.purchaseReturns?.total)} | unresolved: ${number(summary.purchaseReturns?.unresolved)}</div>
         </div></div>
         <div class="card"><div class="card-header"><h5>Allocation Drill-down</h5></div><div class="card-body">
-          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Official</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
+          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Purchase رسمی</option><option value="approved_opening_accounting_cost">Opening مصوب</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button></div></div>
           <div id="fifoAllocations"></div>
         </div></div>
         <div class="info">Build: ${number(dataset.performance?.durationMs)} ms | Mongo read: ${number(dataset.performance?.mongoReadMs)} ms | Allocate: ${number(dataset.performance?.allocationMs)} ms | Mongo write: ${number(dataset.performance?.mongoWriteMs)} ms | Peak observed heap: ${number((dataset.performance?.peakObservedHeapBytes||0)/1024/1024)} MiB</div>`;
@@ -830,10 +834,13 @@ const uiPageLifecycle=(()=>{
     const sourceLabel=row=>row.sourceType==='sale_return_reversal'
       ? `برگشت از فروش ← فروش ${safe(row.originSaleInvoiceNo||'—')}`
       : row.sourceType==='official_purchase_layer'?'فروش — مأخذ خرید رسمی'
+      : row.sourceType==='approved_opening_accounting_cost'?'فروش — Opening Accounting Cost مصوب'
       : row.sourceType==='unknown_cost'?'فروش — مأخذ هزینه نامشخص'
       : `فروش — ${safe(row.sourceType)}`;
     const provenance=row=>row.sourceType==='sale_return_reversal'
       ? `فاکتور خرید ${safe(row.purchaseInvoiceNo||'—')}<br><small>تخصیص معکوس: ${safe(row.originalAllocationId||'—')}<br>${safe(row.returnLinkageSource||'')} ${safe(row.returnLinkageReference||'')}</small>`
+      : row.sourceType==='approved_opening_accounting_cost'
+      ? `Opening Dataset ${safe(row.openingDatasetId||'—')}<br><small>Evidence: ${safe(row.openingEvidenceId||'—')}<br>Base date: ${safe(row.openingBaseDate||'—')}<br>Original: ${safe(row.openingOriginalQuantityExact||'—')} | Remaining: ${safe(row.openingRemainingQuantityExact||'—')}<br>Unit cost: ${safe(row.openingUnitCostExact||row.unitCostExact||'—')}<br>Approval: ${safe(row.openingApprovalStatus||'—')} / revision ${safe(row.openingApprovalRevision||'—')}<br>Fingerprint: ${safe(row.openingRecordFingerprint||'—')}</small>`
       : `فاکتور خرید ${safe(row.purchaseInvoiceNo||'—')}<br><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small>`;
     box.innerHTML=`<div class="small">Rows: ${number(response.total)}</div>
       <div class="info"><b>اثر خالص ردیف‌های نمایش‌داده‌شده</b><br>فروش/برگشت: ${number(netSale)} ریال | هزینه FIFO اثبات‌شده: ${number(netCost)} ریال | سود خالص فقط ردیف‌های اثبات‌شده: ${number(provenSale-netCost)} ریال${knownRows.length!==rows.length?' | ردیف هزینه‌نامشخص در سود اثبات‌شده محاسبه نشده است.':''}</div>

@@ -19,6 +19,7 @@ const COST_SOURCE_TYPES = Object.freeze({
   MANUAL_COST_OPENING_BASIS:'MANUAL_COST_OPENING_BASIS',
   MANUAL_COST_HISTORICAL_EVIDENCE:'MANUAL_COST_HISTORICAL_EVIDENCE',
   OPENING_INVENTORY_EVIDENCE:'OPENING_INVENTORY_EVIDENCE',
+  APPROVED_OPENING_ACCOUNTING_COST:'APPROVED_OPENING_ACCOUNTING_COST',
   UNKNOWN:'UNKNOWN'
 });
 
@@ -37,6 +38,7 @@ function allocationSourceType(row={}){
   if(reversed==='approved_manual_evidence_quantity')return COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE;
   if(reversed==='approved_manual_cost')return COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY;
   if(reversed==='opening_inventory_evidence')return COST_SOURCE_TYPES.OPENING_INVENTORY_EVIDENCE;
+  if(reversed==='approved_opening_accounting_cost')return COST_SOURCE_TYPES.APPROVED_OPENING_ACCOUNTING_COST;
   return COST_SOURCE_TYPES.UNKNOWN;
 }
 
@@ -44,6 +46,7 @@ function actor(value){return value&&typeof value==='object'?{username:clean(valu
 function sourceProjection(row={},manual={}){
   const sourceType=allocationSourceType(row);
   const manualSource=[COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER,COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY,COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS,COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE].includes(sourceType);
+  const openingSource=sourceType===COST_SOURCE_TYPES.APPROVED_OPENING_ACCOUNTING_COST;
   const saleReturn=clean(row.sourceType,100)==='sale_return_reversal';
   return {
     allocationId:clean(row.allocationId,100),
@@ -66,7 +69,19 @@ function sourceProjection(row={},manual={}){
     approvedBy:manualSource?actor(row.manualApprovedBy||manual.approvedBy):null,
     approvedAt:manualSource?(row.manualApprovedAt||manual.approvedAt||null):null,
     manualCostExact:manualSource?clean(row.manualCostExact||manual.manualCostExact||manual.manualCost,100):'',
-    evidenceQuality:sourceType===COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER?'GOVERNED_EXACT_LAYER':sourceType===COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS?'GOVERNED_OPENING_ACCOUNTING_BASIS':sourceType===COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE?'GOVERNED_BOUNDED_HISTORICAL_AVERAGE':sourceType===COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY?'GOVERNED_LEGACY_ITEM':sourceType===COST_SOURCE_TYPES.OFFICIAL_PURCHASE_LAYER?'OFFICIAL_PURCHASE_DOCUMENT':'UNPROVEN',
+    openingDatasetId:openingSource?clean(row.openingDatasetId,100):'',
+    openingEvidenceId:openingSource?clean(row.openingEvidenceId,100):'',
+    openingBaseDate:openingSource?clean(row.openingBaseDate,8):'',
+    openingOriginalQuantityExact:openingSource?clean(row.openingOriginalQuantityExact,100):'',
+    openingRemainingQuantityExact:openingSource?clean(row.openingRemainingQuantityExact,100):'',
+    openingTotalValueExact:openingSource?clean(row.openingTotalValueExact,100):'',
+    openingWarehouseFingerprint:openingSource?clean(row.openingWarehouseFingerprint,64):'',
+    openingRecordFingerprint:openingSource?clean(row.openingRecordFingerprint,64):'',
+    openingApprovalStatus:openingSource?clean(row.openingApprovalStatus,50):'',
+    openingApprovalRevision:openingSource?Number(row.openingApprovalRevision||0):null,
+    openingApprovedBy:openingSource?actor(row.openingApprovedBy):null,
+    openingApprovedAt:openingSource?(row.openingApprovedAt||null):null,
+    evidenceQuality:sourceType===COST_SOURCE_TYPES.APPROVED_OPENING_ACCOUNTING_COST?'GOVERNED_APPROVED_OPENING_ACCOUNTING_COST':sourceType===COST_SOURCE_TYPES.MANUAL_COST_PURCHASE_LAYER?'GOVERNED_EXACT_LAYER':sourceType===COST_SOURCE_TYPES.MANUAL_COST_OPENING_BASIS?'GOVERNED_OPENING_ACCOUNTING_BASIS':sourceType===COST_SOURCE_TYPES.MANUAL_COST_HISTORICAL_EVIDENCE?'GOVERNED_BOUNDED_HISTORICAL_AVERAGE':sourceType===COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY?'GOVERNED_LEGACY_ITEM':sourceType===COST_SOURCE_TYPES.OFFICIAL_PURCHASE_LAYER?'OFFICIAL_PURCHASE_DOCUMENT':'UNPROVEN',
     warning:sourceType===COST_SOURCE_TYPES.MANUAL_COST_ITEM_LEGACY?'این هزینه به فاکتور خرید مشخص متصل نیست.':'',
     unknownReason:sourceType===COST_SOURCE_TYPES.UNKNOWN?clean(row.unknownReason,200):'',
     returnProvenance:saleReturn?{

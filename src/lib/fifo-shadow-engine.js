@@ -4,6 +4,7 @@ const crypto = require('crypto');
 const purchaseLayerDataset = require('./purchase-layer-dataset');
 const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const manualCostResolution = require('./manual-cost-resolution');
+const openingAccountingCostBasis = require('./opening-accounting-cost-basis');
 const saleSnapshot = require('./sale-snapshot');
 const accountingDecimal = require('./accounting-decimal');
 const profitProvenance = require('./fifo-profit-provenance');
@@ -16,8 +17,8 @@ const DIAGNOSTICS = 'fifoDiagnostics';
 const EXCEPTIONS = 'fifoExceptions';
 const STATE = 'fifoDatasetState';
 const SCOPE_KEY = 'fifo-shadow-v2-precision-evidence';
-const SCHEMA_VERSION = 3;
-const ALGORITHM_VERSION = 'fifo-shadow-v4-sale-return-restoration';
+const SCHEMA_VERSION = 4;
+const ALGORITHM_VERSION = 'fifo-shadow-v5-approved-opening-chronology';
 const QUANTITY_SCALE = 6;
 const VALUE_SCALE = 2;
 const EPSILON = 0.000001;
@@ -135,6 +136,9 @@ function compareLayers(a, b) {
     Number(a.sourceRow || 0) - Number(b.sourceRow || 0) ||
     purchaseIdentity(a).localeCompare(purchaseIdentity(b), 'en');
 }
+function openingIdentity(row) {
+  return clean(row.evidenceId, 100) || `OPENING-${clean(row.datasetId, 100)}-${sourceKey(row)}`;
+}
 function manualEffective(row, saleDate) {
   return row.status === 'approved' && row.deleted !== true &&
     validDate(row.effectiveFrom) && row.effectiveFrom <= saleDate &&
@@ -241,6 +245,14 @@ function classifyUnknownSource(sale, source, eligibleForSale, manuals) {
   if (sourceFrom && sale.saleDate < sourceFrom) return 'purchase_history_outside_dataset_range';
   return 'no_purchase_history_available';
 }
+function openingUnknownReason(sale, source, currentSaleAllocations = []) {
+  const rows = matchingRows(indexRows(source.openingRows || []), sale);
+  if (!rows.length) return '';
+  const baseDate = rows.map(row => clean(row.effectiveOpeningDate || row.openingDate, 8)).filter(validDate).sort()[0];
+  if (baseDate && clean(sale.saleDate, 8) < baseDate) return 'PRE_OPENING_PERIOD';
+  if (currentSaleAllocations.some(row => row.sourceType === 'approved_opening_accounting_cost')) return 'OPENING_PARTIAL';
+  return 'OPENING_CAPACITY_EXHAUSTED';
+}
 function immutableProjection(row) {
   return {
     saleLineId:row.saleLineId,
@@ -253,7 +265,7 @@ function immutableProjection(row) {
     saleValue:round(row.saleValue, VALUE_SCALE),
     sourceType:row.sourceType,
     costSourceType:row.costSourceType || profitProvenance.allocationSourceType(row),
-    sourceReference:row.purchaseLineIdentity || row.manualResolutionId || '',
+    sourceReference:row.openingEvidenceId || row.purchaseLineIdentity || row.manualResolutionId || '',
     allocatedQty:round(row.allocatedQty),
     unknownQty:round(row.unknownQty),
     unitCost:row.unitCost == null ? null : round(row.unitCost, VALUE_SCALE),
@@ -261,7 +273,11 @@ function immutableProjection(row) {
     allocatedSaleValueExact:row.allocatedSaleValueExact ?? null,
     quantityExact:row.quantityExact ?? null,
     unitCostExact:row.unitCostExact ?? null,
-    returnResolutionId:row.saleReturnResolutionId || row.purchaseReturnResolutionId || ''
+    returnResolutionId:row.saleReturnResolutionId || row.purchaseReturnResolutionId || '',
+    openingDatasetId:row.openingDatasetId || '',
+    openingEvidenceId:row.openingEvidenceId || '',
+    openingBaseDate:row.openingBaseDate || '',
+    openingRecordFingerprint:row.openingRecordFingerprint || ''
   };
 }
 
@@ -392,6 +408,27 @@ async function loadSources(db, pinned = {}) {
   if (!purchaseActive?.datasetId || !purchaseActive.dataset || purchaseActive.dataset.status !== 'completed') {
     fail('FIFO_SOURCE_PURCHASE_MISSING', 'Purchase Layer Dataset کامل و قابل استفاده پیدا نشد.', 409);
   }
+  let openingActive = null;
+  let openingRows = [];
+  if (pinned.openingDatasetId) {
+    const dataset = await db.collection(openingAccountingCostBasis.DATASETS).findOne({ datasetId:pinned.openingDatasetId });
+    if (!dataset || dataset.status !== 'completed' || dataset.approvalStatus !== 'approved') {
+      fail('FIFO_SOURCE_OPENING_NOT_APPROVED', 'Opening Accounting Evidence کامل و مصوب پیدا نشد.', 409);
+    }
+    const governance = await openingAccountingCostBasis._immutableGovernanceSnapshot(db, dataset);
+    const expected = pinned.openingFingerprints || {};
+    if (clean(expected.dataset, 64) && clean(expected.dataset, 64) !== governance.datasetFingerprint) {
+      fail('FIFO_SOURCE_OPENING_FINGERPRINT_MISMATCH', 'Opening Dataset fingerprint mismatch.', 409);
+    }
+    if (clean(expected.source, 64) && clean(expected.source, 64) !== governance.sourceFingerprint) {
+      fail('FIFO_SOURCE_OPENING_FINGERPRINT_MISMATCH', 'Opening source fingerprint mismatch.', 409);
+    }
+    if (clean(expected.eligibility, 64) && clean(expected.eligibility, 64) !== governance.eligibilityFingerprint) {
+      fail('FIFO_SOURCE_OPENING_FINGERPRINT_MISMATCH', 'Opening eligibility fingerprint mismatch.', 409);
+    }
+    openingActive = { datasetId:dataset.datasetId, dataset, governance };
+    openingRows = governance.evidence.filter(row => row.status === 'VALIDATED_CANDIDATE' && row.extractionComplete === true);
+  }
   const [saleLines, saleHeaders, purchaseLayers, manuals, purchaseReturnResolutions, saleReturnResolutions] = await Promise.all([
     db.collection(saleActive.lineCollection).find(saleActive.lineQuery).toArray(),
     db.collection(saleActive.headerCollection).find(saleActive.headerQuery).toArray(),
@@ -400,7 +437,7 @@ async function loadSources(db, pinned = {}) {
     db.collection('purchaseReturnResolutions').find({ status:'confirmed_linked' }).toArray(),
     db.collection('saleReturnResolutions').find({ status:'confirmed_linked' }).toArray()
   ]);
-  return { saleActive, purchaseActive, saleLines, saleHeaders, purchaseLayers, manuals, purchaseReturnResolutions, saleReturnResolutions };
+  return { saleActive, purchaseActive, openingActive, saleLines, saleHeaders, purchaseLayers, openingRows, manuals, purchaseReturnResolutions, saleReturnResolutions };
 }
 async function loadSourcesWithRetry(db, pinned, options, datasetId) {
   const maxAttempts = Math.max(1, Math.min(Number(options.maxAttempts || 3), 5));
@@ -486,6 +523,43 @@ function allocateSources(datasetId, source, filters = {}) {
       netPurchasedQuantity:scoped,netUnitCost:manual.manualCostExact??manual.manualCost,
       fifoRemainingQuantity:round(scoped),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],
       fifoSourceType:manual.resolutionScope==='opening_quantity'?'approved_manual_opening_quantity':'approved_manual_evidence_quantity',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:clean(manual.resolutionScope,50),manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)
+    });
+  }
+  for (const opening of source.openingRows || []) {
+    const quantity = finite(opening.openingQuantityExact);
+    const unitCost = finite(opening.openingUnitCostExact);
+    const openingDate = clean(opening.effectiveOpeningDate || opening.openingDate, 8);
+    if (!(quantity > EPSILON) || !(unitCost > 0) || !validDate(openingDate)) continue;
+    officialRows.push({
+      datasetId:source.purchaseActive.datasetId,
+      purchaseLineIdentity:`OPENING-${openingIdentity(opening)}`,
+      layerKind:'governed-opening-accounting-cost',
+      validationStatus:'approved-opening-accounting-cost',
+      purchaseInvoiceDate:openingDate,
+      purchaseInvoiceNo:0,
+      sourceRow:0,
+      itemGuid:clean(opening.itemGuid,100),
+      itemCode:clean(opening.itemCode,100),
+      itemDescription:clean(opening.itemDescription,500),
+      netPurchasedQuantity:quantity,
+      netUnitCost:opening.openingUnitCostExact,
+      fifoRemainingQuantity:round(quantity),
+      confirmedReturnAdjustmentQuantity:0,
+      purchaseReturnResolutionIds:[],
+      fifoSourceType:'approved_opening_accounting_cost',
+      openingDatasetId:clean(source.openingActive?.datasetId,100),
+      openingEvidenceId:openingIdentity(opening),
+      openingBaseDate:openingDate,
+      openingOriginalQuantityExact:clean(opening.openingQuantityExact,100),
+      openingUnitCostExact:clean(opening.openingUnitCostExact,100),
+      openingTotalValueExact:clean(opening.openingTotalValueExact,100),
+      openingWarehouseEvidence:Array.isArray(opening.warehouseEvidence) ? opening.warehouseEvidence : [],
+      openingWarehouseFingerprint:clean(opening.sourceFingerprint,64),
+      openingRecordFingerprint:clean(opening.recordFingerprint,64),
+      openingApprovalStatus:'approved',
+      openingApprovalRevision:Number(source.openingActive?.dataset?.revision || 0),
+      openingApprovedBy:source.openingActive?.dataset?.decidedBy || null,
+      openingApprovedAt:source.openingActive?.dataset?.decidedAt || null
     });
   }
   officialRows.sort(compareLayers);
@@ -739,8 +813,8 @@ function allocateSources(datasetId, source, filters = {}) {
         schemaVersion:SCHEMA_VERSION,
         algorithmVersion:ALGORITHM_VERSION,
         sourceType:layer.fifoSourceType||'official_purchase_layer',
-        costSourceType:layer.fifoSourceType==='approved_manual_opening_quantity'?'MANUAL_COST_OPENING_BASIS':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'MANUAL_COST_HISTORICAL_EVIDENCE':(layer.fifoSourceType?'MANUAL_COST_PURCHASE_LAYER':'OFFICIAL_PURCHASE_LAYER')),
-        sourceConfidence:layer.fifoSourceType==='approved_manual_opening_quantity'?'manual-approved-opening-basis':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'manual-approved-bounded-historical-evidence':(layer.fifoSourceType?'manual-approved-purchase-line':'official')),
+        costSourceType:layer.fifoSourceType==='approved_opening_accounting_cost'?'APPROVED_OPENING_ACCOUNTING_COST':(layer.fifoSourceType==='approved_manual_opening_quantity'?'MANUAL_COST_OPENING_BASIS':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'MANUAL_COST_HISTORICAL_EVIDENCE':(layer.fifoSourceType?'MANUAL_COST_PURCHASE_LAYER':'OFFICIAL_PURCHASE_LAYER'))),
+        sourceConfidence:layer.fifoSourceType==='approved_opening_accounting_cost'?'governed-approved-opening-accounting-cost':(layer.fifoSourceType==='approved_manual_opening_quantity'?'manual-approved-opening-basis':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'manual-approved-bounded-historical-evidence':(layer.fifoSourceType?'manual-approved-purchase-line':'official'))),
         saleSnapshotId:source.saleActive.snapshotId,
         saleLineId,
         saleInvoiceType:Number(sale.saleInvoiceType),
@@ -755,6 +829,7 @@ function allocateSources(datasetId, source, filters = {}) {
         itemCode:clean(sale.itemCode, 100),
         itemDescription:clean(sale.itemName, 500),
         officialProductCategoryName:clean(sale.officialProductCategoryName || sale.mainGroupName || sale.mainGroup, 300),
+        officialProductCategoryGuid:clean(sale.officialProductCategoryGuid || sale.mainGroupGuid, 100),
         soldQuantity,
         saleValue,
         allocatedSaleValue,
@@ -783,6 +858,22 @@ function allocateSources(datasetId, source, filters = {}) {
         layerRemainingQuantity:sourceRemaining,
         purchaseReturnResolutionIds:[...(layer.purchaseReturnResolutionIds || [])],
         confirmedReturnAdjustmentQuantity:round(layer.confirmedReturnAdjustmentQuantity || 0),
+        openingDatasetId:clean(layer.openingDatasetId,100),
+        openingEvidenceId:clean(layer.openingEvidenceId,100),
+        openingBaseDate:clean(layer.openingBaseDate,8),
+        openingOriginalQuantityExact:clean(layer.openingOriginalQuantityExact,100),
+        openingAllocatedQuantityExact:layer.openingEvidenceId?accountingDecimal.format(accountingDecimal.parse(quantity,accountingDecimal.QUANTITY_SCALE),accountingDecimal.QUANTITY_SCALE):'',
+        openingRemainingQuantityExact:layer.openingEvidenceId?accountingDecimal.format(accountingDecimal.parse(sourceRemaining,accountingDecimal.QUANTITY_SCALE),accountingDecimal.QUANTITY_SCALE):'',
+        openingUnitCostExact:clean(layer.openingUnitCostExact,100),
+        openingTotalValueExact:clean(layer.openingTotalValueExact,100),
+        openingWarehouseEvidence:layer.openingEvidenceId?layer.openingWarehouseEvidence:undefined,
+        openingWarehouseFingerprint:clean(layer.openingWarehouseFingerprint,64),
+        openingRecordFingerprint:clean(layer.openingRecordFingerprint,64),
+        openingApprovalStatus:clean(layer.openingApprovalStatus,50),
+        openingApprovalRevision:layer.openingEvidenceId?Number(layer.openingApprovalRevision||0):null,
+        openingApprovedBy:layer.openingEvidenceId?layer.openingApprovedBy:null,
+        openingApprovedAt:layer.openingEvidenceId?layer.openingApprovedAt:null,
+        openingChronologyStatus:layer.openingEvidenceId?'OPENING_ELIGIBLE':'',
         unknownReason:'',
         ...precisionFields(quantity, layer.netUnitCost ?? layer.grossUnitCost),
         createdAt:new Date()
@@ -864,7 +955,11 @@ function allocateSources(datasetId, source, filters = {}) {
         }
         sequence++;
         allocationSequenceGlobal++;
-        const unknownReason = classifyUnknownSource(sale, source, eligibleForSale, manuals);
+        const unknownReason = openingUnknownReason(
+          sale,
+          source,
+          allocations.filter(row => row.saleLineId === saleLineId)
+        ) || classifyUnknownSource(sale, source, eligibleForSale, manuals);
         allocations.push({
           datasetId,
           allocationId:`FA-${sha256(`${datasetId}|${saleLineId}|${sequence}|unknown`).slice(0, 32)}`,
@@ -904,6 +999,7 @@ function allocateSources(datasetId, source, filters = {}) {
           supplierAccountNumber:'',
           supplierName:'',
           manualResolutionId:'',
+          openingChronologyStatus:unknownReason,
           unitCost:null,
           allocatedCostAmount:null,
           layerAvailableBefore:null,
@@ -988,7 +1084,7 @@ function reconcile(result) {
   let negativeRemainingCount = 0;
   let orphanLayerCount = 0;
   const officialByIdentity = new Map(result.officialRows.map(row => [purchaseIdentity(row), row]));
-  for (const row of result.allocations.filter(item => ['official_purchase_layer','approved_manual_purchase_layer','approved_manual_opening_quantity','approved_manual_evidence_quantity'].includes(item.sourceType))) {
+  for (const row of result.allocations.filter(item => ['official_purchase_layer','approved_opening_accounting_cost','approved_manual_purchase_layer','approved_manual_opening_quantity','approved_manual_evidence_quantity'].includes(item.sourceType))) {
     const source = officialByIdentity.get(row.purchaseLineIdentity);
     if (!source) orphanLayerCount++;
     if (Number(row.layerRemainingQuantity) < -EPSILON) negativeRemainingCount++;
@@ -999,8 +1095,18 @@ function reconcile(result) {
       layerOverConsumptionCount++;
     }
   }
+  const openingEvidenceIds = new Set();
+  let duplicateOpeningLayerCount = 0;
+  let openingOverConsumptionCount = 0;
+  for (const layer of result.officialRows.filter(row => row.fifoSourceType === 'approved_opening_accounting_cost')) {
+    if (!layer.openingEvidenceId || openingEvidenceIds.has(layer.openingEvidenceId)) duplicateOpeningLayerCount++;
+    openingEvidenceIds.add(layer.openingEvidenceId);
+    const consumed = Number(result.consumedByLayer.get(purchaseIdentity(layer)) || 0);
+    const original = Number(layer.netPurchasedQuantity || 0);
+    if (consumed - original > EPSILON) openingOverConsumptionCount++;
+  }
   const inactiveSourceCount = result.allocations.filter(row =>
-    !['official_purchase_layer', 'approved_manual_purchase_layer', 'approved_manual_opening_quantity', 'approved_manual_evidence_quantity', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
+    !['official_purchase_layer', 'approved_opening_accounting_cost', 'approved_manual_purchase_layer', 'approved_manual_opening_quantity', 'approved_manual_evidence_quantity', 'approved_manual_cost', 'unknown_cost', 'sale_return_reversal'].includes(row.sourceType)
   ).length;
   let monetaryReconciliationDifference = 0n;
   let monetaryPrecisionMismatchCount = 0;
@@ -1032,6 +1138,8 @@ function reconcile(result) {
     layerOverConsumptionCount,
     orphanLayerCount,
     negativeRemainingCount,
+    duplicateOpeningLayerCount,
+    openingOverConsumptionCount,
     inactiveSourceCount,
     monetaryPrecisionMismatchCount,
     monetaryReconciliationDifferenceExact:accountingDecimal.format(monetaryReconciliationDifference, accountingDecimal.MONEY_SCALE),
@@ -1046,6 +1154,8 @@ function reconcile(result) {
     validation.layerOverConsumptionCount === 0 &&
     validation.orphanLayerCount === 0 &&
     validation.negativeRemainingCount === 0 &&
+    validation.duplicateOpeningLayerCount === 0 &&
+    validation.openingOverConsumptionCount === 0 &&
     validation.inactiveSourceCount === 0 &&
     validation.monetaryPrecisionMismatchCount === 0 &&
     monetaryReconciliationDifference === 0n;
@@ -1059,6 +1169,7 @@ function summarize(result, validation) {
   const returnReversals = { rows:0, quantity:0, saleValue:0, costValue:0 };
   const bySource = {
     official_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
+    approved_opening_accounting_cost:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_purchase_layer:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_opening_quantity:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
     approved_manual_evidence_quantity:{ quantity:0, saleValue:0, costValue:0, rows:0, items:new Set() },
@@ -1117,15 +1228,16 @@ function summarize(result, validation) {
   }
   const confidenceScore = round(
     shaped.official_purchase_layer.quantityPercent +
+    shaped.approved_opening_accounting_cost.quantityPercent +
     (shaped.approved_manual_cost.quantityPercent + shaped.approved_manual_purchase_layer.quantityPercent + shaped.approved_manual_opening_quantity.quantityPercent + shaped.approved_manual_evidence_quantity.quantityPercent) * 0.6,
     2
   );
   let confidence = 'Unknown';
   if (shaped.unknown_cost.quantity <= EPSILON) {
-    if (shaped.approved_manual_cost.quantity + shaped.approved_manual_purchase_layer.quantity + shaped.approved_manual_opening_quantity.quantity + shaped.approved_manual_evidence_quantity.quantity <= EPSILON) confidence = 'Official Complete';
-    else if (shaped.official_purchase_layer.quantity <= EPSILON) confidence = 'Manual Complete';
+    if (shaped.approved_opening_accounting_cost.quantity + shaped.approved_manual_cost.quantity + shaped.approved_manual_purchase_layer.quantity + shaped.approved_manual_opening_quantity.quantity + shaped.approved_manual_evidence_quantity.quantity <= EPSILON) confidence = 'Official Complete';
+    else if (shaped.official_purchase_layer.quantity <= EPSILON && shaped.approved_opening_accounting_cost.quantity <= EPSILON) confidence = 'Manual Complete';
     else confidence = 'Mixed';
-  } else if (shaped.official_purchase_layer.quantity > EPSILON || shaped.approved_manual_cost.quantity > EPSILON || shaped.approved_manual_purchase_layer.quantity > EPSILON || shaped.approved_manual_opening_quantity.quantity > EPSILON || shaped.approved_manual_evidence_quantity.quantity > EPSILON) {
+  } else if (shaped.official_purchase_layer.quantity > EPSILON || shaped.approved_opening_accounting_cost.quantity > EPSILON || shaped.approved_manual_cost.quantity > EPSILON || shaped.approved_manual_purchase_layer.quantity > EPSILON || shaped.approved_manual_opening_quantity.quantity > EPSILON || shaped.approved_manual_evidence_quantity.quantity > EPSILON) {
     confidence = 'Official Partial';
   }
   return {
@@ -1136,6 +1248,7 @@ function summarize(result, validation) {
     soldQuantityExact:accountingDecimal.format(totalQuantityScaled,accountingDecimal.QUANTITY_SCALE),
     saleValueExact:accountingDecimal.format(totalSaleValueScaled,accountingDecimal.MONEY_SCALE),
     official:shaped.official_purchase_layer,
+    opening:shaped.approved_opening_accounting_cost,
     manual:{...shaped.approved_manual_cost,rows:shaped.approved_manual_cost.rows+shaped.approved_manual_purchase_layer.rows+shaped.approved_manual_opening_quantity.rows+shaped.approved_manual_evidence_quantity.rows,quantity:round(shaped.approved_manual_cost.quantity+shaped.approved_manual_purchase_layer.quantity+shaped.approved_manual_opening_quantity.quantity+shaped.approved_manual_evidence_quantity.quantity),saleValue:round(shaped.approved_manual_cost.saleValue+shaped.approved_manual_purchase_layer.saleValue+shaped.approved_manual_opening_quantity.saleValue+shaped.approved_manual_evidence_quantity.saleValue,VALUE_SCALE),costValue:round(shaped.approved_manual_cost.costValue+shaped.approved_manual_purchase_layer.costValue+shaped.approved_manual_opening_quantity.costValue+shaped.approved_manual_evidence_quantity.costValue,VALUE_SCALE),purchaseLayerScoped:shaped.approved_manual_purchase_layer,openingQuantityScoped:shaped.approved_manual_opening_quantity,historicalEvidenceQuantityScoped:shaped.approved_manual_evidence_quantity},
     unknown:shaped.unknown_cost,
     confidenceScore,
@@ -1185,7 +1298,13 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
   const requestedByActor = actor(requestedBy);
   const pinned = {
     saleSnapshotId:existing?.sourceSaleSnapshotId || clean(options.saleSnapshotId, 100),
-    purchaseDatasetId:existing?.sourcePurchaseDatasetId || clean(options.purchaseDatasetId, 100)
+    purchaseDatasetId:existing?.sourcePurchaseDatasetId || clean(options.purchaseDatasetId, 100),
+    openingDatasetId:existing?.sourceOpeningDatasetId || clean(options.openingDatasetId, 100),
+    openingFingerprints:{
+      dataset:clean(options.openingDatasetFingerprint,64),
+      source:clean(options.openingSourceFingerprint,64),
+      eligibility:clean(options.openingEligibilityFingerprint,64)
+    }
   };
   let retryCount = Number(existing?.retryCount || 0);
   let sourceReadAttempts = [];
@@ -1216,6 +1335,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
         dateTo:dates.dateTo,
         sourceSaleSnapshotId:pinned.saleSnapshotId,
         sourcePurchaseDatasetId:pinned.purchaseDatasetId,
+        sourceOpeningDatasetId:pinned.openingDatasetId,
         accountingReviewContext:accountingReviewContext(options.accountingReviewContext),
         requestedBy:requestedByActor,
         resumeCount:0,
@@ -1223,6 +1343,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
         immutableAfterCompletion:true,
         accountingApproved:false,
         profitActivationAllowed:false,
+        finalFinancialActivationEligibility:'blocked',
+        finalFinancialActivationBlockers:['OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED'],
         createdAt:startedAt,
         startedAt,
         updatedAt:startedAt
@@ -1241,10 +1363,12 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
     source.saleReturnResolutions = Array.isArray(source.saleReturnResolutions) ? source.saleReturnResolutions : [];
     pinned.saleSnapshotId = source.saleActive.snapshotId;
     pinned.purchaseDatasetId = source.purchaseActive.datasetId;
+    pinned.openingDatasetId = source.openingActive?.datasetId || '';
     const mongoReadMs = Date.now() - readStartedMs;
     await db.collection(DATASETS).updateOne({ datasetId, status:'running' }, { $set:{
       sourceSaleSnapshotId:pinned.saleSnapshotId,
       sourcePurchaseDatasetId:pinned.purchaseDatasetId,
+      sourceOpeningDatasetId:pinned.openingDatasetId,
       sourceSaleSnapshotStatus:source.saleActive.snapshot.status,
       sourcePurchaseDatasetStatus:source.purchaseActive.dataset.status,
       retryCount,
@@ -1257,6 +1381,10 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       saleLines:source.saleLines.length,
       purchaseLayers:source.purchaseLayers.length,
       approvedManualResolutions:source.manuals.length,
+      approvedOpeningEvidenceRows:source.openingRows.length,
+      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
       confirmedPurchaseReturnResolutions:source.purchaseReturnResolutions.length,
       confirmedSaleReturnResolutions:source.saleReturnResolutions.length,
       mongoReadMs,
@@ -1273,12 +1401,19 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
     const sourceFingerprint = sha256(stableStringify({
       saleSnapshotId:pinned.saleSnapshotId,
       purchaseDatasetId:pinned.purchaseDatasetId,
+      openingDatasetId:pinned.openingDatasetId,
+      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
       sales:result.sales.map(row => [saleIdentity(row), row.saleDate, round(row.qty), round(row.saleValue, VALUE_SCALE)]),
       saleReturns:result.saleReturns.map(row => [saleIdentity(row), row.saleDate, clean(row.createdDate,100), round(row.qty), round(row.saleValue, VALUE_SCALE), clean(row.generalRef,100), clean(row.relatedInvHeaderId,100), clean(row.invHeaderIdRoot,100)]),
       purchases:result.officialRows.map(row => [purchaseIdentity(row), row.purchaseInvoiceDate, round(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity), round(row.netUnitCost ?? row.grossUnitCost, VALUE_SCALE)]),
       manuals:[...source.manuals]
         .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
         .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, clean(row.manualCostExact ?? row.manualCost), clean(row.contentHash)]),
+      opening:[...(source.openingRows || [])]
+        .sort((a,b)=>openingIdentity(a).localeCompare(openingIdentity(b),'en'))
+        .map(row => [openingIdentity(row), clean(row.itemGuid,100), clean(row.itemCode,100), clean(row.effectiveOpeningDate||row.openingDate,8), clean(row.openingQuantityExact,100), clean(row.openingUnitCostExact,100), clean(row.openingTotalValueExact,100), clean(row.sourceFingerprint,64), clean(row.recordFingerprint,64)]),
       purchaseReturnResolutions:[...source.purchaseReturnResolutions]
         .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
         .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedPurchaseLayer,clean(row.returnQuantity)]),
@@ -1294,9 +1429,19 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
     }));
     const manualResolutionSet = manualCostResolution._approvedRowsFingerprint(source.manuals);
     const allocationFingerprint = sha256(stableStringify(result.allocations.map(immutableProjection)));
+    const replayResult = allocateSources(datasetId, source, dates);
+    const replayValidation = reconcile(replayResult);
+    const replayAllocationFingerprint = sha256(stableStringify(replayResult.allocations.map(immutableProjection)));
+    if (!replayValidation.valid || replayAllocationFingerprint !== allocationFingerprint) {
+      fail('FIFO_DETERMINISTIC_REPLAY_MISMATCH', 'Deterministic in-memory FIFO replay did not reproduce the allocation fingerprint.', 500);
+    }
     const candidateFingerprint = sha256(stableStringify({
       saleSnapshotId:pinned.saleSnapshotId,
       purchaseDatasetId:pinned.purchaseDatasetId,
+      openingDatasetId:pinned.openingDatasetId,
+      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
       manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
       algorithmVersion:ALGORITHM_VERSION,
       canonicalSourceHash:sourceFingerprint,
@@ -1307,11 +1452,15 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       status:'completed',
       algorithmVersion:ALGORITHM_VERSION,
       sourceFingerprint,
+      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
+      openingApprovalRevision:Number(source.openingActive?.dataset?.revision || 0),
       manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
       manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint
     });
-    const deterministicReplayVerified = Boolean(deterministicPeer);
+    const deterministicReplayVerified = true;
     const heapBeforeWrite = process.memoryUsage().heapUsed;
     await renewLock(db, datasetId);
     options.jobControl?.progress?.({ phase:'Writing Isolated Shadow Ledger', current:0, total:result.allocations.length + result.exceptions.length, message:'Writing shadow collections only' });
@@ -1347,7 +1496,13 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       updatedAt:completedAt,
       sourceSaleSnapshotId:pinned.saleSnapshotId,
       sourcePurchaseDatasetId:pinned.purchaseDatasetId,
+      sourceOpeningDatasetId:pinned.openingDatasetId,
       sourceFingerprint,
+      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
+      openingApprovalRevision:Number(source.openingActive?.dataset?.revision || 0),
+      openingApprovalStatus:clean(source.openingActive?.dataset?.approvalStatus,50),
       manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
       manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint,
@@ -1364,6 +1519,8 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       immutable:true,
       accountingApproved:false,
       profitActivationAllowed:false,
+      finalFinancialActivationEligibility:'blocked',
+      finalFinancialActivationBlockers:['OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED'],
       profitCalculated:false,
       roiCalculated:false,
       commissionCalculated:false
@@ -1397,11 +1554,16 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       activationStatus,
       sourceSaleSnapshotId:pinned.saleSnapshotId,
       sourcePurchaseDatasetId:pinned.purchaseDatasetId,
+      sourceOpeningDatasetId:pinned.openingDatasetId,
       allocationCount:persistedAllocationCount,
       exceptionCount:persistedExceptionCount,
       retryCount,
       resumeCount:Number(existing?.resumeCount || 0) + (existing ? 1 : 0),
       sourceFingerprint,
+      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
+      openingApprovalRevision:Number(source.openingActive?.dataset?.revision || 0),
       manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
       manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint,
@@ -1413,7 +1575,9 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       performance,
       shadowMode:true,
       accountingApproved:false,
-      profitActivationAllowed:false
+      profitActivationAllowed:false,
+      finalFinancialActivationEligibility:'blocked',
+      finalFinancialActivationBlockers:['OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED']
     };
   } catch (error) {
     const status = error?.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed';
