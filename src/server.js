@@ -4960,6 +4960,12 @@ async function handleApi(req, res, pathname, query) {
       const db=await connectMongo();
       return sendJson(res,200,await fifoShadowEngine.listAllocations(db,query));
     }
+    if (pathname === '/api/accounting/fifo-shadow/allocation-audit' && req.method === 'GET') {
+      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.auditAllocations(db,query));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_AUDIT_READ_FAILED',error:String(error.message||error)});}
+    }
     if (pathname === '/api/accounting/fifo-shadow/exceptions' && req.method === 'GET') {
       if (!requireRole(req,res,['admin','accounting','manager'])) return;
       const db=await connectMongo();

@@ -711,6 +711,8 @@ const uiPageLifecycle=(()=>{
   const PAGE='fifo-shadow-validation';
   const q=selector=>document.querySelector(selector);
   let selectedDatasetId='';
+  let controlDatasetId='FIFO-20260826101624-001d4c';
+  let fifoDatasetOptions=[];
   let allocationGeneration=0;
   function safe(value){return esc(value==null?'':String(value));}
   function number(value){
@@ -770,7 +772,9 @@ const uiPageLifecycle=(()=>{
   async function loadDatasets(){
     const response=await json('/api/accounting/fifo-shadow/datasets?limit=30');
     const list=response.list||[];
+    fifoDatasetOptions=list;
     if(!selectedDatasetId)selectedDatasetId=response.activeDatasetId||list[0]?.datasetId||'';
+    if(!list.some(row=>row.datasetId===controlDatasetId))controlDatasetId=list.find(row=>row.datasetId!==selectedDatasetId)?.datasetId||'';
     q('#fifoDatasets').innerHTML=`<table class="table"><thead><tr><th>Dataset</th><th>Status</th><th>Sources</th><th>Allocation</th><th>Confidence</th><th>Build</th><th></th></tr></thead><tbody>${list.map(row=>`<tr>
       <td><small>${safe(row.datasetId)}</small>${row.isActive?'<br><span class="success">ACTIVE SHADOW</span>':''}</td>
       <td>${safe(row.status)} / ${safe(row.activationStatus)}</td>
@@ -804,15 +808,21 @@ const uiPageLifecycle=(()=>{
           <h5>Top Unresolved Items</h5><table class="table"><thead><tr><th>Item</th><th>Description</th><th>Sold</th><th>Unknown</th><th>Sale Value</th></tr></thead><tbody>${(business.topUnresolvedItems||[]).map(row=>`<tr><td>${safe(row.itemCode)}</td><td>${safe(row.itemDescription)}</td><td>${number(row.soldQuantity)}</td><td>${number(row.unknownQuantity)}</td><td>${number(row.saleValue)}</td></tr>`).join('')}</tbody></table>
           <h5>Purchase Returns</h5><div class="info">کل: ${number(summary.purchaseReturns?.total)} | unresolved: ${number(summary.purchaseReturns?.unresolved)}</div>
         </div></div>
-        <div class="card"><div class="card-header"><h5>Allocation Drill-down</h5></div><div class="card-body">
-          <div class="row four"><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Purchase رسمی</option><option value="approved_opening_accounting_cost">Opening مصوب</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button> <button class="mini" id="fifoClear">پاک‌کردن فیلترها</button></div></div>
-          <div class="small">فیلترهای Invoice، ItemCode و Source هم‌زمان اعمال می‌شوند؛ برای جست‌وجوی ItemCode-only ابتدا «پاک‌کردن فیلترها» را بزنید.</div>
+        <div class="card"><div class="card-header"><h5>Allocation Drill-down / Control Delta</h5></div><div class="card-body">
+          <div class="row four"><div class="form-group"><label>حالت</label><select id="fifoMode"><option value="allocations">Allocation</option><option value="delta">Control vs Candidate Delta</option></select></div><div class="form-group"><label>Control Dataset</label><select id="fifoControl">${fifoDatasetOptions.map(row=>`<option value="${safe(row.datasetId)}" ${row.datasetId===controlDatasetId?'selected':''}>${safe(row.datasetId)}</option>`).join('')}</select></div><div class="form-group"><label>Invoice Number</label><input id="fifoInvoice"></div><div class="form-group"><label>ItemCode</label><input id="fifoItem"></div></div>
+          <div class="row four"><div class="form-group"><label>شناسه رسمی فروشنده</label><input id="fifoSellerId" placeholder="canonicalSellerId"></div><div class="form-group"><label>نام فروشنده</label><input id="fifoSellerSearch"></div><div class="form-group"><label>GUID گروه اصلی</label><input id="fifoCategoryGuid"></div><div class="form-group"><label>نام دسته</label><input id="fifoCategorySearch"></div></div>
+          <div class="row four"><div class="form-group"><label>شرح کالا</label><input id="fifoItemSearch"></div><div class="form-group"><label>از تاریخ فروش</label><input id="fifoDateFrom" placeholder="14050101"></div><div class="form-group"><label>تا تاریخ فروش</label><input id="fifoDateTo" placeholder="14051229"></div><div class="form-group"><label>Source</label><select id="fifoSource"><option value="">همه</option><option value="official_purchase_layer">Purchase رسمی</option><option value="approved_opening_accounting_cost">Opening مصوب</option><option value="sale_return_reversal">Sale Return Reversal</option><option value="approved_manual_cost">Manual</option><option value="unknown_cost">Unknown</option></select></div></div>
+          <div class="row four"><div class="form-group"><label>Provenance</label><select id="fifoStatus"><option value="">همه</option><option>PROVEN</option><option>PARTIAL</option><option>UNKNOWN</option></select></div><div class="form-group"><label>Delta</label><select id="fifoDelta"><option value="">همه</option><option value="UNKNOWN_TO_PROVEN">UNKNOWN → PROVEN</option><option value="PROVEN_TO_UNKNOWN">PROVEN → UNKNOWN</option><option value="PROVEN_TO_PROVEN_SAME_COST">PROVEN → PROVEN SAME COST</option><option value="PROVEN_TO_PROVEN_CHANGED_COST">PROVEN → PROVEN CHANGED COST</option><option value="PARTIAL_TO_PROVEN">PARTIAL → PROVEN</option><option value="PROVEN_TO_PARTIAL">PROVEN → PARTIAL</option><option value="UNKNOWN_TO_PARTIAL">UNKNOWN → PARTIAL</option><option value="PARTIAL_TO_UNKNOWN">PARTIAL → UNKNOWN</option></select></div><div class="form-group"><label>مبلغ فروش از / تا</label><div class="row"><input id="fifoSaleMin"><input id="fifoSaleMax"></div></div><div class="form-group"><label>هزینه FIFO از / تا</label><div class="row"><input id="fifoCostMin"><input id="fifoCostMax"></div></div></div>
+          <div class="row four"><div class="form-group"><label>سود FIFO از / تا</label><div class="row"><input id="fifoProfitMin"><input id="fifoProfitMax"></div></div><div class="form-group"><label>&nbsp;</label><button class="btn" id="fifoDrill">نمایش</button> <button class="mini" id="fifoClear">پاک‌کردن فیلترها</button></div></div>
+          <div class="small">تمام فیلترها با AND و فقط پس از «نمایش» یا Enter در سرور اعمال می‌شوند. مرجع فروشنده شناسه canonical و مرجع دسته GUID رسمی شایگان است؛ نام‌ها فقط جست‌وجوی نمایشی‌اند.</div>
           <div id="fifoAllocations"></div>
         </div></div>
         <div class="info">Build: ${number(dataset.performance?.durationMs)} ms | Mongo read: ${number(dataset.performance?.mongoReadMs)} ms | Allocate: ${number(dataset.performance?.allocationMs)} ms | Mongo write: ${number(dataset.performance?.mongoWriteMs)} ms | Peak observed heap: ${number((dataset.performance?.peakObservedHeapBytes||0)/1024/1024)} MiB</div>`;
       q('#fifoDrill').onclick=loadAllocations;
-      q('#fifoClear').onclick=async()=>{q('#fifoInvoice').value='';q('#fifoItem').value='';q('#fifoSource').value='';await loadAllocations();};
-      [q('#fifoInvoice'),q('#fifoItem')].forEach(input=>input.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();loadAllocations();}});
+      q('#fifoClear').onclick=async()=>{['fifoInvoice','fifoItem','fifoSellerId','fifoSellerSearch','fifoCategoryGuid','fifoCategorySearch','fifoItemSearch','fifoDateFrom','fifoDateTo','fifoSaleMin','fifoSaleMax','fifoCostMin','fifoCostMax','fifoProfitMin','fifoProfitMax'].forEach(id=>{if(q('#'+id))q('#'+id).value='';});['fifoSource','fifoStatus','fifoDelta'].forEach(id=>{if(q('#'+id))q('#'+id).value='';});q('#fifoMode').value='allocations';await loadAllocations();};
+      q('#fifoControl').onchange=()=>{controlDatasetId=q('#fifoControl').value;};
+      q('#fifoMode').onchange=()=>{q('#fifoDelta').disabled=q('#fifoMode').value!=='delta';};q('#fifoMode').onchange();
+      document.querySelectorAll('#fifoReport input, #fifoReport select').forEach(input=>input.onkeydown=event=>{if(event.key==='Enter'){event.preventDefault();loadAllocations();}});
       await loadAllocations();
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
@@ -822,22 +832,24 @@ const uiPageLifecycle=(()=>{
     const itemInput=q('#fifoItem');
     const normalizedItemCode=normalizedItemCodeInput(itemInput?.value||'');
     if(itemInput)itemInput.value=normalizedItemCode;
-    const response=await json('/api/accounting/fifo-shadow/allocations?'+query({
+    const mode=q('#fifoMode')?.value||'allocations';
+    controlDatasetId=q('#fifoControl')?.value||controlDatasetId;
+    const response=await json('/api/accounting/fifo-shadow/allocation-audit?'+query({
       datasetId:selectedDatasetId,
+      controlDatasetId,
+      mode,
       invoiceNo:q('#fifoInvoice')?.value||'',
       itemCode:normalizedItemCode,
+      canonicalSellerId:q('#fifoSellerId')?.value||'',sellerSearch:q('#fifoSellerSearch')?.value||'',
+      canonicalCategoryGuid:q('#fifoCategoryGuid')?.value||'',categorySearch:q('#fifoCategorySearch')?.value||'',
+      itemSearch:q('#fifoItemSearch')?.value||'',dateFrom:q('#fifoDateFrom')?.value||'',dateTo:q('#fifoDateTo')?.value||'',
       sourceType:q('#fifoSource')?.value||'',
+      provenanceStatus:q('#fifoStatus')?.value||'',deltaClass:q('#fifoDelta')?.value||'',
+      saleMin:q('#fifoSaleMin')?.value||'',saleMax:q('#fifoSaleMax')?.value||'',costMin:q('#fifoCostMin')?.value||'',costMax:q('#fifoCostMax')?.value||'',profitMin:q('#fifoProfitMin')?.value||'',profitMax:q('#fifoProfitMax')?.value||'',
       pageSize:200
     }));
     if(generation!==allocationGeneration||!box.isConnected)return;
     const rows=response.list||[];
-    const amount=value=>value==null?null:Number(value);
-    const costEffect=row=>amount(row.allocatedCostAmountExact??row.allocatedCostAmount);
-    const saleEffect=row=>amount(row.allocatedSaleValueExact??row.allocatedSaleValue);
-    const knownRows=rows.filter(row=>costEffect(row)!=null);
-    const netSale=rows.reduce((sum,row)=>sum+(saleEffect(row)||0),0);
-    const provenSale=knownRows.reduce((sum,row)=>sum+(saleEffect(row)||0),0);
-    const netCost=knownRows.reduce((sum,row)=>sum+costEffect(row),0);
     const sourceLabel=row=>row.sourceType==='sale_return_reversal'
       ? `برگشت از فروش ← فروش ${safe(row.originSaleInvoiceNo||'—')}`
       : row.sourceType==='official_purchase_layer'?'فروش — مأخذ خرید رسمی'
@@ -850,13 +862,24 @@ const uiPageLifecycle=(()=>{
       ? `Opening Dataset ${safe(row.openingDatasetId||'—')}<br><small>Evidence: ${safe(row.openingEvidenceId||'—')}<br>Base date: ${safe(row.openingBaseDate||'—')}<br>Original: ${safe(row.openingOriginalQuantityExact||'—')} | Remaining: ${safe(row.openingRemainingQuantityExact||'—')}<br>Unit cost: ${safe(row.openingUnitCostExact||row.unitCostExact||'—')}<br>Approval: ${safe(row.openingApprovalStatus||'—')} / revision ${safe(row.openingApprovalRevision||'—')}<br>Fingerprint: ${safe(row.openingRecordFingerprint||'—')}</small>`
       : `فاکتور خرید ${safe(row.purchaseInvoiceNo||'—')}<br><small>${safe(row.purchaseLineIdentity||row.manualResolutionId||'—')}</small>`;
     const applied=response.appliedFilters||{};
-    box.innerHTML=`<div class="small"><b>Dataset:</b> ${safe(response.datasetId||selectedDatasetId)} | <b>فیلترهای اعمال‌شده:</b> Invoice ${safe(applied.invoiceNo||'همه')} | ItemCode ${safe(applied.itemCode||'همه')} | Source ${safe(applied.sourceType||'همه')} | <b>Rows:</b> ${number(response.total)}</div>
-      <div class="info"><b>اثر خالص ردیف‌های نمایش‌داده‌شده</b><br>فروش/برگشت: ${number(netSale)} ریال | هزینه FIFO اثبات‌شده: ${number(netCost)} ریال | سود خالص فقط ردیف‌های اثبات‌شده: ${number(provenSale-netCost)} ریال${knownRows.length!==rows.length?' | ردیف هزینه‌نامشخص در سود اثبات‌شده محاسبه نشده است.':''}</div>
-      <table class="table"><thead><tr><th>فروش / برگشت از فروش</th><th>کالا / فروشنده</th><th>تعداد</th><th>مأخذ هزینه</th><th>اثر فروش</th><th>اثر هزینه</th><th>اثر خالص</th><th>وضعیت</th></tr></thead><tbody>${rows.map(row=>{const sale=saleEffect(row),cost=costEffect(row);return `<tr>
+    const active=Object.entries(applied).filter(([key,value])=>!['datasetId','controlDatasetId','mode'].includes(key)&&value).map(([key,value])=>`<span class="info">${safe(key)}: ${safe(value)}</span>`).join(' ')||'<span class="muted">بدون فیلتر</span>';
+    const aggregates=response.aggregates||{};
+    const performance=`<div class="small">Server read: ${number(response.performance?.serverReadMs)} ms | Candidate rows: ${number(response.performance?.scannedCandidateRows)}${response.performance?.scannedControlRows!=null?` | Control rows: ${number(response.performance.scannedControlRows)}`:''} | Prefiltered: ${number(response.performance?.prefilteredRows)} | ${safe(response.performance?.indexContract||'')}</div>`;
+    if(response.mode==='delta'){
+      const financial=value=>value==null||value===''?'UNKNOWN':number(value);
+      const evidence=fact=>(fact?.evidence||[]).map(item=>`${safe(item.sourceType)} — ${item.purchaseInvoiceNo?`خرید ${safe(item.purchaseInvoiceNo)}`:safe(item.openingEvidenceId||item.manualResolutionId||item.reason||'—')} — ${financial(item.costExact)}${item.costExact==null||item.costExact===''?'':' ریال'}`).join('<br>')||'—';
+      box.innerHTML=`<div class="small"><b>Candidate:</b> ${safe(response.datasetId)} | <b>Control:</b> ${safe(response.controlDatasetId)} | <b>فیلترهای اعمال‌شده:</b> ${active}</div>
+        <div class="info"><b>Delta Aggregates — محاسبه سرور</b><br>Rows: ${number(aggregates.rows)} | Newly PROVEN Sale: ${number(aggregates.newlyProvenSaleExact)} | Newly PROVEN Profit: ${number(aggregates.newlyProvenProfitExact)} | Lost PROVEN Sale: ${number(aggregates.lostProvenSaleExact)} | Changed-cost exposure: ${number(aggregates.changedCostExposureExact)}</div>${performance}
+        <table class="table"><thead><tr><th>هویت پایدار</th><th>Control</th><th>Candidate</th><th>Delta</th><th>دلیل / شواهد</th></tr></thead><tbody>${rows.map(row=>`<tr><td>فاکتور ${safe(row.identity?.saleInvoiceNo)} / ${safe(row.identity?.saleDate)}<br>${safe(row.identity?.itemCode)} — ${safe(row.identity?.itemDescription)}<br><small>${safe(row.saleLineId)}<br>${safe(row.identity?.sellerName)} (${safe(row.identity?.canonicalSellerId)})<br>${safe(row.identity?.categoryName)} (${safe(row.identity?.canonicalCategoryGuid)})</small></td><td>${safe(row.control?.profitProvenanceStatus||'MISSING')}<br>Source: ${safe(row.control?.costSourceType||'—')}<br>Cost: ${financial(row.control?.fifoCostExact)}<br>Profit: ${financial(row.control?.fifoProfitExact)}</td><td>${safe(row.candidate?.profitProvenanceStatus||'MISSING')}<br>Source: ${safe(row.candidate?.costSourceType||'—')}<br>Cost: ${financial(row.candidate?.fifoCostExact)}<br>Profit: ${financial(row.candidate?.fifoProfitExact)}</td><td><b>${safe(row.deltaClass)}</b><br>Cost Δ: ${number(row.costDeltaExact)}<br>Profit Δ: ${number(row.profitDeltaExact)}</td><td><b>Control</b><br>${evidence(row.control)}<br><b>Candidate</b><br>${evidence(row.candidate)}</td></tr>`).join('')||'<tr><td colspan="5">رکوردی وجود ندارد.</td></tr>'}</tbody></table>`;
+      return;
+    }
+    box.innerHTML=`<div class="small"><b>Dataset:</b> ${safe(response.datasetId||selectedDatasetId)} | <b>فیلترهای اعمال‌شده:</b> ${active} | <b>Rows:</b> ${number(response.total)}</div>
+      <div class="info"><b>Aggregates — محاسبه سرور</b><br>Sale lines: ${number(aggregates.saleLines)} | Quantity: ${number(aggregates.quantityExact)} | Sale: ${number(aggregates.saleValueExact)} | FIFO Cost: ${number(aggregates.fifoCostExact)} | FIFO Profit: ${number(aggregates.fifoProfitExact)} | UNKNOWN exposure: ${number(aggregates.unknownExposureExact)}</div>${performance}
+      <table class="table"><thead><tr><th>فروش / برگشت از فروش</th><th>کالا / فروشنده / دسته</th><th>تعداد</th><th>مأخذ هزینه</th><th>اثر فروش</th><th>اثر هزینه</th><th>اثر خالص</th><th>وضعیت</th></tr></thead><tbody>${rows.map(row=>{const sale=Number(row.allocatedSaleValueExact??row.allocatedSaleValue??0),cost=row.allocatedCostAmountExact==null&&row.allocatedCostAmount==null?null:Number(row.allocatedCostAmountExact??row.allocatedCostAmount);return `<tr>
       <td><b>${sourceLabel(row)}</b><br>فاکتور ${safe(row.saleInvoiceNo)} / ${safe(row.saleDate)}<br><small>${safe(row.saleLineId)}</small></td>
-      <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}<br>${safe(row.sellerName||row.sellerAccountNumber||'')}</small></td>
+      <td>${safe(row.itemCode)}<br><small>${safe(row.itemDescription)}<br>${safe(row.sellerName||'')} (${safe(row.canonicalSellerId||'')})<br>${safe(row.canonicalCategoryName||row.officialProductCategoryName||row.productCategory||'')} (${safe(row.canonicalCategoryGuid||'')})</small></td>
       <td>${number(row.allocatedQty||row.unknownQty)}</td><td>${provenance(row)}</td>
-      <td>${number(sale||0)}</td><td>${cost==null?'UNKNOWN':number(cost)}</td><td>${cost==null?'UNKNOWN':number((sale||0)-cost)}</td><td>${safe(row.returnEffect||row.unknownReason||'اثبات‌شده')}</td>
+      <td>${number(sale)}</td><td>${cost==null?'UNKNOWN':number(cost)}</td><td>${cost==null?'UNKNOWN':number(sale-cost)}</td><td>${safe(row.profitProvenanceStatus)}<br><small>${safe(row.returnEffect||row.unknownReason||'اثبات‌شده')}</small></td>
     </tr>`;}).join('')||'<tr><td colspan="8">رکوردی وجود ندارد.</td></tr>'}</tbody></table>`;
   }
   async function startBuild(resumeDatasetId=''){

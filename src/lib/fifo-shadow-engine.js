@@ -282,7 +282,8 @@ function immutableProjection(row) {
   };
 }
 
-async function ensureIndexes(db) {
+const indexReadyByDb = new WeakMap();
+async function initializeIndexes(db) {
   const existing = new Set((await db.listCollections().toArray()).map(row => row.name));
   for (const name of [DATASETS, ALLOCATIONS, DIAGNOSTICS, EXCEPTIONS, STATE]) {
     if (!existing.has(name)) await db.createCollection(name).catch(() => {});
@@ -300,6 +301,8 @@ async function ensureIndexes(db) {
   await db.collection(ALLOCATIONS).createIndex({ datasetId:1, productCategoryGuid:1, saleLineId:1 });
   await db.collection(ALLOCATIONS).createIndex({ datasetId:1, officialProductCategoryName:1, saleLineId:1 });
   await db.collection(ALLOCATIONS).createIndex({ datasetId:1, productCategory:1, saleLineId:1 });
+  await db.collection(ALLOCATIONS).createIndex({ datasetId:1, saleDate:1, saleInvoiceNo:1, saleLineId:1 });
+  await db.collection(ALLOCATIONS).createIndex({ datasetId:1, sourceType:1, saleDate:1, saleLineId:1 });
   await db.collection(ALLOCATIONS).createIndex({ datasetId:1, purchaseLineIdentity:1 });
   await db.collection(ALLOCATIONS).createIndex({ datasetId:1, manualResolutionId:1 });
   await db.collection(DIAGNOSTICS).createIndex({ datasetId:1, at:1 });
@@ -307,6 +310,10 @@ async function ensureIndexes(db) {
   await db.collection(EXCEPTIONS).createIndex({ datasetId:1, status:1, code:1, itemCode:1 });
   await db.collection(STATE).createIndex({ scopeKey:1 }, { unique:true });
   return { ok:true, schemaVersion:SCHEMA_VERSION, algorithmVersion:ALGORITHM_VERSION };
+}
+async function ensureIndexes(db) {
+  if(!indexReadyByDb.has(db))indexReadyByDb.set(db,initializeIndexes(db).catch(error=>{indexReadyByDb.delete(db);throw error;}));
+  return indexReadyByDb.get(db);
 }
 
 async function count(collection, query = {}) {
@@ -1667,6 +1674,207 @@ async function listAllocations(db, filters = {}) {
     shadowMode:true,accountingApproved:false
   };
 }
+
+function escapedRegex(value) {
+  return clean(value, 300).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+function auditSellerId(row) {
+  return clean(row.canonicalSellerId || row.sellerAccountNumber || row.sellerIdentity, 100);
+}
+function auditCategoryGuid(row) {
+  return clean(row.canonicalCategoryGuid || row.officialProductCategoryGuid || row.productCategoryGuid, 100);
+}
+function decimalOrNull(value, scale = accountingDecimal.MONEY_SCALE) {
+  if (value == null || clean(value, 100) === '') return null;
+  try { return accountingDecimal.parse(value, scale); } catch { return null; }
+}
+function exactAmount(row, field) {
+  if (field === 'sale') return decimalOrNull(row.allocatedSaleValueExact ?? row.allocatedSaleValue ?? 0);
+  if (field === 'cost') return decimalOrNull(row.allocatedCostAmountExact ?? row.allocatedCostAmount);
+  const sale = exactAmount(row, 'sale'), cost = exactAmount(row, 'cost');
+  return sale == null || cost == null ? null : sale - cost;
+}
+function rangeValue(filters, key) {
+  const raw = clean(filters[key], 100).replace(/[,،\s]/g, '');
+  if (!raw) return null;
+  const value = decimalOrNull(raw);
+  if (value == null) fail('FIFO_AUDIT_FILTER_INVALID', `فیلتر ${key} معتبر نیست.`, 400);
+  return value;
+}
+function inRange(value, min, max) {
+  return value != null && (min == null || value >= min) && (max == null || value <= max);
+}
+function auditBaseQuery(datasetId, filters = {}) {
+  const query = { datasetId };
+  const saleLineId = clean(filters.saleLineId, 500);
+  const invoiceNo = clean(filters.invoiceNo, 100);
+  const itemCode = canonicalItemCatalog.normalizedItemCode(filters.itemCode);
+  const sourceType = clean(filters.sourceType, 100);
+  const canonicalSellerId = clean(filters.canonicalSellerId, 100);
+  const sellerSearch = escapedRegex(filters.sellerSearch);
+  const itemSearch = escapedRegex(filters.itemSearch);
+  const dateFrom = clean(filters.dateFrom, 8);
+  const dateTo = clean(filters.dateTo, 8);
+  const and = [];
+  if (saleLineId) query.saleLineId = saleLineId;
+  if (invoiceNo) query.saleInvoiceNo = Number(invoiceNo);
+  if (itemCode) query.itemCode = itemCode;
+  if (sourceType) query.sourceType = sourceType;
+  if (canonicalSellerId) and.push({ $or:[{canonicalSellerId},{sellerAccountNumber:canonicalSellerId},{sellerIdentity:canonicalSellerId}] });
+  if (sellerSearch) and.push({ sellerName:{ $regex:sellerSearch, $options:'i' } });
+  if (itemSearch) and.push({ itemDescription:{ $regex:itemSearch, $options:'i' } });
+  if (dateFrom || dateTo) query.saleDate = { ...(dateFrom?{$gte:dateFrom}:{}), ...(dateTo?{$lte:dateTo}:{}) };
+  if (and.length) query.$and = and;
+  return query;
+}
+async function canonicalCategoryMap(db, rows) {
+  const itemCodes=[...new Set(rows.map(row=>canonicalItemCatalog.normalizedItemCode(row.itemCode)).filter(Boolean))];
+  if(!itemCodes.length)return new Map();
+  const assignments=await db.collection('accountingOfficialItemGroupAssignments').find({active:true,itemCode:{$in:itemCodes}}).toArray();
+  const grouped=new Map();
+  for(const row of assignments){
+    const code=canonicalItemCatalog.normalizedItemCode(row.itemCode),guid=clean(row.resolvedMainGroupGuid,100);
+    if(!code||!guid)continue;
+    const byGuid=grouped.get(code)||new Map();
+    byGuid.set(guid,{guid,name:clean(row.resolvedMainGroupName,300),identity:clean(row.resolvedMainGroupIdentity,300),source:'accountingOfficialItemGroupAssignments'});
+    grouped.set(code,byGuid);
+  }
+  return new Map([...grouped].map(([code,byGuid])=>[code,byGuid.size===1?[...byGuid.values()][0]:{guid:'',name:'',identity:'',source:'AMBIGUOUS_OFFICIAL_CATEGORY'}]));
+}
+function enrichAuditCategories(rows,categoryMap){
+  return rows.map(row=>{
+    const resolved=categoryMap.get(canonicalItemCatalog.normalizedItemCode(row.itemCode));
+    const existingGuid=auditCategoryGuid(row);
+    return {...row,canonicalCategoryGuid:existingGuid||resolved?.guid||'',canonicalCategoryName:existingGuid?clean(row.officialProductCategoryName||row.productCategory,300):(resolved?.name||''),canonicalCategorySource:existingGuid?'fifo-allocation':(resolved?.source||'UNRESOLVED')};
+  });
+}
+function categoryFilter(rows,filters){
+  const guid=clean(filters.canonicalCategoryGuid,100),needle=identity(filters.categorySearch);
+  return rows.filter(row=>(!guid||auditCategoryGuid(row)===guid)&&(!needle||identity(row.canonicalCategoryName||row.officialProductCategoryName||row.productCategory).includes(needle)));
+}
+function categoryItemCodes(categoryMap,filters){
+  const guid=clean(filters.canonicalCategoryGuid,100),needle=identity(filters.categorySearch);
+  if(!guid&&!needle)return null;
+  return [...categoryMap].filter(([,row])=>(!guid||row.guid===guid)&&(!needle||identity(row.name).includes(needle))).map(([itemCode])=>itemCode);
+}
+function auditAppliedFilters(datasetId, filters = {}) {
+  return {
+    datasetId,
+    controlDatasetId:clean(filters.controlDatasetId,100),
+    mode:clean(filters.mode,20)||'allocations',
+    canonicalSellerId:clean(filters.canonicalSellerId,100),sellerSearch:clean(filters.sellerSearch,200),
+    canonicalCategoryGuid:clean(filters.canonicalCategoryGuid,100),categorySearch:clean(filters.categorySearch,200),
+    itemCode:canonicalItemCatalog.normalizedItemCode(filters.itemCode),itemSearch:clean(filters.itemSearch,200),
+    invoiceNo:clean(filters.invoiceNo,100),dateFrom:clean(filters.dateFrom,8),dateTo:clean(filters.dateTo,8),
+    sourceType:clean(filters.sourceType,100),provenanceStatus:clean(filters.provenanceStatus,100),deltaClass:clean(filters.deltaClass,100),
+    saleMin:clean(filters.saleMin,100),saleMax:clean(filters.saleMax,100),costMin:clean(filters.costMin,100),costMax:clean(filters.costMax,100),profitMin:clean(filters.profitMin,100),profitMax:clean(filters.profitMax,100)
+  };
+}
+function allocationAggregates(rows) {
+  let quantity=0n,sale=0n,cost=0n,profit=0n,unknown=0n;
+  const lineIds=new Set();
+  for (const row of rows) {
+    lineIds.add(clean(row.originalSaleLineId || row.saleLineId,500));
+    quantity += accountingDecimal.parse(row.quantityExact ?? row.allocatedQty ?? row.unknownQty ?? 0, accountingDecimal.QUANTITY_SCALE);
+    const saleValue=exactAmount(row,'sale')||0n, costValue=exactAmount(row,'cost');
+    sale += saleValue;
+    if (costValue == null) unknown += saleValue;
+    else { cost += costValue; profit += saleValue-costValue; }
+  }
+  return {rows:rows.length,saleLines:lineIds.size,quantityExact:accountingDecimal.format(quantity,accountingDecimal.QUANTITY_SCALE),saleValueExact:accountingDecimal.format(sale,accountingDecimal.MONEY_SCALE),fifoCostExact:accountingDecimal.format(cost,accountingDecimal.MONEY_SCALE),fifoProfitExact:accountingDecimal.format(profit,accountingDecimal.MONEY_SCALE),unknownExposureExact:accountingDecimal.format(unknown,accountingDecimal.MONEY_SCALE)};
+}
+function provenanceByLine(rows, manuals = []) {
+  return new Map(provenanceFacts(rows, manuals).map(row => [row.saleLineId,row]));
+}
+function rowMatchesFinancialFilters(row, ranges) {
+  return (!hasRange(ranges.saleMin,ranges.saleMax)||inRange(exactAmount(row,'sale'),ranges.saleMin,ranges.saleMax))
+    && (!hasRange(ranges.costMin,ranges.costMax)||inRange(exactAmount(row,'cost'),ranges.costMin,ranges.costMax))
+    && (!hasRange(ranges.profitMin,ranges.profitMax)||inRange(exactAmount(row,'profit'),ranges.profitMin,ranges.profitMax));
+}
+function hasRange(min,max){return min!=null||max!=null;}
+function auditRanges(filters){return {saleMin:rangeValue(filters,'saleMin'),saleMax:rangeValue(filters,'saleMax'),costMin:rangeValue(filters,'costMin'),costMax:rangeValue(filters,'costMax'),profitMin:rangeValue(filters,'profitMin'),profitMax:rangeValue(filters,'profitMax')};}
+function allocationAuditStatus(row, byLine) {
+  return byLine.get(clean(row.originalSaleLineId || row.saleLineId,500))?.profitProvenanceStatus || (row.sourceType==='unknown_cost'?'UNKNOWN':'PROVEN');
+}
+function deltaClass(control, candidate) {
+  const before=control?.profitProvenanceStatus||'MISSING',after=candidate?.profitProvenanceStatus||'MISSING';
+  if(before==='PROVEN'&&after==='PROVEN')return control.fifoCostExact===candidate.fifoCostExact?'PROVEN_TO_PROVEN_SAME_COST':'PROVEN_TO_PROVEN_CHANGED_COST';
+  return `${before}_TO_${after}`;
+}
+function factEvidence(row) {
+  return (row?._rows||[]).map(allocation=>({sourceType:allocation.sourceType,costSourceType:allocation.costSourceType||'',purchaseInvoiceNo:Number(allocation.purchaseInvoiceNo||0),purchaseLineIdentity:clean(allocation.purchaseLineIdentity,500),openingEvidenceId:clean(allocation.openingEvidenceId,100),manualResolutionId:clean(allocation.manualResolutionId,100),quantityExact:clean(allocation.quantityExact??allocation.allocatedQty??allocation.unknownQty,100),costExact:clean(allocation.allocatedCostAmountExact??allocation.allocatedCostAmount,100),reason:clean(allocation.unknownReason||allocation.returnEffect,500)}));
+}
+function factMatchesRanges(fact,ranges){
+  const sale=decimalOrNull(fact.saleValueExact),cost=decimalOrNull(fact.fifoCostExact),profit=decimalOrNull(fact.fifoProfitExact);
+  return (!hasRange(ranges.saleMin,ranges.saleMax)||inRange(sale,ranges.saleMin,ranges.saleMax))&&(!hasRange(ranges.costMin,ranges.costMax)||inRange(cost,ranges.costMin,ranges.costMax))&&(!hasRange(ranges.profitMin,ranges.profitMax)||inRange(profit,ranges.profitMin,ranges.profitMax));
+}
+function deltaAggregates(rows) {
+  let newlyProvenSale=0n,newlyProvenProfit=0n,lostProvenSale=0n,changedCostExposure=0n;
+  for(const row of rows){
+    const sale=decimalOrNull(row.candidate?.saleValueExact??row.control?.saleValueExact)||0n;
+    if(row.deltaClass==='UNKNOWN_TO_PROVEN'||row.deltaClass==='PARTIAL_TO_PROVEN'||row.deltaClass==='MISSING_TO_PROVEN'){newlyProvenSale+=sale;newlyProvenProfit+=decimalOrNull(row.candidate?.fifoProfitExact)||0n;}
+    if(row.deltaClass==='PROVEN_TO_UNKNOWN'||row.deltaClass==='PROVEN_TO_PARTIAL'||row.deltaClass==='PROVEN_TO_MISSING')lostProvenSale+=sale;
+    if(row.deltaClass==='PROVEN_TO_PROVEN_CHANGED_COST')changedCostExposure+=sale;
+  }
+  return {rows:rows.length,newlyProvenSaleExact:accountingDecimal.format(newlyProvenSale,2),newlyProvenProfitExact:accountingDecimal.format(newlyProvenProfit,2),lostProvenSaleExact:accountingDecimal.format(lostProvenSale,2),changedCostExposureExact:accountingDecimal.format(changedCostExposure,2)};
+}
+const auditContextCache=new Map();
+async function auditDatasetContext(db,dataset){
+  const key=`${dataset.datasetId}|${dataset.allocationFingerprint||dataset.candidateFingerprint||''}`;
+  if(auditContextCache.has(key))return auditContextCache.get(key);
+  const promise=(async()=>{
+    const rawRows=await db.collection(ALLOCATIONS).find({datasetId:dataset.datasetId}).toArray();
+    const categoryMap=await canonicalCategoryMap(db,rawRows);
+    const rows=enrichAuditCategories(rawRows,categoryMap);
+    return {rows,categoryMap,facts:provenanceByLine(rows)};
+  })().catch(error=>{auditContextCache.delete(key);throw error;});
+  auditContextCache.set(key,promise);
+  while(auditContextCache.size>3)auditContextCache.delete(auditContextCache.keys().next().value);
+  return promise;
+}
+async function auditAllocations(db, filters = {}) {
+  const startedAt=Date.now();
+  await ensureIndexes(db);
+  const datasetId=clean(filters.datasetId,100);
+  if(!datasetId)fail('FIFO_DATASET_REQUIRED','Candidate Dataset الزامی است.',400);
+  const dataset=await db.collection(DATASETS).findOne({datasetId});
+  if(!dataset)fail('FIFO_DATASET_NOT_FOUND','FIFO Candidate پیدا نشد.',404);
+  const appliedFilters=auditAppliedFilters(datasetId,filters),ranges=auditRanges(filters);
+  const page=Math.max(1,Number(filters.page||1)),pageSize=Math.max(1,Math.min(Number(filters.pageSize||100),500));
+  const candidateContext=await auditDatasetContext(db,dataset),allCandidateRows=candidateContext.rows;
+  const baseQuery=auditBaseQuery(datasetId,filters),categoryCodes=categoryItemCodes(candidateContext.categoryMap,filters);
+  if(categoryCodes){
+    if(typeof baseQuery.itemCode==='string'&&!categoryCodes.includes(baseQuery.itemCode))baseQuery.itemCode={ $in:[] };
+    else if(!baseQuery.itemCode)baseQuery.itemCode={ $in:categoryCodes };
+  }
+  let candidateRows=await db.collection(ALLOCATIONS).find(baseQuery).sort({saleDate:1,saleInvoiceNo:1,saleRow:1,allocationSequence:1}).toArray();
+  if(candidateRows.length>100000)fail('FIFO_AUDIT_SCOPE_TOO_LARGE','دامنه ممیزی بیش از حد مجاز است؛ فیلتر محدودتری اعمال کنید.',413);
+  candidateRows=categoryFilter(enrichAuditCategories(candidateRows,candidateContext.categoryMap),filters);
+  const candidateFacts=candidateContext.facts;
+  if(appliedFilters.mode!=='delta'){
+    const rows=candidateRows.filter(row=>!appliedFilters.provenanceStatus||allocationAuditStatus(row,candidateFacts)===appliedFilters.provenanceStatus).filter(row=>{
+      if(!hasRange(ranges.saleMin,ranges.saleMax)&&!hasRange(ranges.costMin,ranges.costMax)&&!hasRange(ranges.profitMin,ranges.profitMax))return true;
+      return rowMatchesFinancialFilters(row,ranges);
+    }).map(row=>({...row,canonicalSellerId:auditSellerId(row),canonicalCategoryGuid:auditCategoryGuid(row),profitProvenanceStatus:allocationAuditStatus(row,candidateFacts)}));
+    return {ok:true,readOnly:true,mode:'allocations',datasetId,total:rows.length,page,pageSize,list:rows.slice((page-1)*pageSize,page*pageSize),aggregates:allocationAggregates(rows),appliedFilters,performance:{serverReadMs:Date.now()-startedAt,scannedCandidateRows:allCandidateRows.length,prefilteredRows:candidateRows.length,indexContract:'datasetId + canonical identity/date/source compounds; explicit-submit only'},shadowMode:true,accountingApproved:false};
+  }
+  const controlDatasetId=appliedFilters.controlDatasetId;
+  if(!controlDatasetId)fail('FIFO_CONTROL_DATASET_REQUIRED','Control Dataset الزامی است.',400);
+  const control=await db.collection(DATASETS).findOne({datasetId:controlDatasetId});
+  if(!control)fail('FIFO_CONTROL_DATASET_NOT_FOUND','Control FIFO پیدا نشد.',404);
+  const controlContext=await auditDatasetContext(db,control),allControlRows=controlContext.rows;
+  const candidateBy=candidateContext.facts,controlBy=controlContext.facts;
+  const eligibleLines=new Set(candidateRows.map(row=>clean(row.originalSaleLineId||row.saleLineId,500)));
+  const keys=[...new Set([...candidateBy.keys(),...controlBy.keys()])].filter(key=>eligibleLines.has(key));
+  const rows=keys.map(saleLineId=>{
+    const candidateFact=candidateBy.get(saleLineId)||null,controlFact=controlBy.get(saleLineId)||null,classification=deltaClass(controlFact,candidateFact);
+    const costDelta=(decimalOrNull(candidateFact?.fifoCostExact)||0n)-(decimalOrNull(controlFact?.fifoCostExact)||0n);
+    const profitDelta=(decimalOrNull(candidateFact?.fifoProfitExact)||0n)-(decimalOrNull(controlFact?.fifoProfitExact)||0n);
+    return {saleLineId,deltaClass:classification,identity:{saleInvoiceNo:candidateFact?.saleInvoiceNo??controlFact?.saleInvoiceNo,itemCode:candidateFact?.itemCode??controlFact?.itemCode,itemDescription:candidateFact?.itemDescription??controlFact?.itemDescription,saleDate:candidateFact?.saleDate??controlFact?.saleDate,canonicalSellerId:candidateFact?.canonicalSellerId??controlFact?.canonicalSellerId,sellerName:candidateFact?.sellerName??controlFact?.sellerName,canonicalCategoryGuid:candidateFact?.canonicalCategoryGuid??controlFact?.canonicalCategoryGuid,categoryName:candidateFact?.productCategory??controlFact?.productCategory},control:controlFact?{...controlFact,evidence:factEvidence(controlFact),_rows:undefined}:null,candidate:candidateFact?{...candidateFact,evidence:factEvidence(candidateFact),_rows:undefined}:null,costDeltaExact:accountingDecimal.format(costDelta,2),profitDeltaExact:accountingDecimal.format(profitDelta,2)};
+  }).filter(row=>(!appliedFilters.deltaClass||row.deltaClass===appliedFilters.deltaClass)&&(!appliedFilters.provenanceStatus||(row.candidate||row.control)?.profitProvenanceStatus===appliedFilters.provenanceStatus)&&factMatchesRanges(row.candidate||row.control,ranges));
+  rows.sort((a,b)=>String(a.identity.saleDate||'').localeCompare(String(b.identity.saleDate||''),'en')||Number(a.identity.saleInvoiceNo||0)-Number(b.identity.saleInvoiceNo||0)||a.saleLineId.localeCompare(b.saleLineId,'en'));
+  return {ok:true,readOnly:true,mode:'delta',datasetId,controlDatasetId,total:rows.length,page,pageSize,list:rows.slice((page-1)*pageSize,page*pageSize),aggregates:deltaAggregates(rows),appliedFilters,performance:{serverReadMs:Date.now()-startedAt,scannedCandidateRows:allCandidateRows.length,scannedControlRows:allControlRows.length,prefilteredRows:candidateRows.length,indexContract:'datasetId + canonical identity/date/source compounds; explicit-submit only'},shadowMode:true,accountingApproved:false};
+}
 async function listExceptions(db, filters = {}) {
   await ensureIndexes(db);
   const active = filters.datasetId ? null : await activeDataset(db);
@@ -1698,7 +1906,7 @@ function provenanceFacts(allocations,manualRows=[]){
     const netQuantityExact=accountingDecimal.format(rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.quantityExact??row.allocatedQty??row.unknownQty??0,accountingDecimal.QUANTITY_SCALE),0n),accountingDecimal.QUANTITY_SCALE);
     const saleValueExact=accountingDecimal.format(rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedSaleValueExact??row.allocatedSaleValue??0,accountingDecimal.MONEY_SCALE),0n),accountingDecimal.MONEY_SCALE);
     const provenance=profitProvenance.lineProvenance(rows,{saleQtyExact:netQuantityExact,saleValueExact,manualById});
-    facts.push({saleLineId,saleInvoiceNo:Number(first.saleInvoiceNo||0),sellerIdentity:clean(first.sellerAccountNumber,100)||'UNRESOLVED',productCategory:clean(first.officialProductCategoryName,300)||'UNRESOLVED',itemCode:clean(first.itemCode,100),quantityExact:provenance.provenanceReconciliation.requiredQtyExact,saleValueExact,fifoCostExact:provenance.provenanceReconciliation.allocatedCostExact,fifoProfitExact:provenance.provenanceReconciliation.fifoProfitExact,profitProvenanceStatus:provenance.profitProvenanceStatus,costSourceType:provenance.costSourceType,provenanceSources:provenance.provenanceSources,provenanceFingerprint:provenance.provenanceFingerprint,returnAllocationCount:rows.filter(row=>row.sourceType==='sale_return_reversal').length});
+    facts.push({saleLineId,saleInvoiceNo:Number(first.saleInvoiceNo||0),saleDate:clean(first.saleDate,8),sellerIdentity:auditSellerId(first)||'UNRESOLVED',canonicalSellerId:auditSellerId(first)||'UNRESOLVED',sellerName:clean(first.sellerName,200),productCategory:clean(first.canonicalCategoryName||first.officialProductCategoryName||first.productCategory,300)||'UNRESOLVED',canonicalCategoryGuid:auditCategoryGuid(first)||'UNRESOLVED',itemCode:clean(first.itemCode,100),itemDescription:clean(first.itemDescription,500),quantityExact:provenance.provenanceReconciliation.requiredQtyExact,saleValueExact,fifoCostExact:provenance.provenanceReconciliation.allocatedCostExact,fifoProfitExact:provenance.provenanceReconciliation.fifoProfitExact,profitProvenanceStatus:provenance.profitProvenanceStatus,costSourceType:provenance.costSourceType,provenanceSources:provenance.provenanceSources,provenanceFingerprint:provenance.provenanceFingerprint,returnAllocationCount:rows.filter(row=>row.sourceType==='sale_return_reversal').length,_rows:rows});
   }
   return facts;
 }
@@ -1817,6 +2025,7 @@ module.exports = {
   listDatasets,
   status,
   listAllocations,
+  auditAllocations,
   listExceptions,
   validationReport,
   candidateQualityReport,

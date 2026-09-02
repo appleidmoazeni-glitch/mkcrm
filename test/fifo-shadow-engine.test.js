@@ -320,17 +320,48 @@ test('route, schema and UI contracts remain isolated from official datasets and 
   const uiSource=fs.readFileSync(path.join(root,'public/assets/app.js'),'utf8');
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/start/);
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/allocations/);
+  assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/allocation-audit/);
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/exceptions/);
   assert.match(uiSource,/SHADOW MODE — NOT ACCOUNTING APPROVED/);
   assert.match(uiSource,/id="fifoClear"/);
   assert.match(uiSource,/normalizedItemCodeInput/);
   assert.match(uiSource,/فیلترهای اعمال‌شده/);
+  assert.match(uiSource,/canonicalSellerId/);
+  assert.match(uiSource,/Control vs Candidate Delta/);
+  assert.match(uiSource,/Aggregates — محاسبه سرور/);
   assert.doesNotMatch(moduleSource,/collection\(purchaseLayerDataset\.LAYERS\)\.(?:insert|update|delete|bulkWrite)/);
   assert.doesNotMatch(moduleSource,/collection\(['"]saleSnapshotDatasetLines['"]\)\.(?:insert|update|delete|bulkWrite)/);
   assert.doesNotMatch(moduleSource,/PutSaleInvoice|Invoice\/Put|putInvoice/);
   assert.match(moduleSource,/profitActivationAllowed:false/);
   assert.match(moduleSource,/profitCalculated:false/);
   assert.match(moduleSource,/commissionCalculated:false/);
+});
+
+test('financial audit filters use canonical identities, return server aggregates and compare stable sale-line deltas', async () => {
+  const db=seedDb();
+  for(const row of db.collection('saleSnapshotDatasetLines').rows){
+    row.sellerAccountNumber='11701012';row.sellerName='محمد محتشمی';row.mainGroupName='NOTEBOOK';
+  }
+  db.collection('accountingOfficialItemGroupAssignments').rows.push(...['A','B','C'].map((itemCode,index)=>({active:true,itemCode,itemGuid:`GUID-${itemCode}`,resolvedMainGroupGuid:'302d03ca-f302-4562-98ad-fa4ca29c62cd',resolvedMainGroupName:'NOTEBOOK',resolvedMainGroupIdentity:'guid:302d03ca-f302-4562-98ad-fa4ca29c62cd',catalogRunId:`RUN-${index}`})));
+  const control=await engine.buildShadowDataset(db,{},accountant);
+  db.collection('supplierPurchaseLayers').rows.find(row=>row.purchaseLineIdentity==='P-A-1').netUnitCost=125;
+  db.collection('supplierPurchaseLayers').rows.push(layer({purchaseLineIdentity:'P-C-1',purchaseInvoiceNo:30,purchaseInvoiceDate:'14050102',itemGuid:'GUID-C',itemCode:'C',netPurchasedQuantity:4,netUnitCost:500}));
+  const candidate=await engine.buildShadowDataset(db,{},accountant);
+  const filtered=await engine.auditAllocations(db,{datasetId:candidate.datasetId,canonicalSellerId:'11701012',canonicalCategoryGuid:'302d03ca-f302-4562-98ad-fa4ca29c62cd',itemSearch:'item',dateFrom:'14050110',dateTo:'14050112',pageSize:100});
+  assert.equal(filtered.ok,true);
+  assert.equal(filtered.readOnly,true);
+  assert.equal(filtered.list.every(row=>row.canonicalSellerId==='11701012'&&row.canonicalCategoryGuid==='302d03ca-f302-4562-98ad-fa4ca29c62cd'),true);
+  assert.equal(filtered.aggregates.rows,filtered.total);
+  assert.match(filtered.aggregates.saleValueExact,/\.\d{2}$/);
+  assert.equal(filtered.appliedFilters.canonicalCategoryGuid,'302d03ca-f302-4562-98ad-fa4ca29c62cd');
+  const delta=await engine.auditAllocations(db,{mode:'delta',datasetId:candidate.datasetId,controlDatasetId:control.datasetId,canonicalSellerId:'11701012',pageSize:100});
+  assert.equal(delta.list.some(row=>row.deltaClass==='UNKNOWN_TO_PROVEN'&&row.identity.itemCode==='C'),true);
+  assert.equal(delta.list.some(row=>row.deltaClass==='PROVEN_TO_PROVEN_CHANGED_COST'&&row.identity.itemCode==='A'),true);
+  assert.equal(delta.aggregates.newlyProvenSaleExact,'8000.00');
+  const changed=delta.list.find(row=>row.deltaClass==='PROVEN_TO_PROVEN_CHANGED_COST');
+  assert.equal(changed.saleLineId,'SL-2-1-001-A');
+  assert.notEqual(changed.control.fifoCostExact,changed.candidate.fifoCostExact);
+  assert.equal(Array.isArray(changed.candidate.evidence),true);
 });
 
 test('allocation read path binds the requested candidate and normalizes ItemCode without hiding combined filters', async () => {
