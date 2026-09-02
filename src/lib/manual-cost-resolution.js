@@ -768,6 +768,7 @@ async function assistedDecision(db,input={},requestedBy={}) {
   }
   if(decision!=='APPROVE_SUGGESTED'&&decision!=='APPROVE_OVERRIDE')fail('MANUAL_COST_DECISION_INVALID','تصمیم حسابداری معتبر نیست.');
   if(suggestion.sourceClass==='EXACT_OFFICIAL_PURCHASE_LAYER')fail('MANUAL_COST_NOT_REQUIRED','لایه خرید رسمی معتبر وجود دارد؛ مسیر اصلاح Dataset را استفاده کنید.',409);
+  if(suggestion.sourceClass==='OPENING_ACCOUNTING_COST'&&suggestion.openingEvidenceDatasetId&&suggestion.approvalStatus==='approved')fail('MANUAL_COST_NOT_REQUIRED','Opening Accounting Cost مصوب، authority مستقل FIFO آینده است و نباید به Manual Cost تبدیل شود.',409);
   if(suggestion.sourceClass==='SOURCE_HISTORY_INCOMPLETE')fail('MANUAL_COST_SOURCE_HISTORY_INCOMPLETE','تا پیش از تکمیل Recovery تاریخچه رسمی، ثبت هزینه دستی مجاز نیست.',409);
   if(suggestion.sourceClass==='PENDING_PURCHASE_PRICE')fail('MANUAL_COST_PENDING_PURCHASE_PRICE','قیمت خرید هنوز موقت است و نمی‌تواند مأخذ هزینه باشد.',409);
   if(suggestion.sourceClass==='PURCHASE_RETURN_CONFLICT')fail('MANUAL_COST_PURCHASE_RETURN_CONFLICT','برگشت خرید حل‌نشده باید ابتدا در Purchase Engine رسمی تعیین تکلیف شود.',409);
