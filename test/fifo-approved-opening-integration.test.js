@@ -104,9 +104,7 @@ test('candidate pins Opening fingerprints, verifies in-memory replay, and remain
   assert.equal(dataset.openingSourceFingerprint,'s'.repeat(64));
   assert.equal(dataset.openingEligibilityFingerprint,'e'.repeat(64));
   assert.equal(dataset.finalFinancialActivationEligibility,'blocked');
-  assert.deepEqual(dataset.finalFinancialActivationBlockers,[
-    'OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED'
-  ]);
+  assert.deepEqual(dataset.finalFinancialActivationBlockers,['HUMAN_FIFO_VALIDATION_REQUIRED']);
   assert.equal(dataset.profitActivationAllowed,false);
 });
 

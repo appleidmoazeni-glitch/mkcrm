@@ -18,6 +18,7 @@ const SOURCE_CLASS = 'OPENING_ACCOUNTING_COST';
 const GOVERNANCE_ROLES = Object.freeze(['admin','accounting','purchase']);
 const INDEPENDENT_LEGACY_APPROVER_ROLES = Object.freeze(['manager']);
 const APPROVAL_PRECEDENCE = Object.freeze(['EXACT_OFFICIAL_PURCHASE_LAYER','APPROVED_OPENING_ACCOUNTING_COST','LOWER_CONFIDENCE_GOVERNED_SOURCE']);
+const AUTHORITY_LIFECYCLE = Object.freeze({APPROVED:'APPROVED',REVOKED:'REVOKED',SUPERSEDED:'SUPERSEDED'});
 
 function clean(value, max=500) { return String(value == null ? '' : value).trim().slice(0,max); }
 function stable(value) {
@@ -425,7 +426,81 @@ async function resumeCandidate(db,datasetId,input={},requestedBy={},options={}){
 async function ensureResourceGovernorIndexes(db){
   const names=await openingResourceGovernor.ensureIndexes(db);
   names.push(await db.collection(PROGRESS).createIndex({datasetId:1,status:1,selectionState:1,nextEligibleAt:1,firstQueuedAt:1,createdAt:1,progressId:1},{name:'opening_resume_deterministic_selection'}));
+  names.push(await db.collection(DATASETS).createIndex({status:1,approvalStatus:1,authorityLifecycleStatus:1,datasetId:1},{name:'opening_authority_resolution'}));
   return names;
+}
+
+function authorityLifecycleStatus(dataset={}){
+  const explicit=clean(dataset.authorityLifecycleStatus,50).toUpperCase();
+  if(Object.values(AUTHORITY_LIFECYCLE).includes(explicit))return explicit;
+  return clean(dataset.approvalStatus,50)==='approved'?AUTHORITY_LIFECYCLE.APPROVED:clean(dataset.approvalStatus,50).toUpperCase();
+}
+function storedAuthoritySnapshot(dataset={}){
+  return {
+    datasetFingerprint:clean(dataset.datasetFingerprint,64),
+    sourceFingerprint:clean(dataset.lastGovernanceEvent?.sourceAggregateFingerprint||dataset.sourceAggregateFingerprint,64),
+    eligibilityFingerprint:clean(dataset.eligibilityPreview?.fingerprint||dataset.lastGovernanceEvent?.eligibilityFingerprint,64),
+    summary:dataset.financialApprovalSummary||dataset.lastGovernanceEvent?.financialApprovalSummary||null
+  };
+}
+function evaluateAuthorityDataset(dataset={}){
+  const lifecycleStatus=authorityLifecycleStatus(dataset);
+  const eligible=dataset.status==='completed'&&dataset.approvalStatus==='approved'&&lifecycleStatus===AUTHORITY_LIFECYCLE.APPROVED;
+  return {eligible,lifecycleStatus,reason:eligible?'ELIGIBLE':dataset.status!=='completed'?'SOURCE_NOT_COMPLETED':dataset.approvalStatus!=='approved'?'NOT_APPROVED':lifecycleStatus};
+}
+async function resolveOpeningAuthority(db,input={}){
+  const requestedDatasetId=clean(input.datasetId,100);
+  let candidates=[];
+  if(requestedDatasetId){
+    const dataset=await db.collection(DATASETS).findOne({datasetId:requestedDatasetId});
+    if(!dataset)fail('OPENING_AUTHORITY_NOT_FOUND','Opening authority یافت نشد.',409);
+    candidates=[dataset];
+  }else{
+    candidates=await db.collection(DATASETS).find({status:'completed',approvalStatus:'approved',$or:[{authorityLifecycleStatus:{$exists:false}},{authorityLifecycleStatus:{$in:['APPROVED','approved']}}]}).sort({datasetId:1}).limit(3).toArray();
+  }
+  const eligible=candidates.filter(dataset=>evaluateAuthorityDataset(dataset).eligible);
+  if(requestedDatasetId&&!eligible.length){
+    const state=evaluateAuthorityDataset(candidates[0]);
+    fail(state.lifecycleStatus==='REVOKED'?'OPENING_AUTHORITY_REVOKED':state.lifecycleStatus==='SUPERSEDED'?'OPENING_AUTHORITY_SUPERSEDED':'OPENING_AUTHORITY_INELIGIBLE',`Opening authority برای ساخت مالی جدید مجاز نیست: ${state.reason}`,409);
+  }
+  if(!requestedDatasetId&&eligible.length===0)fail('OPENING_AUTHORITY_NOT_FOUND','Opening authority مصوب و واجد شرایط وجود ندارد.',409);
+  if(!requestedDatasetId&&eligible.length!==1)fail('OPENING_AUTHORITY_AMBIGUOUS','بیش از یک Opening authority مصوب و واجد شرایط وجود دارد؛ انتخاب خودکار ممنوع است.',409);
+  const dataset=eligible[0],snapshot=storedAuthoritySnapshot(dataset);
+  return {ok:true,readOnly:true,datasetId:dataset.datasetId,approvalStatus:dataset.approvalStatus,lifecycleStatus:AUTHORITY_LIFECYCLE.APPROVED,revision:Number(dataset.revision||1),fingerprints:{dataset:snapshot.datasetFingerprint,source:snapshot.sourceFingerprint,eligibility:snapshot.eligibilityFingerprint},financialApprovalSummary:snapshot.summary,dataset};
+}
+
+async function lifecycleAction(db,datasetId,action,input={},requestedBy={}){
+  const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});
+  if(!dataset)fail('OPENING_CANDIDATE_NOT_FOUND','Opening Candidate یافت نشد.',404);
+  const current=actor(requestedBy);
+  if(!GOVERNANCE_ROLES.includes(current.role))fail('OPENING_LIFECYCLE_ROLE_FORBIDDEN','Revoke/Supersede فقط توسط Admin/Accounting/Purchase مجاز است.',403);
+  const reason=clean(input.reason,1000);
+  if(!reason)fail('OPENING_LIFECYCLE_REASON_REQUIRED','دلیل اقدام حاکمیتی الزامی است.');
+  const expectedRevision=Number(input.revision||dataset.revision||1);
+  if(Number(dataset.revision||1)!==expectedRevision)fail('OPENING_APPROVAL_REVISION_CONFLICT','نسخه Dataset تغییر کرده است.',409);
+  const state=evaluateAuthorityDataset(dataset);
+  if(!state.eligible)fail('OPENING_LIFECYCLE_NOT_APPROVED','فقط Opening authority مصوب و فعال قابل Revoke/Supersede است.',409);
+  const snapshot=await immutableGovernanceSnapshot(db,dataset),expected=input.expectedFingerprints||{};
+  if(clean(expected.dataset,64)&&clean(expected.dataset,64)!==snapshot.datasetFingerprint)fail('OPENING_GOVERNANCE_EXPECTED_FINGERPRINT_MISMATCH','Dataset fingerprint mismatch.',409);
+  if(clean(expected.source,64)&&clean(expected.source,64)!==snapshot.sourceFingerprint)fail('OPENING_GOVERNANCE_EXPECTED_FINGERPRINT_MISMATCH','Source fingerprint mismatch.',409);
+  if(clean(expected.eligibility,64)&&clean(expected.eligibility,64)!==snapshot.eligibilityFingerprint)fail('OPENING_GOVERNANCE_EXPECTED_FINGERPRINT_MISMATCH','Eligibility fingerprint mismatch.',409);
+  let successor=null,successorSnapshot=null;
+  if(action==='supersede'){
+    const successorDatasetId=clean(input.successorDatasetId,100);
+    if(!successorDatasetId||successorDatasetId===dataset.datasetId)fail('OPENING_SUCCESSOR_REQUIRED','یک successor مستقل و صریح الزامی است.',409);
+    successor=await db.collection(DATASETS).findOne({datasetId:successorDatasetId});
+    if(!successor||!evaluateAuthorityDataset(successor).eligible)fail('OPENING_SUCCESSOR_INELIGIBLE','Successor باید مستقلاً authority مصوب و فعال باشد.',409);
+    successorSnapshot=storedAuthoritySnapshot(successor);
+  }
+  const now=new Date(),nextRevision=expectedRevision+1,newState=action==='revoke'?AUTHORITY_LIFECYCLE.REVOKED:AUTHORITY_LIFECYCLE.SUPERSEDED;
+  const event={approvalEventId:`OAPA-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,datasetId:dataset.datasetId,action:action.toUpperCase(),fromStatus:AUTHORITY_LIFECYCLE.APPROVED,toStatus:newState,previousAuthorityState:AUTHORITY_LIFECYCLE.APPROVED,newAuthorityState:newState,actor:current,reason,at:now,revisionBefore:expectedRevision,revision:nextRevision,datasetFingerprint:snapshot.datasetFingerprint,sourceAggregateFingerprint:snapshot.sourceFingerprint,eligibilityFingerprint:snapshot.eligibilityFingerprint,financialApprovalSummary:snapshot.summary,supersededDatasetId:action==='supersede'?dataset.datasetId:'',successorDatasetId:successor?.datasetId||'',successorAuthorityState:successor?authorityLifecycleStatus(successor):'',successorFingerprints:successorSnapshot?{dataset:successorSnapshot.datasetFingerprint,source:successorSnapshot.sourceFingerprint,eligibility:successorSnapshot.eligibilityFingerprint}:null,immutable:true};
+  const set={authorityLifecycleStatus:newState,authorityLifecycleUpdatedAt:now,authorityLifecycleUpdatedBy:current,authorityLifecycleReason:reason,revision:nextRevision,updatedAt:now,lastGovernanceEvent:event};
+  if(action==='revoke'){set.revokedAt=now;set.revokedBy=current;set.revocationReason=reason;}
+  else{set.supersededAt=now;set.supersededBy=current;set.supersessionReason=reason;set.successorDatasetId=successor.datasetId;}
+  const result=await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId,revision:expectedRevision},{$set:set,$push:{governanceAuditLog:event}});
+  if(!result.matchedCount)fail('OPENING_APPROVAL_REVISION_CONFLICT','نسخه Dataset تغییر کرده است.',409);
+  await db.collection(APPROVALS).insertOne(event);
+  return {ok:true,datasetId:dataset.datasetId,approvalStatus:dataset.approvalStatus,lifecycleStatus:newState,revision:nextRevision,successorDatasetId:successor?.datasetId||'',active:false,financialApprovalSummary:snapshot.summary,fifoWrites:0,purchaseWrites:0,evidenceWrites:0};
 }
 async function refreshEligibilityPreview(db,datasetId,input={},requestedBy={}){
   const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)fail('OPENING_CANDIDATE_NOT_FOUND','Opening Candidate یافت نشد.',404);
@@ -460,12 +535,23 @@ async function approvalAction(db,datasetId,action,input={},requestedBy={}){
   const auditEvents=[];
   if(humanValidation)auditEvents.push({approvalEventId:`OAPA-${Date.now()}-validation-${crypto.randomBytes(4).toString('hex')}`,datasetId:dataset.datasetId,action:'human-validation-checkpoint',fromStatus:from,toStatus:from,actor:current,reason:'Management-confirmed Production Human validation checkpoint',at:now,revision:nextRevision,datasetFingerprint:snapshot.datasetFingerprint,sourceAggregateFingerprint:snapshot.sourceFingerprint,eligibilityFingerprint:snapshot.eligibilityFingerprint,humanValidationCheckpoint:humanValidation,financialApprovalSummary:snapshot.summary,immutable:true});
   const persistedEvent={approvalEventId:`OAPA-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,datasetId:dataset.datasetId,...event};auditEvents.push(persistedEvent);
-  const set={approvalStatus:to,revision:nextRevision,updatedAt:now,lastGovernanceEvent:persistedEvent,financialApprovalSummary:snapshot.summary};if(action==='submit'){set.submittedBy=current;set.submittedAt=now;set.submissionReason=event.reason;set.humanValidationCheckpoint=humanValidation;}else{set.decidedBy=current;set.decidedAt=now;set.decisionReason=event.reason;set.approvalAuthorization=selfApproval?'management-authorized-self-approval':'independent-approval';}
+  const set={approvalStatus:to,revision:nextRevision,updatedAt:now,lastGovernanceEvent:persistedEvent,financialApprovalSummary:snapshot.summary};if(action==='submit'){set.submittedBy=current;set.submittedAt=now;set.submissionReason=event.reason;set.humanValidationCheckpoint=humanValidation;}else{set.decidedBy=current;set.decidedAt=now;set.decisionReason=event.reason;set.approvalAuthorization=selfApproval?'management-authorized-self-approval':'independent-approval';if(action==='approve')set.authorityLifecycleStatus=AUTHORITY_LIFECYCLE.APPROVED;}
   const result=await db.collection(DATASETS).updateOne({datasetId:dataset.datasetId,revision:expectedRevision},{$set:set,$push:{governanceAuditLog:{$each:auditEvents}}});if(!result.matchedCount)fail('OPENING_APPROVAL_REVISION_CONFLICT','نسخه Dataset تغییر کرده است.',409);
   await db.collection(APPROVALS).insertMany(auditEvents);
   return {ok:true,datasetId:dataset.datasetId,approvalStatus:to,revision:nextRevision,active:false,selfApproval,sourceAggregateFingerprint:snapshot.sourceFingerprint,financialApprovalSummary:snapshot.summary,fifoWrites:0,manualCostWrites:0};
 }
-async function listCandidates(db,input={}){const limit=Math.max(1,Math.min(Number(input.limit||20),100));const list=await db.collection(DATASETS).find({}).sort({createdAt:-1}).limit(limit).toArray();return {ok:true,readOnly:true,list};}
+async function listCandidates(db,input={}){const limit=Math.max(1,Math.min(Number(input.limit||20),100));const list=(await db.collection(DATASETS).find({}).sort({createdAt:-1}).limit(limit).toArray()).map(dataset=>({...dataset,authorityLifecycleStatus:authorityLifecycleStatus(dataset)}));return {ok:true,readOnly:true,list};}
 async function candidateDetail(db,datasetId,input={}){const dataset=await db.collection(DATASETS).findOne({datasetId:clean(datasetId,100)});if(!dataset)return {ok:false,code:'OPENING_CANDIDATE_NOT_FOUND'};const item=clean(input.item,100),query={datasetId:dataset.datasetId};if(clean(input.status,50))query.status=clean(input.status,50);if(item)query.$or=[{itemCode:item},{itemGuid:item}];const [rows,progress,approvalHistory,eligibility]=await Promise.all([db.collection(COLLECTION).find(query).sort({saleExposure:-1,itemCode:1}).limit(5000).toArray(),db.collection(PROGRESS).find(item?{datasetId:dataset.datasetId,$or:[{'item.itemCode':item},{'item.itemGuid':item}]}:{datasetId:dataset.datasetId}).limit(5000).toArray(),db.collection(APPROVALS).find({datasetId:dataset.datasetId}).sort({at:1}).toArray(),db.collection(ELIGIBILITY).find(item?{datasetId:dataset.datasetId,$or:[{itemCode:item},{itemGuid:item}]}:{datasetId:dataset.datasetId}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1}).limit(5000).toArray()]);let resolvableQuantity=0n,saleExposure=0n,remaining=0n;for(const row of eligibility){resolvableQuantity+=decimal.parse(row.openingEligibleQuantityExact||0,decimal.QUANTITY_SCALE);remaining+=decimal.parse(row.remainingUnknownQuantityExact||0,decimal.QUANTITY_SCALE);saleExposure+=decimal.parse(row.saleExposureExact||0,decimal.MONEY_SCALE);}const impactPreview={authorityClass:dataset.approvalStatus==='approved'?'APPROVED':dataset.status==='completed'?'VALIDATED_NOT_APPROVED':'INCOMPLETE',resolvableLines:eligibility.filter(row=>Number(row.openingEligibleQuantityExact)>0).length,resolvableQuantityExact:decimal.format(resolvableQuantity,decimal.QUANTITY_SCALE),remainingUnknownQuantityExact:decimal.format(remaining,decimal.QUANTITY_SCALE),saleExposureExact:decimal.format(saleExposure,decimal.MONEY_SCALE),fifoWrites:0};let financialApprovalSummary=dataset.financialApprovalSummary||null,governanceSnapshot=null;if(!item&&dataset.status==='completed'){try{governanceSnapshot=await immutableGovernanceSnapshot(db,dataset);if(!financialApprovalSummary)financialApprovalSummary=governanceSnapshot.summary;}catch(_){governanceSnapshot=null;}}const authorityPreview={precedence:APPROVAL_PRECEDENCE,openingDatasetId:dataset.datasetId,approvalStatus:dataset.approvalStatus,sourceAggregateFingerprint:governanceSnapshot?.sourceFingerprint||clean(dataset.lastGovernanceEvent?.sourceAggregateFingerprint,64),discoverableForFutureFifo:dataset.approvalStatus==='approved',activationPointerRequired:false,existingFifoMutated:false,sample:eligibility.filter(row=>Number(row.openingEligibleQuantityExact)>0).slice(0,10).map(row=>({saleLineIdentity:row.saleLineIdentity,itemCode:row.itemCode,sourceClass:dataset.approvalStatus==='approved'?'APPROVED_OPENING_ACCOUNTING_COST':'VALIDATED_OPENING_REVIEW_ONLY',evidenceId:row.openingEvidenceId,quantityCapacityExact:row.openingEligibleQuantityExact,chronology:row.classification}))};return {ok:true,readOnly:true,dataset,rows,progress,approvalHistory,eligibility,impactPreview,financialApprovalSummary,authorityPreview};}
 
-module.exports={COLLECTION,DATASETS,STATE,PROGRESS,APPROVALS,ELIGIBILITY,MODULE_VERSION,SCHEMA_VERSION,SOURCE_CLASS,GOVERNANCE_ROLES,APPROVAL_PRECEDENCE,fromKardex,aggregateWarehouseKardex,materialize,buildCandidate,resumeCandidate,refreshEligibilityPreview,submitCandidate:(db,id,input,user)=>approvalAction(db,id,'submit',input,user),approveCandidate:(db,id,input,user)=>approvalAction(db,id,'approve',input,user),rejectCandidate:(db,id,input,user)=>approvalAction(db,id,'reject',input,user),deferCandidate:(db,id,input,user)=>approvalAction(db,id,'defer',input,user),listCandidates,candidateDetail,buildEligibilityPreview,runtimeStatus:openingResourceGovernor.runtimeStatus,ensureResourceGovernorIndexes,_extractItem:extractItem,_classifyFailure:classifyFailure,_compactKardexResult:compactKardexResult,_hash:hash,_sourceAggregateFingerprint:sourceAggregateFingerprint,_immutableGovernanceSnapshot:immutableGovernanceSnapshot,_legacyBuildCandidate:buildCandidateLegacy,_selectResumeProgress:selectResumeProgress,_markProgressInFlight:markProgressInFlight,_deterministicProgressSort:()=>({...DETERMINISTIC_PROGRESS_SORT})};
+async function candidateDetailGoverned(db,datasetId,input={}){
+  const result=await candidateDetail(db,datasetId,input);
+  if(!result.ok)return result;
+  const authority=evaluateAuthorityDataset(result.dataset);
+  result.dataset.authorityLifecycleStatus=authority.lifecycleStatus;
+  result.authorityPreview.lifecycleStatus=authority.lifecycleStatus;
+  result.authorityPreview.discoverableForFutureFifo=authority.eligible;
+  result.impactPreview.authorityClass=authority.eligible?'APPROVED':authority.lifecycleStatus;
+  return result;
+}
+
+module.exports={COLLECTION,DATASETS,STATE,PROGRESS,APPROVALS,ELIGIBILITY,MODULE_VERSION,SCHEMA_VERSION,SOURCE_CLASS,GOVERNANCE_ROLES,APPROVAL_PRECEDENCE,AUTHORITY_LIFECYCLE,fromKardex,aggregateWarehouseKardex,materialize,buildCandidate,resumeCandidate,refreshEligibilityPreview,submitCandidate:(db,id,input,user)=>approvalAction(db,id,'submit',input,user),approveCandidate:(db,id,input,user)=>approvalAction(db,id,'approve',input,user),rejectCandidate:(db,id,input,user)=>approvalAction(db,id,'reject',input,user),deferCandidate:(db,id,input,user)=>approvalAction(db,id,'defer',input,user),revokeAuthority:(db,id,input,user)=>lifecycleAction(db,id,'revoke',input,user),supersedeAuthority:(db,id,input,user)=>lifecycleAction(db,id,'supersede',input,user),resolveOpeningAuthority,listCandidates,candidateDetail:candidateDetailGoverned,buildEligibilityPreview,runtimeStatus:openingResourceGovernor.runtimeStatus,ensureResourceGovernorIndexes,_authorityLifecycleStatus:authorityLifecycleStatus,_evaluateAuthorityDataset:evaluateAuthorityDataset,_storedAuthoritySnapshot:storedAuthoritySnapshot,_extractItem:extractItem,_classifyFailure:classifyFailure,_compactKardexResult:compactKardexResult,_hash:hash,_sourceAggregateFingerprint:sourceAggregateFingerprint,_immutableGovernanceSnapshot:immutableGovernanceSnapshot,_legacyBuildCandidate:buildCandidateLegacy,_selectResumeProgress:selectResumeProgress,_markProgressInFlight:markProgressInFlight,_deterministicProgressSort:()=>({...DETERMINISTIC_PROGRESS_SORT})};

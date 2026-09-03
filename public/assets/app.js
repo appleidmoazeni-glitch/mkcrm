@@ -5518,7 +5518,31 @@ async function pageSellerProfit(){
       </div><div class="warn">این داشبورد فقط آمادگی داده را نشان می‌دهد؛ FIFO، سود، ROI و پورسانت همچنان غیرفعال‌اند.</div>`;
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
-  function openingStatus(value){return ({validated:'VALIDATED',pending:'PENDING',approved:'APPROVED',incomplete:'INCOMPLETE',draft:'DRAFT',rejected:'REJECTED',deferred:'DEFERRED'})[value]||String(value||'—').toUpperCase();}
+  function openingStatus(value){return ({validated:'VALIDATED',pending:'PENDING',approved:'APPROVED',incomplete:'INCOMPLETE',draft:'DRAFT',rejected:'REJECTED',deferred:'DEFERRED',revoked:'REVOKED',superseded:'SUPERSEDED'})[String(value||'').toLowerCase()]||String(value||'—').toUpperCase();}
+  function openingAuthorityStatus(row){return openingStatus(row?.authorityLifecycleStatus||(row?.approvalStatus==='approved'?'APPROVED':row?.approvalStatus));}
+  async function installOpeningAuthorityControls(){
+    const host=q('#mcOpeningCandidates');if(!host)return;
+    const report=await json('/api/accounting/opening-accounting-evidence/candidates?limit=20');
+    for(const row of report.list||[]){
+      if(row.approvalStatus!=='approved')continue;
+      const button=[...host.querySelectorAll('.mc-opening-detail')].find(node=>node.dataset.id===row.datasetId),cell=button?.closest('td');
+      if(!cell||cell.querySelector('.mc-opening-authority-state'))continue;
+      const lifecycle=String(row.authorityLifecycleStatus||'APPROVED').toUpperCase();
+      cell.insertAdjacentHTML('beforeend',`<div class="mc-opening-authority-state"><small>Authority: <b>${safe(openingStatus(lifecycle))}</b></small>${lifecycle==='APPROVED'&&['admin','accounting','purchase'].includes(userRole())?`<br><button class="mini mc-opening-lifecycle" data-action="revoke" data-id="${safe(row.datasetId)}" data-revision="${safe(row.revision||1)}">لغو Authority</button> <button class="mini mc-opening-lifecycle" data-action="supersede" data-id="${safe(row.datasetId)}" data-revision="${safe(row.revision||1)}">جایگزینی Authority</button>`:''}</div>`);
+    }
+    host.querySelectorAll('.mc-opening-lifecycle').forEach(button=>button.onclick=async()=>{
+      try{
+        const action=button.dataset.action,id=button.dataset.id,detail=await json(`/api/accounting/opening-accounting-evidence/candidates/${encodeURIComponent(id)}?limit=5000`),summary=detail.financialApprovalSummary||{};
+        const successorDatasetId=action==='supersede'?(prompt('شناسه Dataset جانشینِ مصوب را وارد کنید:','')||'').trim():'';
+        if(action==='supersede'&&!successorDatasetId)return;
+        const reason=(prompt(`Dataset: ${id}\nAuthority: ${openingAuthorityStatus(detail.dataset)}\nOpening Qty: ${summary.totalOpeningQuantityExact||'—'}\nOpening Value: ${summary.totalOpeningAccountingValueExact||'—'} IRR\nAffected Sale: ${summary.affectedSaleExposureExact||'—'} IRR\nItems: ${summary.itemCount||detail.rows.length}\nDataset fingerprint: ${detail.dataset.datasetFingerprint||'—'}\nSource fingerprint: ${detail.authorityPreview?.sourceAggregateFingerprint||'—'}\nEligibility fingerprint: ${detail.dataset.eligibilityPreview?.fingerprint||'—'}${successorDatasetId?`\nSuccessor: ${successorDatasetId}`:''}\n\nدلیل الزامی:`, '')||'').trim();
+        if(!reason)return;
+        if(!confirm('این اقدام فقط صلاحیت Dataset را برای ساخت‌های مالی آینده تغییر می‌دهد. FIFOهای تاریخی بازنویسی نمی‌شوند. آیا با ثبت رویداد immutable ادامه می‌دهید؟'))return;
+        await json(`/api/accounting/opening-accounting-evidence/candidates/${encodeURIComponent(id)}/${action}`,{method:'POST',body:JSON.stringify({revision:Number(button.dataset.revision||0),reason,successorDatasetId,expectedFingerprints:{dataset:detail.dataset.datasetFingerprint,source:detail.authorityPreview?.sourceAggregateFingerprint||'',eligibility:detail.dataset.eligibilityPreview?.fingerprint}})});
+        await loadOpeningCandidates();await installOpeningAuthorityControls();
+      }catch(error){q('#mcOpeningDetail').innerHTML=`<div class="error">${safe(error.message)}</div>`;}
+    });
+  }
   async function loadOpeningCandidates(){
     const box=q('#mcOpeningCandidates');if(!box)return;
     try{
@@ -5528,7 +5552,7 @@ async function pageSellerProfit(){
       document.querySelectorAll('.mc-opening-action').forEach(button=>button.onclick=async()=>{try{const action=button.dataset.action,id=button.dataset.id,detail=await json(`/api/accounting/opening-accounting-evidence/candidates/${encodeURIComponent(id)}?limit=5000`),summary=detail.financialApprovalSummary||{};let reason='',passCards=[];if(action==='submit'){reason=prompt(`Opening Accounting Evidence\nDataset: ${id}\nItems: ${summary.itemCount||detail.rows.length}\nTotal Opening Value: ${summary.totalOpeningAccountingValueExact||'—'} IRR\nAffected Sale Exposure: ${summary.affectedSaleExposureExact||'—'} IRR\nProjected FIFO coverage: Lines ${summary.projectedCoverage?.linePercent||'—'}% | Qty ${summary.projectedCoverage?.quantityPercent||'—'}% | Sale ${summary.projectedCoverage?.saleValuePercent||'—'}%\nActor role: ${userRole()}\n\nReason:`,`Production Opening Accounting Evidence completed authoritative source extraction, deterministic validation and Human Production review and is submitted for governed FIFO cost authority.`)||'';if(!reason)return;const cards=prompt('Human PASS card IDs را دقیق و با کاما وارد کنید. هیچ PASS به‌صورت خودکار ساخته نمی‌شود:','')||'';passCards=cards.split(',').map(value=>value.trim()).filter(Boolean);if(!passCards.length||!confirm(`ثبت Human validation checkpoint برای: ${passCards.join(', ')}\nDataset: ${id}`))return;}else if(['approve','reject','defer'].includes(action))reason=prompt(`Opening Accounting Evidence\nDataset: ${id}\nApproval: ${openingStatus(detail.dataset.approvalStatus)}\nTotal Opening Value: ${summary.totalOpeningAccountingValueExact||'—'} IRR\nAffected Sale Exposure: ${summary.affectedSaleExposureExact||'—'} IRR\nActor role: ${userRole()}\n\nReason:`,action==='approve'?'Management-authorized self-approval of Human-validated Production Opening Accounting Evidence for governed FIFO cost authority.':'')||'';if(['approve','reject','defer'].includes(action)&&!reason)return;const body={revision:Number(button.dataset.revision||0),reason,expectedFingerprints:{dataset:detail.dataset.datasetFingerprint,source:detail.authorityPreview?.sourceAggregateFingerprint||'',eligibility:detail.dataset.eligibilityPreview?.fingerprint}};if(action==='submit')body.humanValidationCheckpoint={assertedByManagement:true,passCards,source:'Human-confirmed governance UI'};if(action==='approve'&&detail.dataset.submittedBy?.username===state.user?.username){if(!confirm('Management-authorized self-approval را برای همین Dataset تأیید می‌کنید؟ Submit و Approve جداگانه در Audit ثبت می‌شوند.'))return;body.managementAuthorizedSelfApproval=true;}await json(`/api/accounting/opening-accounting-evidence/candidates/${encodeURIComponent(id)}/${action}`,{method:'POST',body:JSON.stringify(body)});await loadOpeningCandidates();}catch(error){q('#mcOpeningDetail').innerHTML=`<div class="error">${safe(error.message)}</div>`;}});
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
-  async function refreshAll(){await loadQueue();await Promise.all([loadCoverage(),loadResolutions(),loadHealth(),loadOpeningCandidates()]);}
+  async function refreshAll(){await loadQueue();await Promise.all([loadCoverage(),loadResolutions(),loadHealth(),loadOpeningCandidates()]);await installOpeningAuthorityControls();}
   window.pageManualCostResolution=async function(){
     setPage('رفع هزینه خرید نامشخص',`<main class="main-content">
       <div class="card"><div class="card-header"><h5>Accounting Readiness — بدون FIFO و بدون سود</h5></div><div class="card-body"><div id="mcDatasetMeta" class="small muted"></div><div id="mcCoverageCards" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px"></div></div></div>

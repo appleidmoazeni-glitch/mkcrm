@@ -419,10 +419,8 @@ async function loadSources(db, pinned = {}) {
   let openingActive = null;
   let openingRows = [];
   if (pinned.openingDatasetId) {
-    const dataset = await db.collection(openingAccountingCostBasis.DATASETS).findOne({ datasetId:pinned.openingDatasetId });
-    if (!dataset || dataset.status !== 'completed' || dataset.approvalStatus !== 'approved') {
-      fail('FIFO_SOURCE_OPENING_NOT_APPROVED', 'Opening Accounting Evidence کامل و مصوب پیدا نشد.', 409);
-    }
+    const authority = await openingAccountingCostBasis.resolveOpeningAuthority(db,{datasetId:pinned.openingDatasetId});
+    const dataset = authority.dataset;
     const governance = await openingAccountingCostBasis._immutableGovernanceSnapshot(db, dataset);
     const expected = pinned.openingFingerprints || {};
     if (clean(expected.dataset, 64) && clean(expected.dataset, 64) !== governance.datasetFingerprint) {
@@ -1352,7 +1350,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
         accountingApproved:false,
         profitActivationAllowed:false,
         finalFinancialActivationEligibility:'blocked',
-        finalFinancialActivationBlockers:['OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED'],
+        finalFinancialActivationBlockers:['HUMAN_FIFO_VALIDATION_REQUIRED'],
         createdAt:startedAt,
         startedAt,
         updatedAt:startedAt
@@ -1528,7 +1526,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       accountingApproved:false,
       profitActivationAllowed:false,
       finalFinancialActivationEligibility:'blocked',
-      finalFinancialActivationBlockers:['OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED'],
+      finalFinancialActivationBlockers:['HUMAN_FIFO_VALIDATION_REQUIRED'],
       profitCalculated:false,
       roiCalculated:false,
       commissionCalculated:false
@@ -1585,7 +1583,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       accountingApproved:false,
       profitActivationAllowed:false,
       finalFinancialActivationEligibility:'blocked',
-      finalFinancialActivationBlockers:['OPENING_REVOCATION_SUPERSESSION_GOVERNANCE_NOT_IMPLEMENTED','HUMAN_FIFO_VALIDATION_REQUIRED']
+      finalFinancialActivationBlockers:['HUMAN_FIFO_VALIDATION_REQUIRED']
     };
   } catch (error) {
     const status = error?.code === 'JOB_CANCELLED' ? 'cancelled' : 'failed';

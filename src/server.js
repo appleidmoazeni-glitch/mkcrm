@@ -4023,16 +4023,20 @@ async function handleApi(req, res, pathname, query) {
     if(pathname==='/api/accounting/opening-accounting-evidence/runtime'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();return sendJson(res,200,await openingAccountingCostBasis.runtimeStatus(db,query.datasetId));
     }
-    const openingCandidateMatch=pathname.match(/^\/api\/accounting\/opening-accounting-evidence\/candidates\/([^/]+)(?:\/(resume|refresh-preview|submit|approve|reject|defer))?$/);
+    if(pathname==='/api/accounting/opening-accounting-evidence/authority'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await openingAccountingCostBasis.resolveOpeningAuthority(db,{datasetId:query.datasetId}));}catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'OPENING_AUTHORITY_RESOLUTION_FAILED',error:String(error.message||error)});}
+    }
+    const openingCandidateMatch=pathname.match(/^\/api\/accounting\/opening-accounting-evidence\/candidates\/([^/]+)(?:\/(resume|refresh-preview|submit|approve|reject|defer|revoke|supersede))?$/);
     if(openingCandidateMatch&&req.method==='GET'&&!openingCandidateMatch[2]){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       const result=await openingAccountingCostBasis.candidateDetail(db,decodeURIComponent(openingCandidateMatch[1]),query);return sendJson(res,result.ok?200:404,result);
     }
     if(openingCandidateMatch&&req.method==='POST'&&openingCandidateMatch[2]){
-      const action=openingCandidateMatch[2],roles=['resume','refresh-preview'].includes(action)?['admin','accounting']:action==='submit'?['admin','accounting','purchase']:['admin','accounting','manager','purchase'];if(!requireRole(req,res,roles))return;const body=await collectBody(req),db=await connectMongo(),id=decodeURIComponent(openingCandidateMatch[1]);
+      const action=openingCandidateMatch[2],roles=['resume','refresh-preview'].includes(action)?['admin','accounting']:['revoke','supersede'].includes(action)?['admin','accounting','purchase']:action==='submit'?['admin','accounting','purchase']:['admin','accounting','manager','purchase'];if(!requireRole(req,res,roles))return;const body=await collectBody(req),db=await connectMongo(),id=decodeURIComponent(openingCandidateMatch[1]);
       const hasExplicitOpeningTarget=action==='resume'&&['targetProgressId','targetCanonicalIdentity','targetItemCode'].some(field=>String(body[field]||'').trim());
       if(hasExplicitOpeningTarget&&!requireRole(req,res,['admin']))return;
-      try{const fn={resume:'resumeCandidate','refresh-preview':'refreshEligibilityPreview',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate'}[action];const result=action==='resume'?await openingAccountingCostBasis[fn](db,id,body,currentUser(req),openingGovernorOptions(body)):await openingAccountingCostBasis[fn](db,id,body,currentUser(req));return sendJson(res,200,result);}
+      try{const fn={resume:'resumeCandidate','refresh-preview':'refreshEligibilityPreview',submit:'submitCandidate',approve:'approveCandidate',reject:'rejectCandidate',defer:'deferCandidate',revoke:'revokeAuthority',supersede:'supersedeAuthority'}[action];const result=action==='resume'?await openingAccountingCostBasis[fn](db,id,body,currentUser(req),openingGovernorOptions(body)):await openingAccountingCostBasis[fn](db,id,body,currentUser(req));return sendJson(res,200,result);}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'OPENING_CANDIDATE_ACTION_FAILED',error:String(error.message||error)});}
     }
     if(pathname==='/api/manual-cost-resolutions/assisted/decisions'&&req.method==='POST'){
