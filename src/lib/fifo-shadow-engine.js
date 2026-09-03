@@ -1801,6 +1801,23 @@ function deltaClass(control, candidate) {
   if(before==='PROVEN'&&after==='PROVEN')return control.fifoCostExact===candidate.fifoCostExact?'PROVEN_TO_PROVEN_SAME_COST':'PROVEN_TO_PROVEN_CHANGED_COST';
   return `${before}_TO_${after}`;
 }
+const AUDIT_DELTA_CLASSES = new Set([
+  'UNKNOWN_TO_PROVEN','PROVEN_TO_UNKNOWN','PROVEN_TO_PROVEN_SAME_COST','PROVEN_TO_PROVEN_CHANGED_COST','UNKNOWN_TO_UNKNOWN',
+  'PARTIAL_TO_PROVEN','PROVEN_TO_PARTIAL','UNKNOWN_TO_PARTIAL','PARTIAL_TO_UNKNOWN','PARTIAL_TO_PARTIAL',
+  'MISSING_TO_PROVEN','MISSING_TO_PARTIAL','MISSING_TO_UNKNOWN','PROVEN_TO_MISSING','PARTIAL_TO_MISSING','UNKNOWN_TO_MISSING'
+]);
+function deltaReason(control, candidate, classification) {
+  const candidateReason=(candidate?.evidence||[]).map(row=>clean(row.reason,500)).find(Boolean);
+  if(candidateReason)return candidateReason;
+  if(classification==='PROVEN_TO_PROVEN_CHANGED_COST'){
+    const before=(control?.evidence||[]).map(row=>clean(row.purchaseLineIdentity||row.openingEvidenceId||row.manualResolutionId,500)).filter(Boolean).sort().join('|');
+    const after=(candidate?.evidence||[]).map(row=>clean(row.purchaseLineIdentity||row.openingEvidenceId||row.manualResolutionId,500)).filter(Boolean).sort().join('|');
+    return before!==after?'OFFICIAL_PURCHASE_SOURCE_CHANGED':'SOURCE_COST_CHANGED';
+  }
+  if(classification==='UNKNOWN_TO_PROVEN')return 'COST_EVIDENCE_RESOLVED';
+  if(classification==='PROVEN_TO_UNKNOWN')return 'VALID_COST_EVIDENCE_NO_LONGER_ELIGIBLE';
+  return classification;
+}
 function factEvidence(row) {
   return (row?._rows||[]).map(allocation=>({sourceType:allocation.sourceType,costSourceType:allocation.costSourceType||'',purchaseInvoiceNo:Number(allocation.purchaseInvoiceNo||0),purchaseLineIdentity:clean(allocation.purchaseLineIdentity,500),openingEvidenceId:clean(allocation.openingEvidenceId,100),manualResolutionId:clean(allocation.manualResolutionId,100),quantityExact:clean(allocation.quantityExact??allocation.allocatedQty??allocation.unknownQty,100),costExact:clean(allocation.allocatedCostAmountExact??allocation.allocatedCostAmount,100),reason:clean(allocation.unknownReason||allocation.returnEffect,500)}));
 }
@@ -1840,6 +1857,7 @@ async function auditAllocations(db, filters = {}) {
   const dataset=await db.collection(DATASETS).findOne({datasetId});
   if(!dataset)fail('FIFO_DATASET_NOT_FOUND','FIFO Candidate پیدا نشد.',404);
   const appliedFilters=auditAppliedFilters(datasetId,filters),ranges=auditRanges(filters);
+  if(appliedFilters.deltaClass&&!AUDIT_DELTA_CLASSES.has(appliedFilters.deltaClass))fail('FIFO_AUDIT_DELTA_INVALID','طبقه‌بندی Delta معتبر نیست.',400);
   const page=Math.max(1,Number(filters.page||1)),pageSize=Math.max(1,Math.min(Number(filters.pageSize||100),500));
   const candidateContext=await auditDatasetContext(db,dataset),allCandidateRows=candidateContext.rows;
   const baseQuery=auditBaseQuery(datasetId,filters),categoryCodes=categoryItemCodes(candidateContext.categoryMap,filters);
@@ -1870,10 +1888,38 @@ async function auditAllocations(db, filters = {}) {
     const candidateFact=candidateBy.get(saleLineId)||null,controlFact=controlBy.get(saleLineId)||null,classification=deltaClass(controlFact,candidateFact);
     const costDelta=(decimalOrNull(candidateFact?.fifoCostExact)||0n)-(decimalOrNull(controlFact?.fifoCostExact)||0n);
     const profitDelta=(decimalOrNull(candidateFact?.fifoProfitExact)||0n)-(decimalOrNull(controlFact?.fifoProfitExact)||0n);
-    return {saleLineId,deltaClass:classification,identity:{saleInvoiceNo:candidateFact?.saleInvoiceNo??controlFact?.saleInvoiceNo,itemCode:candidateFact?.itemCode??controlFact?.itemCode,itemDescription:candidateFact?.itemDescription??controlFact?.itemDescription,saleDate:candidateFact?.saleDate??controlFact?.saleDate,canonicalSellerId:candidateFact?.canonicalSellerId??controlFact?.canonicalSellerId,sellerName:candidateFact?.sellerName??controlFact?.sellerName,canonicalCategoryGuid:candidateFact?.canonicalCategoryGuid??controlFact?.canonicalCategoryGuid,categoryName:candidateFact?.productCategory??controlFact?.productCategory},control:controlFact?{...controlFact,evidence:factEvidence(controlFact),_rows:undefined}:null,candidate:candidateFact?{...candidateFact,evidence:factEvidence(candidateFact),_rows:undefined}:null,costDeltaExact:accountingDecimal.format(costDelta,2),profitDeltaExact:accountingDecimal.format(profitDelta,2)};
+    const shapedControl=controlFact?{...controlFact,evidence:factEvidence(controlFact),_rows:undefined}:null;
+    const shapedCandidate=candidateFact?{...candidateFact,evidence:factEvidence(candidateFact),_rows:undefined}:null;
+    return {saleLineId,deltaClass:classification,deltaReason:deltaReason(shapedControl,shapedCandidate,classification),identity:{saleInvoiceNo:candidateFact?.saleInvoiceNo??controlFact?.saleInvoiceNo,itemCode:candidateFact?.itemCode??controlFact?.itemCode,itemDescription:candidateFact?.itemDescription??controlFact?.itemDescription,saleDate:candidateFact?.saleDate??controlFact?.saleDate,canonicalSellerId:candidateFact?.canonicalSellerId??controlFact?.canonicalSellerId,sellerName:candidateFact?.sellerName??controlFact?.sellerName,canonicalCategoryGuid:candidateFact?.canonicalCategoryGuid??controlFact?.canonicalCategoryGuid,categoryName:candidateFact?.productCategory??controlFact?.productCategory},control:shapedControl,candidate:shapedCandidate,costDeltaExact:accountingDecimal.format(costDelta,2),profitDeltaExact:accountingDecimal.format(profitDelta,2)};
   }).filter(row=>(!appliedFilters.deltaClass||row.deltaClass===appliedFilters.deltaClass)&&(!appliedFilters.provenanceStatus||(row.candidate||row.control)?.profitProvenanceStatus===appliedFilters.provenanceStatus)&&factMatchesRanges(row.candidate||row.control,ranges));
   rows.sort((a,b)=>String(a.identity.saleDate||'').localeCompare(String(b.identity.saleDate||''),'en')||Number(a.identity.saleInvoiceNo||0)-Number(b.identity.saleInvoiceNo||0)||a.saleLineId.localeCompare(b.saleLineId,'en'));
   return {ok:true,readOnly:true,mode:'delta',datasetId,controlDatasetId,total:rows.length,page,pageSize,list:rows.slice((page-1)*pageSize,page*pageSize),aggregates:deltaAggregates(rows),appliedFilters,performance:{serverReadMs:Date.now()-startedAt,scannedCandidateRows:allCandidateRows.length,scannedControlRows:allControlRows.length,prefilteredRows:candidateRows.length,indexContract:'datasetId + canonical identity/date/source compounds; explicit-submit only'},shadowMode:true,accountingApproved:false};
+}
+async function auditDimensions(db, filters = {}) {
+  const datasetId=clean(filters.datasetId,100);
+  if(!datasetId)fail('FIFO_DATASET_REQUIRED','Candidate Dataset الزامی است.',400);
+  const dataset=await db.collection(DATASETS).findOne({datasetId});
+  if(!dataset)fail('FIFO_DATASET_NOT_FOUND','FIFO Candidate پیدا نشد.',404);
+  const context=await auditDatasetContext(db,dataset),sellers=new Map(),categories=new Map();
+  for(const fact of context.facts.values()){
+    const sellerId=clean(fact.canonicalSellerId,100),sellerName=clean(fact.sellerName,200);
+    if(sellerId&&sellerId!=='UNRESOLVED'){
+      const current=sellers.get(sellerId)||{canonicalSellerId:sellerId,sellerName:'',rawNames:new Set(),saleLines:0};
+      if(sellerName){current.rawNames.add(sellerName);if(!current.sellerName)current.sellerName=sellerName;}
+      current.saleLines++;sellers.set(sellerId,current);
+    }
+    const categoryGuid=clean(fact.canonicalCategoryGuid,100),categoryName=clean(fact.productCategory,300);
+    if(categoryGuid&&categoryGuid!=='UNRESOLVED'){
+      const current=categories.get(categoryGuid)||{canonicalCategoryGuid:categoryGuid,categoryName:'',rawNames:new Set(),saleLines:0};
+      if(categoryName){current.rawNames.add(categoryName);if(!current.categoryName)current.categoryName=categoryName;}
+      current.saleLines++;categories.set(categoryGuid,current);
+    }
+  }
+  const shape=row=>({...row,rawNames:[...row.rawNames].sort((a,b)=>a.localeCompare(b,'fa'))});
+  return {ok:true,readOnly:true,datasetId,
+    sellers:[...sellers.values()].map(shape).sort((a,b)=>(a.sellerName||a.canonicalSellerId).localeCompare(b.sellerName||b.canonicalSellerId,'fa')||a.canonicalSellerId.localeCompare(b.canonicalSellerId,'en')),
+    categories:[...categories.values()].map(shape).sort((a,b)=>(a.categoryName||a.canonicalCategoryGuid).localeCompare(b.categoryName||b.canonicalCategoryGuid,'fa')||a.canonicalCategoryGuid.localeCompare(b.canonicalCategoryGuid,'en')),
+    authority:{seller:'canonicalSellerId',category:'officialMainGroupGuid'},shadowMode:true,accountingApproved:false};
 }
 async function listExceptions(db, filters = {}) {
   await ensureIndexes(db);
@@ -2026,6 +2072,7 @@ module.exports = {
   status,
   listAllocations,
   auditAllocations,
+  auditDimensions,
   listExceptions,
   validationReport,
   candidateQualityReport,

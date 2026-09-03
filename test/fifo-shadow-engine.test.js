@@ -321,6 +321,7 @@ test('route, schema and UI contracts remain isolated from official datasets and 
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/start/);
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/allocations/);
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/allocation-audit/);
+  assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/audit-dimensions/);
   assert.match(serverSource,/\/api\/accounting\/fifo-shadow\/exceptions/);
   assert.match(uiSource,/SHADOW MODE — NOT ACCOUNTING APPROVED/);
   assert.match(uiSource,/id="fifoClear"/);
@@ -328,6 +329,11 @@ test('route, schema and UI contracts remain isolated from official datasets and 
   assert.match(uiSource,/فیلترهای اعمال‌شده/);
   assert.match(uiSource,/canonicalSellerId/);
   assert.match(uiSource,/Control vs Candidate Delta/);
+  assert.match(uiSource,/UNKNOWN → UNKNOWN/);
+  assert.match(uiSource,/PARTIAL → PARTIAL/);
+  assert.match(uiSource,/id="fifoSellerId"><option value="">همه/);
+  assert.match(uiSource,/id="fifoCategoryGuid"><option value="">همه/);
+  assert.doesNotMatch(uiSource,/fifoDelta'\)\.disabled/);
   assert.match(uiSource,/Aggregates — محاسبه سرور/);
   assert.doesNotMatch(moduleSource,/collection\(purchaseLayerDataset\.LAYERS\)\.(?:insert|update|delete|bulkWrite)/);
   assert.doesNotMatch(moduleSource,/collection\(['"]saleSnapshotDatasetLines['"]\)\.(?:insert|update|delete|bulkWrite)/);
@@ -347,6 +353,10 @@ test('financial audit filters use canonical identities, return server aggregates
   db.collection('supplierPurchaseLayers').rows.find(row=>row.purchaseLineIdentity==='P-A-1').netUnitCost=125;
   db.collection('supplierPurchaseLayers').rows.push(layer({purchaseLineIdentity:'P-C-1',purchaseInvoiceNo:30,purchaseInvoiceDate:'14050102',itemGuid:'GUID-C',itemCode:'C',netPurchasedQuantity:4,netUnitCost:500}));
   const candidate=await engine.buildShadowDataset(db,{},accountant);
+  const dimensions=await engine.auditDimensions(db,{datasetId:candidate.datasetId});
+  assert.deepEqual(dimensions.sellers.map(row=>row.canonicalSellerId),['11701012']);
+  assert.equal(dimensions.categories.some(row=>row.canonicalCategoryGuid==='302d03ca-f302-4562-98ad-fa4ca29c62cd'&&row.categoryName==='NOTEBOOK'),true);
+  assert.deepEqual(dimensions.authority,{seller:'canonicalSellerId',category:'officialMainGroupGuid'});
   const filtered=await engine.auditAllocations(db,{datasetId:candidate.datasetId,canonicalSellerId:'11701012',canonicalCategoryGuid:'302d03ca-f302-4562-98ad-fa4ca29c62cd',itemSearch:'item',dateFrom:'14050110',dateTo:'14050112',pageSize:100});
   assert.equal(filtered.ok,true);
   assert.equal(filtered.readOnly,true);
@@ -362,6 +372,8 @@ test('financial audit filters use canonical identities, return server aggregates
   assert.equal(changed.saleLineId,'SL-2-1-001-A');
   assert.notEqual(changed.control.fifoCostExact,changed.candidate.fifoCostExact);
   assert.equal(Array.isArray(changed.candidate.evidence),true);
+  assert.equal(changed.deltaReason,'SOURCE_COST_CHANGED');
+  await assert.rejects(engine.auditAllocations(db,{mode:'delta',datasetId:candidate.datasetId,controlDatasetId:control.datasetId,deltaClass:'NOT_A_TRANSITION'}),error=>error.code==='FIFO_AUDIT_DELTA_INVALID');
 });
 
 test('allocation read path binds the requested candidate and normalizes ItemCode without hiding combined filters', async () => {
