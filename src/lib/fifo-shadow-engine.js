@@ -325,6 +325,13 @@ function immutableProjection(row) {
   };
 }
 
+function allocationContentFingerprint(rows = []) {
+  return sha256(stableStringify(rows
+    .map(immutableProjection)
+    .map(row=>stableStringify(row))
+    .sort((a,b)=>a.localeCompare(b,'en'))));
+}
+
 function sourceFingerprintFor(result, source, pinned) {
   return sha256(stableStringify({
     saleSnapshotId:pinned.saleSnapshotId,
@@ -534,8 +541,9 @@ async function revalidateForActivation(db, datasetId, options = {}) {
     db.collection(ALLOCATIONS).find({datasetId:id}).toArray(),
     count(db.collection(ALLOCATIONS),{datasetId:id}),count(db.collection(EXCEPTIONS),{datasetId:id})
   ]);
-  const persistedFingerprint=sha256(stableStringify(persistedAllocations.map(immutableProjection)));
-  if(persistedFingerprint!==actual.allocation||persistedAllocationCount!==Number(dataset.allocationCount||0)||persistedExceptionCount!==Number(dataset.exceptionCount||0))fail('FIFO_ACTIVATION_PERSISTENCE_MISMATCH','Persisted FIFO rows or counts changed after Candidate validation.',409);
+  const persistedContentFingerprint=allocationContentFingerprint(persistedAllocations);
+  const replayContentFingerprint=allocationContentFingerprint(result.allocations);
+  if(persistedContentFingerprint!==replayContentFingerprint||persistedAllocationCount!==Number(dataset.allocationCount||0)||persistedExceptionCount!==Number(dataset.exceptionCount||0))fail('FIFO_ACTIVATION_PERSISTENCE_MISMATCH','Persisted FIFO rows or counts changed after Candidate validation.',409);
   const facts=provenanceFacts(persistedAllocations,source.manuals),coverage=provenanceCoverage(facts);
   const exposure=status=>accountingDecimal.format(facts.filter(row=>row.profitProvenanceStatus===status).reduce((sum,row)=>sum+accountingDecimal.parse(row.saleValueExact,accountingDecimal.MONEY_SCALE),0n),accountingDecimal.MONEY_SCALE);
   const unresolvedProven=facts.filter(row=>row.profitProvenanceStatus==='PROVEN'&&(row.fifoCostExact==null||row.fifoProfitExact==null));
@@ -545,7 +553,7 @@ async function revalidateForActivation(db, datasetId, options = {}) {
   return {ok:true,readOnly:true,dataset,validation,fingerprints:actual,allocationCount:persistedAllocationCount,exceptionCount:persistedExceptionCount,
     authorities:{saleSnapshotId:saleActive.snapshotId,purchaseDatasetId:purchaseActive.datasetId,openingDatasetId:openingAuthority.datasetId,openingLifecycleStatus:openingAuthority.lifecycleStatus,openingRevision:openingAuthority.revision},
     financialSummary:{netSaleValueExact:coverage.totalSaleValueExact,provenSaleValueExact:coverage.provenSaleValueExact,provenFifoCostExact:coverage.provenFifoCostExact,provenFifoProfitExact:coverage.provenFifoProfitExact,unknownExposureExact:exposure('UNKNOWN'),partialExposureExact:exposure('PARTIAL'),provenProfitCoveragePercent:coverage.provenProfitCoveragePercent},
-    safety:{futurePurchaseLeakage:0,fabricatedZeroCost:0,unresolvedProvenProfit:0,deterministicReplay:true,persistedFingerprintMatch:true}};
+    safety:{futurePurchaseLeakage:0,fabricatedZeroCost:0,unresolvedProvenProfit:0,deterministicReplay:true,persistedFingerprintMatch:true,persistedContentFingerprint,replayContentFingerprint}};
 }
 
 async function activationGate(db, datasetId, options = {}) {

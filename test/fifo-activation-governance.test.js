@@ -29,6 +29,7 @@ test('incomplete Human population records evidence but cannot qualify activation
 
 test('activation performs read-only deterministic replay then atomically selects authority without Candidate mutation',async()=>{
   const {db,bundle,built,dataset,input}=await candidateFixture();
+  db.collection(fifo.ALLOCATIONS).rows.reverse();
   const beforeDataset=structuredClone(dataset),beforeAllocations=structuredClone(db.collection(fifo.ALLOCATIONS).rows);
   const recorded=await fifo.recordHumanValidation(db,built.datasetId,{...input,result:'PASS',reason:'Management Human validation completed',humanTests:fifo.REQUIRED_HUMAN_TESTS},actors.admin);
   const gate=await fifo.activationGate(db,built.datasetId,{sourceLoader:async()=>structuredClone(bundle)});
