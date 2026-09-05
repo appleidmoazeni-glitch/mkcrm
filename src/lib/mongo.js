@@ -21,6 +21,7 @@ async function initMongo() {
   const collections = await database.listCollections().toArray();
   const existing = new Set(collections.map(c => c.name));
   const needed = ['settings','customers','leads','invoiceReservations','invoiceCounters','invoiceAuditLogs','saleIssueLocks','saleIssuanceFingerprintLocks','userShayganMappings','userAccountAccesses','proformas','itemCatalog','itemCatalogAll','itemCatalogReconciliationAudit','itemInventoryCatalog','purchaseHistoryDiscoveryQueue','inventoryDiscoveryVerificationQueue','accountCatalog','searchCache','appLogs','purchaseDrafts','customerInvoiceHistory','customerSyncRuns','users','roles','boardEvents','sellerPerformanceHistory','stockSleepSnapshots','stockSleepQueue','stockSleepItemLayers','stockSleepSupplierSummary','stockSleepHistory','supplierPurchaseInvoices','supplierPurchaseLayers','purchaseLayerDatasets','purchaseLayerDatasetState','purchaseLayerDiagnostics','manualCostResolutions','openingAccountingCostBasis','openingAccountingEvidenceDatasets','openingAccountingEvidenceState','openingAccountingEvidenceProgress','openingAccountingEvidenceApprovals','openingAccountingEligibilityPreview','openingAccountingExtractionLeases','openingAccountingExtractionRuntime','openingAccountingExtractionEvents','financialSourceReviews','financialSourceReviewActions','openingInventoryEvidence','accountingCostEvidence','purchaseReturnResolutions','saleReturnResolutions','accountingValidationSamples','accountingReadinessState','accountingEvidenceInvestigations','purchaseLayerRecoveryCandidates','accountingItemIdentityResolutions','accountingReturnReviewCases','manualCostEvidencePackages','accountingReviewBatches','accountingReviewSessions','accountingComparisonImports','accountingComparisonRows','accountingComparisonRuns','accountingComparisonDifferences','fatDefinitions','fatRuns','fatEvidence','fatDifferences','fatApprovals','fifoDatasets','fifoAllocations','fifoDiagnostics','fifoExceptions','fifoDatasetState','supplierInventoryAllocation','supplierSleepSummary','supplierSleepSnapshots','saleSnapshots','saleInvoiceHeaders','saleInvoiceLines','saleSnapshotDiagnostics','saleSnapshotState','appJobs'];
+  needed.push('fifoHumanValidationAudits');
   for (const name of needed) if (!existing.has(name)) await database.createCollection(name);
   await database.collection('settings').createIndex({ key: 1 }, { unique: true });
   await database.collection('customers').createIndex({ mobile: 1 });
@@ -204,6 +205,8 @@ async function initMongo() {
   await database.collection('fifoExceptions').createIndex({ datasetId: 1, exceptionKey: 1 }, { unique: true });
   await database.collection('fifoExceptions').createIndex({ datasetId: 1, status: 1, code: 1, itemCode: 1 });
   await database.collection('fifoDatasetState').createIndex({ scopeKey: 1 }, { unique: true });
+  await database.collection('fifoHumanValidationAudits').createIndex({ validationId:1 }, { unique:true });
+  await database.collection('fifoHumanValidationAudits').createIndex({ datasetId:1, candidateFingerprint:1, result:1, createdAt:-1 });
 
 
   await database.collection('purchaseDrafts').createIndex({ purchaseDraftNo: 1 }, { unique: true });

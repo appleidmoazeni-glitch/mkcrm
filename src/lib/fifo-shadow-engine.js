@@ -17,6 +17,7 @@ const ALLOCATIONS = 'fifoAllocations';
 const DIAGNOSTICS = 'fifoDiagnostics';
 const EXCEPTIONS = 'fifoExceptions';
 const STATE = 'fifoDatasetState';
+const HUMAN_VALIDATIONS = 'fifoHumanValidationAudits';
 const SCOPE_KEY = 'fifo-shadow-v2-precision-evidence';
 const SCHEMA_VERSION = 4;
 const ALGORITHM_VERSION = 'fifo-shadow-v5-approved-opening-chronology';
@@ -24,6 +25,21 @@ const QUANTITY_SCALE = 6;
 const VALUE_SCALE = 2;
 const EPSILON = 0.000001;
 const LOCK_MS = 15 * 60 * 1000;
+const ACTIVATION_ROLES = new Set(['admin','accounting','purchase']);
+const REQUIRED_HUMAN_TESTS = Object.freeze([
+  'FIFO-N01-SALE-RETURN-RESTORATION',
+  'FIFO-N02-APPROVED-OPENING-ALLOCATION',
+  'FIFO-N03-OPENING-BOUNDED-CAPACITY',
+  'FIFO-N04-PRE-OPENING-CHRONOLOGY',
+  'FIFO-N05-FUTURE-PURCHASE-LEAKAGE',
+  'FIFO-N06-PURCHASE-ONLY-MULTI-LAYER',
+  'FIFO-N07-NO-OPENING-STOCK',
+  'FIFO-N08-UNKNOWN-TO-PROVEN',
+  'FIFO-N09-SELLER-ATTRIBUTION',
+  'FIFO-N10-CATEGORY-ATTRIBUTION',
+  'FIFO-N11-PROVEN-TO-UNKNOWN',
+  'FIFO-N12-PROVEN-CHANGED-COST'
+]);
 
 function clean(value, max = 500) {
   return String(value == null ? '' : value).trim().slice(0, max);
@@ -69,7 +85,34 @@ function safeError(value) {
     .replace(/((?:authorization|password|passwd|token|api[-_ ]?key)\s*[:=]\s*)[^\s,;"'<>]+/gi, '$1[REDACTED]');
 }
 function actor(input = {}) {
-  return { username:clean(input.username || input.user || 'system', 100), role:clean(input.role || 'system', 50) };
+  return {
+    userId:clean(input.userId || input.id || input._id, 100),
+    username:clean(input.username || input.user || 'system', 100),
+    displayName:clean(input.displayName || input.name || input.fullName, 200),
+    role:clean(input.role || 'system', 50)
+  };
+}
+function governanceId(prefix) {
+  return `${prefix}-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+}
+function assertActivationRole(input = {}) {
+  const value=actor(input);
+  if(!ACTIVATION_ROLES.has(value.role))fail('FIFO_ACTIVATION_FORBIDDEN','Only Admin, Accounting or Commercial may govern FIFO activation.',403);
+  return value;
+}
+function datasetFingerprints(dataset = {}) {
+  return {
+    candidate:clean(dataset.candidateFingerprint,64),
+    source:clean(dataset.sourceFingerprint,64),
+    allocation:clean(dataset.allocationFingerprint,64)
+  };
+}
+function requireExpectedFingerprints(dataset, input = {}) {
+  const actual=datasetFingerprints(dataset),expected=input.expectedFingerprints||{};
+  for(const key of ['candidate','source','allocation']){
+    if(!clean(expected[key],64)||clean(expected[key],64)!==actual[key])fail('FIFO_ACTIVATION_FINGERPRINT_STALE',`Expected ${key} fingerprint is required and must match.`,409);
+  }
+  return actual;
 }
 function accountingReviewContext(input = {}) {
   if (!input || typeof input !== 'object') return null;
@@ -282,10 +325,57 @@ function immutableProjection(row) {
   };
 }
 
+function sourceFingerprintFor(result, source, pinned) {
+  return sha256(stableStringify({
+    saleSnapshotId:pinned.saleSnapshotId,
+    purchaseDatasetId:pinned.purchaseDatasetId,
+    openingDatasetId:pinned.openingDatasetId,
+    openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
+    openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
+    openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
+    sales:result.sales.map(row => [saleIdentity(row), row.saleDate, round(row.qty), round(row.saleValue, VALUE_SCALE)]),
+    saleReturns:result.saleReturns.map(row => [saleIdentity(row), row.saleDate, clean(row.createdDate,100), round(row.qty), round(row.saleValue, VALUE_SCALE), clean(row.generalRef,100), clean(row.relatedInvHeaderId,100), clean(row.invHeaderIdRoot,100)]),
+    purchases:result.officialRows.map(row => [purchaseIdentity(row), row.purchaseInvoiceDate, round(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity), round(row.netUnitCost ?? row.grossUnitCost, VALUE_SCALE)]),
+    manuals:[...source.manuals]
+      .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
+      .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, clean(row.manualCostExact ?? row.manualCost), clean(row.contentHash)]),
+    opening:[...(source.openingRows || [])]
+      .sort((a,b)=>openingIdentity(a).localeCompare(openingIdentity(b),'en'))
+      .map(row => [openingIdentity(row), clean(row.itemGuid,100), clean(row.itemCode,100), clean(row.effectiveOpeningDate||row.openingDate,8), clean(row.openingQuantityExact,100), clean(row.openingUnitCostExact,100), clean(row.openingTotalValueExact,100), clean(row.sourceFingerprint,64), clean(row.recordFingerprint,64)]),
+    purchaseReturnResolutions:[...source.purchaseReturnResolutions]
+      .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
+      .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedPurchaseLayer,clean(row.returnQuantity)]),
+    saleReturnResolutions:[...source.saleReturnResolutions]
+      .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
+      .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedOriginalSaleLineId,clean(row.returnQuantity)]),
+    precision:{
+      quantityScale:accountingDecimal.QUANTITY_SCALE,
+      unitCostScale:accountingDecimal.UNIT_COST_SCALE,
+      moneyScale:accountingDecimal.MONEY_SCALE,
+      roundingMode:accountingDecimal.ROUNDING_MODE
+    }
+  }));
+}
+
+function candidateFingerprintFor(dataset, sourceFingerprint, allocationFingerprint, manualResolutionSetFingerprint) {
+  return sha256(stableStringify({
+    saleSnapshotId:clean(dataset.sourceSaleSnapshotId,100),
+    purchaseDatasetId:clean(dataset.sourcePurchaseDatasetId,100),
+    openingDatasetId:clean(dataset.sourceOpeningDatasetId,100),
+    openingDatasetFingerprint:clean(dataset.openingDatasetFingerprint,64),
+    openingSourceFingerprint:clean(dataset.openingSourceFingerprint,64),
+    openingEligibilityFingerprint:clean(dataset.openingEligibilityFingerprint,64),
+    manualResolutionSetFingerprint:clean(manualResolutionSetFingerprint,64),
+    algorithmVersion:clean(dataset.algorithmVersion,100),
+    canonicalSourceHash:clean(sourceFingerprint,64),
+    allocationFingerprint:clean(allocationFingerprint,64)
+  }));
+}
+
 const indexReadyByDb = new WeakMap();
 async function initializeIndexes(db) {
   const existing = new Set((await db.listCollections().toArray()).map(row => row.name));
-  for (const name of [DATASETS, ALLOCATIONS, DIAGNOSTICS, EXCEPTIONS, STATE]) {
+  for (const name of [DATASETS, ALLOCATIONS, DIAGNOSTICS, EXCEPTIONS, STATE, HUMAN_VALIDATIONS]) {
     if (!existing.has(name)) await db.createCollection(name).catch(() => {});
   }
   await db.collection(DATASETS).createIndex({ datasetId:1 }, { unique:true });
@@ -309,6 +399,8 @@ async function initializeIndexes(db) {
   await db.collection(EXCEPTIONS).createIndex({ datasetId:1, exceptionKey:1 }, { unique:true });
   await db.collection(EXCEPTIONS).createIndex({ datasetId:1, status:1, code:1, itemCode:1 });
   await db.collection(STATE).createIndex({ scopeKey:1 }, { unique:true });
+  await db.collection(HUMAN_VALIDATIONS).createIndex({ validationId:1 }, { unique:true });
+  await db.collection(HUMAN_VALIDATIONS).createIndex({ datasetId:1, candidateFingerprint:1, result:1, createdAt:-1 });
   return { ok:true, schemaVersion:SCHEMA_VERSION, algorithmVersion:ALGORITHM_VERSION };
 }
 async function ensureIndexes(db) {
@@ -352,6 +444,148 @@ async function ensureState(db) {
     { upsert:true }
   );
 }
+
+async function qualifyingHumanValidation(db, dataset) {
+  if(!dataset)return null;
+  const fingerprints=datasetFingerprints(dataset);
+  const row=await db.collection(HUMAN_VALIDATIONS).findOne({
+    datasetId:dataset.datasetId,
+    candidateFingerprint:fingerprints.candidate,
+    sourceFingerprint:fingerprints.source,
+    allocationFingerprint:fingerprints.allocation,
+    result:'PASS',
+    completePopulation:true
+  },{sort:{createdAt:-1}});
+  if(!row)return null;
+  const tests=new Set(Array.isArray(row.humanTests)?row.humanTests:[]);
+  return REQUIRED_HUMAN_TESTS.every(test=>tests.has(test))?row:null;
+}
+
+async function recordHumanValidation(db, datasetId, input = {}, requestedBy = {}) {
+  await ensureIndexes(db);
+  const currentActor=assertActivationRole(requestedBy);
+  const id=clean(datasetId,100),reason=clean(input.reason,2000);
+  if(!id||!reason)fail('FIFO_HUMAN_VALIDATION_INPUT_REQUIRED','Candidate and Human validation reason are required.',400);
+  const dataset=await db.collection(DATASETS).findOne({datasetId:id});
+  if(!dataset||dataset.status!=='completed'||dataset.activationStatus!=='validated-candidate'||dataset.validation?.valid!==true)fail('FIFO_HUMAN_VALIDATION_CANDIDATE_INVALID','Only a completed validated immutable FIFO Candidate may be Human-validated.',409);
+  const fingerprints=requireExpectedFingerprints(dataset,input);
+  const result=clean(input.result,20).toUpperCase();
+  if(!['PASS','FAIL'].includes(result))fail('FIFO_HUMAN_VALIDATION_RESULT_INVALID','Human validation result must be PASS or FAIL.',400);
+  const supplied=[...new Set((Array.isArray(input.humanTests)?input.humanTests:[]).map(value=>clean(value,100)).filter(Boolean))].sort();
+  const allowed=new Set(REQUIRED_HUMAN_TESTS);
+  if(!supplied.length||supplied.some(test=>!allowed.has(test)))fail('FIFO_HUMAN_VALIDATION_POPULATION_INVALID','Human test population contains missing or unsupported identifiers.',400);
+  const completePopulation=REQUIRED_HUMAN_TESTS.every(test=>supplied.includes(test));
+  const existing=await db.collection(HUMAN_VALIDATIONS).findOne({
+    datasetId:id,candidateFingerprint:fingerprints.candidate,sourceFingerprint:fingerprints.source,
+    allocationFingerprint:fingerprints.allocation,result,humanPopulationFingerprint:sha256(stableStringify(supplied))
+  });
+  if(existing)return {ok:true,idempotent:true,validation:existing,humanValidated:Boolean(result==='PASS'&&completePopulation)};
+  const openingAuthority=await openingAccountingCostBasis.resolveOpeningAuthority(db,{datasetId:dataset.sourceOpeningDatasetId});
+  if(clean(openingAuthority.datasetId,100)!==clean(dataset.sourceOpeningDatasetId,100)||Number(openingAuthority.revision||0)!==Number(dataset.openingApprovalRevision||0))fail('FIFO_HUMAN_VALIDATION_OPENING_STALE','Opening authority lineage changed before Human validation was recorded.',409);
+  const createdAt=new Date();
+  const validation={
+    validationId:governanceId('FHVAL'),action:'HUMAN_VALIDATE_FIFO',datasetId:id,result,
+    humanTests:supplied,humanPopulationFingerprint:sha256(stableStringify(supplied)),completePopulation,
+    candidateFingerprint:fingerprints.candidate,sourceFingerprint:fingerprints.source,allocationFingerprint:fingerprints.allocation,
+    saleSnapshotId:clean(dataset.sourceSaleSnapshotId,100),purchaseDatasetId:clean(dataset.sourcePurchaseDatasetId,100),
+    openingDatasetId:clean(dataset.sourceOpeningDatasetId,100),openingApprovalRevision:Number(dataset.openingApprovalRevision||0),
+    openingDatasetFingerprint:clean(dataset.openingDatasetFingerprint,64),openingSourceFingerprint:clean(dataset.openingSourceFingerprint,64),
+    openingEligibilityFingerprint:clean(dataset.openingEligibilityFingerprint,64),actor:currentActor,reason,createdAt,immutable:true,
+    applicationVersion:APP_VERSION
+  };
+  await db.collection(HUMAN_VALIDATIONS).insertOne(validation);
+  return {ok:true,idempotent:false,validation,humanValidated:Boolean(result==='PASS'&&completePopulation)};
+}
+
+async function revalidateForActivation(db, datasetId, options = {}) {
+  await ensureIndexes(db);
+  const id=clean(datasetId,100);
+  const dataset=await db.collection(DATASETS).findOne({datasetId:id});
+  if(!dataset||dataset.status!=='completed'||dataset.activationStatus!=='validated-candidate'||dataset.validation?.valid!==true)fail('FIFO_ACTIVATION_CANDIDATE_INVALID','FIFO Candidate is not completed and validated.',409);
+  const saleActive=await saleSnapshot._activeDataset(db);
+  const purchaseActive=await purchaseLayerDataset.activeDataset(db);
+  const openingAuthority=await openingAccountingCostBasis.resolveOpeningAuthority(db,{});
+  if(clean(saleActive?.snapshotId,100)!==clean(dataset.sourceSaleSnapshotId,100))fail('FIFO_ACTIVATION_SALE_AUTHORITY_CHANGED','Active Sale Snapshot differs from Candidate lineage.',409);
+  if(clean(purchaseActive?.datasetId,100)!==clean(dataset.sourcePurchaseDatasetId,100))fail('FIFO_ACTIVATION_PURCHASE_AUTHORITY_CHANGED','Active Purchase Dataset differs from Candidate lineage.',409);
+  if(clean(openingAuthority?.datasetId,100)!==clean(dataset.sourceOpeningDatasetId,100)||clean(openingAuthority?.lifecycleStatus,30)!=='APPROVED')fail('FIFO_ACTIVATION_OPENING_AUTHORITY_CHANGED','Canonical Opening authority differs from Candidate lineage.',409);
+  if(Number(openingAuthority.revision||0)!==Number(dataset.openingApprovalRevision||0))fail('FIFO_ACTIVATION_OPENING_REVISION_CHANGED','Opening authority revision differs from Candidate lineage.',409);
+  const openingFingerprints=openingAuthority.fingerprints||{};
+  if(clean(openingFingerprints.dataset,64)!==clean(dataset.openingDatasetFingerprint,64)||clean(openingFingerprints.source,64)!==clean(dataset.openingSourceFingerprint,64)||clean(openingFingerprints.eligibility,64)!==clean(dataset.openingEligibilityFingerprint,64))fail('FIFO_ACTIVATION_OPENING_FINGERPRINT_CHANGED','Opening authority fingerprints differ from Candidate lineage.',409);
+  const pinned={
+    saleSnapshotId:dataset.sourceSaleSnapshotId,purchaseDatasetId:dataset.sourcePurchaseDatasetId,openingDatasetId:dataset.sourceOpeningDatasetId,
+    openingFingerprints:{dataset:dataset.openingDatasetFingerprint,source:dataset.openingSourceFingerprint,eligibility:dataset.openingEligibilityFingerprint}
+  };
+  const source=options.sourceLoader?await options.sourceLoader(db,pinned):await loadSources(db,pinned);
+  source.purchaseReturnResolutions=Array.isArray(source.purchaseReturnResolutions)?source.purchaseReturnResolutions:[];
+  source.saleReturnResolutions=Array.isArray(source.saleReturnResolutions)?source.saleReturnResolutions:[];
+  const result=allocateSources(id,source,{dateFrom:dataset.dateFrom,dateTo:dataset.dateTo});
+  const validation=reconcile(result);
+  if(!validation.valid)fail('FIFO_ACTIVATION_REVALIDATION_FAILED','FIFO accounting invariants failed during pre-activation replay.',409);
+  const sourceFingerprint=sourceFingerprintFor(result,source,pinned);
+  const allocationFingerprint=sha256(stableStringify(result.allocations.map(immutableProjection)));
+  const manualSet=manualCostResolution._approvedRowsFingerprint(source.manuals);
+  const candidateFingerprint=candidateFingerprintFor(dataset,sourceFingerprint,allocationFingerprint,manualSet.fingerprint);
+  const actual=datasetFingerprints(dataset);
+  if(sourceFingerprint!==actual.source||allocationFingerprint!==actual.allocation||candidateFingerprint!==actual.candidate)fail('FIFO_ACTIVATION_REPLAY_FINGERPRINT_MISMATCH','Read-only activation replay does not match immutable Candidate fingerprints.',409);
+  const [persistedAllocations,persistedAllocationCount,persistedExceptionCount]=await Promise.all([
+    // insertMany preserves the deterministic allocation order used to produce the
+    // Candidate fingerprint. Re-read in that same natural order; sorting by the
+    // opaque allocationId would compute a different byte sequence.
+    db.collection(ALLOCATIONS).find({datasetId:id}).toArray(),
+    count(db.collection(ALLOCATIONS),{datasetId:id}),count(db.collection(EXCEPTIONS),{datasetId:id})
+  ]);
+  const persistedFingerprint=sha256(stableStringify(persistedAllocations.map(immutableProjection)));
+  if(persistedFingerprint!==actual.allocation||persistedAllocationCount!==Number(dataset.allocationCount||0)||persistedExceptionCount!==Number(dataset.exceptionCount||0))fail('FIFO_ACTIVATION_PERSISTENCE_MISMATCH','Persisted FIFO rows or counts changed after Candidate validation.',409);
+  const facts=provenanceFacts(persistedAllocations,source.manuals),coverage=provenanceCoverage(facts);
+  const exposure=status=>accountingDecimal.format(facts.filter(row=>row.profitProvenanceStatus===status).reduce((sum,row)=>sum+accountingDecimal.parse(row.saleValueExact,accountingDecimal.MONEY_SCALE),0n),accountingDecimal.MONEY_SCALE);
+  const unresolvedProven=facts.filter(row=>row.profitProvenanceStatus==='PROVEN'&&(row.fifoCostExact==null||row.fifoProfitExact==null));
+  const futurePurchaseLeakage=persistedAllocations.filter(row=>row.sourceType==='official_purchase_layer'&&validDate(row.purchaseInvoiceDate)&&validDate(row.saleDate)&&row.purchaseInvoiceDate>row.saleDate);
+  const fabricatedZero=persistedAllocations.filter(row=>row.sourceType==='unknown_cost'&&row.allocatedCostAmountExact!=null);
+  if(unresolvedProven.length||futurePurchaseLeakage.length||fabricatedZero.length)fail('FIFO_ACTIVATION_FINANCIAL_SAFETY_FAILED','Financial provenance safety checks failed.',409);
+  return {ok:true,readOnly:true,dataset,validation,fingerprints:actual,allocationCount:persistedAllocationCount,exceptionCount:persistedExceptionCount,
+    authorities:{saleSnapshotId:saleActive.snapshotId,purchaseDatasetId:purchaseActive.datasetId,openingDatasetId:openingAuthority.datasetId,openingLifecycleStatus:openingAuthority.lifecycleStatus,openingRevision:openingAuthority.revision},
+    financialSummary:{netSaleValueExact:coverage.totalSaleValueExact,provenSaleValueExact:coverage.provenSaleValueExact,provenFifoCostExact:coverage.provenFifoCostExact,provenFifoProfitExact:coverage.provenFifoProfitExact,unknownExposureExact:exposure('UNKNOWN'),partialExposureExact:exposure('PARTIAL'),provenProfitCoveragePercent:coverage.provenProfitCoveragePercent},
+    safety:{futurePurchaseLeakage:0,fabricatedZeroCost:0,unresolvedProvenProfit:0,deterministicReplay:true,persistedFingerprintMatch:true}};
+}
+
+async function activationGate(db, datasetId, options = {}) {
+  const revalidation=await revalidateForActivation(db,datasetId,options);
+  const humanValidation=await qualifyingHumanValidation(db,revalidation.dataset);
+  const state=await db.collection(STATE).findOne({scopeKey:SCOPE_KEY});
+  return {ok:true,readOnly:true,eligible:Boolean(humanValidation),humanValidation:humanValidation||null,revalidation,
+    currentActiveDatasetId:clean(state?.activeDatasetId,100),authorityRevision:Number(state?.authorityRevision||0),
+    blocker:humanValidation?'':'HUMAN_FIFO_VALIDATION_REQUIRED'};
+}
+
+async function activateDataset(db, datasetId, input = {}, requestedBy = {}, options = {}) {
+  await ensureIndexes(db);
+  const currentActor=assertActivationRole(requestedBy),reason=clean(input.reason,2000);
+  if(!reason)fail('FIFO_ACTIVATION_REASON_REQUIRED','FIFO activation reason is required.',400);
+  const gate=await activationGate(db,datasetId,options),dataset=gate.revalidation.dataset;
+  const fingerprints=requireExpectedFingerprints(dataset,input);
+  if(!gate.eligible)fail('FIFO_HUMAN_VALIDATION_REQUIRED','Fingerprint-bound Human FIFO validation is required.',409);
+  if(clean(input.humanValidationId,100)!==clean(gate.humanValidation.validationId,100))fail('FIFO_HUMAN_VALIDATION_STALE','Exact qualifying Human validation audit ID is required.',409);
+  const expectedPrevious=clean(input.expectedPreviousActiveDatasetId,100),expectedRevision=Number(input.authorityRevision||0);
+  if(expectedPrevious!==gate.currentActiveDatasetId||expectedRevision!==gate.authorityRevision)fail('FIFO_ACTIVATION_STATE_STALE','Active FIFO authority changed; refresh activation gate.',409);
+  const activatedAt=new Date(),activationId=governanceId('FACT'),event={
+    activationId,action:'ACTIVATE_FIFO',candidateId:dataset.datasetId,previousActiveFIFO:gate.currentActiveDatasetId,newActiveFIFO:dataset.datasetId,
+    actor:currentActor,role:currentActor.role,at:activatedAt,reason,candidateFingerprint:fingerprints.candidate,sourceFingerprint:fingerprints.source,
+    allocationFingerprint:fingerprints.allocation,saleSnapshotId:dataset.sourceSaleSnapshotId,purchaseDatasetId:dataset.sourcePurchaseDatasetId,
+    openingDatasetId:dataset.sourceOpeningDatasetId,openingAuthorityLifecycleState:gate.revalidation.authorities.openingLifecycleStatus,
+    humanValidationId:gate.humanValidation.validationId,allocationCount:gate.revalidation.allocationCount,exceptionCount:gate.revalidation.exceptionCount,
+    financialSummary:gate.revalidation.financialSummary,immutable:true,applicationVersion:APP_VERSION
+  };
+  await ensureState(db);
+  const revisionFilter=expectedRevision===0?{$or:[{authorityRevision:0},{authorityRevision:{$exists:false}}]}:{authorityRevision:expectedRevision};
+  const updated=await db.collection(STATE).updateOne({scopeKey:SCOPE_KEY,activeDatasetId:expectedPrevious,...revisionFilter},{$set:{
+    activeDatasetId:dataset.datasetId,previousActiveDatasetId:gate.currentActiveDatasetId,authorityContractVersion:1,authorityRevision:expectedRevision+1,
+    activatedAt,activatedBy:currentActor,activationReason:reason,activeDatasetStatus:'completed',activeCandidateFingerprint:fingerprints.candidate,
+    activeSourceFingerprint:fingerprints.source,activeAllocationFingerprint:fingerprints.allocation,humanValidationId:gate.humanValidation.validationId,
+    lastActivationAudit:event,updatedAt:activatedAt
+  },$push:{activationAuditLog:event}});
+  if(!updated.matchedCount)fail('FIFO_ACTIVATION_STATE_STALE','Active FIFO authority changed concurrently; activation stopped.',409);
+  return {ok:true,activationPerformed:true,activationAudit:event,previousActiveDatasetId:gate.currentActiveDatasetId,activeDatasetId:dataset.datasetId,humanValidation:gate.humanValidation,revalidation:gate.revalidation};
+}
 async function acquireLock(db, ownerId) {
   await ensureState(db);
   const now = new Date();
@@ -389,8 +623,17 @@ async function activeDataset(db) {
   const state = await db.collection(STATE).findOne({ scopeKey:SCOPE_KEY });
   if (!state?.activeDatasetId) return null;
   const dataset = await db.collection(DATASETS).findOne({ datasetId:state.activeDatasetId });
-  if (!dataset || dataset.status !== 'completed' || !['validated-shadow','active-shadow'].includes(dataset.activationStatus)) return null;
-  return { datasetId:dataset.datasetId, dataset, state };
+  if (!dataset || dataset.status !== 'completed') return null;
+  if(Number(state.authorityContractVersion||0)>=1){
+    const fingerprints=datasetFingerprints(dataset);
+    const humanValidation=await qualifyingHumanValidation(db,dataset);
+    if(!humanValidation||clean(state.humanValidationId,100)!==clean(humanValidation.validationId,100)||
+      clean(state.activeCandidateFingerprint,64)!==fingerprints.candidate||clean(state.activeSourceFingerprint,64)!==fingerprints.source||
+      clean(state.activeAllocationFingerprint,64)!==fingerprints.allocation)return null;
+    return {datasetId:dataset.datasetId,dataset,state,humanValidation,authorityContractVersion:1};
+  }
+  if(!['validated-shadow','active-shadow'].includes(dataset.activationStatus))return null;
+  return { datasetId:dataset.datasetId, dataset, state, authorityContractVersion:0 };
 }
 
 async function loadSources(db, pinned = {}) {
@@ -1404,35 +1647,7 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
     const allocationMs = Date.now() - allocationStartedMs;
     const validation = reconcile(result);
     const summary = summarize(result, validation);
-    const sourceFingerprint = sha256(stableStringify({
-      saleSnapshotId:pinned.saleSnapshotId,
-      purchaseDatasetId:pinned.purchaseDatasetId,
-      openingDatasetId:pinned.openingDatasetId,
-      openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
-      openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
-      openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
-      sales:result.sales.map(row => [saleIdentity(row), row.saleDate, round(row.qty), round(row.saleValue, VALUE_SCALE)]),
-      saleReturns:result.saleReturns.map(row => [saleIdentity(row), row.saleDate, clean(row.createdDate,100), round(row.qty), round(row.saleValue, VALUE_SCALE), clean(row.generalRef,100), clean(row.relatedInvHeaderId,100), clean(row.invHeaderIdRoot,100)]),
-      purchases:result.officialRows.map(row => [purchaseIdentity(row), row.purchaseInvoiceDate, round(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity), round(row.netUnitCost ?? row.grossUnitCost, VALUE_SCALE)]),
-      manuals:[...source.manuals]
-        .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
-        .map(row => [row.resolutionId, row.revision, row.status, row.effectiveFrom, row.effectiveTo, clean(row.manualCostExact ?? row.manualCost), clean(row.contentHash)]),
-      opening:[...(source.openingRows || [])]
-        .sort((a,b)=>openingIdentity(a).localeCompare(openingIdentity(b),'en'))
-        .map(row => [openingIdentity(row), clean(row.itemGuid,100), clean(row.itemCode,100), clean(row.effectiveOpeningDate||row.openingDate,8), clean(row.openingQuantityExact,100), clean(row.openingUnitCostExact,100), clean(row.openingTotalValueExact,100), clean(row.sourceFingerprint,64), clean(row.recordFingerprint,64)]),
-      purchaseReturnResolutions:[...source.purchaseReturnResolutions]
-        .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
-        .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedPurchaseLayer,clean(row.returnQuantity)]),
-      saleReturnResolutions:[...source.saleReturnResolutions]
-        .sort((a,b)=>clean(a.resolutionId).localeCompare(clean(b.resolutionId),'en'))
-        .map(row => [row.resolutionId,row.revision,row.status,row.returnLineIdentity,row.selectedOriginalSaleLineId,clean(row.returnQuantity)]),
-      precision:{
-        quantityScale:accountingDecimal.QUANTITY_SCALE,
-        unitCostScale:accountingDecimal.UNIT_COST_SCALE,
-        moneyScale:accountingDecimal.MONEY_SCALE,
-        roundingMode:accountingDecimal.ROUNDING_MODE
-      }
-    }));
+    const sourceFingerprint = sourceFingerprintFor(result, source, pinned);
     const manualResolutionSet = manualCostResolution._approvedRowsFingerprint(source.manuals);
     const allocationFingerprint = sha256(stableStringify(result.allocations.map(immutableProjection)));
     const replayResult = allocateSources(datasetId, source, dates);
@@ -1441,18 +1656,15 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
     if (!replayValidation.valid || replayAllocationFingerprint !== allocationFingerprint) {
       fail('FIFO_DETERMINISTIC_REPLAY_MISMATCH', 'Deterministic in-memory FIFO replay did not reproduce the allocation fingerprint.', 500);
     }
-    const candidateFingerprint = sha256(stableStringify({
-      saleSnapshotId:pinned.saleSnapshotId,
-      purchaseDatasetId:pinned.purchaseDatasetId,
-      openingDatasetId:pinned.openingDatasetId,
+    const candidateFingerprint = candidateFingerprintFor({
+      sourceSaleSnapshotId:pinned.saleSnapshotId,
+      sourcePurchaseDatasetId:pinned.purchaseDatasetId,
+      sourceOpeningDatasetId:pinned.openingDatasetId,
       openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
       openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
       openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
-      manualResolutionSetFingerprint:manualResolutionSet.fingerprint,
-      algorithmVersion:ALGORITHM_VERSION,
-      canonicalSourceHash:sourceFingerprint,
-      allocationFingerprint
-    }));
+      algorithmVersion:ALGORITHM_VERSION
+    }, sourceFingerprint, allocationFingerprint, manualResolutionSet.fingerprint);
     const deterministicPeer = await db.collection(DATASETS).findOne({
       datasetId:{ $ne:datasetId },
       status:'completed',
@@ -1611,12 +1823,18 @@ async function listDatasets(db, limit = 20) {
   await ensureIndexes(db);
   const active = await activeDataset(db);
   const list = await db.collection(DATASETS).find({}).sort({ createdAt:-1 }).limit(Math.max(1, Math.min(Number(limit || 20), 100))).toArray();
+  const validations=await db.collection(HUMAN_VALIDATIONS).find({datasetId:{$in:list.map(row=>row.datasetId)},result:'PASS',completePopulation:true}).sort({createdAt:-1}).toArray();
+  const validationByDataset=new Map();
+  for(const row of validations)if(!validationByDataset.has(row.datasetId))validationByDataset.set(row.datasetId,row);
   return {
     ok:true,
     activeDatasetId:active?.datasetId || '',
-    list:list.map(row => ({ ...row, isActive:row.datasetId === active?.datasetId })),
+    list:list.map(row => {
+      const validation=validationByDataset.get(row.datasetId),qualified=validation&&validation.candidateFingerprint===row.candidateFingerprint&&validation.sourceFingerprint===row.sourceFingerprint&&validation.allocationFingerprint===row.allocationFingerprint;
+      return {...row,isActive:row.datasetId===active?.datasetId,humanValidation:qualified?{validationId:validation.validationId,result:validation.result,createdAt:validation.createdAt,actor:validation.actor}:null,humanValidated:Boolean(qualified)};
+    }),
     shadowMode:true,
-    accountingApproved:false
+    accountingApproved:Boolean(active)
   };
 }
 async function status(db, datasetId = '') {
@@ -1626,6 +1844,7 @@ async function status(db, datasetId = '') {
     ? await db.collection(DATASETS).findOne({ datasetId:clean(datasetId, 100) })
     : active?.dataset || await db.collection(DATASETS).findOne({}, { sort:{ createdAt:-1 } });
   const state = await db.collection(STATE).findOne({ scopeKey:SCOPE_KEY });
+  const humanValidation=dataset?await qualifyingHumanValidation(db,dataset):null;
   const manualResolutionSet = await manualCostResolution.approvedSetFingerprint(db);
   const staleReasons=[];
   if (dataset && !dataset.manualResolutionSetFingerprint) staleReasons.push('legacy-dataset-without-manual-resolution-fingerprint');
@@ -1638,12 +1857,13 @@ async function status(db, datasetId = '') {
       buildLockOwner:state?.buildLockOwner || '',
       buildLockExpiresAt:state?.buildLockExpiresAt || null
     },
-    dataset:dataset ? { ...dataset, isActive:dataset.datasetId === active?.datasetId } : null,
+    dataset:dataset ? { ...dataset, isActive:dataset.datasetId === active?.datasetId, humanValidated:Boolean(humanValidation), humanValidation:humanValidation?{validationId:humanValidation.validationId,result:humanValidation.result,createdAt:humanValidation.createdAt,actor:humanValidation.actor}:null } : null,
     stale:staleReasons.length>0,
     staleReasons,
     currentManualResolutionSetFingerprint:manualResolutionSet.fingerprint,
-    shadowMode:true,
-    accountingApproved:false
+    activationAuthority:Number(state?.authorityContractVersion||0)>=1?{revision:Number(state?.authorityRevision||0),lastActivationAudit:state.lastActivationAudit||null}:null,
+    shadowMode:!active,
+    accountingApproved:Boolean(active)
   };
 }
 async function listAllocations(db, filters = {}) {
@@ -1982,11 +2202,13 @@ async function candidateQualityReport(db,datasetId){
 }
 async function validationReport(db, datasetId = '') {
   await ensureIndexes(db);
-  const active = datasetId ? null : await activeDataset(db);
+  const active = await activeDataset(db);
   const id = clean(datasetId || active?.datasetId, 100);
   if (!id) return { ok:true, available:false, shadowMode:true, accountingApproved:false };
   const dataset = await db.collection(DATASETS).findOne({ datasetId:id });
   if (!dataset) fail('FIFO_DATASET_NOT_FOUND', 'FIFO Shadow Dataset پیدا نشد.', 404);
+  const humanValidation=await qualifyingHumanValidation(db,dataset);
+  const isActive=id===active?.datasetId;
   const startedMs = Date.now();
   const [allocations, exceptions, diagnostics] = await Promise.all([
     db.collection(ALLOCATIONS).find({ datasetId:id }).toArray(),
@@ -2029,7 +2251,7 @@ async function validationReport(db, datasetId = '') {
   return {
     ok:true,
     available:true,
-    dataset,
+    dataset:{...dataset,isActive,humanValidated:Boolean(humanValidation),humanValidation:humanValidation?{validationId:humanValidation.validationId,result:humanValidation.result,createdAt:humanValidation.createdAt,actor:humanValidation.actor}:null,activationAudit:isActive?active.state?.lastActivationAudit||null:null},
     coverage:dataset.summary,
     confidence:{ score:dataset.summary?.confidenceScore || 0, classification:dataset.summary?.confidence || 'Unknown' },
     reconciliation:dataset.validation,
@@ -2046,8 +2268,8 @@ async function validationReport(db, datasetId = '') {
     topExceptions:exceptions.filter(row => row.status === 'unresolved').slice(0, 50),
     diagnostics,
     reportPerformance:{ mongoReadAndAggregationMs:Date.now() - startedMs, allocationRowsRead:allocations.length, exceptionRowsRead:exceptions.length },
-    shadowMode:true,
-    accountingApproved:false,
+    shadowMode:!isActive,
+    accountingApproved:isActive,
     profitCalculated:false,
     roiCalculated:false,
     commissionCalculated:false
@@ -2060,11 +2282,15 @@ module.exports = {
   DIAGNOSTICS,
   EXCEPTIONS,
   STATE,
+  HUMAN_VALIDATIONS,
   SCOPE_KEY,
   SCHEMA_VERSION,
   ALGORITHM_VERSION,
   ensureIndexes,
   activeDataset,
+  recordHumanValidation,
+  activationGate,
+  activateDataset,
   buildShadowDataset,
   listDatasets,
   status,
@@ -2081,6 +2307,11 @@ module.exports = {
   _eligibleOfficial:eligibleOfficial,
   _manualEffective:manualEffective,
   _immutableProjection:immutableProjection
+  ,_qualifyingHumanValidation:qualifyingHumanValidation
+  ,_revalidateForActivation:revalidateForActivation
+  ,_sourceFingerprintFor:sourceFingerprintFor
+  ,_candidateFingerprintFor:candidateFingerprintFor
+  ,REQUIRED_HUMAN_TESTS
   ,_provenanceFacts:provenanceFacts
   ,_provenanceCoverage:provenanceCoverage
 };

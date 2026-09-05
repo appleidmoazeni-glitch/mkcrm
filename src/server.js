@@ -760,7 +760,7 @@ const ROLE_PERMISSIONS = {
   seller: ['dashboard','sale','proforma','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
   accounting: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports','app-logs','tablo'],
   warehouse: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports','app-logs','tablo'],
-  purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','reports','app-logs','tablo'],
+  purchase: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','stock-sleep','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports','app-logs','tablo'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','purchase-drafts','stocks','cardex','turnover','customers','leads','reservations','seller-profit','tablo'],
   manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','reports'],
   supervisor: ['dashboard','seller-profit','reports']
@@ -4845,7 +4845,8 @@ async function handleApi(req, res, pathname, query) {
           fifoShadowEngine.ALLOCATIONS,
           fifoShadowEngine.DIAGNOSTICS,
           fifoShadowEngine.EXCEPTIONS,
-          fifoShadowEngine.STATE
+          fifoShadowEngine.STATE,
+          fifoShadowEngine.HUMAN_VALIDATIONS
         ],
         shadowMode:true,
         accountingApproved:false,
@@ -4932,23 +4933,38 @@ async function handleApi(req, res, pathname, query) {
       });
     }
     if (pathname === '/api/accounting/fifo-shadow/datasets' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await fifoShadowEngine.listDatasets(db,Number(query.limit||20)));
     }
+    if(pathname==='/api/accounting/fifo-shadow/activation-gate'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.activationGate(db,query.datasetId||''));}
+      catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'FIFO_ACTIVATION_GATE_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/accounting/fifo-shadow/human-validation'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting','purchase']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,201,await fifoShadowEngine.recordHumanValidation(db,body.datasetId,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_HUMAN_VALIDATION_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/accounting/fifo-shadow/activate'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting','purchase']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.activateDataset(db,body.datasetId,body,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'FIFO_ACTIVATION_FAILED',error:String(error.message||error)});}
+    }
     if (pathname === '/api/accounting/fifo-shadow/status' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await fifoShadowEngine.status(db,query.datasetId||''));
     }
     if (pathname === '/api/accounting/fifo-shadow/candidate-report' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try{return sendJson(res,200,await fifoShadowEngine.candidateQualityReport(db,query.datasetId||''));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_CANDIDATE_REPORT_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/accounting/fifo-shadow/report' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try{return sendJson(res,200,await fifoShadowEngine.validationReport(db,query.datasetId||''));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_REPORT_FAILED',error:String(error.message||error)});}
@@ -4960,24 +4976,24 @@ async function handleApi(req, res, pathname, query) {
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RELIABILITY_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/accounting/fifo-shadow/allocations' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await fifoShadowEngine.listAllocations(db,query));
     }
     if (pathname === '/api/accounting/fifo-shadow/allocation-audit' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try{return sendJson(res,200,await fifoShadowEngine.auditAllocations(db,query));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_AUDIT_READ_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/accounting/fifo-shadow/audit-dimensions' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       try{return sendJson(res,200,await fifoShadowEngine.auditDimensions(db,query));}
       catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_AUDIT_DIMENSIONS_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/accounting/fifo-shadow/exceptions' && req.method === 'GET') {
-      if (!requireRole(req,res,['admin','accounting','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','manager','purchase'])) return;
       const db=await connectMongo();
       return sendJson(res,200,await fifoShadowEngine.listExceptions(db,query));
     }

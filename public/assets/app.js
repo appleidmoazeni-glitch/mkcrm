@@ -21,7 +21,7 @@ const ROLE_PAGES = {
   seller: ['dashboard','sale','proforma','proforma-list','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
   accounting: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','fifo-profit-facts','profit-adjustment-review','saved-profit-ledger','supplier-incentive-ledger','commission-rate-versions','commission-policy-governance','commission-category-governance','commission-rate-governance','saved-profit-opening-governance','commission-export-readiness','draft-commission-report','tir-1405-reconstruction','accounting-excel-audit','reports'],
   warehouse: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','reports'],
-  purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','reports'],
+  purchase: ['dashboard','sale','proforma','proforma-list','stocks','cardex','inv-sale','inv-buy','turnover','customers','leads','lead-audit','supplier-aging','seller-profit','manual-cost-resolution','fifo-shadow-validation','reports'],
   seller_buyer: ['dashboard','sale','proforma','proforma-list','buy','stocks','cardex','turnover','customers','leads','reservations','seller-profit'],
   manager: ['dashboard','seller-profit','manual-cost-resolution','fifo-shadow-validation','accounting-fifo-readiness','accounting-review-workbench','accounting-fat','fifo-profit-facts','profit-adjustment-review','saved-profit-ledger','supplier-incentive-ledger','commission-rate-versions','commission-policy-governance','commission-category-governance','commission-rate-governance','saved-profit-opening-governance','commission-export-readiness','draft-commission-report','tir-1405-reconstruction','accounting-excel-audit','reports'],
   supervisor: ['dashboard','seller-profit','reports']
@@ -748,6 +748,24 @@ const uiPageLifecycle=(()=>{
     }
     throw new Error('مهلت انتظار FIFO Shadow به پایان رسید؛ وضعیت Job را بررسی کنید.');
   }
+  const FIFO_HUMAN_TESTS=['FIFO-N01-SALE-RETURN-RESTORATION','FIFO-N02-APPROVED-OPENING-ALLOCATION','FIFO-N03-OPENING-BOUNDED-CAPACITY','FIFO-N04-PRE-OPENING-CHRONOLOGY','FIFO-N05-FUTURE-PURCHASE-LEAKAGE','FIFO-N06-PURCHASE-ONLY-MULTI-LAYER','FIFO-N07-NO-OPENING-STOCK','FIFO-N08-UNKNOWN-TO-PROVEN','FIFO-N09-SELLER-ATTRIBUTION','FIFO-N10-CATEGORY-ATTRIBUTION','FIFO-N11-PROVEN-TO-UNKNOWN','FIFO-N12-PROVEN-CHANGED-COST'];
+  function expectedFingerprints(dataset){return {candidate:dataset.candidateFingerprint||'',source:dataset.sourceFingerprint||'',allocation:dataset.allocationFingerprint||''};}
+  async function recordHumanPass(dataset){
+    const reason=prompt('دلیل ثبت Human FIFO validation را وارد کنید:','Management-confirmed Human PASS for FIFO-N01 through FIFO-N12.');
+    if(!String(reason||'').trim())return;
+    if(!confirm(`Human PASS برای ${dataset.datasetId} و فقط برای اثرانگشت‌های نمایش‌داده‌شده ثبت شود؟`))return;
+    const response=await json('/api/accounting/fifo-shadow/human-validation',{method:'POST',body:JSON.stringify({datasetId:dataset.datasetId,result:'PASS',reason,humanTests:FIFO_HUMAN_TESTS,expectedFingerprints:expectedFingerprints(dataset)})});
+    alert(`Human validation ثبت شد: ${response.validation?.validationId||'—'}`);await loadDatasets();await loadReport();
+  }
+  async function activateFifo(dataset){
+    const gate=await json('/api/accounting/fifo-shadow/activation-gate?'+query({datasetId:dataset.datasetId}));
+    if(!gate.eligible){alert(gate.blocker||'Activation gate آماده نیست.');return;}
+    const reason=prompt('دلیل فعال‌سازی FIFO را وارد کنید:','Management-authorized activation of Human-validated Production FIFO Candidate after canonical Purchase, approved Opening and Sale Return reconciliation.');
+    if(!String(reason||'').trim())return;
+    if(!confirm(`FIFO فعال از «${gate.currentActiveDatasetId||'هیچ‌کدام'}» به «${dataset.datasetId}» تغییر کند؟\nهیچ Allocation بازسازی نمی‌شود.`))return;
+    const response=await json('/api/accounting/fifo-shadow/activate',{method:'POST',body:JSON.stringify({datasetId:dataset.datasetId,reason,humanValidationId:gate.humanValidation.validationId,expectedPreviousActiveDatasetId:gate.currentActiveDatasetId,authorityRevision:gate.authorityRevision,expectedFingerprints:expectedFingerprints(dataset)})});
+    alert(`FIFO فعال شد. Audit: ${response.activationAudit?.activationId||'—'}`);await loadDatasets();await loadReport();
+  }
   function coverageCards(summary={}){
     return [
       ['Official',summary.official?.quantityPercent,summary.official?.quantity],
@@ -776,15 +794,17 @@ const uiPageLifecycle=(()=>{
     if(!selectedDatasetId)selectedDatasetId=response.activeDatasetId||list[0]?.datasetId||'';
     if(!list.some(row=>row.datasetId===controlDatasetId))controlDatasetId=list.find(row=>row.datasetId!==selectedDatasetId)?.datasetId||'';
     q('#fifoDatasets').innerHTML=`<table class="table"><thead><tr><th>Dataset</th><th>Status</th><th>Sources</th><th>Allocation</th><th>Confidence</th><th>Build</th><th></th></tr></thead><tbody>${list.map(row=>`<tr>
-      <td><small>${safe(row.datasetId)}</small>${row.isActive?'<br><span class="success">ACTIVE SHADOW</span>':''}</td>
+      <td><small>${safe(row.datasetId)}</small>${row.isActive?'<br><span class="success">ACTIVE FIFO</span>':''}${row.humanValidated?`<br><span class="success">HUMAN VALIDATED</span><br><small>${safe(row.humanValidation?.validationId||'')}</small>`:''}</td>
       <td>${safe(row.status)} / ${safe(row.activationStatus)}</td>
       <td><small>Sale: ${safe(row.sourceSaleSnapshotId)}<br>Purchase: ${safe(row.sourcePurchaseDatasetId)}<br>Opening: ${safe(row.sourceOpeningDatasetId||'—')}</small></td>
       <td>${number(row.allocationCount)}</td><td>${number(row.summary?.confidenceScore)} — ${safe(row.summary?.confidence)}</td>
       <td>${number(row.performance?.durationMs)} ms</td>
-      <td><button class="mini fifo-select" data-id="${safe(row.datasetId)}">مشاهده</button>${['failed','cancelled','completed_with_errors'].includes(row.status)&&['admin','accounting'].includes(userRole())?` <button class="mini fifo-resume" data-id="${safe(row.datasetId)}">Resume</button>`:''}</td>
+      <td><button class="mini fifo-select" data-id="${safe(row.datasetId)}">مشاهده</button>${['failed','cancelled','completed_with_errors'].includes(row.status)&&['admin','accounting'].includes(userRole())?` <button class="mini fifo-resume" data-id="${safe(row.datasetId)}">Resume</button>`:''}${row.status==='completed'&&row.activationStatus==='validated-candidate'&&['admin','accounting','purchase'].includes(userRole())&&!row.humanValidated?` <button class="mini fifo-human-pass" data-id="${safe(row.datasetId)}">ثبت Human PASS</button>`:''}${row.status==='completed'&&row.activationStatus==='validated-candidate'&&['admin','accounting','purchase'].includes(userRole())&&row.humanValidated&&!row.isActive?` <button class="mini green fifo-activate" data-id="${safe(row.datasetId)}">فعال‌سازی FIFO</button>`:''}</td>
     </tr>`).join('')||'<tr><td colspan="7">Dataset ساخته نشده است.</td></tr>'}</tbody></table>`;
     document.querySelectorAll('.fifo-select').forEach(button=>button.onclick=async()=>{selectedDatasetId=button.dataset.id;await loadReport();});
     document.querySelectorAll('.fifo-resume').forEach(button=>button.onclick=()=>startBuild(button.dataset.id));
+    document.querySelectorAll('.fifo-human-pass').forEach(button=>button.onclick=()=>recordHumanPass(list.find(row=>row.datasetId===button.dataset.id)));
+    document.querySelectorAll('.fifo-activate').forEach(button=>button.onclick=()=>activateFifo(list.find(row=>row.datasetId===button.dataset.id)));
   }
   async function loadReport(){
     const box=q('#fifoReport');if(!box)return;
@@ -798,7 +818,7 @@ const uiPageLifecycle=(()=>{
       const sellerOptions=(dimensions.sellers||[]).map(row=>`<option value="${safe(row.canonicalSellerId)}">${safe(row.sellerName||'بدون نام')} — ${safe(row.canonicalSellerId)}</option>`).join('');
       const categoryOptions=(dimensions.categories||[]).map(row=>`<option value="${safe(row.canonicalCategoryGuid)}">${safe(row.categoryName||'بدون نام')} — ${safe(row.canonicalCategoryGuid)}</option>`).join('');
       box.innerHTML=`
-        <div class="warn"><b>SHADOW MODE — NOT ACCOUNTING APPROVED</b><br>هیچ سود، ROI یا پورسانتی از این Dataset فعال نیست.${dataset.finalFinancialActivationEligibility==='blocked'?`<br><b>NOT ELIGIBLE FOR FINAL FINANCIAL ACTIVATION</b>: ${safe((dataset.finalFinancialActivationBlockers||[]).join('، '))}`:''}</div>
+        <div class="${dataset.isActive?'success':'warn'}"><b>${dataset.isActive?'ACTIVE FIFO AUTHORITY':'SHADOW MODE — NOT ACTIVE'}</b><br>${dataset.isActive?'این Dataset مرجع فعال FIFO است؛ Commission همچنان مستقل و غیرفعال است.':'NOT ELIGIBLE FOR FINAL FINANCIAL ACTIVATION تا زمان ثبت Human PASS و عبور Activation Gate.'}${dataset.humanValidated?`<br>Human validation: ${safe(dataset.humanValidation?.validationId||'ثبت شده')}`:''}${dataset.activationAudit?`<br>Activation audit: ${safe(dataset.activationAudit.activationId||'—')}`:''}</div>
         <div class="info"><b>Financial lineage</b><br>Sale Snapshot: ${safe(dataset.sourceSaleSnapshotId)}<br>Purchase Dataset: ${safe(dataset.sourcePurchaseDatasetId)}<br>Opening Dataset: ${safe(dataset.sourceOpeningDatasetId||'—')} — ${safe(dataset.openingApprovalStatus||'not-used')} / revision ${number(dataset.openingApprovalRevision||0)}<br><small>Opening dataset: ${safe(dataset.openingDatasetFingerprint||'—')}<br>Opening source: ${safe(dataset.openingSourceFingerprint||'—')}<br>Opening eligibility: ${safe(dataset.openingEligibilityFingerprint||'—')}</small></div>
         <div class="row four">
           <div class="info"><b>Dataset</b><br><small>${safe(dataset.datasetId)}</small><br>${safe(dataset.status)} / ${safe(dataset.activationStatus)}</div>
@@ -919,7 +939,7 @@ const uiPageLifecycle=(()=>{
   const inheritedMenu=window.renderMenu||renderMenu;
   window.renderMenu=renderMenu=function(){
     inheritedMenu.apply(this,arguments);
-    if(!['admin','accounting','manager'].includes(userRole()))return;
+    if(!['admin','accounting','manager','purchase'].includes(userRole()))return;
     const menu=q('#menu');if(!menu||menu.querySelector(`[data-page="${PAGE}"]`))return;
     const button=document.createElement('button');button.className='navbtn';button.dataset.page=PAGE;button.textContent='FIFO Shadow Validation';
     button.onclick=event=>{event.preventDefault();location.hash=PAGE;route();};
@@ -929,7 +949,7 @@ const uiPageLifecycle=(()=>{
   const inheritedRoute=window.route||route;
   window.route=route=async function(){
     const page=location.hash.slice(1)||firstAllowedPage();
-    if(page===PAGE&&['admin','accounting','manager'].includes(userRole()))return window.pageFifoShadowValidation();
+    if(page===PAGE&&['admin','accounting','manager','purchase'].includes(userRole()))return window.pageFifoShadowValidation();
     return inheritedRoute.apply(this,arguments);
   };
   try{renderMenu();}catch{}
@@ -5947,7 +5967,7 @@ async function pageSellerProfit(){
   };
   const HIDDEN_DIRECT={
     'manual-cost-resolution':['admin','accounting','manager','purchase'],
-    'fifo-shadow-validation':['admin','accounting','manager'],
+    'fifo-shadow-validation':['admin','accounting','manager','purchase'],
     'saved-profit-opening-governance':['admin','accounting','manager']
   };
   const ALL_IDS=[...new Set([...PRIMARY.map(row=>row.id),...ADVANCED.map(row=>row.id),...Object.keys(REDIRECTS),...Object.keys(HIDDEN_DIRECT)])];
