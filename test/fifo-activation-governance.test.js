@@ -27,6 +27,14 @@ test('incomplete Human population records evidence but cannot qualify activation
   assert.equal(recorded.humanValidated,false);assert.equal(await fifo._qualifyingHumanValidation(db,dataset),null);
 });
 
+test('session actor without userId is resolved to the stable governed User identity',async()=>{
+  const {db,built,input}=await candidateFixture();
+  db.collection('users').rows.push({_id:'mongo-user-admin',username:'admin',fullName:'Admin'});
+  const recorded=await fifo.recordHumanValidation(db,built.datasetId,{...input,result:'PASS',reason:'Management Human validation completed',humanTests:fifo.REQUIRED_HUMAN_TESTS},{username:'admin',displayName:'Admin',role:'admin'});
+  assert.equal(recorded.validation.actor.userId,'mongo-user-admin');
+  assert.equal(recorded.validation.actor.username,'admin');
+});
+
 test('activation performs read-only deterministic replay then atomically selects authority without Candidate mutation',async()=>{
   const {db,bundle,built,dataset,input}=await candidateFixture();
   db.collection(fifo.ALLOCATIONS).rows.reverse();

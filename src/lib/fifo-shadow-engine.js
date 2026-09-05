@@ -100,6 +100,14 @@ function assertActivationRole(input = {}) {
   if(!ACTIVATION_ROLES.has(value.role))fail('FIFO_ACTIVATION_FORBIDDEN','Only Admin, Accounting or Commercial may govern FIFO activation.',403);
   return value;
 }
+async function resolveActivationActor(db, input = {}) {
+  const value=assertActivationRole(input);
+  if(value.userId)return value;
+  const user=await db.collection('users').findOne({username:value.username});
+  const userId=clean(user?.userId || user?._id || value.username,100);
+  if(!userId)fail('FIFO_ACTIVATION_ACTOR_ID_REQUIRED','Governance actor requires a stable user identity.',409);
+  return {...value,userId};
+}
 function datasetFingerprints(dataset = {}) {
   return {
     candidate:clean(dataset.candidateFingerprint,64),
@@ -470,7 +478,7 @@ async function qualifyingHumanValidation(db, dataset) {
 
 async function recordHumanValidation(db, datasetId, input = {}, requestedBy = {}) {
   await ensureIndexes(db);
-  const currentActor=assertActivationRole(requestedBy);
+  const currentActor=await resolveActivationActor(db,requestedBy);
   const id=clean(datasetId,100),reason=clean(input.reason,2000);
   if(!id||!reason)fail('FIFO_HUMAN_VALIDATION_INPUT_REQUIRED','Candidate and Human validation reason are required.',400);
   const dataset=await db.collection(DATASETS).findOne({datasetId:id});
@@ -486,7 +494,7 @@ async function recordHumanValidation(db, datasetId, input = {}, requestedBy = {}
     datasetId:id,candidateFingerprint:fingerprints.candidate,sourceFingerprint:fingerprints.source,
     allocationFingerprint:fingerprints.allocation,result,humanPopulationFingerprint:sha256(stableStringify(supplied))
   });
-  if(existing)return {ok:true,idempotent:true,validation:existing,humanValidated:Boolean(result==='PASS'&&completePopulation)};
+  if(existing&&clean(existing.actor?.userId,100))return {ok:true,idempotent:true,validation:existing,humanValidated:Boolean(result==='PASS'&&completePopulation)};
   const openingAuthority=await openingAccountingCostBasis.resolveOpeningAuthority(db,{datasetId:dataset.sourceOpeningDatasetId});
   if(clean(openingAuthority.datasetId,100)!==clean(dataset.sourceOpeningDatasetId,100)||Number(openingAuthority.revision||0)!==Number(dataset.openingApprovalRevision||0))fail('FIFO_HUMAN_VALIDATION_OPENING_STALE','Opening authority lineage changed before Human validation was recorded.',409);
   const createdAt=new Date();
@@ -567,7 +575,7 @@ async function activationGate(db, datasetId, options = {}) {
 
 async function activateDataset(db, datasetId, input = {}, requestedBy = {}, options = {}) {
   await ensureIndexes(db);
-  const currentActor=assertActivationRole(requestedBy),reason=clean(input.reason,2000);
+  const currentActor=await resolveActivationActor(db,requestedBy),reason=clean(input.reason,2000);
   if(!reason)fail('FIFO_ACTIVATION_REASON_REQUIRED','FIFO activation reason is required.',400);
   const gate=await activationGate(db,datasetId,options),dataset=gate.revalidation.dataset;
   const fingerprints=requireExpectedFingerprints(dataset,input);
