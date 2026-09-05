@@ -29,6 +29,8 @@ test('incomplete Human population records evidence but cannot qualify activation
 
 test('session actor without userId is resolved to the stable governed User identity',async()=>{
   const {db,built,input}=await candidateFixture();
+  db.collection(fifo.HUMAN_VALIDATIONS).rows.push({datasetId:built.datasetId,result:'PASS',completePopulation:true,humanTests:[...fifo.REQUIRED_HUMAN_TESTS],candidateFingerprint:input.expectedFingerprints.candidate,sourceFingerprint:input.expectedFingerprints.source,allocationFingerprint:input.expectedFingerprints.allocation,actor:{username:'admin',userId:''},createdAt:new Date(0)});
+  assert.equal(await fifo._qualifyingHumanValidation(db,db.collection(fifo.DATASETS).rows[0]),null);
   db.collection('users').rows.push({_id:'mongo-user-admin',username:'admin',fullName:'Admin'});
   const recorded=await fifo.recordHumanValidation(db,built.datasetId,{...input,result:'PASS',reason:'Management Human validation completed',humanTests:fifo.REQUIRED_HUMAN_TESTS},{username:'admin',displayName:'Admin',role:'admin'});
   assert.equal(recorded.validation.actor.userId,'mongo-user-admin');

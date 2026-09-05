@@ -469,7 +469,8 @@ async function qualifyingHumanValidation(db, dataset) {
     sourceFingerprint:fingerprints.source,
     allocationFingerprint:fingerprints.allocation,
     result:'PASS',
-    completePopulation:true
+    completePopulation:true,
+    'actor.userId':{$exists:true,$ne:''}
   },{sort:{createdAt:-1}});
   if(!row)return null;
   const tests=new Set(Array.isArray(row.humanTests)?row.humanTests:[]);
