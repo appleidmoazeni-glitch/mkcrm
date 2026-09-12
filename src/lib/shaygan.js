@@ -1,4 +1,5 @@
 const { config } = require('./config');
+const inventoryAutoSyncPolicy = require('./inventory-auto-sync-policy');
 
 function range(from = '', to = '', arr = []) { return { From: String(from || ''), To: String(to || ''), In: arr }; }
 function sortRange(value = '0') { return { From: String(value), To: '', In: [] }; } // Shaygan GetStatement requires Sort.From = 0 or 1
@@ -19,9 +20,10 @@ async function post(endpoint, domain, rowStart = 0, rowCount = 100, opts = {}) {
     });
     const raw = await response.json().catch(() => ({}));
     const err = raw.ErrorMessage || (Array.isArray(raw.Result) && raw.Result.find(x => x && x.ErrorMessage)?.ErrorMessage) || '';
-    return { ok: response.ok && !err, status: response.status, result: Array.isArray(raw.Result) ? raw.Result : [], raw, error: err };
+    const resultIsArray = Array.isArray(raw.Result);
+    return { ok: response.ok && !err, status: response.status, result: resultIsArray ? raw.Result : [], resultIsArray, raw, error: err };
   } catch (e) {
-    return { ok: false, status: 0, result: [], raw: null, error: e.name === 'AbortError' ? 'Shaygan request timeout' : e.message };
+    return { ok: false, status: 0, result: [], resultIsArray:false, raw: null, error: e.name === 'AbortError' ? 'Shaygan request timeout' : e.message };
   } finally { clearTimeout(timer); }
 }
 
@@ -238,7 +240,8 @@ async function getInventoryByItemCode(itemCode) {
     remainCost: Number(x.RemainCost || 0),
     raw: x
   })).filter(x => x.quantity > 0).sort((a,b) => b.quantity - a.quantity || String(a.stockNumber).localeCompare(String(b.stockNumber)));
-  return { ...res, list };
+  const getRemainHealth = inventoryAutoSyncPolicy.exactGetRemainHealth(res, itemCode);
+  return { ...res, list, getRemainValidity:getRemainHealth.validity, getRemainHealth };
 }
 
 
@@ -264,7 +267,10 @@ async function getInventoryPage(rowStart = 0, rowCount = 100, filters = {}) {
     remainCost: Number(x.RemainCost || 0),
     raw: x
   })).filter(x => x.itemCode && x.quantity > 0);
-  return { ...res, list };
+  const getRemainHealth = !res.ok || res.resultIsArray === false || !res.result.length
+    ? { validity:inventoryAutoSyncPolicy.GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:res.error || (res.resultIsArray === false ? 'getremain-result-not-array' : 'empty-page-requires-snapshot-validation'), rawRows:res.result.length, positiveRows:list.length }
+    : { validity:inventoryAutoSyncPolicy.GETREMAIN_VALIDITY.VALID_DATA, trustworthy:true, reason:'page-contains-data', rawRows:res.result.length, positiveRows:list.length };
+  return { ...res, list, getRemainValidity:getRemainHealth.validity, getRemainHealth };
 }
 
 function normalizeKardexRow(row = {}) {

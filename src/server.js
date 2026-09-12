@@ -1050,10 +1050,13 @@ async function refreshInventoryCacheForItem(db, itemCode, reason = 'manual-refre
 
   const oldRows = await readInventoryRowsForItem(db, code);
   const inv = await shaygan.getInventoryByItemCode(code).catch(e => ({ ok:false, list:[], error:String(e.message||e) }));
-  if (!inv.ok || !Array.isArray(inv.list)) {
-    const err = inv.error || 'خواندن موجودی از شایگان ناموفق بود';
-    await db.collection('appLogs').insertOne({ type:'inventory_item_cache_refresh_error', itemCode:code, reason:reasonText, oldRowCount:oldRows.length, error:err, ok:false, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
-    return { ok:false, itemCode:code, error:err, refreshed:false, rows:oldRows, oldRowCount:oldRows.length, source:'safe-authoritative-item-refresh-error-preserved-cache' };
+  const getRemainHealth = inv.getRemainHealth || inventoryAutoSyncPolicy.exactGetRemainHealth(inv, code);
+  if (!inv.ok || !Array.isArray(inv.list) || getRemainHealth.validity === inventoryAutoSyncPolicy.GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT) {
+    const now = new Date();
+    const warning = 'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.';
+    const err = inv.error || getRemainHealth.reason || 'خواندن موجودی از شایگان ناموفق بود';
+    await db.collection('appLogs').insertOne({ type:'inventory_getremain_suspect', scope:'exact-item-refresh', itemCode:code, reason:reasonText, suspectReason:getRemainHealth.reason, observedRows:Number(getRemainHealth.rawRows||0), zeroProtected:oldRows.filter(row=>Number(row.quantity||0)>0).length, oldRowCount:oldRows.length, error:err, warning, ok:false, at:now, atTehran:time.formatTehranDateTime(now) }).catch(()=>{});
+    return { ok:false, suspect:true, validity:getRemainHealth.validity, suspectReason:getRemainHealth.reason, warning, itemCode:code, error:err, refreshed:false, preserved:true, rows:oldRows, oldRowCount:oldRows.length, zeroedCount:0, source:'safe-authoritative-item-refresh-suspect-preserved-cache' };
   }
 
   const rows = activePositiveRows(inv.list).map(x => ({ ...x, itemCode:String(x.itemCode || x.ItemCode || code).trim() || code, stockNumber:String(x.stockNumber || x.STNumber || x.StoreNumber || '').trim(), refreshReason:reasonText, refreshSource:'live-item-refresh', lastLiveVerifiedAt:new Date(), inventoryConfidence:'live-item-positive' })).filter(x => x.itemCode && x.stockNumber);
@@ -1064,13 +1067,13 @@ async function refreshInventoryCacheForItem(db, itemCode, reason = 'manual-refre
 
   if (!rows.length) {
     const allowZeroReplace = opts.allowZeroReplace === true || opts.confirmZero === true;
-    if (allowZeroReplace) {
+    if (allowZeroReplace && getRemainHealth.validity === inventoryAutoSyncPolicy.GETREMAIN_VALIDITY.VALID_ZERO) {
       await db.collection('itemInventoryCatalog').updateMany({ itemCode:code }, { $set:{ quantity:0, refreshReason:reasonText, refreshZeroConfirmed:true, lastSeenInItemRefresh:false, updatedAt:new Date(), syncedAt:new Date() } }).catch(()=>{});
       await db.collection('appLogs').insertOne({ type:'inventory_item_cache_refresh_zero_confirmed', itemCode:code, reason:reasonText, oldRowCount:oldRows.length, rowCount:0, ok:true, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
       return { ok:true, itemCode:code, refreshed:true, zeroConfirmed:true, rows:[], rowCount:0, oldRowCount:oldRows.length, source:'safe-authoritative-item-refresh-zero-confirmed' };
     }
-    await db.collection('appLogs').insertOne({ type:'inventory_item_cache_refresh_zero_untrusted', itemCode:code, reason:reasonText, oldRowCount:oldRows.length, rowCount:0, ok:true, preserved:true, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
-    return { ok:true, itemCode:code, refreshed:false, zeroUntrusted:true, preserved:true, rows:oldRows, rowCount:oldRows.length, liveRowCount:0, oldRowCount:oldRows.length, source:'safe-authoritative-item-refresh-zero-preserved-cache' };
+    await db.collection('appLogs').insertOne({ type:'inventory_item_cache_refresh_zero_untrusted', itemCode:code, reason:reasonText, validity:getRemainHealth.validity, healthReason:getRemainHealth.reason, oldRowCount:oldRows.length, rowCount:0, ok:false, preserved:true, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
+    return { ok:false, itemCode:code, refreshed:false, zeroUntrusted:true, preserved:true, validity:getRemainHealth.validity, suspectReason:getRemainHealth.reason, rows:oldRows, rowCount:oldRows.length, liveRowCount:0, oldRowCount:oldRows.length, zeroedCount:0, source:'safe-authoritative-item-refresh-zero-preserved-cache' };
   }
 
   await upsertInventoryRows(db, rows, { source:'exact-code-repair', reason:reasonText });
@@ -1106,11 +1109,20 @@ async function authoritativeLiveReconcileItem(db, itemCode, reason = 'authoritat
   if (!code) return { ok:false, itemCode:code, error:'itemCode is empty', rows:[] };
   const active = await getActiveWarehouseNumbers(db).catch(()=>[]);
   const activeSet = new Set((active || []).map(x=>String(x||'').trim()).filter(Boolean));
+  const oldRows = await readInventoryRowsForItem(db, code);
   const inv = await shaygan.getInventoryByItemCode(code).catch(e => ({ ok:false, list:[], error:String(e.message||e) }));
-  if (!inv.ok || !Array.isArray(inv.list)) {
-    const error = inv.error || 'خواندن live موجودی از شایگان ناموفق بود';
-    await db.collection('appLogs').insertOne({ type:'inventory_authoritative_live_reconcile_error', itemCode:code, reason:reasonText, error, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
-    return { ok:false, itemCode:code, error, rows:[], activeWarehouseNumbers:active };
+  const getRemainHealth = inv.getRemainHealth || inventoryAutoSyncPolicy.exactGetRemainHealth(inv, code);
+  if (!inv.ok || !Array.isArray(inv.list) || getRemainHealth.validity === inventoryAutoSyncPolicy.GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT) {
+    const now = new Date();
+    const warning = 'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.';
+    const error = inv.error || getRemainHealth.reason || 'خواندن live موجودی از شایگان ناموفق بود';
+    const zeroProtected = oldRows.filter(row=>Number(row.quantity||0)>0 && (!activeSet.size || activeSet.has(String(row.stockNumber||'')))).length;
+    const diagnostic = { scope:'exact-item-reconcile', itemCode:code, reason:reasonText, suspectReason:getRemainHealth.reason, observedRows:Number(getRemainHealth.rawRows||0), zeroProtected, error, warning, at:now, atTehran:time.formatTehranDateTime(now) };
+    await Promise.all([
+      db.collection('appLogs').insertOne({ type:'inventory_getremain_suspect', ...diagnostic }).catch(()=>{}),
+      db.collection('appLogs').insertOne({ type:'inventory_sync_fail_closed', ...diagnostic }).catch(()=>{})
+    ]);
+    return { ok:false, suspect:true, validity:getRemainHealth.validity, suspectReason:getRemainHealth.reason, warning, preserved:true, itemCode:code, error, rows:oldRows.filter(row=>Number(row.quantity||0)>0), zeroedCount:0, zeroProtected, activeWarehouseNumbers:active };
   }
   const liveRows = activePositiveRows(inv.list).map(x => ({
     ...x,
@@ -1136,8 +1148,8 @@ async function authoritativeLiveReconcileItem(db, itemCode, reason = 'authoritat
     zeroedCount = Number(upd.modifiedCount || 0);
   }
   const finalRows = await readInventoryRowsForItem(db, code);
-  await db.collection('appLogs').insertOne({ type:'inventory_authoritative_live_reconcile', itemCode:code, reason:reasonText, livePositiveCount:liveRows.length, missingStocks:[...new Set(missingStocks)], zeroedCount, activeWarehouseNumbers:active, ok:true, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
-  return { ok:true, itemCode:code, rows:finalRows.filter(x=>Number(x.quantity||0)>0 && (!activeSet.size || activeSet.has(String(x.stockNumber)))), livePositiveCount:liveRows.length, missingStocks:[...new Set(missingStocks)], zeroedCount, activeWarehouseNumbers:active, source:'authoritative-live-item-reconcile' };
+  await db.collection('appLogs').insertOne({ type:'inventory_authoritative_live_reconcile', itemCode:code, reason:reasonText, validity:getRemainHealth.validity, healthReason:getRemainHealth.reason, livePositiveCount:liveRows.length, missingStocks:[...new Set(missingStocks)], zeroedCount, activeWarehouseNumbers:active, ok:true, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) }).catch(()=>{});
+  return { ok:true, validity:getRemainHealth.validity, healthReason:getRemainHealth.reason, itemCode:code, rows:finalRows.filter(x=>Number(x.quantity||0)>0 && (!activeSet.size || activeSet.has(String(x.stockNumber)))), livePositiveCount:liveRows.length, missingStocks:[...new Set(missingStocks)], zeroedCount, activeWarehouseNumbers:active, source:'authoritative-live-item-reconcile' };
 }
 
 async function verifyMissingStockRowsLive(db, stockNumber, batchId, reason = 'stock-sync-missing-live-verify') {
@@ -1904,12 +1916,20 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
   const batchId = `${opts.batchPrefix || 'stock'}-${st}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const startedAt = new Date();
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, lastStockNumber:st, lastStartedAt:startedAt, lastError:'', lastResult:null });
+  const healthKey = `inventory.getremain.health.warehouse.${st}`;
+  const [existingPositiveRows, previousHealthRow] = await Promise.all([
+    db.collection('itemInventoryCatalog').countDocuments({ stockNumber:st, quantity:{ $gt:0 } }).catch(()=>0),
+    db.collection('settings').findOne({ key:healthKey }).catch(()=>null)
+  ]);
+  const previousHealth = previousHealthRow?.value || {};
+  const lastKnownGoodRowCount = Math.max(0, Number(previousHealth.lastKnownGoodRowCount || 0));
   let total = 0, page = 0, endedNaturally = false;
   let rawRows = 0;
   let terminalCondition = '';
   let pageEvidence = [];
   const quantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
   const quantityDirectionSamples = [];
+  const bufferedPages = [];
   const jobControl=opts.jobControl;
   try {
     const pagination = await inventoryAutoSyncPolicy.walkAuthoritativeInventoryPages({
@@ -1923,11 +1943,9 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       onPage:async ({ pageIndex, response:res }) => {
         jobControl?.checkCancellation?.();
         const rows = (res.list || []).map(x => ({ ...x, stockNumber:String(x.stockNumber || st), syncBatchId:batchId, syncStockNumber:st, syncSource:opts.source || 'stock-filter-positive-sync' }));
-        const persisted = await upsertInventoryRows(db, rows, { source:opts.source || 'stock-filter-positive-sync' });
-        for (const key of Object.keys(quantityDirections)) quantityDirections[key] += Number(persisted?.quantityDirections?.[key] || 0);
-        for (const sample of (persisted?.quantityDirectionSamples||[])) if (quantityDirectionSamples.length < 50) quantityDirectionSamples.push(sample);
+        bufferedPages.push(rows);
         total += rows.length;
-        jobControl?.progress?.({phase:'Persist inventory',current:pageIndex+1,total:safePages,message:`Persisted warehouse ${st}, page ${pageIndex+1}`});
+        jobControl?.progress?.({phase:'Reading Shaygan pages',current:pageIndex+1,total:safePages,message:`Buffered warehouse ${st}, page ${pageIndex+1}; awaiting health validation`});
         jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
       }
     });
@@ -1935,14 +1953,47 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
     rawRows = pagination.rawRows;
     terminalCondition = pagination.terminalCondition;
     pageEvidence = pagination.evidence;
-    if (!pagination.ok) {
-      const result = { ok:false, stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, error:pagination.error, batchId, completed:false, mode:'inventory-stock-positive-snapshot' };
-      await db.collection('appLogs').insertOne({ type:'inventory_stock_sync_error', stockNumber:st, total, rawRows, pages:page, pagesRead:page, pageEvidence, terminalCondition, error:pagination.error || '', batchId, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
-      await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:pagination.error || '' });
+    const health = inventoryAutoSyncPolicy.warehouseSnapshotHealth(pagination, {
+      baselineRows:lastKnownGoodRowCount,
+      existingPositiveRows,
+      minimumValidRatio:config.inventorySyncMinValidRatio,
+      minimumBaselineRows:config.inventorySyncMinBaselineRows
+    });
+    if (!pagination.ok || health.validity === inventoryAutoSyncPolicy.GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT) {
+      const now = new Date();
+      const consecutiveSuspectCount = Number(previousHealth.consecutiveSuspectCount || 0) + 1;
+      const warning = 'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.';
+      const error = String(pagination.error || health.reason || 'GetRemain response is unavailable or suspect');
+      const result = { ok:false, degraded:true, suspect:true, validity:health.validity, suspectReason:health.reason, warning, stockNumber:st, total:0, observedRows:total, rawRows, positiveRows:total, baselineRows:health.baselineRows, lastKnownGoodRowCount, existingPositiveRows, consecutiveSuspectCount, zeroProtected:Number(existingPositiveRows||0), zeroedCount:0, removedStale:0, pages:page, pagesRead:page, pageEvidence, terminalCondition, error, batchId, completed:false, endedNaturally:false, mode:'inventory-stock-getremain-fail-closed' };
+      const diagnostic = { stockNumber:st, batchId, baselineRows:health.baselineRows, lastKnownGoodRowCount, existingPositiveRows, observedRows:total, rawRows, page, reason:health.reason, zeroProtected:Number(existingPositiveRows||0), consecutiveSuspectCount, warning, at:now, atTehran:time.formatTehranDateTime(now), source:opts.source || 'manual' };
+      await Promise.all([
+        db.collection('appLogs').insertOne({ type:'inventory_getremain_suspect', ...diagnostic }).catch(()=>{}),
+        db.collection('appLogs').insertOne({ type:'inventory_sync_fail_closed', ...diagnostic }).catch(()=>{}),
+        db.collection('settings').updateOne({ key:healthKey }, { $set:{ key:healthKey, value:{ ...previousHealth, stockNumber:st, lastKnownGoodRowCount, lastKnownGoodAt:previousHealth.lastKnownGoodAt||null, lastSuspectAt:now, lastSuspectReason:health.reason, lastObservedRowCount:total, lastRawRowCount:rawRows, consecutiveSuspectCount, warning }, updatedAt:now, updatedBy:'inventory-sync' } }, { upsert:true }).catch(()=>{})
+      ]);
+      await saveAutoInventoryStatus({ running:opts.parentCycle === true, degraded:true, warning, affectedWarehouse:st, suspectReason:health.reason, baselineRows:health.baselineRows, observedRows:total, consecutiveSuspectCount, lastRunAt:now, lastStockNumber:st, lastResult:result, lastError:error });
       return result;
     }
     endedNaturally = pagination.completed;
     const completed = Boolean(endedNaturally);
+    const guardedWrite = await inventoryAutoSyncPolicy.guardedInventoryWrite(health, async () => {
+      const persistedPages = [];
+      // Preserve the established per-page write semantics after the complete
+      // warehouse snapshot passes the health gate. upsertInventoryRows keeps
+      // its bounded precedence lookup for every source page this way.
+      for (const rows of bufferedPages) {
+        const persisted = await upsertInventoryRows(db, rows, { source:opts.source || 'stock-filter-positive-sync' });
+        persistedPages.push(persisted);
+        for (const key of Object.keys(quantityDirections)) quantityDirections[key] += Number(persisted?.quantityDirections?.[key] || 0);
+        for (const sample of (persisted?.quantityDirectionSamples||[])) if (quantityDirectionSamples.length < 50) quantityDirectionSamples.push(sample);
+      }
+      return persistedPages;
+    }, existingPositiveRows);
+    if (!guardedWrite.written) throw new Error(`GetRemain health gate prevented inventory write: ${guardedWrite.reason}`);
+    const recovered = Number(previousHealth.consecutiveSuspectCount || 0) > 0;
+    const healthyAt = new Date();
+    await db.collection('settings').updateOne({ key:healthKey }, { $set:{ key:healthKey, value:{ stockNumber:st, validity:health.validity, lastKnownGoodRowCount:total, lastKnownGoodRawRows:rawRows, lastKnownGoodAt:healthyAt, lastObservedRowCount:total, consecutiveSuspectCount:0, recovered }, updatedAt:healthyAt, updatedBy:'inventory-sync' } }, { upsert:true }).catch(()=>{});
+    if (recovered) await db.collection('appLogs').insertOne({ type:'inventory_sync_recovered', stockNumber:st, batchId, baselineRows:health.baselineRows, observedRows:total, rawRows, previousConsecutiveSuspectCount:Number(previousHealth.consecutiveSuspectCount||0), at:healthyAt, atTehran:time.formatTehranDateTime(healthyAt) }).catch(()=>{});
     let removedStale = 0;
     let protectedFromStale = 0;
     let queuedForLiveVerify = 0;
@@ -1964,7 +2015,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       queuedForLiveVerify = Number(remaining.modifiedCount||0);
       liveMissingVerify = { deferred:true, checked:0, zeroedCount:0, failed:0, remainingQueued:queuedForLiveVerify, results:[] };
     }
-    const result = { ok:true, stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, quantityDirections, quantityDirectionSamples, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
+    const result = { ok:true, degraded:false, validity:health.validity, healthReason:health.reason, stockNumber:st, total, rawRows, positiveRows:total, baselineRows:health.baselineRows, lastKnownGoodRowCount, existingPositiveRows, observedRatio:health.observedRatio, consecutiveSuspectCount:0, zeroProtected:0, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, quantityDirections, quantityDirectionSamples, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
     await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, batchId, at:new Date(), source:opts.source || 'manual', durationMs:result.durationMs }).catch(()=>{});
     await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:'' });
     return result;
@@ -2103,26 +2154,36 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
     for (const key of Object.keys(broadQuantityDirections)) broadQuantityDirections[key] += Number(r.quantityDirections?.[key] || 0);
-    stockResults.push({ stockNumber:String(st), ok:r.ok, total:r.total||0, rawRows:r.rawRows||0, positiveRows:r.positiveRows||0, pages:r.pages||0, pagesRead:r.pagesRead||0, pageEvidence:(r.pageEvidence||[]).slice(0,300), terminalCondition:r.terminalCondition||'', completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, quantityDirections:r.quantityDirections||null, quantityDirectionSamples:(r.quantityDirectionSamples||[]).slice(0,50), error:r.error||'' });
+    stockResults.push({ stockNumber:String(st), ok:r.ok, degraded:!!r.degraded, suspect:!!r.suspect, validity:r.validity||'', suspectReason:r.suspectReason||'', warning:r.warning||'', baselineRows:r.baselineRows||0, lastKnownGoodRowCount:r.lastKnownGoodRowCount||0, existingPositiveRows:r.existingPositiveRows||0, observedRows:r.observedRows??r.total??0, zeroProtected:r.zeroProtected||0, consecutiveSuspectCount:r.consecutiveSuspectCount||0, total:r.total||0, rawRows:r.rawRows||0, positiveRows:r.positiveRows||0, pages:r.pages||0, pagesRead:r.pagesRead||0, pageEvidence:(r.pageEvidence||[]).slice(0,300), terminalCondition:r.terminalCondition||'', completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, quantityDirections:r.quantityDirections||null, quantityDirectionSamples:(r.quantityDirectionSamples||[]).slice(0,50), error:r.error||'' });
     jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);
     if (delay > 0) await new Promise(resolve => setTimeout(resolve, delay));
   }
   const stockSyncDurationMs = Date.now()-startedAt.getTime();
-  jobControl?.progress?.({phase:'New item verification',current:0,total:1,message:'Verifying newly discovered operational items'});
-  jobControl?.checkCancellation?.();
-  const newItemVerification = await verifyNewOperationalItemsLive(db).catch(error => ({ checked:0, verified:0, discoveredPositive:0, failed:1, remainingQueued:0, results:[], error:String(error.message || error) }));
-  jobControl?.progress?.({phase:'Bounded stale verification',current:0,total:1,message:'Verifying bounded stale-positive backlog'});
-  jobControl?.checkCancellation?.();
-  const missingVerification = await verifyQueuedMissingRowsLive(db).catch(error => ({ attempted:0, distinctAttempted:0, zeroedRows:0, timeouts:0, failed:1, durationMs:0, queueBefore:null, queueAfter:null, results:[], error:String(error.message||error) }));
+  const suspectWarehouses = stockResults.filter(row=>row.ok===false || row.completed!==true || row.suspect===true).map(row=>row.stockNumber);
+  const sourceHealthy = suspectWarehouses.length === 0 && stockCompleted === active.length;
+  let newItemVerification;
+  let missingVerification;
+  if (sourceHealthy) {
+    jobControl?.progress?.({phase:'New item verification',current:0,total:1,message:'Verifying newly discovered operational items'});
+    jobControl?.checkCancellation?.();
+    newItemVerification = await verifyNewOperationalItemsLive(db).catch(error => ({ checked:0, verified:0, discoveredPositive:0, failed:1, remainingQueued:0, results:[], error:String(error.message || error) }));
+    jobControl?.progress?.({phase:'Bounded stale verification',current:0,total:1,message:'Verifying bounded stale-positive backlog'});
+    jobControl?.checkCancellation?.();
+    missingVerification = await verifyQueuedMissingRowsLive(db).catch(error => ({ attempted:0, distinctAttempted:0, zeroedRows:0, timeouts:0, failed:1, durationMs:0, queueBefore:null, queueAfter:null, results:[], error:String(error.message||error) }));
+  } else {
+    const warning = 'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.';
+    newItemVerification = { skipped:true, reason:'warehouse-getremain-suspect', checked:0, verified:0, discoveredPositive:0, failed:0, remainingQueued:0, results:[], durationMs:0 };
+    missingVerification = { skipped:true, reason:'warehouse-getremain-suspect', attempted:0, distinctAttempted:0, zeroedRows:0, timeouts:0, failed:0, durationMs:0, queueBefore:null, queueAfter:null, results:[], warning };
+  }
   const exactVerificationDurationMs = Number(newItemVerification.durationMs||0) + Number(missingVerification.durationMs||0);
   const distinctExactItemsAttempted = new Set([...(newItemVerification.results||[]), ...(missingVerification.results||[])].map(row=>String(row.itemCode||'').trim()).filter(Boolean)).size;
   const queueBefore = { NEW_IDENTITY:newItemVerification.queueBefore||null, STALE_POSITIVE:missingVerification.queueBefore||null };
   const queueAfter = { NEW_IDENTITY:newItemVerification.queueAfter||null, STALE_POSITIVE:missingVerification.queueAfter||null };
   const oldestQueueAge = Math.max(Number(newItemVerification.queueAfter?.oldestAgeMs||0), Number(missingVerification.queueAfter?.oldestAgeMs||0));
   const result = {
-    ok:true, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active,
+    ok:sourceHealthy, degraded:!sourceHealthy, warning:sourceHealthy?'':'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.', suspectWarehouses, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active,
     stockRows:stockTotal, stockCompleted, protectedFromStale, broadQuantityDirections,
     stockSyncDurationMs, broadSyncDuration:stockSyncDurationMs,
     exactVerificationDurationMs, exactVerificationDuration:exactVerificationDurationMs,
@@ -2146,7 +2207,7 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   jobControl?.progress?.({phase:'Finalize',current:0,total:1,message:'Finalizing inventory synchronization'});
   jobControl?.checkCancellation?.();
   await db.collection('appLogs').insertOne({ type:'inventory_active_stock_sync', ...result, at:new Date(), source:opts.source || 'auto' }).catch(()=>{});
-  await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:false, mode:result.mode, lastRunAt:new Date(), lastStockNumber:'ACTIVE', currentStockNumber:'', nextStockNumber:'ACTIVE', lastResult:result, lastError:'' });
+  await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:false, degraded:!sourceHealthy, warning:result.warning, affectedWarehouses:suspectWarehouses, mode:result.mode, lastRunAt:new Date(), lastStockNumber:'ACTIVE', currentStockNumber:'', nextStockNumber:'ACTIVE', lastResult:result, lastError:sourceHealthy?'':`GetRemain suspect for warehouses: ${suspectWarehouses.join(', ')}` });
   return result;
 }
 

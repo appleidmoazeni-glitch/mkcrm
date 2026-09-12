@@ -7,6 +7,11 @@ const QUEUE_CLASSES = Object.freeze({
   NEW_IDENTITY:'NEW_IDENTITY',
   STALE_POSITIVE:'STALE_POSITIVE'
 });
+const GETREMAIN_VALIDITY = Object.freeze({
+  VALID_DATA:'VALID_DATA',
+  VALID_ZERO:'VALID_ZERO',
+  UNAVAILABLE_OR_SUSPECT:'UNAVAILABLE_OR_SUSPECT'
+});
 const OPERATIONAL_DISCOVERY_SOURCES = new Set([
   'canonical-purchase-engine',
   'canonical-sale-snapshot',
@@ -72,6 +77,69 @@ function finiteNonNegative(value) {
   return Number.isFinite(number) && number >= 0 ? number : null;
 }
 
+function quantity1(row = {}) {
+  const value = row.Quantity1 ?? row.quantity ?? row.RemainQ ?? row.Quantity ?? null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function normalizedCode(value) {
+  return clean(value, 200).toUpperCase();
+}
+
+function exactGetRemainHealth(response = {}, expectedItemCode = '') {
+  const rawRows = Array.isArray(response.result) ? response.result : [];
+  const resultShapeValid = response.resultIsArray !== false && Array.isArray(response.result);
+  if (response.ok === false || !resultShapeValid) {
+    return { validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:response.error || (!resultShapeValid ? 'getremain-result-not-array' : 'getremain-source-error'), rawRows:rawRows.length, positiveRows:0, explicitZeroRows:0 };
+  }
+  const expected = normalizedCode(expectedItemCode);
+  const matching = expected ? rawRows.filter(row => normalizedCode(row.ItemCode ?? row.itemCode ?? row.ProductCode) === expected) : rawRows;
+  if (rawRows.length && expected && !matching.length) {
+    return { validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:'exact-item-identity-mismatch', rawRows:rawRows.length, positiveRows:0, explicitZeroRows:0 };
+  }
+  const quantities = matching.map(quantity1);
+  if (quantities.some(value => value === null)) {
+    return { validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:'exact-item-invalid-quantity', rawRows:rawRows.length, positiveRows:0, explicitZeroRows:0 };
+  }
+  const positiveRows = quantities.filter(value => value > 0).length;
+  const explicitZeroRows = quantities.filter(value => value === 0).length;
+  if (positiveRows) return { validity:GETREMAIN_VALIDITY.VALID_DATA, trustworthy:true, reason:'exact-positive-data', rawRows:rawRows.length, positiveRows, explicitZeroRows };
+  if (matching.length && explicitZeroRows === matching.length) return { validity:GETREMAIN_VALIDITY.VALID_ZERO, trustworthy:true, reason:'explicit-zero-row', rawRows:rawRows.length, positiveRows:0, explicitZeroRows };
+  return { validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:'empty-exact-result-unconfirmed', rawRows:0, positiveRows:0, explicitZeroRows:0 };
+}
+
+function warehouseSnapshotHealth(pagination = {}, options = {}) {
+  const baselineRows = Math.max(0, Number(options.baselineRows || 0));
+  const existingPositiveRows = Math.max(0, Number(options.existingPositiveRows || 0));
+  const observedRows = Math.max(0, Number(pagination.positiveRows || 0));
+  const rawRows = Math.max(0, Number(pagination.rawRows || 0));
+  const minimumBaselineRows = Math.max(1, Number(options.minimumBaselineRows || 50));
+  const minimumValidRatio = Math.min(1, Math.max(0.01, Number(options.minimumValidRatio || 0.5)));
+  const effectiveBaselineRows = Math.max(baselineRows, existingPositiveRows);
+  const observedRatio = effectiveBaselineRows > 0 ? observedRows / effectiveBaselineRows : null;
+  const common = { baselineRows:effectiveBaselineRows, lastKnownGoodRowCount:baselineRows, existingPositiveRows, observedRows, rawRows, observedRatio, minimumBaselineRows, minimumValidRatio };
+  if (pagination.ok === false || pagination.completed !== true) {
+    return { ...common, validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:pagination.error || pagination.terminalCondition || 'incomplete-pagination' };
+  }
+  if (rawRows === 0) {
+    if (effectiveBaselineRows > 0) return { ...common, validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:'empty-first-page-against-positive-baseline' };
+    return { ...common, validity:GETREMAIN_VALIDITY.VALID_ZERO, trustworthy:true, reason:'empty-warehouse-with-zero-baseline' };
+  }
+  if (effectiveBaselineRows >= minimumBaselineRows && observedRatio < minimumValidRatio) {
+    return { ...common, validity:GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, trustworthy:false, reason:'abnormal-row-count-collapse' };
+  }
+  return { ...common, validity:GETREMAIN_VALIDITY.VALID_DATA, trustworthy:true, reason:'healthy-complete-snapshot' };
+}
+
+async function guardedInventoryWrite(health, write, protectedCount = 0) {
+  if (!health || health.trustworthy !== true || health.validity === GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT) {
+    return { written:false, zeroProtected:Math.max(0, Number(protectedCount || 0)), validity:health?.validity || GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT, reason:health?.reason || 'missing-getremain-health' };
+  }
+  const result = typeof write === 'function' ? await write() : null;
+  return { written:true, zeroProtected:0, validity:health.validity, reason:health.reason, result };
+}
+
 function extractTotalRecords(response = {}) {
   const result = Array.isArray(response.result) ? response.result : [];
   const candidates = [
@@ -94,14 +162,15 @@ function authoritativeInventoryPageEvidence(response = {}, { rowStart = 0, rowCo
   const pageSize = Math.max(1, Number(rowCount || 100));
   const rawRows = Array.isArray(response.result) ? response.result : [];
   const positiveRows = Array.isArray(response.list) ? response.list : [];
+  const resultShapeValid = response.resultIsArray !== false && Array.isArray(response.result);
   const rawCount = rawRows.length;
   const positiveCount = positiveRows.length;
   const totalRecords = extractTotalRecords(response);
-  const sourceOk = response.ok !== false;
+  const sourceOk = response.ok !== false && resultShapeValid;
   let terminal = false;
   let terminalCondition = 'continue-full-raw-page';
 
-  if (!sourceOk) terminalCondition = 'source-error';
+  if (!sourceOk) terminalCondition = resultShapeValid ? 'source-error' : 'invalid-result-shape';
   else if (rawCount === 0) {
     terminal = true;
     terminalCondition = 'empty-raw-page';
@@ -115,6 +184,7 @@ function authoritativeInventoryPageEvidence(response = {}, { rowStart = 0, rowCo
 
   return {
     sourceOk,
+    resultShapeValid,
     rowStart:Number(rowStart || 0),
     rowCount:pageSize,
     rawCount,
@@ -192,6 +262,7 @@ function summarizeStockResults(results = []) {
 module.exports = {
   INVENTORY_DISCOVERY_QUEUE,
   QUEUE_CLASSES,
+  GETREMAIN_VALIDITY,
   OPERATIONAL_DISCOVERY_SOURCES,
   isOperationalDiscoverySource,
   discoveryQueueId,
@@ -202,6 +273,9 @@ module.exports = {
   broadMissingEligibleFilter,
   shouldProtectExactFromBroad,
   classifyBroadQuantityDirection,
+  exactGetRemainHealth,
+  warehouseSnapshotHealth,
+  guardedInventoryWrite,
   extractTotalRecords,
   authoritativeInventoryPageEvidence,
   walkAuthoritativeInventoryPages,

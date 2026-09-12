@@ -64,6 +64,8 @@ const config = {
   autoInventorySyncDelayBetweenStocksMs: Number(process.env.AUTO_INVENTORY_SYNC_DELAY_BETWEEN_STOCKS_MS || 1000),
   autoInventorySyncPageLimit: Number(process.env.AUTO_INVENTORY_SYNC_PAGE_LIMIT || 300),
   autoInventorySyncDeleteStalePerStock: String(process.env.AUTO_INVENTORY_SYNC_DELETE_STALE_PER_STOCK || 'true').toLowerCase() !== 'false',
+  inventorySyncMinValidRatio: Number(process.env.INVENTORY_SYNC_MIN_VALID_RATIO || 0.5),
+  inventorySyncMinBaselineRows: Number(process.env.INVENTORY_SYNC_MIN_BASELINE_ROWS || 50),
   inventoryMissingLiveVerifyCycleLimit: Number(process.env.INVENTORY_MISSING_LIVE_VERIFY_CYCLE_LIMIT || 30),
   inventoryMissingLiveVerifyBudgetMs: Number(process.env.INVENTORY_MISSING_LIVE_VERIFY_BUDGET_MS || 90000),
   inventoryExactPositiveRecheckMs: Number(process.env.INVENTORY_EXACT_POSITIVE_RECHECK_MS || 900000),

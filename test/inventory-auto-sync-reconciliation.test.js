@@ -232,6 +232,86 @@ test('repeated full pages are bounded by maxPages instead of being mistaken for 
   assert.equal(result.terminalCondition, 'max-pages-guard');
 });
 
+test('fail-closed warehouse gate preserves 800 positive rows on HTTP 200 empty Result', async () => {
+  const previous = Array.from({ length:800 }, (_, index) => ({ itemCode:`I-${index}`, stockNumber:'01', quantity:1 }));
+  const db = new MemoryDb({ itemInventoryCatalog:structuredClone(previous) });
+  const pagination = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => ({ ok:true, status:200, result:[], list:[], resultIsArray:true }), pageSize:100, maxPages:10 });
+  const health = policy.warehouseSnapshotHealth(pagination, { baselineRows:800, existingPositiveRows:800, minimumValidRatio:0.5, minimumBaselineRows:50 });
+  let writes = 0;
+  const guarded = await policy.guardedInventoryWrite(health, async () => { writes++; await db.collection('itemInventoryCatalog').updateMany({ stockNumber:'01' }, { $set:{ quantity:0 } }); }, 800);
+  assert.equal(health.validity, policy.GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT);
+  assert.equal(health.reason, 'empty-first-page-against-positive-baseline');
+  assert.equal(guarded.written, false);
+  assert.equal(guarded.zeroProtected, 800);
+  assert.equal(writes, 0);
+  assert.equal(await db.collection('itemInventoryCatalog').countDocuments({ quantity:{ $gt:0 } }), 800);
+});
+
+test('abnormal five-row collapse against 800-row baseline is suspect and non-destructive', async () => {
+  const five = Array.from({ length:5 }, (_, index) => ({ ItemCode:`I-${index}`, Quantity1:1 }));
+  const previous = Array.from({ length:800 }, (_, index) => ({ itemCode:`I-${index}`, stockNumber:'01', quantity:1 }));
+  const db = new MemoryDb({ itemInventoryCatalog:structuredClone(previous) });
+  const pagination = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => ({ ok:true, status:200, result:five, list:five, resultIsArray:true }), pageSize:100, maxPages:10 });
+  const health = policy.warehouseSnapshotHealth(pagination, { baselineRows:800, existingPositiveRows:800, minimumValidRatio:0.5, minimumBaselineRows:50 });
+  const guarded = await policy.guardedInventoryWrite(health, async () => db.collection('itemInventoryCatalog').updateMany({}, { $set:{ quantity:0 } }), 800);
+  assert.equal(health.reason, 'abnormal-row-count-collapse');
+  assert.equal(health.observedRows, 5);
+  assert.equal(guarded.written, false);
+  assert.equal(await db.collection('itemInventoryCatalog').countDocuments({ quantity:{ $gt:0 } }), 800);
+});
+
+test('healthy multi-page warehouse snapshot remains writable and complete', async () => {
+  const full = Array.from({ length:100 }, (_, index) => ({ ItemCode:`I-${index}`, Quantity1:1 }));
+  const final = Array.from({ length:80 }, (_, index) => ({ ItemCode:`F-${index}`, Quantity1:1 }));
+  let calls = 0;
+  const pagination = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => [
+    { ok:true, result:full, list:full, resultIsArray:true },
+    { ok:true, result:final, list:final, resultIsArray:true }
+  ][calls++], pageSize:100, maxPages:10 });
+  const health = policy.warehouseSnapshotHealth(pagination, { baselineRows:200, existingPositiveRows:200, minimumValidRatio:0.5, minimumBaselineRows:50 });
+  let persisted = 0;
+  const guarded = await policy.guardedInventoryWrite(health, async () => { persisted = pagination.positiveRows; return persisted; }, 200);
+  assert.equal(health.validity, policy.GETREMAIN_VALIDITY.VALID_DATA);
+  assert.equal(pagination.completed, true);
+  assert.equal(guarded.written, true);
+  assert.equal(persisted, 180);
+});
+
+test('exact item HTTP 200 empty Result is suspect and cannot zero prior positive stock', async () => {
+  const db = new MemoryDb({ itemInventoryCatalog:[{ itemCode:'KEEP', stockNumber:'01', quantity:3 }] });
+  const health = policy.exactGetRemainHealth({ ok:true, status:200, result:[], list:[], resultIsArray:true }, 'KEEP');
+  const guarded = await policy.guardedInventoryWrite(health, async () => db.collection('itemInventoryCatalog').updateMany({ itemCode:'KEEP' }, { $set:{ quantity:0 } }), 1);
+  assert.equal(health.validity, policy.GETREMAIN_VALIDITY.UNAVAILABLE_OR_SUSPECT);
+  assert.equal(health.reason, 'empty-exact-result-unconfirmed');
+  assert.equal(guarded.written, false);
+  assert.equal(db.collection('itemInventoryCatalog').rows[0].quantity, 3);
+});
+
+test('explicit exact zero row is the trusted criterion that permits zero reconciliation', async () => {
+  const db = new MemoryDb({ itemInventoryCatalog:[{ itemCode:'ZERO', stockNumber:'01', quantity:2 }] });
+  const health = policy.exactGetRemainHealth({ ok:true, status:200, result:[{ ItemCode:'ZERO', StoreNumber:'01', Quantity1:0 }], list:[], resultIsArray:true }, 'ZERO');
+  const guarded = await policy.guardedInventoryWrite(health, async () => db.collection('itemInventoryCatalog').updateMany({ itemCode:'ZERO' }, { $set:{ quantity:0 } }), 1);
+  assert.equal(health.validity, policy.GETREMAIN_VALIDITY.VALID_ZERO);
+  assert.equal(health.reason, 'explicit-zero-row');
+  assert.equal(guarded.written, true);
+  assert.equal(db.collection('itemInventoryCatalog').rows[0].quantity, 0);
+});
+
+test('timeout preserves old inventory and a later healthy recovery becomes writable', async () => {
+  const previous = [{ itemCode:'RECOVER', stockNumber:'01', quantity:4 }];
+  const db = new MemoryDb({ itemInventoryCatalog:structuredClone(previous) });
+  const failedPagination = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => ({ ok:false, result:[], list:[], resultIsArray:true, error:'Shaygan request timeout' }) });
+  const failedHealth = policy.warehouseSnapshotHealth(failedPagination, { baselineRows:1, existingPositiveRows:1 });
+  const failedWrite = await policy.guardedInventoryWrite(failedHealth, async () => db.collection('itemInventoryCatalog').updateMany({}, { $set:{ quantity:0 } }), 1);
+  assert.equal(failedWrite.written, false);
+  assert.equal(db.collection('itemInventoryCatalog').rows[0].quantity, 4);
+  const healthyPagination = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => ({ ok:true, result:[{ ItemCode:'RECOVER', Quantity1:5 }], list:[{ ItemCode:'RECOVER', Quantity1:5 }], resultIsArray:true }) });
+  const healthy = policy.warehouseSnapshotHealth(healthyPagination, { baselineRows:1, existingPositiveRows:1 });
+  const recovered = await policy.guardedInventoryWrite(healthy, async () => db.collection('itemInventoryCatalog').updateMany({ itemCode:'RECOVER' }, { $set:{ quantity:5 } }), 1);
+  assert.equal(recovered.written, true);
+  assert.equal(db.collection('itemInventoryCatalog').rows[0].quantity, 5);
+});
+
 test('server keeps exact verification authoritative and does not perform a request-time full catalog scan', () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
   const verify = source.slice(source.indexOf('async function verifyMissingStockRowsLive'), source.indexOf('async function ensureItemInventoryFresh'));
@@ -272,8 +352,25 @@ test('automatic reconciliation completes positive stock reads before bounded exa
   assert.match(reconcile, /pageEvidence:\(r\.pageEvidence\|\|\[\]\)\.slice\(0,300\)/);
   const stockSync = source.slice(source.indexOf('async function syncInventoryStock'), source.indexOf('async function syncInventoryGlobal'));
   assert.match(stockSync, /walkAuthoritativeInventoryPages/);
+  assert.match(stockSync, /warehouseSnapshotHealth/);
+  assert.match(stockSync, /bufferedPages/);
+  assert.match(stockSync, /inventory_sync_fail_closed/);
   assert.doesNotMatch(stockSync, /res\.list\.length\s*<\s*100/);
   assert.doesNotMatch(stockSync, /!res\.list\.length/);
+  assert.match(reconcile, /sourceHealthy/);
+  assert.match(reconcile, /warehouse-getremain-suspect/);
+});
+
+test('GetRemain safety defaults and wrapper health metadata are wired', () => {
+  const configSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'config.js'), 'utf8');
+  const shayganSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'lib', 'shaygan.js'), 'utf8');
+  const serverSource = fs.readFileSync(path.join(__dirname, '..', 'src', 'server.js'), 'utf8');
+  assert.match(configSource, /INVENTORY_SYNC_MIN_VALID_RATIO \|\| 0\.5/);
+  assert.match(configSource, /INVENTORY_SYNC_MIN_BASELINE_ROWS \|\| 50/);
+  assert.match(shayganSource, /resultIsArray/);
+  assert.match(shayganSource, /exactGetRemainHealth\(res, itemCode\)/);
+  assert.match(serverSource, /empty-exact-result-unconfirmed|GETREMAIN_VALIDITY\.UNAVAILABLE_OR_SUSPECT/);
+  assert.match(serverSource, /پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد\./);
 });
 
 test('direction evidence remains bounded and excludes unchanged rows', () => {
