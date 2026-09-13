@@ -72,6 +72,88 @@ test('weaker broad mismatch cannot overwrite an exact authoritative quantity', (
   assert.equal(policy.shouldProtectExactFromBroad({ inventoryAuthority:'exact-getremain', quantity:1 }, { quantity:1 }), false);
 });
 
+test('newer accepted complete snapshot supersedes old exact evidence', () => {
+  const observationStartedAt = new Date('2026-09-12T07:54:00.000Z');
+  const observationCompletedAt = new Date('2026-09-12T07:55:00.000Z');
+  const existing = { itemCode:'REVIVE', stockNumber:'01', quantity:0, inventoryAuthority:'exact-getremain', lastAuthoritativeExactAt:new Date('2026-09-12T05:30:00.000Z') };
+  assert.equal(policy.shouldProtectExactFromBroad(existing, { quantity:2 }, { acceptedCompleteWarehouseSnapshot:true, observationStartedAt, observationCompletedAt }), false);
+  const plan = policy.planAcceptedWarehouseSnapshot({ existingRows:[existing], snapshotRows:[{ itemCode:'REVIVE', stockNumber:'01', quantity:2 }], warehouse:'01', observationStartedAt, observationCompletedAt });
+  assert.equal(plan.positives.length, 1);
+  assert.equal(plan.protectedLocal.length, 0);
+  assert.equal(plan.quantityDirections.increases, 1);
+});
+
+test('exact evidence newer than warehouse snapshot completion is not overwritten', () => {
+  const observationStartedAt = new Date('2026-09-12T07:54:00.000Z');
+  const observationCompletedAt = new Date('2026-09-12T07:55:00.000Z');
+  const existing = { itemCode:'EXACT-RACE', stockNumber:'01', quantity:4, inventoryAuthority:'exact-getremain', lastAuthoritativeExactAt:new Date('2026-09-12T07:55:01.000Z') };
+  const plan = policy.planAcceptedWarehouseSnapshot({ existingRows:[existing], snapshotRows:[{ itemCode:'EXACT-RACE', stockNumber:'01', quantity:3 }], warehouse:'01', observationStartedAt, observationCompletedAt });
+  assert.equal(plan.positives.length, 0);
+  assert.equal(plan.protectedLocal.length, 1);
+  assert.equal(plan.protectedLocal[0].reason, 'exact-evidence-newer-than-snapshot-completion');
+});
+
+test('local invoice mutation after snapshot observation boundary is protected', () => {
+  const observationStartedAt = new Date('2026-09-12T07:54:00.000Z');
+  const existing = { itemCode:'RACE', stockNumber:'01', quantity:0, pendingShayganConfirm:true, lastLocalSaleDeductAt:new Date('2026-09-12T07:54:01.000Z') };
+  const plan = policy.planAcceptedWarehouseSnapshot({ existingRows:[existing], snapshotRows:[{ itemCode:'RACE', stockNumber:'01', quantity:1 }], warehouse:'01', observationStartedAt });
+  assert.equal(plan.positives.length, 0);
+  assert.equal(plan.protectedLocal.length, 1);
+  assert.equal(plan.quantityDirections.localSaleProtected, 1);
+});
+
+test('accepted complete snapshot zeros missing positives and clears legacy pending state without exact calls', () => {
+  const observationStartedAt = new Date('2026-09-12T07:54:00.000Z');
+  const existingRows = [
+    { itemCode:'KEEP', stockNumber:'01', quantity:3, inventoryAuthority:'exact-getremain', needsLiveVerify:true },
+    { itemCode:'ZERO', stockNumber:'01', quantity:1, protectedFromAutoSyncStale:true },
+    { itemCode:'OLD-PENDING', stockNumber:'01', quantity:0, missingInStockSync:true, needsLiveVerify:true }
+  ];
+  const plan = policy.planAcceptedWarehouseSnapshot({ existingRows, snapshotRows:[{ itemCode:'KEEP', stockNumber:'01', quantity:2 }], warehouse:'01', observationStartedAt });
+  assert.equal(plan.positives.length, 1);
+  assert.equal(plan.missingToZero, 1);
+  assert.equal(plan.absences.length, 2);
+  assert.equal(plan.clearedLegacyPending, 3);
+  assert.equal(plan.quantityDirections.decreases, 1);
+});
+
+test('September 12 recovery reconciles all 19 warehouses in one plan pass and second pass is idempotent', () => {
+  const observationStartedAt = new Date('2026-09-12T07:54:00.000Z');
+  let totalPositive = 0;
+  let totalZero = 0;
+  for (let warehouseIndex=0; warehouseIndex<19; warehouseIndex++) {
+    const count = warehouseIndex === 18 ? 171 : 188; // 3,555 total.
+    const stockNumber = String(warehouseIndex+1).padStart(2, '0');
+    const existingRows = Array.from({ length:count+1 }, (_, index) => ({
+      itemCode:`W${stockNumber}-${index}`,
+      stockNumber,
+      quantity:index < count ? 0 : 1,
+      inventoryAuthority:'exact-getremain',
+      lastAuthoritativeExactAt:new Date('2026-09-12T05:00:00.000Z'),
+      needsLiveVerify:true,
+      protectedFromAutoSyncStale:true
+    }));
+    const snapshotRows = Array.from({ length:count }, (_, index) => ({ itemCode:`W${stockNumber}-${index}`, stockNumber, quantity:1 }));
+    const first = policy.planAcceptedWarehouseSnapshot({ existingRows, snapshotRows, warehouse:stockNumber, observationStartedAt });
+    totalPositive += first.positives.length;
+    totalZero += first.missingToZero;
+    assert.equal(first.protectedLocal.length, 0);
+    const convergedRows = snapshotRows.map(row => ({ ...row, inventoryAuthority:'accepted-complete-warehouse-snapshot', needsLiveVerify:false, protectedFromAutoSyncStale:false }));
+    convergedRows.push({ itemCode:`W${stockNumber}-${count}`, stockNumber, quantity:0, inventoryAuthority:'accepted-complete-warehouse-snapshot-absence' });
+    const second = policy.planAcceptedWarehouseSnapshot({ existingRows:convergedRows, snapshotRows, warehouse:stockNumber, observationStartedAt:new Date('2026-09-12T08:00:00.000Z') });
+    assert.equal(second.quantityDirections.unchanged, count);
+    assert.equal(second.missingToZero, 0);
+    assert.equal(second.absences.length, 0);
+  }
+  assert.equal(totalPositive, 3555);
+  assert.equal(totalZero, 19);
+});
+
+test('inventory write failure propagates through the health guard and cannot report completion', async () => {
+  const health = { trustworthy:true, validity:policy.GETREMAIN_VALIDITY.VALID_DATA, reason:'healthy-complete-snapshot' };
+  await assert.rejects(() => policy.guardedInventoryWrite(health, async () => { throw new Error('mongo bulkWrite failed'); }), /mongo bulkWrite failed/);
+});
+
 test('broad positive source classifies every supported quantity direction', () => {
   assert.equal(policy.classifyBroadQuantityDirection(null, { quantity:1 }), 'newRows');
   assert.equal(policy.classifyBroadQuantityDirection({ quantity:0 }, { quantity:2 }), 'increases');
@@ -247,6 +329,22 @@ test('fail-closed warehouse gate preserves 800 positive rows on HTTP 200 empty R
   assert.equal(await db.collection('itemInventoryCatalog').countDocuments({ quantity:{ $gt:0 } }), 800);
 });
 
+test('September 12 all-warehouse empty phase rejects all 19 snapshots without mutation', async () => {
+  const original = Array.from({ length:19 }, (_, index) => ({ itemCode:`PRESERVE-${index}`, stockNumber:String(index+1).padStart(2,'0'), quantity:1 }));
+  const db = new MemoryDb({ itemInventoryCatalog:structuredClone(original) });
+  let completedWarehouses = 0;
+  for (const row of original) {
+    const pagination = await policy.walkAuthoritativeInventoryPages({ fetchPage:async () => ({ ok:true, status:200, result:[], list:[], resultIsArray:true, error:'' }) });
+    const health = policy.warehouseSnapshotHealth(pagination, { baselineRows:1, existingPositiveRows:1 });
+    const guarded = await policy.guardedInventoryWrite(health, async () => db.collection('itemInventoryCatalog').updateMany({ stockNumber:row.stockNumber }, { $set:{ quantity:0 } }), 1);
+    if (pagination.completed && guarded.written) completedWarehouses++;
+    assert.equal(health.reason, 'empty-first-page-against-positive-baseline');
+    assert.equal(guarded.written, false);
+  }
+  assert.equal(completedWarehouses, 0);
+  assert.deepEqual(db.collection('itemInventoryCatalog').rows.map(row=>row.quantity), Array(19).fill(1));
+});
+
 test('abnormal five-row collapse against 800-row baseline is suspect and non-destructive', async () => {
   const five = Array.from({ length:5 }, (_, index) => ({ ItemCode:`I-${index}`, Quantity1:1 }));
   const previous = Array.from({ length:800 }, (_, index) => ({ itemCode:`I-${index}`, stockNumber:'01', quantity:1 }));
@@ -333,19 +431,19 @@ test('server keeps exact verification authoritative and does not perform a reque
   assert.match(mongo, /needsLiveVerify:1, nextLiveVerifyEligibleAt:1, lastLiveAttemptAt:1, firstMissingInStockAt:1/);
 });
 
-test('automatic reconciliation completes positive stock reads before bounded exact verification', () => {
+test('automatic reconciliation completes pagination and warehouse reconciliation without bounded exact queue drainage', () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/server.js'), 'utf8');
   const reconcile = source.slice(source.indexOf('async function syncInventoryReconciliation'), source.indexOf('async function runAutoInventorySyncTick'));
-  assert.match(reconcile, /deferMissingVerification:true/);
+  assert.doesNotMatch(reconcile, /deferMissingVerification:true/);
   assert.match(reconcile, /stockSyncDurationMs/);
-  assert.match(reconcile, /verifyQueuedMissingRowsLive/);
+  assert.doesNotMatch(reconcile, /verifyQueuedMissingRowsLive/);
   assert.match(reconcile, /exactVerificationDurationMs/);
   assert.match(reconcile, /exactItemsAttempted/);
-  assert.match(reconcile, /distinctExactItemsAttempted/);
-  assert.match(reconcile, /exactTimeouts/);
-  assert.match(reconcile, /newIdentityAttempted/);
-  assert.match(reconcile, /stalePositiveAttempted/);
-  assert.match(reconcile, /oldestQueueAge/);
+  assert.match(reconcile, /totalZeroReconciled/);
+  assert.match(reconcile, /legacyPendingCleared/);
+  assert.match(reconcile, /remainingCyclePending/);
+  assert.match(reconcile, /completedWarehouses/);
+  assert.match(reconcile, /rejectedWarehouses/);
   assert.match(reconcile, /broadQuantityDirections/);
   assert.match(reconcile, /quantityDirections:r\.quantityDirections/);
   assert.match(reconcile, /quantityDirectionSamples:\(r\.quantityDirectionSamples\|\|\[\]\)\.slice\(0,50\)/);
@@ -354,11 +452,15 @@ test('automatic reconciliation completes positive stock reads before bounded exa
   assert.match(stockSync, /walkAuthoritativeInventoryPages/);
   assert.match(stockSync, /warehouseSnapshotHealth/);
   assert.match(stockSync, /bufferedPages/);
+  assert.match(stockSync, /reconcileAcceptedWarehouseSnapshot/);
+  assert.match(stockSync, /paginationComplete && reconciliationComplete/);
+  assert.match(stockSync, /accepted-complete-warehouse-snapshot/);
+  assert.doesNotMatch(stockSync, /verifyMissingStockRowsLive/);
   assert.match(stockSync, /inventory_sync_fail_closed/);
   assert.doesNotMatch(stockSync, /res\.list\.length\s*<\s*100/);
   assert.doesNotMatch(stockSync, /!res\.list\.length/);
   assert.match(reconcile, /sourceHealthy/);
-  assert.match(reconcile, /warehouse-getremain-suspect/);
+  assert.match(reconcile, /suspectWarehouses/);
 });
 
 test('GetRemain safety defaults and wrapper health metadata are wired', () => {

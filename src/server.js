@@ -1016,13 +1016,166 @@ async function upsertInventoryRows(db, rows, meta = {}) {
     set.protectedFromAutoSyncStale = false;
     return { updateOne: { filter: { itemCode: x.itemCode, stockNumber: x.stockNumber }, update: { $set: set, $addToSet: { sourceEvidence: src } }, upsert: true } };
   });
-  if (ops.length) await db.collection('itemInventoryCatalog').bulkWrite(ops, { ordered:false }).catch(()=>{});
+  if (ops.length) await db.collection('itemInventoryCatalog').bulkWrite(ops, { ordered:false });
   const itemMap = new Map();
   arr.forEach(x => { if (x.itemCode && !itemMap.has(x.itemCode)) itemMap.set(x.itemCode, x); });
   const itemOps = [...itemMap.values()].map(x => ({ updateOne: { filter: { itemCode: x.itemCode }, update: { $set: { itemCode:x.itemCode, itemDescription:x.itemDescription, itemGuid:x.itemGuid, searchText: normalizeFa(`${x.itemCode} ${x.itemDescription}`), syncedAt: now, updatedAt: now } }, upsert:true } }));
-  if (itemOps.length) await db.collection('itemCatalog').bulkWrite(itemOps, { ordered:false }).catch(()=>{});
+  if (itemOps.length) await db.collection('itemCatalog').bulkWrite(itemOps, { ordered:false });
   if (arr.length) await canonicalItemCatalog.ensureCatalogItems(db, arr, { source:meta.source || sourceProbe || 'inventory-getremain' });
   return { acceptedRows:arr.length, quantityDirections, quantityDirectionSamples, source:sourceProbe || meta.source || 'inventory-positive-evidence' };
+}
+
+function inventoryEvidenceGuard(observationStartedAt, observationCompletedAt) {
+  const localBoundary = new Date(observationStartedAt);
+  const exactBoundary = new Date(observationCompletedAt);
+  const fields = ['lastLocalSaleDeductAt', 'lastLocalInventoryMutationAt', 'lastInvoiceInventoryMutationAt', 'localEvidenceAt'];
+  return { $and:[
+    ...fields.map(field => ({ $or:[{ [field]:{ $exists:false } }, { [field]:null }, { [field]:{ $lte:localBoundary } }] })),
+    { $or:[{ lastAuthoritativeExactAt:{ $exists:false } }, { lastAuthoritativeExactAt:null }, { lastAuthoritativeExactAt:{ $lte:exactBoundary } }] }
+  ] };
+}
+
+async function reconcileAcceptedWarehouseSnapshot(db, snapshotRows, meta = {}) {
+  const stockNumber = String(meta.stockNumber || '').trim();
+  const cycleId = String(meta.cycleId || meta.batchId || '').trim();
+  const observationStartedAt = new Date(meta.observationStartedAt);
+  const observationCompletedAt = new Date(meta.observationCompletedAt || Date.now());
+  if (!stockNumber || !cycleId || !Number.isFinite(observationStartedAt.getTime())) throw new Error('accepted warehouse snapshot metadata is incomplete');
+  const existingRows = await db.collection('itemInventoryCatalog').find({ stockNumber }).toArray();
+  const plan = inventoryAutoSyncPolicy.planAcceptedWarehouseSnapshot({ existingRows, snapshotRows, warehouse:stockNumber, observationStartedAt, observationCompletedAt });
+  const evidenceGuard = inventoryEvidenceGuard(observationStartedAt, observationCompletedAt);
+  const source = 'accepted-complete-warehouse-snapshot';
+  const commonSet = {
+    missingInGlobalSync:false,
+    missingInStockSync:false,
+    missingInLiveRefresh:false,
+    needsLiveVerify:false,
+    protectedFromAutoSyncStale:false,
+    pendingShayganConfirm:false,
+    verificationQueueClass:null,
+    verificationReason:'',
+    nextLiveVerifyEligibleAt:null,
+    acceptedWarehouseCycleId:cycleId,
+    acceptedWarehouseObservationStartedAt:observationStartedAt,
+    acceptedWarehouseObservationCompletedAt:observationCompletedAt,
+    lastAcceptedWarehouseSnapshotAt:observationCompletedAt,
+    syncedAt:observationCompletedAt,
+    updatedAt:observationCompletedAt
+  };
+  const staleUnset = {
+    lastAuthoritativeExactAt:'', broadObservedQuantity:'', broadObservedAt:'', broadObservationSource:'',
+    firstMissingInStockAt:'', lastMissingInStockAt:'', lastQueuedAt:'', lastLiveAttemptAt:''
+  };
+  const operations = [];
+  for (const entry of plan.positives) {
+    const row = entry.incoming;
+    const set = {
+      ...row,
+      ...commonSet,
+      stockNumber,
+      quantity:Number(row.quantity ?? row.Quantity1 ?? 0),
+      searchText:normalizeFa(rowSearchText(row)),
+      inventoryAuthority:source,
+      inventoryConfidence:'authoritative-complete-warehouse-snapshot',
+      authoritativeQuantity:Number(row.quantity ?? row.Quantity1 ?? 0),
+      lastPositiveSeenAt:observationCompletedAt,
+      lastStockSeenAt:observationCompletedAt,
+      stockSyncBatchId:cycleId,
+      lastLiveResult:'snapshot-positive'
+    };
+    const filter = entry.existing
+      ? { _id:entry.existing._id, ...evidenceGuard }
+      : { itemCode:row.itemCode, stockNumber };
+    operations.push({ updateOne:{ filter, update:{ $set:set, $unset:staleUnset, $addToSet:{ sourceEvidence:source } }, upsert:!entry.existing } });
+  }
+  for (const entry of plan.absences) {
+    operations.push({ updateOne:{
+      filter:{ _id:entry.existing._id, ...evidenceGuard },
+      update:{
+        $set:{
+          ...commonSet,
+          quantity:0,
+          quantity2:0,
+          inventoryAuthority:'accepted-complete-warehouse-snapshot-absence',
+          inventoryConfidence:'authoritative-complete-warehouse-snapshot-absence',
+          authoritativeQuantity:0,
+          zeroConfirmedBy:'accepted-complete-warehouse-snapshot-absence',
+          lastLiveResult:'snapshot-absence-zero',
+          stockSyncBatchId:cycleId
+        },
+        $unset:staleUnset,
+        $addToSet:{ sourceEvidence:'accepted-complete-warehouse-snapshot-absence' }
+      },
+      upsert:false
+    } });
+  }
+  const writeResult = operations.length
+    ? await db.collection('itemInventoryCatalog').bulkWrite(operations, { ordered:false })
+    : { acknowledged:true, matchedCount:0, modifiedCount:0, upsertedCount:0 };
+  if (writeResult?.acknowledged === false) throw new Error('warehouse inventory reconciliation was not acknowledged');
+
+  const acceptedRows = plan.positives.map(entry => entry.incoming);
+  const itemMap = new Map();
+  acceptedRows.forEach(row => { if (row.itemCode && !itemMap.has(row.itemCode)) itemMap.set(row.itemCode, row); });
+  const itemOps = [...itemMap.values()].map(row => ({ updateOne:{
+    filter:{ itemCode:row.itemCode },
+    update:{ $set:{ itemCode:row.itemCode, itemDescription:row.itemDescription, itemGuid:row.itemGuid, searchText:normalizeFa(`${row.itemCode} ${row.itemDescription||''}`), syncedAt:observationCompletedAt, updatedAt:observationCompletedAt } },
+    upsert:true
+  } }));
+  if (itemOps.length) await db.collection('itemCatalog').bulkWrite(itemOps, { ordered:false });
+  if (acceptedRows.length) await canonicalItemCatalog.ensureCatalogItems(db, acceptedRows, { source:meta.source || 'auto-active-stock-filter-positive', now:observationCompletedAt });
+
+  const affectedCodes = [...new Set([...plan.positives.map(entry=>entry.incoming.itemCode), ...plan.absences.map(entry=>entry.existing.itemCode)].filter(Boolean))];
+  if (affectedCodes.length) {
+    await db.collection(inventoryAutoSyncPolicy.INVENTORY_DISCOVERY_QUEUE).updateMany(
+      { itemCode:{ $in:affectedCodes }, status:{ $in:['pending','in_progress'] }, $or:[{ firstQueuedAt:{ $exists:false } }, { firstQueuedAt:null }, { firstQueuedAt:{ $lte:observationCompletedAt } }] },
+      { $set:{ status:'verified', resultSource:source, verifiedByCycleId:cycleId, verifiedAt:observationCompletedAt, updatedAt:observationCompletedAt }, $unset:{ nextEligibleAt:'', lastError:'' } }
+    );
+  }
+
+  const persistedRows = await db.collection('itemInventoryCatalog').find({ stockNumber }).toArray();
+  const persistedByKey = new Map(persistedRows.map(row => [inventoryAutoSyncPolicy.inventoryIdentity(row, stockNumber), row]));
+  const unresolved = [];
+  for (const entry of plan.positives) {
+    const row = persistedByKey.get(entry.key);
+    if (row && (inventoryAutoSyncPolicy.hasNewerLocalEvidence(row, observationStartedAt) || inventoryAutoSyncPolicy.hasNewerExactEvidence(row, observationCompletedAt))) {
+      unresolved.push({ key:entry.key, reason:inventoryAutoSyncPolicy.hasNewerLocalEvidence(row, observationStartedAt)?'newer-local-evidence-protected':'newer-exact-evidence-protected' });
+    } else if (!row || Number(row.quantity || 0) !== Number(entry.incoming.quantity || 0) || row.acceptedWarehouseCycleId !== cycleId) {
+      unresolved.push({ key:entry.key, reason:'positive-persistence-mismatch' });
+    }
+  }
+  for (const entry of plan.absences) {
+    const row = persistedByKey.get(entry.key);
+    if (row && (inventoryAutoSyncPolicy.hasNewerLocalEvidence(row, observationStartedAt) || inventoryAutoSyncPolicy.hasNewerExactEvidence(row, observationCompletedAt))) {
+      unresolved.push({ key:entry.key, reason:inventoryAutoSyncPolicy.hasNewerLocalEvidence(row, observationStartedAt)?'newer-local-evidence-protected':'newer-exact-evidence-protected' });
+    } else if (!row || Number(row.quantity || 0) !== 0 || row.acceptedWarehouseCycleId !== cycleId) {
+      unresolved.push({ key:entry.key, reason:'absence-persistence-mismatch' });
+    }
+  }
+  for (const entry of plan.protectedLocal) unresolved.push({ key:entry.key, reason:entry.reason });
+  const matchedCount = Number(writeResult?.matchedCount ?? Math.max(0, operations.length-Number(writeResult?.upsertedCount||0)));
+  const result = {
+    cycleId,
+    stockNumber,
+    observationStartedAt,
+    observationCompletedAt,
+    previousPositiveRows:plan.previousPositiveRows,
+    newPositiveRows:plan.newPositiveRows,
+    missingToZero:plan.missingToZero,
+    matchedCount,
+    modifiedCount:Number(writeResult?.modifiedCount||0),
+    upsertedCount:Number(writeResult?.upsertedCount||0),
+    clearedLegacyPending:plan.clearedLegacyPending,
+    localRaceProtected:plan.protectedLocal.length,
+    remainingCyclePending:unresolved.length,
+    reconciliationComplete:unresolved.length === 0,
+    unresolved:unresolved.slice(0,100),
+    quantityDirections:plan.quantityDirections
+  };
+  if (!result.reconciliationComplete) {
+    await db.collection('appLogs').insertOne({ type:'inventory_snapshot_reconciliation_incomplete', ...result, at:new Date(), atTehran:time.formatTehranDateTime(new Date()) });
+  }
+  return result;
 }
 
 
@@ -1915,6 +2068,7 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
   const safePages = Math.max(1, Number(pages || config.autoInventorySyncPageLimit || 300));
   const batchId = `${opts.batchPrefix || 'stock'}-${st}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   const startedAt = new Date();
+  const cycleId = String(opts.cycleId || batchId);
   await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, lastStockNumber:st, lastStartedAt:startedAt, lastError:'', lastResult:null });
   const healthKey = `inventory.getremain.health.warehouse.${st}`;
   const [existingPositiveRows, previousHealthRow] = await Promise.all([
@@ -1975,49 +2129,75 @@ async function syncInventoryStock(stockNumber, pages = config.autoInventorySyncP
       return result;
     }
     endedNaturally = pagination.completed;
-    const completed = Boolean(endedNaturally);
+    const observationCompletedAt = new Date();
+    const paginationComplete = Boolean(endedNaturally);
     const guardedWrite = await inventoryAutoSyncPolicy.guardedInventoryWrite(health, async () => {
-      const persistedPages = [];
-      // Preserve the established per-page write semantics after the complete
-      // warehouse snapshot passes the health gate. upsertInventoryRows keeps
-      // its bounded precedence lookup for every source page this way.
-      for (const rows of bufferedPages) {
-        const persisted = await upsertInventoryRows(db, rows, { source:opts.source || 'stock-filter-positive-sync' });
-        persistedPages.push(persisted);
-        for (const key of Object.keys(quantityDirections)) quantityDirections[key] += Number(persisted?.quantityDirections?.[key] || 0);
-        for (const sample of (persisted?.quantityDirectionSamples||[])) if (quantityDirectionSamples.length < 50) quantityDirectionSamples.push(sample);
-      }
-      return persistedPages;
+      return await reconcileAcceptedWarehouseSnapshot(db, bufferedPages.flat(), {
+        stockNumber:st,
+        cycleId,
+        batchId,
+        source:opts.source || 'auto-active-stock-filter-positive',
+        observationStartedAt:startedAt,
+        observationCompletedAt
+      });
     }, existingPositiveRows);
     if (!guardedWrite.written) throw new Error(`GetRemain health gate prevented inventory write: ${guardedWrite.reason}`);
+    const reconciliation = guardedWrite.result;
+    for (const key of Object.keys(quantityDirections)) quantityDirections[key] = Number(reconciliation?.quantityDirections?.[key] || 0);
+    const reconciliationComplete = reconciliation?.reconciliationComplete === true;
+    const completed = paginationComplete && reconciliationComplete;
     const recovered = Number(previousHealth.consecutiveSuspectCount || 0) > 0;
     const healthyAt = new Date();
-    await db.collection('settings').updateOne({ key:healthKey }, { $set:{ key:healthKey, value:{ stockNumber:st, validity:health.validity, lastKnownGoodRowCount:total, lastKnownGoodRawRows:rawRows, lastKnownGoodAt:healthyAt, lastObservedRowCount:total, consecutiveSuspectCount:0, recovered }, updatedAt:healthyAt, updatedBy:'inventory-sync' } }, { upsert:true }).catch(()=>{});
-    if (recovered) await db.collection('appLogs').insertOne({ type:'inventory_sync_recovered', stockNumber:st, batchId, baselineRows:health.baselineRows, observedRows:total, rawRows, previousConsecutiveSuspectCount:Number(previousHealth.consecutiveSuspectCount||0), at:healthyAt, atTehran:time.formatTehranDateTime(healthyAt) }).catch(()=>{});
-    let removedStale = 0;
-    let protectedFromStale = 0;
-    let queuedForLiveVerify = 0;
-    let liveMissingVerify = { checked:0, zeroedCount:0, failed:0, remainingQueued:0, results:[] };
-    // 0.9.19.58: when a previously-positive row is absent from a completed warehouse sync,
-    // exact live item GetRemain becomes authoritative. Missing active-warehouse rows are zeroed.
-    if (completed && opts.deferMissingVerification !== true) {
-      jobControl?.progress?.({phase:'Live repair queue',current:0,total:1,message:`Reconciling missing rows for warehouse ${st}`});
-      jobControl?.checkCancellation?.();
-      liveMissingVerify = await verifyMissingStockRowsLive(db, st, batchId, 'completed-stock-sync-missing-row').catch(e => ({ checked:0, zeroedCount:0, failed:1, remainingQueued:0, results:[], error:String(e.message||e) }));
-      removedStale = Number(liveMissingVerify.zeroedCount || 0);
-      queuedForLiveVerify = Number(liveMissingVerify.remainingQueued || 0);
-    } else if (completed) {
-      const exactRecheckBefore = new Date(Date.now() - Math.max(0, Number(config.inventoryExactPositiveRecheckMs || 900000)));
-      const remaining = await db.collection('itemInventoryCatalog').updateMany(
-        { stockNumber:st, quantity:{ $gt:0 }, stockSyncBatchId:{ $ne:batchId }, ...inventoryAutoSyncPolicy.broadMissingEligibleFilter(exactRecheckBefore) },
-        { $set:{ missingInStockSync:true, needsLiveVerify:true, protectedFromAutoSyncStale:false, verificationQueueClass:inventoryAutoSyncPolicy.QUEUE_CLASSES.STALE_POSITIVE, verificationReason:'broad-missing-crm-positive', lastMissingInStockAt:new Date(), lastQueuedAt:new Date() }, $min:{ firstMissingInStockAt:new Date() }, $inc:{ missingInStockCount:1 } }
-      ).catch(()=>({ modifiedCount:0 }));
-      queuedForLiveVerify = Number(remaining.modifiedCount||0);
-      liveMissingVerify = { deferred:true, checked:0, zeroedCount:0, failed:0, remainingQueued:queuedForLiveVerify, results:[] };
-    }
-    const result = { ok:true, degraded:false, validity:health.validity, healthReason:health.reason, stockNumber:st, total, rawRows, positiveRows:total, baselineRows:health.baselineRows, lastKnownGoodRowCount, existingPositiveRows, observedRatio:health.observedRatio, consecutiveSuspectCount:0, zeroProtected:0, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, protectedFromStale, queuedForLiveVerify, liveMissingVerify, quantityDirections, quantityDirectionSamples, batchId, durationMs:Date.now()-startedAt.getTime(), mode:'inventory-stock-authoritative-missing-live-reconcile' };
-    await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', stockNumber:st, total, rawRows, positiveRows:total, pages:page, pagesRead:page, pageEvidence, terminalCondition, completed, endedNaturally, removedStale, batchId, at:new Date(), source:opts.source || 'manual', durationMs:result.durationMs }).catch(()=>{});
-    await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:'' });
+    if (completed) await db.collection('settings').updateOne({ key:healthKey }, { $set:{ key:healthKey, value:{ stockNumber:st, validity:health.validity, lastKnownGoodRowCount:total, lastKnownGoodRawRows:rawRows, lastKnownGoodAt:healthyAt, lastObservedRowCount:total, consecutiveSuspectCount:0, recovered }, updatedAt:healthyAt, updatedBy:'inventory-sync' } }, { upsert:true });
+    if (recovered && completed) await db.collection('appLogs').insertOne({ type:'inventory_sync_recovered', stockNumber:st, batchId, baselineRows:health.baselineRows, observedRows:total, rawRows, previousConsecutiveSuspectCount:Number(previousHealth.consecutiveSuspectCount||0), at:healthyAt, atTehran:time.formatTehranDateTime(healthyAt) }).catch(()=>{});
+    const result = {
+      ok:completed,
+      degraded:!completed,
+      validity:health.validity,
+      healthReason:health.reason,
+      snapshotStatus:completed?'accepted-reconciled':'accepted-reconciliation-incomplete',
+      stockNumber:st,
+      cycleId,
+      observationStartedAt:startedAt,
+      observationCompletedAt,
+      total,
+      rawRows,
+      positiveRows:total,
+      baselineRows:health.baselineRows,
+      lastKnownGoodRowCount,
+      existingPositiveRows,
+      previousPositiveRows:Number(reconciliation?.previousPositiveRows||0),
+      newPositiveRows:Number(reconciliation?.newPositiveRows||0),
+      missingToZero:Number(reconciliation?.missingToZero||0),
+      zeroedCount:Number(reconciliation?.missingToZero||0),
+      matchedCount:Number(reconciliation?.matchedCount||0),
+      modifiedCount:Number(reconciliation?.modifiedCount||0),
+      upsertedCount:Number(reconciliation?.upsertedCount||0),
+      clearedLegacyPending:Number(reconciliation?.clearedLegacyPending||0),
+      remainingCyclePending:Number(reconciliation?.remainingCyclePending||0),
+      localRaceProtected:Number(reconciliation?.localRaceProtected||0),
+      reconciliationComplete,
+      paginationComplete,
+      observedRatio:health.observedRatio,
+      consecutiveSuspectCount:completed?0:Number(previousHealth.consecutiveSuspectCount||0),
+      zeroProtected:Number(reconciliation?.localRaceProtected||0),
+      pages:page,
+      pagesRead:page,
+      pageEvidence,
+      terminalCondition,
+      completed,
+      endedNaturally,
+      removedStale:Number(reconciliation?.missingToZero||0),
+      protectedFromStale:Number(reconciliation?.localRaceProtected||0),
+      queuedForLiveVerify:0,
+      quantityDirections,
+      quantityDirectionSamples,
+      batchId,
+      durationMs:Date.now()-startedAt.getTime(),
+      mode:'accepted-complete-warehouse-snapshot-reconciliation'
+    };
+    await db.collection('appLogs').insertOne({ type:'inventory_stock_sync', ...result, at:new Date(), source:opts.source || 'manual' }).catch(()=>{});
+    await saveAutoInventoryStatus({ running:opts.parentCycle === true, lastRunAt:new Date(), lastStockNumber:st, lastResult:result, lastError:completed?'':'warehouse reconciliation incomplete' });
     return result;
   } catch (e) {
     const err = String(e.message || e);
@@ -2128,9 +2308,8 @@ async function syncCatalog(pages = config.inventoryCatalogSyncPages) {
 }
 
 async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPages, opts = {}) {
-  // 0.9.19.53: Operational Auto Sync is reverted to active-warehouse stock-filter sync only.
-  // Global GetRemain is kept out of auto sync because it produced duplicate/unstable merges in production.
-  // Stock sync is positive-evidence only; no auto source may delete positive/local-sale rows.
+  // One canonical AutoSync: each healthy, complete active-warehouse snapshot is
+  // reconciled fully before this cycle can report success.
   const db = await connectMongo();
   const startedAt = new Date();
   const active = await getActiveWarehouseNumbers(db).catch(()=>[]);
@@ -2138,7 +2317,7 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   jobControl?.progress?.({phase:'Reading warehouses',current:0,total:active.length||1,message:'Loaded active warehouses'});
   jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
   const batchId = `${opts.batchPrefix || 'active-stock-inv'}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, mode:'active-stock-sync-positive-only', lastStartedAt:startedAt, currentStockNumber:'ACTIVE', lastError:'', lastResult:null, activeWarehouseNumbers:active });
+  await saveAutoInventoryStatus({ enabled:Boolean(config.autoInventorySyncEnabled), running:true, mode:'accepted-complete-warehouse-snapshot', lastStartedAt:startedAt, currentStockNumber:'ACTIVE', lastError:'', lastResult:null, activeWarehouseNumbers:active, cycleId:batchId });
   const stockResults = [];
   let stockTotal = 0;
   let stockCompleted = 0;
@@ -2148,13 +2327,13 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
     const st=active[warehouseIndex];
     jobControl?.progress?.({phase:'Reading warehouses',current:warehouseIndex,total:active.length,message:`Starting warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
-    await saveAutoInventoryStatus({ running:true, mode:'active-stock-sync-positive-only', currentStockNumber:String(st), lastStockNumber:String(st) });
-    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock`, jobControl, parentCycle:true, deferMissingVerification:true });
+    await saveAutoInventoryStatus({ running:true, mode:'accepted-complete-warehouse-snapshot', currentStockNumber:String(st), lastStockNumber:String(st), cycleId:batchId });
+    const r = await syncInventoryStock(st, Number(config.autoInventorySyncPageLimit || 300), { source:'auto-active-stock-filter-positive', batchPrefix:`${batchId}-stock`, cycleId:batchId, jobControl, parentCycle:true });
     stockTotal += Number(r.total || 0);
     if (r.completed) stockCompleted += 1;
     protectedFromStale += Number(r.protectedFromStale || 0);
     for (const key of Object.keys(broadQuantityDirections)) broadQuantityDirections[key] += Number(r.quantityDirections?.[key] || 0);
-    stockResults.push({ stockNumber:String(st), ok:r.ok, degraded:!!r.degraded, suspect:!!r.suspect, validity:r.validity||'', suspectReason:r.suspectReason||'', warning:r.warning||'', baselineRows:r.baselineRows||0, lastKnownGoodRowCount:r.lastKnownGoodRowCount||0, existingPositiveRows:r.existingPositiveRows||0, observedRows:r.observedRows??r.total??0, zeroProtected:r.zeroProtected||0, consecutiveSuspectCount:r.consecutiveSuspectCount||0, total:r.total||0, rawRows:r.rawRows||0, positiveRows:r.positiveRows||0, pages:r.pages||0, pagesRead:r.pagesRead||0, pageEvidence:(r.pageEvidence||[]).slice(0,300), terminalCondition:r.terminalCondition||'', completed:!!r.completed, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:r.queuedForLiveVerify||0, liveMissingVerify:r.liveMissingVerify||null, quantityDirections:r.quantityDirections||null, quantityDirectionSamples:(r.quantityDirectionSamples||[]).slice(0,50), error:r.error||'' });
+    stockResults.push({ stockNumber:String(st), cycleId:r.cycleId||batchId, ok:r.ok, degraded:!!r.degraded, suspect:!!r.suspect, validity:r.validity||'', snapshotStatus:r.snapshotStatus||'', suspectReason:r.suspectReason||'', warning:r.warning||'', baselineRows:r.baselineRows||0, lastKnownGoodRowCount:r.lastKnownGoodRowCount||0, existingPositiveRows:r.existingPositiveRows||0, previousPositiveRows:r.previousPositiveRows||0, newPositiveRows:r.newPositiveRows||0, observedRows:r.observedRows??r.total??0, zeroProtected:r.zeroProtected||0, consecutiveSuspectCount:r.consecutiveSuspectCount||0, total:r.total||0, rawRows:r.rawRows||0, positiveRows:r.positiveRows||0, pages:r.pages||0, pagesRead:r.pagesRead||0, pageEvidence:(r.pageEvidence||[]).slice(0,300), terminalCondition:r.terminalCondition||'', paginationComplete:!!r.paginationComplete, reconciliationComplete:!!r.reconciliationComplete, completed:!!r.completed, missingToZero:r.missingToZero||0, zeroedCount:r.zeroedCount||0, matchedCount:r.matchedCount||0, modifiedCount:r.modifiedCount||0, upsertedCount:r.upsertedCount||0, clearedLegacyPending:r.clearedLegacyPending||0, remainingCyclePending:r.remainingCyclePending||0, localRaceProtected:r.localRaceProtected||0, protectedFromStale:r.protectedFromStale||0, removedStale:r.removedStale||0, queuedForLiveVerify:0, quantityDirections:r.quantityDirections||null, quantityDirectionSamples:(r.quantityDirectionSamples||[]).slice(0,50), observationStartedAt:r.observationStartedAt||null, observationCompletedAt:r.observationCompletedAt||null, durationMs:r.durationMs||0, error:r.error||'' });
     jobControl?.progress?.({phase:'Merge inventory',current:warehouseIndex+1,total:active.length,message:`Merged warehouse ${st}`});
     jobControl?.heartbeat?.(); jobControl?.checkCancellation?.();
     const delay = Number(config.autoInventorySyncDelayBetweenStocksMs || 1000);
@@ -2162,47 +2341,26 @@ async function syncInventoryReconciliation(pages = config.inventoryCatalogSyncPa
   }
   const stockSyncDurationMs = Date.now()-startedAt.getTime();
   const suspectWarehouses = stockResults.filter(row=>row.ok===false || row.completed!==true || row.suspect===true).map(row=>row.stockNumber);
-  const sourceHealthy = suspectWarehouses.length === 0 && stockCompleted === active.length;
-  let newItemVerification;
-  let missingVerification;
-  if (sourceHealthy) {
-    jobControl?.progress?.({phase:'New item verification',current:0,total:1,message:'Verifying newly discovered operational items'});
-    jobControl?.checkCancellation?.();
-    newItemVerification = await verifyNewOperationalItemsLive(db).catch(error => ({ checked:0, verified:0, discoveredPositive:0, failed:1, remainingQueued:0, results:[], error:String(error.message || error) }));
-    jobControl?.progress?.({phase:'Bounded stale verification',current:0,total:1,message:'Verifying bounded stale-positive backlog'});
-    jobControl?.checkCancellation?.();
-    missingVerification = await verifyQueuedMissingRowsLive(db).catch(error => ({ attempted:0, distinctAttempted:0, zeroedRows:0, timeouts:0, failed:1, durationMs:0, queueBefore:null, queueAfter:null, results:[], error:String(error.message||error) }));
-  } else {
-    const warning = 'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.';
-    newItemVerification = { skipped:true, reason:'warehouse-getremain-suspect', checked:0, verified:0, discoveredPositive:0, failed:0, remainingQueued:0, results:[], durationMs:0 };
-    missingVerification = { skipped:true, reason:'warehouse-getremain-suspect', attempted:0, distinctAttempted:0, zeroedRows:0, timeouts:0, failed:0, durationMs:0, queueBefore:null, queueAfter:null, results:[], warning };
-  }
-  const exactVerificationDurationMs = Number(newItemVerification.durationMs||0) + Number(missingVerification.durationMs||0);
-  const distinctExactItemsAttempted = new Set([...(newItemVerification.results||[]), ...(missingVerification.results||[])].map(row=>String(row.itemCode||'').trim()).filter(Boolean)).size;
-  const queueBefore = { NEW_IDENTITY:newItemVerification.queueBefore||null, STALE_POSITIVE:missingVerification.queueBefore||null };
-  const queueAfter = { NEW_IDENTITY:newItemVerification.queueAfter||null, STALE_POSITIVE:missingVerification.queueAfter||null };
-  const oldestQueueAge = Math.max(Number(newItemVerification.queueAfter?.oldestAgeMs||0), Number(missingVerification.queueAfter?.oldestAgeMs||0));
+  const sourceHealthy = active.length > 0 && suspectWarehouses.length === 0 && stockCompleted === active.length;
+  const totalPositiveRows = stockResults.reduce((sum,row)=>sum+Number(row.positiveRows||0),0);
+  const totalZeroReconciled = stockResults.reduce((sum,row)=>sum+Number(row.missingToZero||0),0);
+  const legacyPendingCleared = stockResults.reduce((sum,row)=>sum+Number(row.clearedLegacyPending||0),0);
+  const remainingCyclePending = stockResults.reduce((sum,row)=>sum+Number(row.remainingCyclePending||0),0);
   const result = {
     ok:sourceHealthy, degraded:!sourceHealthy, warning:sourceHealthy?'':'پاسخ معتبر موجودی از WebService شایگان دریافت نشد؛ آخرین موجودی معتبر CRM حفظ شد.', suspectWarehouses, batchId, globalSkipped:true, stockResults, activeWarehouseNumbers:active,
     stockRows:stockTotal, stockCompleted, protectedFromStale, broadQuantityDirections,
     stockSyncDurationMs, broadSyncDuration:stockSyncDurationMs,
-    exactVerificationDurationMs, exactVerificationDuration:exactVerificationDurationMs,
-    newIdentityAttempted:Number(newItemVerification.checked||0),
-    stalePositiveAttempted:Number(missingVerification.attempted||0),
-    exactItemsAttempted:Number(newItemVerification.checked||0)+Number(missingVerification.attempted||0),
-    distinctExactItemsAttempted, distinctItemsAttempted:distinctExactItemsAttempted,
-    checkedMissingLive:missingVerification.attempted||0,
-    zeroedAfterExactVerify:missingVerification.zeroedRows||0,
-    exactZeroResults:Number(newItemVerification.verifiedZero||0)+Number(missingVerification.zeroReconciliations||0),
-    zeroTransitionsConfirmed:Number(missingVerification.zeroedRows||0),
-    positiveReconciliations:Number(newItemVerification.discoveredPositive||0)+Number(missingVerification.positiveReconciliations||0),
-    failedLiveVerify:missingVerification.failed||0,
-    exactTimeouts:Number(newItemVerification.timeouts||0)+Number(missingVerification.timeouts||0),
-    timeouts:Number(newItemVerification.timeouts||0)+Number(missingVerification.timeouts||0),
-    queueBefore, queueAfter, oldestQueueAge,
-    queuedForLiveVerify:missingVerification.queueAfter?.distinctItems||0,
-    missingVerification, newItemVerification,
-    durationMs:Date.now()-startedAt.getTime(), mode:'active-stock-sync-positive-only-bounded-fair-exact-verify', atTehran:time.formatTehranDateTime(new Date())
+    activeWarehouses:active.length,
+    completedWarehouses:stockCompleted,
+    rejectedWarehouses:suspectWarehouses.length,
+    totalPositiveRows,
+    totalZeroReconciled,
+    legacyPendingCleared,
+    remainingCyclePending,
+    exactVerificationDurationMs:0,
+    exactItemsAttempted:0,
+    queuedForLiveVerify:0,
+    durationMs:Date.now()-startedAt.getTime(), fullCycleDurationMs:Date.now()-startedAt.getTime(), mode:'accepted-complete-warehouse-snapshot-reconciliation', atTehran:time.formatTehranDateTime(new Date())
   };
   jobControl?.progress?.({phase:'Finalize',current:0,total:1,message:'Finalizing inventory synchronization'});
   jobControl?.checkCancellation?.();

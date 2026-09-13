@@ -57,10 +57,106 @@ function broadMissingEligibleFilter(recheckBefore = new Date()) {
   ] };
 }
 
-function shouldProtectExactFromBroad(existing = {}, incoming = {}) {
+function timestamp(value) {
+  if (!value) return 0;
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function newestLocalEvidenceAt(existing = {}) {
+  return Math.max(
+    timestamp(existing.lastLocalSaleDeductAt),
+    timestamp(existing.lastLocalInventoryMutationAt),
+    timestamp(existing.lastInvoiceInventoryMutationAt),
+    timestamp(existing.localEvidenceAt)
+  );
+}
+
+function hasNewerLocalEvidence(existing = {}, observationStartedAt) {
+  const boundary = timestamp(observationStartedAt);
+  return boundary > 0 && newestLocalEvidenceAt(existing) > boundary;
+}
+
+function hasNewerExactEvidence(existing = {}, observationCompletedAt) {
+  const boundary = timestamp(observationCompletedAt);
+  return boundary > 0 && timestamp(existing.lastAuthoritativeExactAt) > boundary;
+}
+
+function shouldProtectExactFromBroad(existing = {}, incoming = {}, context = {}) {
+  // Exact evidence has no timeless precedence. A complete, healthy warehouse
+  // snapshot supersedes exact evidence observed before the snapshot began.
+  if (context.acceptedCompleteWarehouseSnapshot === true) {
+    return hasNewerLocalEvidence(existing, context.observationStartedAt)
+      || hasNewerExactEvidence(existing, context.observationCompletedAt);
+  }
   const exact = existing.inventoryAuthority === 'exact-getremain' || Boolean(existing.lastAuthoritativeExactAt);
   if (!exact) return false;
   return Number(existing.quantity || 0) !== Number(incoming.quantity ?? incoming.Quantity1 ?? 0);
+}
+
+function inventoryIdentity(row = {}, warehouse = '') {
+  return `${clean(row.itemCode ?? row.ItemCode, 200)}::${clean(row.stockNumber ?? row.STNumber ?? warehouse, 100)}`;
+}
+
+function planAcceptedWarehouseSnapshot({ existingRows = [], snapshotRows = [], warehouse = '', observationStartedAt, observationCompletedAt } = {}) {
+  const stockNumber = clean(warehouse, 100);
+  if (!stockNumber) throw new TypeError('warehouse required');
+  if (!timestamp(observationStartedAt)) throw new TypeError('observationStartedAt required');
+
+  const existingByKey = new Map();
+  for (const row of existingRows || []) {
+    const key = inventoryIdentity(row, stockNumber);
+    if (key !== `::${stockNumber}`) existingByKey.set(key, row);
+  }
+  const snapshotByKey = new Map();
+  for (const row of snapshotRows || []) {
+    const quantity = Number(row?.quantity ?? row?.Quantity1 ?? 0);
+    const key = inventoryIdentity(row, stockNumber);
+    if (key === `::${stockNumber}` || !Number.isFinite(quantity) || quantity <= 0) continue;
+    snapshotByKey.set(key, { ...row, stockNumber:clean(row.stockNumber ?? row.STNumber ?? stockNumber, 100), quantity });
+  }
+
+  const positives = [];
+  const absences = [];
+  const protectedLocal = [];
+  const quantityDirections = { newRows:0, increases:0, decreases:0, unchanged:0, precedenceConflicts:0, localSaleProtected:0 };
+  for (const [key, row] of snapshotByKey) {
+    const existing = existingByKey.get(key) || null;
+    if (existing && (hasNewerLocalEvidence(existing, observationStartedAt) || hasNewerExactEvidence(existing, observationCompletedAt))) {
+      const reason = hasNewerLocalEvidence(existing, observationStartedAt) ? 'local-evidence-newer-than-snapshot-observation' : 'exact-evidence-newer-than-snapshot-completion';
+      protectedLocal.push({ key, existing, incoming:row, reason });
+      quantityDirections.localSaleProtected++;
+      continue;
+    }
+    quantityDirections[classifyBroadQuantityDirection(existing, row)]++;
+    positives.push({ key, existing, incoming:row });
+  }
+  for (const [key, existing] of existingByKey) {
+    if (snapshotByKey.has(key)) continue;
+    const requiresReconciliation = Number(existing.quantity || 0) > 0
+      || existing.needsLiveVerify === true
+      || existing.protectedFromAutoSyncStale === true
+      || existing.missingInStockSync === true;
+    if (!requiresReconciliation) continue;
+    if (hasNewerLocalEvidence(existing, observationStartedAt) || hasNewerExactEvidence(existing, observationCompletedAt)) {
+      const reason = hasNewerLocalEvidence(existing, observationStartedAt) ? 'local-evidence-newer-than-snapshot-observation' : 'exact-evidence-newer-than-snapshot-completion';
+      protectedLocal.push({ key, existing, incoming:null, reason });
+      quantityDirections.localSaleProtected++;
+      continue;
+    }
+    absences.push({ key, existing });
+  }
+  return {
+    stockNumber,
+    positives,
+    absences,
+    protectedLocal,
+    previousPositiveRows:(existingRows || []).filter(row => Number(row.quantity || 0) > 0).length,
+    newPositiveRows:positives.filter(entry => !entry.existing || Number(entry.existing.quantity || 0) <= 0).length,
+    missingToZero:absences.filter(entry => Number(entry.existing.quantity || 0) > 0).length,
+    clearedLegacyPending:[...positives, ...absences].filter(entry => entry.existing?.needsLiveVerify === true || entry.existing?.protectedFromAutoSyncStale === true || entry.existing?.missingInStockSync === true).length,
+    quantityDirections
+  };
 }
 
 function classifyBroadQuantityDirection(existing, incoming = {}) {
@@ -272,6 +368,11 @@ module.exports = {
   staleEligibleAtFilter,
   broadMissingEligibleFilter,
   shouldProtectExactFromBroad,
+  newestLocalEvidenceAt,
+  hasNewerLocalEvidence,
+  hasNewerExactEvidence,
+  inventoryIdentity,
+  planAcceptedWarehouseSnapshot,
   classifyBroadQuantityDirection,
   exactGetRemainHealth,
   warehouseSnapshotHealth,
