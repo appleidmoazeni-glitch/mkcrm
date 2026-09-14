@@ -3836,6 +3836,7 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/accounting/governance/opening-balances': 'accounting-governance.opening-balances.create',
     'POST /api/accounting/seller-financial-performance/rebuild': 'seller-financial-performance.rebuild',
     'POST /api/accounting/seller-financial-performance/resume': 'seller-financial-performance.resume',
+    'POST /api/accounting/seller-financial-performance/candidate-build': 'seller-financial-performance.candidate-build',
     'POST /api/accounting/profit-ledger/rates': 'profit-ledger.rates.create',
     'POST /api/accounting/profit-ledger/rates/seed-tir': 'profit-ledger.rates.seed-tir',
     'POST /api/accounting/profit-ledger/discounts/extract': 'profit-ledger.discounts.extract',
@@ -3892,6 +3893,7 @@ function stagingReadOnlyOperation(req, pathname) {
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/manual-cost-resolutions\/[^/]+(?:\/(?:submit|approve|reject|expire))?$/.test(normalizedPathname)) return 'manual-cost-resolutions.workflow';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/profit-ledger\/(?:adjustments|categories|rates)\/[^/]+(?:\/(?:submit|approve|reject|return|cancel|expire|reverse))?$/.test(normalizedPathname)) return 'profit-ledger.workflow';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/commission-policies(?:\/[^/]+(?:\/(?:submit|approve|retire))?)?$/.test(normalizedPathname)) return 'commission-policies.workflow';
+  if (method === 'POST' && /^\/api\/accounting\/seller-financial-performance\/candidates\/[^/]+\/(?:human-validation|activate)$/.test(normalizedPathname)) return 'seller-financial-performance.governance';
   if (['PUT','PATCH','POST'].includes(method) && /^\/api\/accounting\/governance\/opening-balances\/[^/]+(?:\/(?:submit|approve|reject|return|cancel))?$/.test(normalizedPathname)) return 'accounting-governance.opening-balances.workflow';
   return '';
 }
@@ -4482,13 +4484,23 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await sellerFinancialPerformance.status(db,config.sellerFinancialReadModelEnabled,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_STATUS_FAILED');}
     }
+    if(pathname===`${sellerFinancialPrefix}/build-context`&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await sellerFinancialPerformance.buildContext(db,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_BUILD_CONTEXT_FAILED');}
+    }
     if(pathname===`${sellerFinancialPrefix}/candidate-build`&&req.method==='POST'){
-      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();const fifoDatasetId=String(body.fifoDatasetId||'').trim().slice(0,100);
+      if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();const request={fifoDatasetId:String(body.fifoDatasetId||'').trim().slice(0,100),expectedActiveFifoDatasetId:String(body.expectedActiveFifoDatasetId||'').trim().slice(0,100),expectedFifoSourceFingerprint:String(body.expectedFifoSourceFingerprint||'').trim().slice(0,64),expectedFifoAllocationFingerprint:String(body.expectedFifoAllocationFingerprint||'').trim().slice(0,64),expectedFifoCandidateFingerprint:String(body.expectedFifoCandidateFingerprint||'').trim().slice(0,64),candidateOnly:true,batchSize:Number(body.batchSize||500),maxAttempts:Number(body.maxAttempts||3)};if(Object.prototype.hasOwnProperty.call(body,'expectedFifoAuthorityRevision'))request.expectedFifoAuthorityRevision=Number(body.expectedFifoAuthorityRevision);
       try{
-        const facts=await profitCommissionLedger.materializeFifoProfitFacts(db,{fifoDatasetId,candidateOnly:true},currentUser(req));
-        const request={fifoDatasetId,candidateOnly:true,batchSize:Number(body.batchSize||500),maxAttempts:Number(body.maxAttempts||3)};
+        await sellerFinancialPerformance.assertCanonicalBuildBinding(db,request);
+        const facts=await profitCommissionLedger.materializeFifoProfitFacts(db,{fifoDatasetId:request.fifoDatasetId,candidateOnly:true},currentUser(req));
+        await sellerFinancialPerformance.assertCanonicalBuildBinding(db,request);
         const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request,createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now,candidateOnly:true,nonPayable:true});startSellerFinancialBackgroundJob({db,jobId,request,requestedBy:currentUser(req)});return sendJson(res,202,{ok:true,jobId,facts,status:'queued',candidateOnly:true,active:false,nonPayable:true});
       }catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_CANDIDATE_BUILD_FAILED');}
+    }
+    const sellerFinancialCandidateLifecycle=pathname.match(/^\/api\/accounting\/seller-financial-performance\/candidates\/([^/]+)\/(human-validation|activate)$/);
+    if(sellerFinancialCandidateLifecycle&&req.method==='POST'){
+      const action=sellerFinancialCandidateLifecycle[2];if(!requireRole(req,res,action==='human-validation'?['admin','manager']:['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();const runId=decodeURIComponent(sellerFinancialCandidateLifecycle[1]);
+      try{return sendJson(res,action==='human-validation'?201:200,action==='human-validation'?await sellerFinancialPerformance.recordHumanValidation(db,runId,body,currentUser(req)):await sellerFinancialPerformance.activateCandidate(db,runId,body,currentUser(req)));}catch(error){return sendLedgerError(error,action==='human-validation'?'SELLER_FINANCIAL_HUMAN_VALIDATION_FAILED':'SELLER_FINANCIAL_ACTIVATION_FAILED');}
     }
     const candidateRunListRequest=pathname===`${sellerFinancialPrefix}/runs`;
     if(pathname.startsWith(sellerFinancialPrefix)&&!config.sellerFinancialReadModelEnabled&&!query.runId&&!candidateRunListRequest){
@@ -4572,6 +4584,7 @@ async function handleApi(req, res, pathname, query) {
     }
     if([`${sellerFinancialPrefix}/rebuild`,`${sellerFinancialPrefix}/resume`].includes(pathname)&&req.method==='POST'){
       if(!requireRole(req,res,['admin','accounting']))return;const body=await collectBody(req);const db=await connectMongo();
+      if(pathname.endsWith('/rebuild'))return sendJson(res,410,{ok:false,code:'SELLER_FINANCIAL_LEGACY_REBUILD_DISABLED',error:'Legacy Build+Activation is unsafe for the canonical workflow. Use candidate-build with the current Active FIFO binding.'});
       if(sellerFinancialJobManager.isRunning('seller-financial-performance')){const running=sellerFinancialJobManager.getRunning('seller-financial-performance');return sendJson(res,409,{ok:false,code:'JOB_LOCKED',error:'Seller Financial Performance job is already running',jobId:running?.id||''});}
       const request={...body,candidateOnly:body.candidateOnly===true,fifoDatasetId:String(body.fifoDatasetId||'').trim().slice(0,100)};if(pathname.endsWith('/resume')&&!request.runId)return sendJson(res,400,{ok:false,code:'SELLER_FINANCIAL_RUN_ID_REQUIRED',error:'runId is required for resume'});
       const jobId=`JOB-SELLER-FINANCIAL-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;const now=new Date();await db.collection('appJobs').insertOne({jobId,type:'seller-financial-performance',status:'queued',phase:'queued',request:{runId:String(request.runId||'').trim().slice(0,100),fifoDatasetId:request.fifoDatasetId,candidateOnly:request.candidateOnly,batchSize:Number(request.batchSize||500),maxAttempts:Number(request.maxAttempts||3)},createdBy:currentUser(req),createdAt:now,updatedAt:now,heartbeatAt:now});

@@ -26,6 +26,8 @@ const SUMMARIES = 'sellerFinancialPerformanceSummaries';
 const STATE = 'sellerFinancialPerformanceState';
 const LOCKS = 'sellerFinancialPerformanceLocks';
 const VERIFICATIONS = 'sellerFinancialPerformanceVerificationRuns';
+const HUMAN_VALIDATIONS = 'sellerFinancialPerformanceHumanValidations';
+const ACTIVATION_AUDITS = 'sellerFinancialPerformanceActivationAudits';
 const SCOPE_KEY = 'seller-financial-performance-v1';
 const SCHEMA_VERSION = 4;
 const ALGORITHM_VERSION = 'seller-financial-performance-v4-canonical-financial-dimensions';
@@ -33,7 +35,9 @@ const MODULE_VERSION = 'seller-financial-performance-1.3.0';
 const UNRESOLVED_CATEGORY_GUID = '__UNRESOLVED__';
 const READ_ROLES = Object.freeze(['admin', 'accounting', 'manager', 'purchase']);
 const BUILD_ROLES = Object.freeze(['admin', 'accounting']);
-const COLLECTIONS = Object.freeze([RUNS, LINES, SUMMARIES, STATE, LOCKS, VERIFICATIONS]);
+const VALIDATE_ROLES = Object.freeze(['admin', 'manager']);
+const ACTIVATE_ROLES = Object.freeze(['admin', 'manager']);
+const COLLECTIONS = Object.freeze([RUNS, LINES, SUMMARIES, STATE, LOCKS, VERIFICATIONS, HUMAN_VALIDATIONS, ACTIVATION_AUDITS]);
 const MAX_PAGE_SIZE = 500;
 const SHA256_HEX = /^[a-f0-9]{64}$/;
 
@@ -101,6 +105,10 @@ async function ensureIndexes(db) {
   await db.collection(LOCKS).createIndex({scopeKey:1},{unique:true});
   await db.collection(VERIFICATIONS).createIndex({verificationId:1},{unique:true});
   await db.collection(VERIFICATIONS).createIndex({status:1,createdAt:-1});
+  await db.collection(HUMAN_VALIDATIONS).createIndex({validationId:1},{unique:true});
+  await db.collection(HUMAN_VALIDATIONS).createIndex({runId:1,candidateFingerprint:1,result:1,createdAt:-1});
+  await db.collection(ACTIVATION_AUDITS).createIndex({activationId:1},{unique:true});
+  await db.collection(ACTIVATION_AUDITS).createIndex({newActiveSellerFinancialId:1,createdAt:-1});
   return {ok:true,moduleVersion:MODULE_VERSION,collections:COLLECTIONS};
 }
 
@@ -110,6 +118,76 @@ async function activeRun(db) {
   if(!state?.activeRunId)return null;
   const run=await db.collection(RUNS).findOne({runId:state.activeRunId,status:'completed'});
   return run?{runId:run.runId,run,state}:null;
+}
+
+function fifoFingerprints(dataset = {}) {
+  return {
+    source:clean(dataset.sourceFingerprint,64),
+    allocation:clean(dataset.allocationFingerprint,64),
+    candidate:clean(dataset.candidateFingerprint,64)
+  };
+}
+
+async function resolveActiveFifoLineage(db) {
+  const state=await db.collection(fifo.STATE).findOne({scopeKey:fifo.SCOPE_KEY});
+  const datasetId=clean(state?.activeDatasetId,100);
+  if(!datasetId)fail('SELLER_FINANCIAL_ACTIVE_FIFO_MISSING','Active FIFO authority is not configured; Candidate build is blocked.',409);
+  const dataset=await db.collection(fifo.DATASETS).findOne({datasetId});
+  if(!dataset||dataset.status!=='completed')fail('SELLER_FINANCIAL_ACTIVE_FIFO_INVALID','Active FIFO authority does not resolve to a completed immutable Dataset.',409);
+  const fingerprints=fifoFingerprints(dataset);
+  if(Object.values(fingerprints).some(value=>!SHA256_HEX.test(value)))fail('SELLER_FINANCIAL_ACTIVE_FIFO_FINGERPRINT_INVALID','Active FIFO fingerprints are incomplete or invalid.',409,{datasetId});
+  return {
+    datasetId,
+    authorityRevision:Number(state?.authorityRevision||0),
+    saleSnapshotId:clean(dataset.sourceSaleSnapshotId,100),
+    purchaseDatasetId:clean(dataset.sourcePurchaseDatasetId,100),
+    openingDatasetId:clean(dataset.sourceOpeningDatasetId,100),
+    sourceFingerprint:fingerprints.source,
+    allocationFingerprint:fingerprints.allocation,
+    candidateFingerprint:fingerprints.candidate,
+    status:dataset.status,
+    activationStatus:clean(dataset.activationStatus,50),
+    immutable:dataset.immutable!==false
+  };
+}
+
+async function assertCanonicalBuildBinding(db,input={}) {
+  if(input.candidateOnly!==true)fail('SELLER_FINANCIAL_CANDIDATE_ONLY_REQUIRED','Canonical Seller Financial build must be Candidate-only.',409);
+  const expectedId=clean(input.expectedActiveFifoDatasetId,100);
+  const requestedId=clean(input.fifoDatasetId,100);
+  if(!expectedId||!requestedId)fail('SELLER_FINANCIAL_ACTIVE_FIFO_BINDING_REQUIRED','Exact Active FIFO binding from the current page is required.',400);
+  if(!Object.prototype.hasOwnProperty.call(input,'expectedFifoAuthorityRevision'))fail('SELLER_FINANCIAL_FIFO_AUTHORITY_REVISION_REQUIRED','Active FIFO authority revision is required.',400);
+  const active=await resolveActiveFifoLineage(db);
+  if(expectedId!==active.datasetId||requestedId!==active.datasetId)fail('SELLER_FINANCIAL_ACTIVE_FIFO_STALE','Active FIFO changed or the requested FIFO is not authoritative; refresh the page.',409,{expectedActiveFifoDatasetId:expectedId,requestedFifoDatasetId:requestedId,currentActiveFifoDatasetId:active.datasetId});
+  if(Number(input.expectedFifoAuthorityRevision)!==active.authorityRevision)fail('SELLER_FINANCIAL_ACTIVE_FIFO_STALE','Active FIFO authority revision changed; refresh the page.',409,{expectedFifoAuthorityRevision:Number(input.expectedFifoAuthorityRevision),currentFifoAuthorityRevision:active.authorityRevision});
+  const expected={
+    source:clean(input.expectedFifoSourceFingerprint,64),
+    allocation:clean(input.expectedFifoAllocationFingerprint,64),
+    candidate:clean(input.expectedFifoCandidateFingerprint,64)
+  };
+  if(Object.values(expected).some(value=>!SHA256_HEX.test(value)))fail('SELLER_FINANCIAL_FIFO_FINGERPRINT_BINDING_REQUIRED','Exact Active FIFO fingerprints are required.',400);
+  if(expected.source!==active.sourceFingerprint||expected.allocation!==active.allocationFingerprint||expected.candidate!==active.candidateFingerprint)fail('SELLER_FINANCIAL_ACTIVE_FIFO_STALE','Active FIFO lineage fingerprints changed; refresh the page.',409);
+  return active;
+}
+
+async function buildContext(db,requestedBy={}) {
+  requireRole(requestedBy,READ_ROLES);await ensureIndexes(db);
+  const activeFifo=await resolveActiveFifoLineage(db);
+  const [active,latestCandidate]=await Promise.all([
+    activeRun(db),
+    db.collection(RUNS).findOne({status:'completed',candidateOnly:true},{sort:{completedAt:-1,createdAt:-1}})
+  ]);
+  const current=actor(requestedBy);
+  return {
+    ok:true,
+    activeFifo,
+    currentActiveSellerFinancialId:active?.runId||'',
+    latestCandidate:latestCandidate?{runId:latestCandidate.runId,sourceFifoDatasetId:latestCandidate.sourceFifoDatasetId,candidateFingerprint:latestCandidate.candidateFingerprint||latestCandidate.resultFingerprint||'',status:latestCandidate.status,activationStatus:latestCandidate.activationStatus,active:Boolean(latestCandidate.active),candidateOnly:Boolean(latestCandidate.candidateOnly),nonPayable:latestCandidate.nonPayable!==false}:null,
+    canBuild:BUILD_ROLES.includes(current.role),
+    buildRoles:BUILD_ROLES,
+    resultContract:{active:false,candidateOnly:true,nonPayable:true,activationStatus:'validated-candidate',commissionCreated:false,activationSeparate:true},
+    legacyRebuild:{classification:'LEGACY_UNSAFE_FOR_CANONICAL_BUILD',availableFromCanonicalUi:false}
+  };
 }
 
 function immutableSourceProjection(row) {
@@ -411,13 +489,14 @@ async function writeBatches(db,runId,lines,options={}) {
 }
 
 async function buildReadModel(db,input={},requestedBy={}) {
-  const current=requireRole(requestedBy,BUILD_ROLES);await ensureIndexes(db);const candidateOnly=input.candidateOnly===true;const requestedFifoDatasetId=clean(input.fifoDatasetId,100);if(candidateOnly&&!requestedFifoDatasetId)fail('SELLER_FINANCIAL_FIFO_CANDIDATE_REQUIRED','fifoDatasetId برای Candidate Read Model الزامی است.',400);const runId=clean(input.runId,100)||newId('SFPR');let lock=null;const memorySamples=[memorySample('before-rebuild')];
+  const current=requireRole(requestedBy,BUILD_ROLES);await ensureIndexes(db);const candidateOnly=input.candidateOnly===true;const requestedFifoDatasetId=clean(input.fifoDatasetId,100);if(candidateOnly&&!requestedFifoDatasetId)fail('SELLER_FINANCIAL_FIFO_CANDIDATE_REQUIRED','fifoDatasetId برای Candidate Read Model الزامی است.',400);if(candidateOnly)await assertCanonicalBuildBinding(db,input);const runId=clean(input.runId,100)||newId('SFPR');let lock=null;const memorySamples=[memorySample('before-rebuild')];
   try{
     lock=await acquireLock(db,runId);progress(input.jobControl,'Reading Immutable Sources',0,1,'Reading approved source datasets');const bundle=await sourceBundle(db,{fifoDatasetId:requestedFifoDatasetId,candidateOnly});memorySamples.push(memorySample('after-source-read'));
+    if(candidateOnly)await assertCanonicalBuildBinding(db,input);
     const [fastMetadata,recency]=await Promise.all([fastSourceMetadata(db,{fifoDatasetId:bundle.fifoDatasetId,candidateOnly}),sourceRecency(db,bundle.saleSnapshotId)]);
-    const requestedMode=clean(input.mode||'full',30).toLowerCase();const currentBeforeBuild=candidateOnly?null:await activeRun(db);const duplicateCandidate=candidateOnly?await db.collection(RUNS).findOne({status:'completed',candidateOnly:true,sourceFifoDatasetId:bundle.fifoDatasetId,sourceFingerprint:bundle.sourceFingerprint,schemaVersion:SCHEMA_VERSION,algorithmVersion:ALGORITHM_VERSION}):null;if(duplicateCandidate)return {ok:true,runId:duplicateCandidate.runId,lineCount:Number(duplicateCandidate.lineCount||0),summaryCount:Number(duplicateCandidate.summaryCount||0),retryCount:Number(duplicateCandidate.retryCount||0),resumeCount:Number(duplicateCandidate.resumeCount||0),sourceFingerprint:bundle.sourceFingerprint,resultFingerprint:duplicateCandidate.resultFingerprint,active:false,candidateOnly:true,duplicate:true,buildMode:'candidate-no-source-change',nonPayable:true};if(requestedMode==='incremental'&&currentBeforeBuild?.run?.sourceFingerprint===bundle.sourceFingerprint&&currentBeforeBuild.run.schemaVersion===SCHEMA_VERSION&&currentBeforeBuild.run.algorithmVersion===ALGORITHM_VERSION)return {ok:true,runId:currentBeforeBuild.runId,lineCount:Number(currentBeforeBuild.run.lineCount||0),summaryCount:Number(currentBeforeBuild.run.summaryCount||0),retryCount:0,resumeCount:Number(currentBeforeBuild.run.resumeCount||0),sourceFingerprint:bundle.sourceFingerprint,resultFingerprint:currentBeforeBuild.run.resultFingerprint,active:true,duplicate:true,buildMode:'incremental-no-source-change',nonPayable:true};
+    const requestedMode=clean(input.mode||'full',30).toLowerCase();const currentBeforeBuild=candidateOnly?null:await activeRun(db);const duplicateCandidate=candidateOnly?await db.collection(RUNS).findOne({status:'completed',candidateOnly:true,sourceFifoDatasetId:bundle.fifoDatasetId,sourceFingerprint:bundle.sourceFingerprint,schemaVersion:SCHEMA_VERSION,algorithmVersion:ALGORITHM_VERSION}):null;if(duplicateCandidate)return {ok:true,runId:duplicateCandidate.runId,lineCount:Number(duplicateCandidate.lineCount||0),summaryCount:Number(duplicateCandidate.summaryCount||0),retryCount:Number(duplicateCandidate.retryCount||0),resumeCount:Number(duplicateCandidate.resumeCount||0),sourceFingerprint:bundle.sourceFingerprint,resultFingerprint:duplicateCandidate.resultFingerprint,candidateFingerprint:duplicateCandidate.candidateFingerprint||duplicateCandidate.resultFingerprint,active:false,candidateOnly:true,duplicate:true,buildMode:'candidate-no-source-change',nonPayable:true};if(requestedMode==='incremental'&&currentBeforeBuild?.run?.sourceFingerprint===bundle.sourceFingerprint&&currentBeforeBuild.run.schemaVersion===SCHEMA_VERSION&&currentBeforeBuild.run.algorithmVersion===ALGORITHM_VERSION)return {ok:true,runId:currentBeforeBuild.runId,lineCount:Number(currentBeforeBuild.run.lineCount||0),summaryCount:Number(currentBeforeBuild.run.summaryCount||0),retryCount:0,resumeCount:Number(currentBeforeBuild.run.resumeCount||0),sourceFingerprint:bundle.sourceFingerprint,resultFingerprint:currentBeforeBuild.run.resultFingerprint,active:true,duplicate:true,buildMode:'incremental-no-source-change',nonPayable:true};
     let run=await db.collection(RUNS).findOne({runId});const now=new Date();let resumeCount=0;
-    if(run){if(!['building','failed'].includes(run.status))fail('SELLER_FINANCIAL_RUN_IMMUTABLE','فقط Run ناقص یا ناموفق قابل Resume است.',409);if(run.sourceFingerprint&&run.sourceFingerprint!==bundle.sourceFingerprint)fail('SELLER_FINANCIAL_SOURCE_CHANGED','منابع از زمان Run قبلی تغییر کرده‌اند؛ Resume مجاز نیست.',409);resumeCount=Number(run.resumeCount||0)+1;await db.collection(RUNS).updateOne({runId},{$set:{status:'building',candidateOnly,sourceFingerprint:bundle.sourceFingerprint,fastSourceMetadata:fastMetadata.metadata,fastSourceMetadataFingerprint:fastMetadata.fingerprint,sourceRecency:recency,resumeCount,updatedAt:now,lastError:''}});}else{const policyIds=bundle.approvedPolicies.map(row=>row.policyVersionId).sort();run={runId,schemaVersion:SCHEMA_VERSION,algorithmVersion:ALGORITHM_VERSION,moduleVersion:MODULE_VERSION,buildMode:candidateOnly?'candidate-full':requestedMode==='incremental'?'incremental-safe-full-rebuild':'full',status:'building',active:false,candidateOnly,activationStatus:'candidate',sourceFingerprint:bundle.sourceFingerprint,fastSourceMetadata:fastMetadata.metadata,fastSourceMetadataFingerprint:fastMetadata.fingerprint,sourceRecency:recency,sourceFifoDatasetId:bundle.fifoDatasetId,sourceSaleSnapshotId:bundle.saleSnapshotId,sourceProfitFactsDatasetId:bundle.facts[0]?.profitFactsDatasetId||'',sourcePolicyVersionId:policyIds.length===1?policyIds[0]:'',sourcePolicyVersionIds:policyIds,sourceCategoryCatalogRunId:bundle.catalogMaps.run?.catalogRunId||'',sourceCatalogRunId:bundle.catalogMaps.run?.catalogRunId||'',sourceDiscountVersion:1,sourceDiscountFingerprint:bundle.sourceProjection.discounts.fingerprint,sourceAdjustmentFingerprint:bundle.sourceProjection.adjustments.fingerprint,sourceLedgerFingerprint:bundle.sourceProjection.savedEntries.fingerprint,sourceSellerMappingFingerprint:bundle.sourceProjection.sellerMappings.fingerprint,checkpoint:{linesWritten:0,lastSaleLineIdentity:''},retryCount:0,resumeCount:0,createdBy:current,startedAt:now,createdAt:now,updatedAt:now,diagnostics:[],immutable:true,nonPayable:true,sellerFacing:false};await db.collection(RUNS).insertOne(run);}
+    if(run){if(!['building','failed'].includes(run.status))fail('SELLER_FINANCIAL_RUN_IMMUTABLE','فقط Run ناقص یا ناموفق قابل Resume است.',409);if(run.sourceFingerprint&&run.sourceFingerprint!==bundle.sourceFingerprint)fail('SELLER_FINANCIAL_SOURCE_CHANGED','منابع از زمان Run قبلی تغییر کرده‌اند؛ Resume مجاز نیست.',409);resumeCount=Number(run.resumeCount||0)+1;await db.collection(RUNS).updateOne({runId},{$set:{status:'building',candidateOnly,sourceFingerprint:bundle.sourceFingerprint,fastSourceMetadata:fastMetadata.metadata,fastSourceMetadataFingerprint:fastMetadata.fingerprint,sourceRecency:recency,resumeCount,updatedAt:now,lastError:''}});}else{const policyIds=bundle.approvedPolicies.map(row=>row.policyVersionId).sort();run={runId,schemaVersion:SCHEMA_VERSION,algorithmVersion:ALGORITHM_VERSION,moduleVersion:MODULE_VERSION,buildMode:candidateOnly?'candidate-full':requestedMode==='incremental'?'incremental-safe-full-rebuild':'full',status:'building',active:false,candidateOnly,activationStatus:'candidate',sourceFingerprint:bundle.sourceFingerprint,fastSourceMetadata:fastMetadata.metadata,fastSourceMetadataFingerprint:fastMetadata.fingerprint,sourceRecency:recency,sourceFifoDatasetId:bundle.fifoDatasetId,sourceFifoAuthorityRevision:candidateOnly?Number(input.expectedFifoAuthorityRevision):null,sourceFifoSourceFingerprint:clean(bundle.fifoActive.dataset.sourceFingerprint,64),sourceFifoAllocationFingerprint:clean(bundle.fifoActive.dataset.allocationFingerprint,64),sourceFifoCandidateFingerprint:clean(bundle.fifoActive.dataset.candidateFingerprint,64),sourceSaleSnapshotId:bundle.saleSnapshotId,sourceProfitFactsDatasetId:bundle.facts[0]?.profitFactsDatasetId||'',sourcePolicyVersionId:policyIds.length===1?policyIds[0]:'',sourcePolicyVersionIds:policyIds,sourceCategoryCatalogRunId:bundle.catalogMaps.run?.catalogRunId||'',sourceCatalogRunId:bundle.catalogMaps.run?.catalogRunId||'',sourceDiscountVersion:1,sourceDiscountFingerprint:bundle.sourceProjection.discounts.fingerprint,sourceAdjustmentFingerprint:bundle.sourceProjection.adjustments.fingerprint,sourceLedgerFingerprint:bundle.sourceProjection.savedEntries.fingerprint,sourceSellerMappingFingerprint:bundle.sourceProjection.sellerMappings.fingerprint,checkpoint:{linesWritten:0,lastSaleLineIdentity:''},retryCount:0,resumeCount:0,createdBy:current,startedAt:now,createdAt:now,updatedAt:now,diagnostics:[],immutable:true,nonPayable:true,sellerFacing:false};await db.collection(RUNS).insertOne(run);}
     progress(input.jobControl,'Projecting Seller Financial Lines',0,bundle.facts.length,'Resolving governed financial dimensions');const calculatedAt=new Date();const lines=buildProjectedLines(bundle,runId,calculatedAt);memorySamples.push(memorySample('after-line-projection'));
     progress(input.jobControl,'Writing Seller Financial Lines',0,lines.length,'Writing isolated candidate rows');const write=await writeBatches(db,runId,lines,input);
     memorySamples.push(memorySample('after-line-write'));progress(input.jobControl,'Building Summaries',0,1,'Building deterministic summary dimensions');const summaries=buildSummaries(lines,runId,calculatedAt);await db.collection(SUMMARIES).deleteMany({runId});await insertMany(db.collection(SUMMARIES),summaries);memorySamples.push(memorySample('after-summary-write'));
@@ -427,8 +506,8 @@ async function buildReadModel(db,input={},requestedBy={}) {
     if(replayLineFingerprint!==lineFingerprint||replaySummaryFingerprint!==summaryFingerprint||replayResultFingerprint!==resultFingerprint)fail('SELLER_FINANCIAL_FINGERPRINT_REPLAY_FAILED','Fingerprint ذخیره‌شده پس از replay یکسان نیست.',409,{lineMatch:replayLineFingerprint===lineFingerprint,summaryMatch:replaySummaryFingerprint===summaryFingerprint,resultMatch:replayResultFingerprint===resultFingerprint});
     const validation={valid:true,expectedLineCount:bundle.facts.length,lineCount:lines.length,uniqueLineCount:new Set(lines.map(row=>row.saleLineIdentity)).size,summaryCount:summaries.length,duplicateLineCount:lines.length-new Set(lines.map(row=>row.saleLineIdentity)).size,sourceFingerprint:bundle.sourceFingerprint,resultFingerprint};
     if(!validation.valid||validation.duplicateLineCount)fail('SELLER_FINANCIAL_VALIDATION_FAILED','اعتبارسنجی Candidate ناموفق بود.',409,{validation});
-    const previous=candidateOnly?null:await activeRun(db);const completedAt=new Date();memorySamples.push(memorySample('immediately-after-rebuild'));const peakRssBytes=Math.max(...memorySamples.map(row=>row.rssBytes));await db.collection(RUNS).updateOne({runId},{$set:{status:'completed',active:false,candidateOnly,activationStatus:'validated-candidate',lineCount:lines.length,summaryCount:summaries.length,availableCommissionLineCount:lines.filter(row=>row.commissionStatus==='available').length,unavailableCommissionLineCount:lines.filter(row=>row.commissionStatus!=='available').length,retryCount:write.retryCount,resumeCount,attemptDiagnostics:write.attempts.slice(-100),diagnostics:[{code:'SOURCE_VALIDATED',at:completedAt,sourceFingerprint:bundle.sourceFingerprint},{code:'FINGERPRINT_REPLAY_VALIDATED',at:completedAt,lineFingerprint,summaryFingerprint,resultFingerprint},{code:'CANDIDATE_VALIDATED',at:completedAt,validation}],validation,lineFingerprint,summaryFingerprint,resultFingerprint,fingerprintContract:{algorithm:'SHA-256',encoding:'lowercase-hex',length:64,canonicalOrdering:true,replayValidated:true},memorySamples,peakRssBytes,completedAt,immutable:true,nonPayable:true,sellerFacing:false,updatedAt:completedAt}});
-    if(candidateOnly){progress(input.jobControl,'Completed',1,1,'Seller Financial Candidate is ready for human validation');return {ok:true,runId,lineCount:lines.length,summaryCount:summaries.length,retryCount:write.retryCount,resumeCount,sourceFingerprint:bundle.sourceFingerprint,resultFingerprint,previousActiveRunId:'',active:false,candidateOnly:true,activationStatus:'validated-candidate',nonPayable:true};}
+    const previous=candidateOnly?null:await activeRun(db);const completedAt=new Date();memorySamples.push(memorySample('immediately-after-rebuild'));const peakRssBytes=Math.max(...memorySamples.map(row=>row.rssBytes));await db.collection(RUNS).updateOne({runId},{$set:{status:'completed',active:false,candidateOnly,activationStatus:'validated-candidate',candidateFingerprint:resultFingerprint,lineCount:lines.length,summaryCount:summaries.length,availableCommissionLineCount:lines.filter(row=>row.commissionStatus==='available').length,unavailableCommissionLineCount:lines.filter(row=>row.commissionStatus!=='available').length,retryCount:write.retryCount,resumeCount,attemptDiagnostics:write.attempts.slice(-100),diagnostics:[{code:'SOURCE_VALIDATED',at:completedAt,sourceFingerprint:bundle.sourceFingerprint},{code:'FINGERPRINT_REPLAY_VALIDATED',at:completedAt,lineFingerprint,summaryFingerprint,resultFingerprint},{code:'CANDIDATE_VALIDATED',at:completedAt,validation}],validation,lineFingerprint,summaryFingerprint,resultFingerprint,fingerprintContract:{algorithm:'SHA-256',encoding:'lowercase-hex',length:64,canonicalOrdering:true,replayValidated:true},memorySamples,peakRssBytes,completedAt,immutable:true,nonPayable:true,sellerFacing:false,commissionCreated:false,payrollAuthority:false,updatedAt:completedAt}});
+    if(candidateOnly){progress(input.jobControl,'Completed',1,1,'Seller Financial Candidate is ready for human validation');return {ok:true,runId,lineCount:lines.length,summaryCount:summaries.length,retryCount:write.retryCount,resumeCount,sourceFingerprint:bundle.sourceFingerprint,resultFingerprint,candidateFingerprint:resultFingerprint,previousActiveRunId:'',active:false,candidateOnly:true,activationStatus:'validated-candidate',nonPayable:true,commissionCreated:false};}
     await db.collection(STATE).updateOne({scopeKey:SCOPE_KEY},{$set:{scopeKey:SCOPE_KEY,activeRunId:runId,previousActiveRunId:previous?.runId||'',sourceFingerprint:bundle.sourceFingerprint,activatedAt:completedAt,updatedAt:completedAt},$setOnInsert:{createdAt:completedAt}},{upsert:true});
     if(previous?.runId&&previous.runId!==runId)await db.collection(RUNS).updateOne({runId:previous.runId},{$set:{status:'superseded',active:false,activationStatus:'superseded',supersededAt:completedAt,updatedAt:completedAt}});
     await db.collection(RUNS).updateOne({runId},{$set:{active:true,activationStatus:'active',activatedAt:completedAt,updatedAt:completedAt}});
@@ -539,4 +618,46 @@ async function governanceCoverage(db,requestedBy={}) {
   return {ok:true,runId:active.runId,approvedSelectablePolicies:approvedPolicies,approvedMappings,approvedRates,totalLines,totalSaleValueExact:allValueExact,approvedMappedLines:Number(mapped.lineCount||0),approvedMappedLineCoveragePercent:Number((Number(mapped.lineCount||0)*100/Math.max(1,totalLines)).toFixed(4)),approvedMappedSaleValueExact:decimalText(mapped.saleValueNumeric)||'0.00',approvedMappedSaleValueCoveragePercent:percent(mapped.saleValueNumeric),approvedRateLines:Number(rated.lineCount||0),missingRateLines:Math.max(0,totalLines-Number(rated.lineCount||0)),approvedRateLineCoveragePercent:Number((Number(rated.lineCount||0)*100/Math.max(1,totalLines)).toFixed(4)),approvedRateSaleValueExact:ratedValueExact,missingRateSaleValueExact:subtract(allValueExact,ratedValueExact),approvedRateSaleValueCoveragePercent:percent(rated.saleValueNumeric),approvedRateCoveragePercent:percent(rated.saleValueNumeric),approvedRateSellerCoveragePercent:Number((fullyRatedSellerCount*100/Math.max(1,totalSellers.size)).toFixed(4)),approvedRateGroupCoveragePercent:Number((fullyRatedGroupCount*100/Math.max(1,totalGroups.size)).toFixed(4)),approvedOnly:true,projectedIncluded:false,automaticApproval:false};
 }
 
-module.exports={RUNS,LINES,SUMMARIES,STATE,LOCKS,VERIFICATIONS,SCOPE_KEY,SCHEMA_VERSION,ALGORITHM_VERSION,MODULE_VERSION,READ_ROLES,BUILD_ROLES,COLLECTIONS,ensureIndexes,activeRun,buildReadModel,listLines,listInvoices,listInvoiceLines,listSummaries,totals,categoryTotals,filterOptions,lineDrilldown,listRuns,status,freshness,fingerprintIntegrity,deepVerify,listVerifications,discountStatusReport,governanceCoverage,_sourceBundle:sourceBundle,_fastSourceMetadata:fastSourceMetadata,_sourceRecency:sourceRecency,_buildProjectedLines:buildProjectedLines,_buildSummaries:buildSummaries,_queryFromFilters:queryFromFilters,_canonicalLineFingerprint:canonicalLineFingerprint,_canonicalSummaryFingerprint:canonicalSummaryFingerprint};
+function candidateFingerprintOf(run={}) {return clean(run.candidateFingerprint||run.resultFingerprint,64);}
+async function requireCandidate(db,runId) {
+  const id=clean(runId,100);const run=await db.collection(RUNS).findOne({runId:id});
+  if(!run||run.status!=='completed'||run.activationStatus!=='validated-candidate'||run.candidateOnly!==true||run.active===true||run.nonPayable===false)fail('SELLER_FINANCIAL_CANDIDATE_INVALID','Only a completed inactive non-payable Seller Financial Candidate is eligible.',409);
+  const fingerprint=candidateFingerprintOf(run);if(!SHA256_HEX.test(fingerprint))fail('SELLER_FINANCIAL_CANDIDATE_FINGERPRINT_INVALID','Candidate fingerprint is missing or invalid.',409);
+  return {run,fingerprint};
+}
+
+async function recordHumanValidation(db,runId,input={},requestedBy={}) {
+  const current=requireRole(requestedBy,VALIDATE_ROLES);await ensureIndexes(db);
+  const {run,fingerprint}=await requireCandidate(db,runId);const expected=clean(input.candidateFingerprint,64),reason=clean(input.reason,2000),result=clean(input.result,20).toUpperCase();
+  if(expected!==fingerprint)fail('SELLER_FINANCIAL_VALIDATION_FINGERPRINT_STALE','Exact Candidate fingerprint is required.',409);
+  if(!reason||!['PASS','FAIL'].includes(result))fail('SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED','PASS/FAIL and a Human validation reason are required.',400);
+  if(clean(run.createdBy?.username,100)===current.username)fail('SELLER_FINANCIAL_SELF_VALIDATION_FORBIDDEN','Candidate creator cannot record its Human validation.',403);
+  const existing=await db.collection(HUMAN_VALIDATIONS).findOne({runId:run.runId,candidateFingerprint:fingerprint,result,'actor.username':current.username});
+  if(existing)return {ok:true,idempotent:true,validation:existing};
+  const createdAt=new Date(),validation={validationId:newId('SFHVAL'),action:'HUMAN_VALIDATE_SELLER_FINANCIAL',runId:run.runId,candidateFingerprint:fingerprint,result,reason,actor:current,createdAt,immutable:true};
+  await db.collection(HUMAN_VALIDATIONS).insertOne(validation);
+  return {ok:true,idempotent:false,validation};
+}
+
+async function activateCandidate(db,runId,input={},requestedBy={}) {
+  const current=requireRole(requestedBy,ACTIVATE_ROLES);await ensureIndexes(db);
+  const {run,fingerprint}=await requireCandidate(db,runId);const expectedFingerprint=clean(input.candidateFingerprint,64),validationId=clean(input.humanValidationId,100),reason=clean(input.reason,2000);
+  if(expectedFingerprint!==fingerprint)fail('SELLER_FINANCIAL_ACTIVATION_FINGERPRINT_STALE','Exact Candidate fingerprint is required for activation.',409);
+  if(!validationId||!reason)fail('SELLER_FINANCIAL_ACTIVATION_GOVERNANCE_REQUIRED','Human validation ID and activation reason are required.',400);
+  const validation=await db.collection(HUMAN_VALIDATIONS).findOne({validationId,runId:run.runId,candidateFingerprint:fingerprint,result:'PASS',immutable:true});
+  if(!validation)fail('SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED','A fingerprint-bound PASS Human validation record is required.',409);
+  const activeFifo=await resolveActiveFifoLineage(db);
+  if(clean(run.sourceFifoDatasetId,100)!==activeFifo.datasetId||Number(run.sourceFifoAuthorityRevision)!==activeFifo.authorityRevision||clean(run.sourceFifoSourceFingerprint,64)!==activeFifo.sourceFingerprint||clean(run.sourceFifoAllocationFingerprint,64)!==activeFifo.allocationFingerprint||clean(run.sourceFifoCandidateFingerprint,64)!==activeFifo.candidateFingerprint)fail('SELLER_FINANCIAL_ACTIVATION_FIFO_AUTHORITY_CHANGED','Active FIFO authority or fingerprints changed after Candidate build; rebuild and revalidate Seller Financial.',409);
+  const state=await db.collection(STATE).findOne({scopeKey:SCOPE_KEY});const previousActiveSellerFinancialId=clean(state?.activeRunId,100);const expectedPrevious=clean(input.expectedPreviousActiveSellerFinancialId,100);
+  if(expectedPrevious!==previousActiveSellerFinancialId)fail('SELLER_FINANCIAL_ACTIVATION_STATE_STALE','Active Seller Financial authority changed; refresh before activation.',409,{expectedPreviousActiveSellerFinancialId:expectedPrevious,currentActiveSellerFinancialId:previousActiveSellerFinancialId});
+  const activatedAt=new Date(),activationId=newId('SFACT'),audit={activationId,action:'ACTIVATE_SELLER_FINANCIAL',candidateId:run.runId,candidateFingerprint:fingerprint,humanValidationId:validation.validationId,actor:current,role:current.role,timestamp:activatedAt,reason,previousActiveSellerFinancialId,newActiveSellerFinancialId:run.runId,nonPayable:true,commissionCreated:false,immutable:true};
+  const activeFilter=previousActiveSellerFinancialId?{activeRunId:previousActiveSellerFinancialId}:{$or:[{activeRunId:''},{activeRunId:null},{activeRunId:{$exists:false}}]};
+  const updated=await db.collection(STATE).updateOne({scopeKey:SCOPE_KEY,...activeFilter},{$set:{scopeKey:SCOPE_KEY,activeRunId:run.runId,previousActiveRunId:previousActiveSellerFinancialId,activeCandidateFingerprint:fingerprint,humanValidationId:validation.validationId,activatedAt,activatedBy:current,activationReason:reason,lastActivationAudit:audit,updatedAt:activatedAt},$push:{activationAuditLog:audit}},{upsert:!state});
+  if(!(updated.matchedCount||updated.upsertedCount))fail('SELLER_FINANCIAL_ACTIVATION_STATE_STALE','Active Seller Financial authority changed concurrently; activation stopped.',409);
+  await db.collection(ACTIVATION_AUDITS).insertOne(audit);
+  if(previousActiveSellerFinancialId&&previousActiveSellerFinancialId!==run.runId)await db.collection(RUNS).updateOne({runId:previousActiveSellerFinancialId},{$set:{status:'superseded',active:false,activationStatus:'superseded',supersededAt:activatedAt,updatedAt:activatedAt}});
+  await db.collection(RUNS).updateOne({runId:run.runId,candidateFingerprint:fingerprint},{$set:{active:true,candidateOnly:false,activationStatus:'active',humanValidationId:validation.validationId,activatedAt,activatedBy:current,activationReason:reason,nonPayable:true,payrollAuthority:false,commissionCreated:false,updatedAt:activatedAt}});
+  return {ok:true,activationPerformed:true,activationAudit:audit,previousActiveSellerFinancialId,newActiveSellerFinancialId:run.runId,nonPayable:true,commissionCreated:false};
+}
+
+module.exports={RUNS,LINES,SUMMARIES,STATE,LOCKS,VERIFICATIONS,HUMAN_VALIDATIONS,ACTIVATION_AUDITS,SCOPE_KEY,SCHEMA_VERSION,ALGORITHM_VERSION,MODULE_VERSION,READ_ROLES,BUILD_ROLES,VALIDATE_ROLES,ACTIVATE_ROLES,COLLECTIONS,ensureIndexes,activeRun,resolveActiveFifoLineage,assertCanonicalBuildBinding,buildContext,buildReadModel,recordHumanValidation,activateCandidate,listLines,listInvoices,listInvoiceLines,listSummaries,totals,categoryTotals,filterOptions,lineDrilldown,listRuns,status,freshness,fingerprintIntegrity,deepVerify,listVerifications,discountStatusReport,governanceCoverage,_sourceBundle:sourceBundle,_fastSourceMetadata:fastSourceMetadata,_sourceRecency:sourceRecency,_buildProjectedLines:buildProjectedLines,_buildSummaries:buildSummaries,_queryFromFilters:queryFromFilters,_canonicalLineFingerprint:canonicalLineFingerprint,_canonicalSummaryFingerprint:canonicalSummaryFingerprint};

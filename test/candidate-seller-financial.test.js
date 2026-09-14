@@ -19,12 +19,21 @@ test('Candidate Seller Financial UI is Persian-first, candidate-scoped and expos
 
 test('Candidate financial build route materializes canonical FIFO facts and never activates FIFO or payroll',()=>{
   const server=read('src/server.js'),service=read('src/lib/seller-financial-performance.js');
-  assert.match(server,/sellerFinancialPrefix}\/candidate-build/);assert.match(server,/materializeFifoProfitFacts\(db,\{fifoDatasetId,candidateOnly:true\}/);
+  assert.match(server,/sellerFinancialPrefix}\/candidate-build/);assert.match(server,/materializeFifoProfitFacts\(db,\{fifoDatasetId:request\.fifoDatasetId,candidateOnly:true\}/);
+  assert.match(server,/assertCanonicalBuildBinding\(db,request\)/);assert.match(server,/SELLER_FINANCIAL_LEGACY_REBUILD_DISABLED/);
   assert.match(server,/candidateRunListRequest=pathname===`\$\{sellerFinancialPrefix\}\/runs`/);
   assert.match(server,/!query\.runId&&!candidateRunListRequest/);
   assert.match(service,/if\(candidateOnly\).*Seller Financial Candidate is ready for human validation/);
   assert.match(service,/active:false,candidateOnly:true,activationStatus:'validated-candidate'/);
+  assert.match(service,/commissionCreated:false/);assert.match(service,/payrollAuthority:false/);
   for(const forbidden of ['Invoice/Put','PutSaleInvoice','PutBuyInvoice','itemInventoryCatalog.update','supplierPurchaseLayers.update'])assert.equal(service.includes(forbidden),false,forbidden);
+});
+
+test('governed activation endpoints are separate from build and require backend roles',()=>{
+  const server=read('src/server.js'),service=read('src/lib/seller-financial-performance.js');
+  assert.match(server,/candidates\\\/\(\[\^\/\]\+\)\\\/\(human-validation\|activate\)/);
+  assert.match(server,/\['admin','manager'\]/);assert.match(service,/SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED/);
+  assert.match(service,/expectedPreviousActiveSellerFinancialId/);assert.match(service,/ACTIVATION_AUDITS/);
 });
 
 test('Candidate facts preserve return linkage and unknown profit remains null',()=>{

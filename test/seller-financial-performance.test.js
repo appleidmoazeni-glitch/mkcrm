@@ -13,6 +13,13 @@ const manager={username:'manager',role:'manager'};
 const purchase={username:'buyer',role:'purchase'};
 const seller={username:'seller',role:'seller'};
 
+function bindActiveCandidate(db,{datasetId='FIFO-A',revision=7}={}){
+  const dataset=db.collection('fifoDatasets').rows.find(row=>row.datasetId===datasetId);
+  Object.assign(dataset,{activationStatus:'validated-candidate',sourceFingerprint:'1'.repeat(64),allocationFingerprint:'2'.repeat(64),candidateFingerprint:'3'.repeat(64),sourcePurchaseDatasetId:'PURCHASE-A',sourceOpeningDatasetId:'OPENING-A',immutable:true});
+  const state=db.collection('fifoDatasetState').rows[0];Object.assign(state,{activeDatasetId:datasetId,authorityRevision:revision});
+  return {fifoDatasetId:datasetId,expectedActiveFifoDatasetId:datasetId,expectedFifoAuthorityRevision:revision,expectedFifoSourceFingerprint:dataset.sourceFingerprint,expectedFifoAllocationFingerprint:dataset.allocationFingerprint,expectedFifoCandidateFingerprint:dataset.candidateFingerprint,candidateOnly:true};
+}
+
 function dbSeed(){return new MemoryDb({
   saleSnapshotState:[{scopeKey:'sale-type2|14050101|',activeSnapshotId:'SALE-A',activatedAt:new Date('2026-08-02T00:00:00Z')}],
   saleSnapshots:[{snapshotId:'SALE-A',status:'completed',createdAt:new Date('2026-08-02T00:00:00Z')}],
@@ -178,19 +185,61 @@ test('seller is denied and projection source contract has no forbidden write int
 });
 
 test('validated FIFO candidate builds a non-active non-payroll Seller Financial candidate selectable by runId',async()=>{
-  const db=dbSeed();db.collection('fifoDatasets').rows[0].activationStatus='validated-candidate';db.collection('fifoDatasets').rows[0].candidateFingerprint='a'.repeat(64);db.collection('fifoDatasetState').rows=[];for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
-  const built=await service.buildReadModel(db,{fifoDatasetId:'FIFO-A',candidateOnly:true},accounting);
+  const db=dbSeed(),binding=bindActiveCandidate(db);for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
+  const built=await service.buildReadModel(db,binding,accounting);
   assert.equal(built.candidateOnly,true);assert.equal(built.active,false);assert.equal(built.activationStatus,'validated-candidate');assert.equal(await service.activeRun(db),null);
-  const run=db.collection(service.RUNS).rows.find(row=>row.runId===built.runId);assert.equal(run.active,false);assert.equal(run.nonPayable,true);assert.equal(run.sourceProfitFactsDatasetId,'PFACT-CANDIDATE');
+  const run=db.collection(service.RUNS).rows.find(row=>row.runId===built.runId);assert.equal(run.active,false);assert.equal(run.nonPayable,true);assert.equal(run.sourceProfitFactsDatasetId,'PFACT-CANDIDATE');assert.equal(run.commissionCreated,false);assert.equal(run.payrollAuthority,false);
   const report=await service.listLines(db,{runId:built.runId,provenanceStatus:'PROVEN'},manager);assert.equal(report.total,1);assert.equal(report.candidateOnly,true);assert.equal(report.list[0].purchaseInvoiceNumbers[0],7001);
   const totals=await service.totals(db,{runId:built.runId},manager);assert.equal(totals.active,false);assert.equal(totals.nonPayroll,true);assert.equal(totals.unknownExposureLineCount,1);
   const categories=await service.categoryTotals(db,{runId:built.runId,provenanceStatus:'PROVEN',categoryGuid:'NB'},manager);assert.equal(categories.total,1);assert.equal(categories.list[0].officialProductCategoryName,'NOTEBOOK');assert.equal(categories.list[0].canonicalCategoryGuid,'NB');assert.equal(categories.list[0].unknownOrPartialSaleValueExact,'0.00');
   const drill=await service.lineDrilldown(db,'LINE-1',manager,{runId:built.runId});assert.equal(drill.candidateOnly,true);assert.equal(drill.source.costProvenance[0].purchaseInvoiceNumber,7001);
 });
 
+test('canonical build context resolves immutable lineage from FIFO authority and aligns build roles',async()=>{
+  const db=dbSeed(),binding=bindActiveCandidate(db);const adminContext=await service.buildContext(db,{username:'admin',role:'admin'}),managerContext=await service.buildContext(db,manager);
+  assert.deepEqual(adminContext.activeFifo,{datasetId:'FIFO-A',authorityRevision:7,saleSnapshotId:'SALE-A',purchaseDatasetId:'PURCHASE-A',openingDatasetId:'OPENING-A',sourceFingerprint:binding.expectedFifoSourceFingerprint,allocationFingerprint:binding.expectedFifoAllocationFingerprint,candidateFingerprint:binding.expectedFifoCandidateFingerprint,status:'completed',activationStatus:'validated-candidate',immutable:true});
+  assert.equal(adminContext.canBuild,true);assert.equal(managerContext.canBuild,false);assert.deepEqual(adminContext.buildRoles,['admin','accounting']);assert.deepEqual(adminContext.resultContract,{active:false,candidateOnly:true,nonPayable:true,activationStatus:'validated-candidate',commissionCreated:false,activationSeparate:true});
+});
+
+test('canonical Candidate build fails closed without Active FIFO and rejects stale or changed authority binding',async()=>{
+  const db=dbSeed(),binding=bindActiveCandidate(db);
+  db.collection('fifoDatasetState').rows=[];
+  await assert.rejects(service.assertCanonicalBuildBinding(db,binding),error=>error.code==='SELLER_FINANCIAL_ACTIVE_FIFO_MISSING');
+  db.collection('fifoDatasetState').rows=[{scopeKey:fifo.SCOPE_KEY,activeDatasetId:'FIFO-A',authorityRevision:7}];
+  await assert.rejects(service.assertCanonicalBuildBinding(db,{...binding,fifoDatasetId:'FIFO-OLD'}),error=>error.code==='SELLER_FINANCIAL_ACTIVE_FIFO_STALE');
+  const pageContext=await service.buildContext(db,accounting);db.collection('fifoDatasetState').rows[0].authorityRevision=8;
+  await assert.rejects(service.assertCanonicalBuildBinding(db,{fifoDatasetId:pageContext.activeFifo.datasetId,expectedActiveFifoDatasetId:pageContext.activeFifo.datasetId,expectedFifoAuthorityRevision:pageContext.activeFifo.authorityRevision,expectedFifoSourceFingerprint:pageContext.activeFifo.sourceFingerprint,expectedFifoAllocationFingerprint:pageContext.activeFifo.allocationFingerprint,expectedFifoCandidateFingerprint:pageContext.activeFifo.candidateFingerprint,candidateOnly:true}),error=>error.code==='SELLER_FINANCIAL_ACTIVE_FIFO_STALE');
+});
+
+test('canonical Candidate duplicate guard returns the existing immutable Candidate',async()=>{
+  const db=dbSeed(),binding=bindActiveCandidate(db);for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
+  const first=await service.buildReadModel(db,binding,accounting),second=await service.buildReadModel(db,binding,accounting);
+  assert.equal(second.duplicate,true);assert.equal(second.runId,first.runId);assert.equal(db.collection(service.RUNS).rows.filter(row=>row.candidateOnly===true&&row.status==='completed').length,1);assert.equal(await service.activeRun(db),null);
+});
+
+test('separate activation requires independent fingerprint-bound Human PASS and immutable audit',async()=>{
+  const db=dbSeed(),binding=bindActiveCandidate(db);for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
+  const admin={username:'admin',role:'admin'},built=await service.buildReadModel(db,binding,admin);
+  await assert.rejects(service.activateCandidate(db,built.runId,{candidateFingerprint:built.candidateFingerprint,humanValidationId:'missing',expectedPreviousActiveSellerFinancialId:'',reason:'activate'},manager),error=>error.code==='SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED');
+  await assert.rejects(service.recordHumanValidation(db,built.runId,{candidateFingerprint:built.candidateFingerprint,result:'PASS',reason:'self validation'},admin),error=>error.code==='SELLER_FINANCIAL_SELF_VALIDATION_FORBIDDEN');
+  const validation=await service.recordHumanValidation(db,built.runId,{candidateFingerprint:built.candidateFingerprint,result:'PASS',reason:'Human validation cards completed independently'},manager);
+  db.collection('fifoDatasetState').rows[0].authorityRevision=8;
+  await assert.rejects(service.activateCandidate(db,built.runId,{candidateFingerprint:built.candidateFingerprint,humanValidationId:validation.validation.validationId,expectedPreviousActiveSellerFinancialId:'',reason:'activate stale Candidate'},manager),error=>error.code==='SELLER_FINANCIAL_ACTIVATION_FIFO_AUTHORITY_CHANGED');
+  db.collection('fifoDatasetState').rows[0].authorityRevision=7;
+  const activated=await service.activateCandidate(db,built.runId,{candidateFingerprint:built.candidateFingerprint,humanValidationId:validation.validation.validationId,expectedPreviousActiveSellerFinancialId:'',reason:'Management-authorized authority transition'},manager);
+  assert.equal(activated.newActiveSellerFinancialId,built.runId);assert.equal(activated.nonPayable,true);assert.equal(activated.commissionCreated,false);assert.equal(db.collection(service.ACTIVATION_AUDITS).rows.length,1);assert.equal(db.collection(service.ACTIVATION_AUDITS).rows[0].immutable,true);
+  const run=db.collection(service.RUNS).rows.find(row=>row.runId===built.runId);assert.equal(run.active,true);assert.equal(run.nonPayable,true);assert.equal(run.payrollAuthority,false);assert.equal(run.commissionCreated,false);
+});
+
 test('existing seller-profit UI is upgraded without a duplicate page and keeps financial safety labels',()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
   assert.match(phase,/const PAGE='seller-profit'/);assert.match(phase,/عملکرد مالی فروشندگان/);assert.match(phase,/officialProductCategoryName/);assert.match(phase,/commissionRatePool/);assert.match(phase,/PRELIMINARY \/ NON-PAYABLE/);assert.match(phase,/invoiceAmountMin/);assert.match(phase,/fifoProfitMin/);assert.match(phase,/mkcrm-seller-financial-presets/);assert.match(phase,/ALLOWED=\['admin','accounting','manager','purchase'\]/);assert.doesNotMatch(phase,/ALLOWED=.*seller/);
+});
+
+test('canonical UI has read-only Active FIFO lineage, explicit Candidate confirmation, and no legacy rebuild call',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
+  for(const contract of ['sfCandidateBuild','ساخت Read Model کاندیدا','seller-financial-performance/build-context','expectedActiveFifoDatasetId','expectedFifoAuthorityRevision','expectedFifoSourceFingerprint','expectedFifoAllocationFingerprint','expectedFifoCandidateFingerprint','Inactive','Candidate Only','Non-Payable','Commission','Separate governed action','CURRENT ACTIVE SELLER FINANCIAL','LATEST CANDIDATE'])assert.match(phase,new RegExp(contract));
+  assert.match(phase,/\['admin','accounting'\]\.includes\(userRole\(\)\)/);assert.doesNotMatch(phase,/seller-financial-performance\/rebuild/);assert.doesNotMatch(phase,/sfFifoCandidate/);
 });
 
 test('seller financial UI uses stable category GUID and idempotent selector rendering',()=>{
