@@ -195,6 +195,15 @@ test('validated FIFO candidate builds a non-active non-payroll Seller Financial 
   const drill=await service.lineDrilldown(db,'LINE-1',manager,{runId:built.runId});assert.equal(drill.candidateOnly,true);assert.equal(drill.source.costProvenance[0].purchaseInvoiceNumber,7001);
 });
 
+test('completed Candidate remains an explicit read target when no Active Seller Financial exists',async()=>{
+  const db=dbSeed(),binding=bindActiveCandidate(db);for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
+  const built=await service.buildReadModel(db,binding,accounting),status=await service.status(db,true,manager),runs=await service.listRuns(db,{pageSize:100},manager);
+  assert.equal(status.activeRunId,'');assert.equal(status.latestRun.runId,built.runId);assert.equal(runs.activeRunId,'');assert.equal(runs.list[0].runId,built.runId);assert.equal(runs.list[0].status,'completed');assert.equal(runs.list[0].candidateOnly,true);
+  await assert.rejects(service.totals(db,{},manager),error=>error.code==='SELLER_FINANCIAL_ACTIVE_RUN_MISSING');
+  const totals=await service.totals(db,{runId:built.runId},manager),filters=await service.filterOptions(db,{runId:built.runId},manager),summaries=await service.listSummaries(db,{runId:built.runId},manager);
+  assert.equal(totals.runId,built.runId);assert.equal(filters.runId,built.runId);assert.equal(summaries.runId,built.runId);assert.equal(totals.active,false);assert.equal(totals.candidateOnly,true);assert.equal(totals.nonPayable,true);
+});
+
 test('canonical build context resolves immutable lineage from FIFO authority and aligns build roles',async()=>{
   const db=dbSeed(),binding=bindActiveCandidate(db);const adminContext=await service.buildContext(db,{username:'admin',role:'admin'}),managerContext=await service.buildContext(db,manager);
   assert.deepEqual(adminContext.activeFifo,{datasetId:'FIFO-A',authorityRevision:7,saleSnapshotId:'SALE-A',purchaseDatasetId:'PURCHASE-A',openingDatasetId:'OPENING-A',sourceFingerprint:binding.expectedFifoSourceFingerprint,allocationFingerprint:binding.expectedFifoAllocationFingerprint,candidateFingerprint:binding.expectedFifoCandidateFingerprint,status:'completed',activationStatus:'validated-candidate',immutable:true});
@@ -249,6 +258,17 @@ test('canonical seller financial renderer remains the final seller-profit route 
   const afterCanonicalAssignment=ui.slice(ui.indexOf('window.pageSellerProfit=pageRenderer;',phaseStart));
   assert.doesNotMatch(afterCanonicalAssignment,/window\.pageSellerProfit\s*=\s*window\.__candidateSellerFinancialPage/);
   assert.doesNotMatch(afterCanonicalAssignment,/return window\.__candidateSellerFinancialPage\(\)/);
+});
+
+test('canonical Seller Financial read path selects and preserves an explicit completed run',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
+  for(const contract of ['id="sfRun"','SELECTED READ MODEL','CANDIDATE / INACTIVE / NON-PAYABLE','mkcrm-seller-financial-selected-run','runId:selectedReadRun()','provenanceStatus:selected(\'#sfProvenance\')','validStored||active||latestCandidate','seller-financial-performance/filters','runScopedUrl','sourceFifoDatasetId'])assert.ok(phase.includes(contract),`missing ${contract}`);
+  assert.match(phase,/control\.onchange=async\(\)=>\{rememberSelectedRun\(control\.value\);[\s\S]*?await loadOptions\(\);await refresh\(\);\}/);
+  assert.match(phase,/invoices\/\$\{encodeURIComponent\(invoice\)\}\/lines\?pageSize=500/);
+  assert.match(phase,/lines\/\$\{encodeURIComponent\(line\)\}\/drilldown/);
+  assert.match(phase,/__sellerFinancialRenderGeneration/);assert.match(phase,/requestKey!==params\(\)\.toString\(\)/);assert.match(phase,/if\(!isCurrent\(\)\)return/);
+  const selectorHandler=phase.match(/control\.onchange=async\(\)=>\{([\s\S]*?)\};return r;/)?.[1]||'';
+  assert.doesNotMatch(selectorHandler,/candidate-build|buildCandidate|activate|commission/i);
 });
 
 test('seller financial UI uses stable category GUID and idempotent selector rendering',()=>{
