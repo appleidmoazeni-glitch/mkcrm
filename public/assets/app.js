@@ -6206,10 +6206,3 @@ window.__saleIssuanceHotfix={refreshStatus:refreshIssuanceStatus,discoverActive:
   window.route=route=async function(){const requested=location.hash.slice(1)||firstAllowedPage();const current=REDIRECTS[requested]||requested;if(REDIRECTS[requested]&&typeof history!=='undefined')history.replaceState(null,'',`#${current}`);if(['official-group-catalog','fifo-audit'].includes(current)){if(!FINANCIAL_ROLES.includes(userRole()))return denied();return current==='official-group-catalog'?officialCatalogPage():fifoAuditPage();}if(current==='fifo-shadow-validation'){if(!FINANCIAL_ROLES.includes(userRole()))return denied();return window.pageFifoShadowValidation();}if(current==='commission-rate-governance'){const renderer=window.__phaseBFinancialRenderers?.[current];if(renderer)return renderer();}if(current==='financial-data-health'){const renderer=window.__accountingGovernanceRenderers?.['commission-export-readiness']||window.pageAccountingFifoReadiness;if(renderer)return renderer();}return inheritedRoute.apply(this,arguments);};
   try{renderMenu();}catch{}
 })();
-
-/* Absolute-final Candidate Seller Financial route. */
-(()=>{
-  const inheritedRoute=window.route||route;
-  window.pageSellerProfit=window.__candidateSellerFinancialPage;
-  window.route=route=async function(){if((location.hash.slice(1)||firstAllowedPage())==='seller-profit'&&window.__candidateSellerFinancialPage)return window.__candidateSellerFinancialPage();return inheritedRoute.apply(this,arguments);};
-})();

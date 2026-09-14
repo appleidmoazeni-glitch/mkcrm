@@ -242,6 +242,15 @@ test('canonical UI has read-only Active FIFO lineage, explicit Candidate confirm
   assert.match(phase,/\['admin','accounting'\]\.includes\(userRole\(\)\)/);assert.doesNotMatch(phase,/seller-financial-performance\/rebuild/);assert.doesNotMatch(phase,/sfFifoCandidate/);
 });
 
+test('canonical seller financial renderer remains the final seller-profit route authority',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
+  const phaseStart=ui.lastIndexOf('/* Phase C final registry');
+  assert.ok(phaseStart>=0);
+  const afterCanonicalAssignment=ui.slice(ui.indexOf('window.pageSellerProfit=pageRenderer;',phaseStart));
+  assert.doesNotMatch(afterCanonicalAssignment,/window\.pageSellerProfit\s*=\s*window\.__candidateSellerFinancialPage/);
+  assert.doesNotMatch(afterCanonicalAssignment,/return window\.__candidateSellerFinancialPage\(\)/);
+});
+
 test('seller financial UI uses stable category GUID and idempotent selector rendering',()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
   assert.match(ui,/categoryGuid:q\('#csfCategory'\)/);assert.match(ui,/categoryGuid:selected\('#sfCategory'\)/);assert.match(ui,/optionRows\(r\.categories,'guid','label'\)/);
