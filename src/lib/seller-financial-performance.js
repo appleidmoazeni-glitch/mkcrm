@@ -559,6 +559,80 @@ async function listSummaries(db,filters={},requestedBy={}) {
   requireRole(requestedBy,READ_ROLES);const active=await requireRun(db,filters);const query={runId:active.runId};if(filters.dimension)query.dimension=clean(filters.dimension,100);if(filters.sellerIdentity)query.canonicalSellerId={$in:listParam(filters.sellerIdentity)};if(filters.month)query.accountingMonth=clean(filters.month,6);if(filters.category&&!filters.categoryGuid&&!filters.officialProductCategoryGuid)fail('SELLER_FINANCIAL_CATEGORY_GUID_REQUIRED','فیلتر Product Category باید با GUID رسمی ارسال شود.',400);addCategoryGuidFilter(query,filters.categoryGuid||filters.officialProductCategoryGuid);if(filters.ratePool)query.commissionRatePool={$in:listParam(filters.ratePool)};const page=Math.max(1,Number(filters.page||1));const pageSize=Math.max(1,Math.min(Number(filters.pageSize||100),MAX_PAGE_SIZE));const [total,list]=await Promise.all([count(db.collection(SUMMARIES),query),db.collection(SUMMARIES).find(query).sort({saleValueNumeric:-1,dimensionKey:1}).skip((page-1)*pageSize).limit(pageSize).toArray()]);return {ok:true,runId:active.runId,candidateOnly:Boolean(active.run.candidateOnly),page,pageSize,total,list,nonPayable:true};
 }
 function decimalText(value) { if(value==null)return null;if(typeof value==='number')return exact(value);if(typeof value.toString==='function')return exact(value.toString());return exact(value); }
+function nullableDifference(left,right) { return left==null||left===''||right==null||right===''?null:subtract(left,right); }
+function withinMoneyTolerance(value,tolerance='0.01') {
+  if(value==null||value==='')return null;
+  const amount=accountingDecimal.parse(value,accountingDecimal.MONEY_SCALE);
+  const limit=accountingDecimal.parse(tolerance,accountingDecimal.MONEY_SCALE);
+  return (amount<0n?-amount:amount)<=limit;
+}
+function humanAuditView(line={},allocations=[],provenance={}) {
+  const reconciliation=provenance.provenanceReconciliation||{};
+  const sources=provenance.provenanceSources||[];
+  const knownSources=sources.filter(row=>row.sourceType!=='UNKNOWN'&&row.allocatedCostExact!=null);
+  const unknownSources=sources.filter(row=>row.sourceType==='UNKNOWN'||row.allocatedCostExact==null);
+  const knownAllocationCostExact=knownSources.length?add(knownSources.map(row=>row.allocatedCostExact)):'0.00';
+  const canonicalReasons=[...new Set([
+    ...unknownSources.map(row=>clean(row.unknownReason,200)),
+    ...allocations.map(row=>clean(row.unknownReason||row.reason||row.exceptionReason,200)),
+    clean(line.unknownCostReason,200)
+  ].filter(Boolean))];
+  const sellerFinancialSaleExact=line.grossSaleAmountExact==null?null:exact(line.grossSaleAmountExact);
+  const fifoSaleImpactExact=reconciliation.saleValueExact==null?null:exact(reconciliation.saleValueExact);
+  const sellerFinancialFifoCostExact=line.fifoCostExact==null?null:exact(line.fifoCostExact);
+  const fifoAllocationCostExact=reconciliation.allocatedCostExact==null?null:exact(reconciliation.allocatedCostExact);
+  const sellerFinancialProfitExact=line.actualFifoProfitExact==null?null:exact(line.actualFifoProfitExact);
+  const expectedFifoProfitExact=reconciliation.fifoProfitExact==null?null:exact(reconciliation.fifoProfitExact);
+  const saleDifferenceExact=nullableDifference(sellerFinancialSaleExact,fifoSaleImpactExact);
+  const costDifferenceExact=nullableDifference(sellerFinancialFifoCostExact,fifoAllocationCostExact);
+  const profitDifferenceExact=nullableDifference(sellerFinancialProfitExact,expectedFifoProfitExact);
+  const returnSources=sources.map(row=>row.returnProvenance).filter(Boolean);
+  return {
+    readOnly:true,
+    transaction:{
+      type:Number(line.saleInvoiceType)===6?'RETURN':'SALE',
+      typeLabel:Number(line.saleInvoiceType)===6?'برگشت از فروش':'فروش',
+      invoiceNumber:Number(line.saleInvoiceNumber||line.saleInvoiceNo||0)||null,
+      saleLineIdentity:clean(line.saleLineIdentity,500),
+      itemCode:clean(line.itemCode,100),itemDescription:clean(line.itemDescription,500),
+      sellerName:clean(line.sellerName||line.sellerDisplayName,200),canonicalSellerId:clean(line.canonicalSellerId||line.sellerIdentity,200),
+      storeName:clean(line.storeName,200),saleDate:clean(line.saleDate,8),quantityExact:line.quantityExact==null?null:exact(line.quantityExact,6)
+    },
+    financial:{
+      saleImpactExact:sellerFinancialSaleExact,fifoCostExact:sellerFinancialFifoCostExact,
+      fifoProfitExact:sellerFinancialProfitExact,fifoMarginExact:line.fifoMarginExact==null?null:clean(line.fifoMarginExact,100),
+      provenanceStatus:provenance.profitProvenanceStatus||clean(line.profitProvenanceStatus,20)||'UNKNOWN',
+      costSourceType:provenance.costSourceType||clean(line.costSourceType,100)||'UNKNOWN',
+      canonicalReasons,
+      unavailableMessage:(provenance.profitProvenanceStatus||line.profitProvenanceStatus)==='UNKNOWN'?'هزینه قابل اثبات نیست':''
+    },
+    allocationCoverage:{
+      requiredQuantityExact:reconciliation.requiredQtyExact||null,
+      provenQuantityExact:reconciliation.provenQtyExact||'0.000000',
+      unresolvedQuantityExact:reconciliation.unknownQtyExact||'0.000000',
+      knownAllocationCostExact,
+      quantityConserved:Boolean(reconciliation.quantityConserved),
+      moneyConserved:Boolean(reconciliation.moneyConserved)
+    },
+    costSources:sources,
+    returnReversal:{
+      isReturn:Number(line.saleInvoiceType)===6||returnSources.length>0,
+      lineLinkage:line.returnLinkage||null,sources:returnSources,
+      originalInvoiceNumber:returnSources[0]?.originSaleInvoiceNumber||line.returnLinkage?.originSaleInvoiceNumber||line.originSaleInvoiceNumber||null,
+      originalSaleLineIdentity:returnSources[0]?.originSaleLineId||line.returnLinkage?.originSaleLineIdentity||line.originSaleLineIdentity||'',
+      reversalInvoiceNumber:returnSources[0]?.returnInvoiceNumber||Number(line.saleInvoiceNumber||0)||null,
+      reversedQuantityExact:line.quantityExact==null?null:exact(line.quantityExact,6),
+      reversedCostExact:line.fifoCostExact==null?null:exact(line.fifoCostExact),
+      reversedProfitExact:line.actualFifoProfitExact==null?null:exact(line.actualFifoProfitExact)
+    },
+    reconciliation:{
+      currencyUnit:'IRR',roundingToleranceExact:'0.01',
+      sellerFinancialSaleExact,fifoSaleImpactExact,saleDifferenceExact,saleWithinTolerance:withinMoneyTolerance(saleDifferenceExact),
+      sellerFinancialFifoCostExact,fifoAllocationCostExact,costDifferenceExact,costWithinTolerance:withinMoneyTolerance(costDifferenceExact),
+      sellerFinancialProfitExact,expectedFifoProfitExact,profitDifferenceExact,profitWithinTolerance:withinMoneyTolerance(profitDifferenceExact)
+    }
+  };
+}
 async function totals(db,filters={},requestedBy={}) {
   requireRole(requestedBy,READ_ROLES);const active=await requireRun(db,filters);const query=queryFromFilters(active.runId,filters);const present=field=>({$sum:{$cond:[{$ne:[`$${field}`,null]},1,0]}});const rows=await db.collection(LINES).aggregate([{$match:query},{$group:{_id:null,lineCount:{$sum:1},saleQuantityNumeric:{$sum:'$quantityNumeric'},saleValueNumeric:{$sum:'$grossSaleAmountNumeric'},netSaleValueNumeric:{$sum:'$netSaleAmountNumeric'},fifoCostNumeric:{$sum:'$fifoCostNumeric'},actualFifoProfitNumeric:{$sum:'$actualFifoProfitNumeric'},approvedAdjustmentNumeric:{$sum:'$approvedAdjustmentAmountNumeric'},savedProfitCreditNumeric:{$sum:'$savedProfitCreditNumeric'},savedProfitSubsidyNumeric:{$sum:'$savedProfitSubsidyNumeric'},commissionableProfitNumeric:{$sum:'$commissionableProfitNumeric'},preliminaryCommissionNumeric:{$sum:'$preliminaryCommissionNumeric'},netKnownCount:present('netSaleAmountNumeric'),costKnownCount:present('fifoCostNumeric'),profitKnownCount:present('actualFifoProfitNumeric'),commissionableKnownCount:present('commissionableProfitNumeric'),commissionKnownCount:present('preliminaryCommissionNumeric')}}]).toArray();
   const invoiceGroups=await db.collection(LINES).aggregate([{$match:query},{$group:{_id:'$saleInvoiceIdentity'}},{$count:'count'}]).toArray();const unavailableQuery={$and:[query,{commissionStatus:'unavailable'}]};const unknownQuery={$and:[query,{costCoverageStatus:{$ne:'complete'}}]};const provenQuery={$and:[query,{profitProvenanceStatus:'PROVEN'}]};const [unavailableLineCount,unknownCostLineCount,provenRows]=await Promise.all([count(db.collection(LINES),unavailableQuery),count(db.collection(LINES),unknownQuery),db.collection(LINES).aggregate([{$match:provenQuery},{$group:{_id:null,lineCount:{$sum:1},saleValueNumeric:{$sum:'$grossSaleAmountNumeric'},fifoProfitNumeric:{$sum:'$actualFifoProfitNumeric'}}}]).toArray()]);const row=rows[0]||{},proven=provenRows[0]||{};
@@ -591,7 +665,8 @@ async function lineDrilldown(db,saleLineIdentity,requestedBy={},filters={}) {
   const manualResolutionIds=[...new Set(allocations.map(row=>clean(row.manualResolutionId,100)).filter(Boolean))];
   const manualCostEvidence=manualResolutionIds.length?await db.collection(manualCostResolution.COLLECTION).find({resolutionId:{$in:manualResolutionIds}}).toArray():[];
   const provenance=fifoProfitProvenance.lineProvenance(allocations,{saleQtyExact:line.quantityExact,saleValueExact:line.grossSaleAmountExact,manualById:new Map(manualCostEvidence.map(row=>[clean(row.resolutionId,100),row]))});
-  return {ok:true,runId:active.runId,line:decorateAdjustmentEligibility({...line,profitProvenanceStatus:provenance.profitProvenanceStatus,costSourceType:provenance.costSourceType,provenanceFingerprint:provenance.provenanceFingerprint},false),readModelStale:false,candidateOnly:Boolean(active.run.candidateOnly),source:{allocations,costProvenance:provenance.provenanceSources,provenanceReconciliation:provenance.provenanceReconciliation,manualCostEvidence,adjustments,savedEntries,discountFact},immutableFifo:true,auditable:true,nonPayable:true};
+  const decoratedLine=decorateAdjustmentEligibility({...line,profitProvenanceStatus:provenance.profitProvenanceStatus,costSourceType:provenance.costSourceType,provenanceFingerprint:provenance.provenanceFingerprint},false);
+  return {ok:true,runId:active.runId,line:decoratedLine,humanAudit:humanAuditView(decoratedLine,allocations,provenance),readModelStale:false,candidateOnly:Boolean(active.run.candidateOnly),source:{allocations,costProvenance:provenance.provenanceSources,provenanceReconciliation:provenance.provenanceReconciliation,manualCostEvidence,adjustments,savedEntries,discountFact},immutableFifo:true,auditable:true,nonPayable:true};
 }
 async function listRuns(db,filters={},requestedBy={}) { requireRole(requestedBy,READ_ROLES);await ensureIndexes(db);const active=await activeRun(db);const page=Math.max(1,Number(filters.page||1)),pageSize=Math.max(1,Math.min(Number(filters.pageSize||20),100));const query={};if(filters.status)query.status=clean(filters.status,50);const [total,list]=await Promise.all([count(db.collection(RUNS),query),db.collection(RUNS).find(query).sort({createdAt:-1}).skip((page-1)*pageSize).limit(pageSize).toArray()]);return {ok:true,activeRunId:active?.runId||'',page,pageSize,total,list}; }
 async function status(db,enabled,requestedBy={}) { requireRole(requestedBy,READ_ROLES);await ensureIndexes(db);const active=await activeRun(db);const lock=await db.collection(LOCKS).findOne({scopeKey:SCOPE_KEY});const latest=await db.collection(RUNS).findOne({}, {sort:{createdAt:-1}});return {ok:true,enabled:Boolean(enabled),activeRunId:active?.runId||'',activeRun:active?.run||null,latestRun:latest||null,buildLocked:Boolean(lock?.owner&&new Date(lock.expiresAt||0)>new Date()),moduleVersion:MODULE_VERSION,algorithmVersion:ALGORITHM_VERSION,nonPayable:true,sellerFacing:false}; }
@@ -660,4 +735,4 @@ async function activateCandidate(db,runId,input={},requestedBy={}) {
   return {ok:true,activationPerformed:true,activationAudit:audit,previousActiveSellerFinancialId,newActiveSellerFinancialId:run.runId,nonPayable:true,commissionCreated:false};
 }
 
-module.exports={RUNS,LINES,SUMMARIES,STATE,LOCKS,VERIFICATIONS,HUMAN_VALIDATIONS,ACTIVATION_AUDITS,SCOPE_KEY,SCHEMA_VERSION,ALGORITHM_VERSION,MODULE_VERSION,READ_ROLES,BUILD_ROLES,VALIDATE_ROLES,ACTIVATE_ROLES,COLLECTIONS,ensureIndexes,activeRun,resolveActiveFifoLineage,assertCanonicalBuildBinding,buildContext,buildReadModel,recordHumanValidation,activateCandidate,listLines,listInvoices,listInvoiceLines,listSummaries,totals,categoryTotals,filterOptions,lineDrilldown,listRuns,status,freshness,fingerprintIntegrity,deepVerify,listVerifications,discountStatusReport,governanceCoverage,_sourceBundle:sourceBundle,_fastSourceMetadata:fastSourceMetadata,_sourceRecency:sourceRecency,_buildProjectedLines:buildProjectedLines,_buildSummaries:buildSummaries,_queryFromFilters:queryFromFilters,_canonicalLineFingerprint:canonicalLineFingerprint,_canonicalSummaryFingerprint:canonicalSummaryFingerprint};
+module.exports={RUNS,LINES,SUMMARIES,STATE,LOCKS,VERIFICATIONS,HUMAN_VALIDATIONS,ACTIVATION_AUDITS,SCOPE_KEY,SCHEMA_VERSION,ALGORITHM_VERSION,MODULE_VERSION,READ_ROLES,BUILD_ROLES,VALIDATE_ROLES,ACTIVATE_ROLES,COLLECTIONS,ensureIndexes,activeRun,resolveActiveFifoLineage,assertCanonicalBuildBinding,buildContext,buildReadModel,recordHumanValidation,activateCandidate,listLines,listInvoices,listInvoiceLines,listSummaries,totals,categoryTotals,filterOptions,lineDrilldown,listRuns,status,freshness,fingerprintIntegrity,deepVerify,listVerifications,discountStatusReport,governanceCoverage,_humanAuditView:humanAuditView,_sourceBundle:sourceBundle,_fastSourceMetadata:fastSourceMetadata,_sourceRecency:sourceRecency,_buildProjectedLines:buildProjectedLines,_buildSummaries:buildSummaries,_queryFromFilters:queryFromFilters,_canonicalLineFingerprint:canonicalLineFingerprint,_canonicalSummaryFingerprint:canonicalSummaryFingerprint};
