@@ -281,7 +281,7 @@ test('official layer still has priority over an approved manual resolution under
   db.collection('fifoExceptions').rows=[];
   db.collection('fifoDatasetState').rows=[];
   db.collection('manualCostResolutions').rows.push({
-    resolutionId:'MC-A',status:'approved',itemGuid:'GUID-A',itemCode:'A',manualCost:1,effectiveFrom:'14050101',effectiveTo:'',deleted:false
+    resolutionId:'MC-A',schemaVersion:3,status:'approved',itemGuid:'GUID-A',itemCode:'A',manualCost:1,effectiveFrom:'14050101',effectiveTo:'',deleted:false,legacyConsumptionReview:{status:'approved-for-fifo',reviewedBy:{username:'manager'},reason:'legacy precision-v2 fixture'}
   });
   const result=await fifo.buildShadowDataset(db,{},accounting);
   const rows=db.collection(fifo.ALLOCATIONS).rows.filter(row=>row.datasetId===result.datasetId&&row.saleLineId==='SL-2-1-1-A');
