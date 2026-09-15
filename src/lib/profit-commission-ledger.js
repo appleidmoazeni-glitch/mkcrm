@@ -230,8 +230,9 @@ async function materializeFifoProfitFacts(db, input = {}, requestedBy = {}) {
     : await fifoShadow.activeDataset(db);
   const dataset = active?.dataset;
   const candidateOnly = input.candidateOnly === true;
+  const canonicalActive=!input.fifoDatasetId&&Boolean(active?.authorityContractVersion>=1);
   const allowedActivation = candidateOnly ? 'validated-candidate' : 'validated-shadow';
-  if (!dataset || dataset.status !== 'completed' || dataset.activationStatus !== allowedActivation || dataset.validation?.valid === false) {
+  if (!dataset || dataset.status !== 'completed' || (!canonicalActive&&dataset.activationStatus !== allowedActivation) || dataset.validation?.valid === false) {
     fail('FIFO_FACT_SOURCE_NOT_APPROVED', candidateOnly
       ? 'فقط FIFO Candidate کامل و validated-candidate می‌تواند منبع Candidate Fact باشد.'
       : 'فقط FIFO Shadow کامل و validated-shadow می‌تواند منبع Fact باشد.', 409);

@@ -7,6 +7,7 @@ const purchaseLayerDataset = require('./purchase-layer-dataset');
 const readiness = require('./accounting-evidence-confidence');
 const operational = require('./accounting-operational-review');
 const profitLedger = require('./profit-commission-ledger');
+const fifoShadow = require('./fifo-shadow-engine');
 const { normalizeJalaliDate } = require('./jalali-date');
 const { APP_VERSION } = require('./app-version');
 
@@ -323,19 +324,17 @@ async function ensureIndexes(db) {
 }
 
 async function activeContext(db) {
-  const [sale, purchase, state] = await Promise.all([
+  const [sale, purchase, activeFifo] = await Promise.all([
     saleSnapshot._activeDataset(db),
     purchaseLayerDataset.activeDataset(db),
-    db.collection('fifoDatasetState').findOne({ scopeKey:readiness.ALGORITHM_VERSION })
+    fifoShadow.activeDataset(db)
   ]);
-  const fifo = state?.activeDatasetId
-    ? await db.collection('fifoDatasets').findOne({ datasetId:state.activeDatasetId })
-    : null;
+  const fifo=activeFifo?.dataset||null;
   if (!sale?.snapshotId || !purchase?.datasetId || !fifo?.datasetId) {
     fail('ACCOUNTING_SESSION_SOURCE_MISSING', 'منابع فعال Sale، Purchase یا FIFO موجود نیست.', 409);
   }
-  if (fifo.status !== 'completed' || fifo.activationStatus !== 'validated-shadow') {
-    fail('ACCOUNTING_SESSION_FIFO_INVALID', 'FIFO فعال completed و validated-shadow نیست.', 409);
+  if (fifo.status !== 'completed') {
+    fail('ACCOUNTING_SESSION_FIFO_INVALID', 'مرجع canonical FIFO فعال و completed نیست.', 409);
   }
   return { sale, purchase, fifo };
 }
@@ -1181,8 +1180,11 @@ async function executeTechnicalFat(db, fatRunId, by = {}) {
   if (['passed', 'passed_with_tolerance', 'cancelled'].includes(run.status)) fail('FAT_RUN_IMMUTABLE', 'FAT run نهایی immutable است.', 409);
   const session = await getSession(db, run.sessionId);
   const fifo = await db.collection('fifoDatasets').findOne({ datasetId:session.frozen.fifoDatasetId });
+  const frozenFifoInvalid = !fifo || fifo.status !== 'completed' ||
+    clean(fifo.sourceFingerprint, 128) !== clean(session.frozen.sourceFingerprint, 128) ||
+    clean(fifo.allocationFingerprint, 128) !== clean(session.frozen.allocationFingerprint, 128);
   const [invalidFifo, duplicateAllocations, comparisonReady, humanProgress, profitFacts, savedEntries, rateVersions, discountFacts, excelExports, tirIssues] = await Promise.all([
-    count(db.collection('fifoDatasets'), { datasetId:session.frozen.fifoDatasetId, $or:[{status:{$ne:'completed'}},{activationStatus:{$ne:'validated-shadow'}}] }),
+    Promise.resolve(frozenFifoInvalid ? 1 : 0),
     db.collection('fifoAllocations').aggregate([
       { $match:{ datasetId:session.frozen.fifoDatasetId } },
       { $group:{ _id:'$allocationId', count:{ $sum:1 } } },

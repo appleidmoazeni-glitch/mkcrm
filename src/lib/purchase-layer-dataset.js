@@ -219,7 +219,7 @@ function mapSourceLine(invoice, line, row, datasetId) {
     validationStatus:rejectedReasons.length ? 'rejected' : (warnings.length ? 'warning' : 'valid'),
     validationWarnings:[...rejectedReasons,...warnings],
     costStatus:sourceIsPurchase
-      ? (purchasePricePendingCorrection ? 'pending-purchase-price-correction' : (costKnown ? 'known-from-shaygan-line' : 'unknown'))
+      ? (purchasePricePendingCorrection ? canonicalLayerContract.PENDING_PURCHASE_PRICE : (costKnown ? 'known-from-shaygan-line' : 'unknown'))
       : 'not-applicable-return-row',
     returnMatchStatus:sourceIsPurchase ? 'not-applicable' : 'unmatched',
     returnLinkageClass:sourceIsPurchase ? 'NOT_APPLICABLE' : 'UNLINKED_RETURN',
@@ -535,7 +535,7 @@ async function buildPurchaseLayerDataset(db, options = {}) {
     const itemKeys = new Set(purchaseRows.map(row => clean(row.itemCode || row.itemGuid)).filter(Boolean));
     const suppliers = new Set(purchaseRows.map(row => clean(row.supplierAccountNumber || row.supplierGuid)).filter(Boolean));
     const costUnknownCount = purchaseRows.filter(row => row.costStatus === 'unknown').length;
-    const pendingPurchasePriceCount = purchaseRows.filter(row => row.costStatus === 'pending-purchase-price-correction').length;
+    const pendingPurchasePriceCount = purchaseRows.filter(row => row.costStatus === canonicalLayerContract.PENDING_PURCHASE_PRICE).length;
     const successful = validation.valid;
     const fingerprints = datasetFingerprints(rows);
     const completedAt = new Date();
@@ -601,7 +601,7 @@ async function coverage(db, datasetId = '') {
     : await activeDataset(db);
   if (!active?.datasetId) return { ok:true, available:false, profitActivationAllowed:false, reason:'NO_ACTIVE_PURCHASE_LAYER_DATASET' };
   const layers = await db.collection(LAYERS).find(canonicalLayerContract.canonicalPurchaseQuery({ datasetId:active.datasetId })).toArray();
-  const accountingEligibleLayers=layers.filter(row => row.costStatus !== 'pending-purchase-price-correction' && Number(row.netUnitCost ?? row.grossUnitCost) > 0);
+  const accountingEligibleLayers=layers.filter(row => row.costStatus !== canonicalLayerContract.PENDING_PURCHASE_PRICE && Number(row.netUnitCost ?? row.grossUnitCost) > 0);
   const purchaseItems = new Set(accountingEligibleLayers.map(row => clean(row.itemCode)).filter(Boolean));
   const saleSource=await saleSnapshot._activeDataset(db);
   const saleRows=await db.collection(saleSource.lineCollection).find({...saleSource.lineQuery,saleInvoiceType:2}).toArray().catch(()=>[]);

@@ -191,9 +191,9 @@ async function purchaseAuditDatasets(db,filters={},by={}){
 }
 function purchaseAuditViewQuery(datasetId,view){
   const base={datasetId};
-  if(view==='pending')return canonicalLayerContract.canonicalPurchaseQuery({...base,costStatus:'pending-purchase-price-correction'});
+  if(view==='pending')return canonicalLayerContract.canonicalPurchaseQuery({...base,costStatus:canonicalLayerContract.PENDING_PURCHASE_PRICE});
   if(view==='returns')return canonicalLayerContract.canonicalPurchaseReturnQuery({...base,returnLinkageClass:{$in:['AMBIGUOUS_RETURN','UNLINKED_RETURN','OVER_RETURN','DUPLICATE_RETURN']}});
-  return canonicalLayerContract.canonicalPurchaseQuery({...base,costStatus:{$ne:'pending-purchase-price-correction'},validationStatus:{$nin:['rejected','invalid']},netPurchasedQuantity:{$gt:0}});
+  return canonicalLayerContract.canonicalPurchaseQuery({...base,costStatus:{$ne:canonicalLayerContract.PENDING_PURCHASE_PRICE},validationStatus:{$nin:['rejected','invalid']},netPurchasedQuantity:{$gt:0}});
 }
 function purchaseAuditSearchQuery(datasetId,filters={}){
   const parts=[];const invoice=clean(filters.invoiceNumber,30),returnInvoice=clean(filters.returnInvoiceNumber,30),itemCode=clean(filters.itemCode,100),lineIdentity=clean(filters.purchaseLineIdentity,500),supplier=clean(filters.supplier,300);

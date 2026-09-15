@@ -632,7 +632,7 @@ function identityMatches(row, target) {
 }
 function eligibleSuggestionLayer(row, target, applicableDate) {
   if(!identityMatches(row,target)||row.layerKind!=='purchase')return false;
-  if(clean(row.costStatus).toLowerCase()==='pending-purchase-price-correction')return false;
+  if(clean(row.costStatus).toLowerCase()===canonicalLayerContract.PENDING_PURCHASE_PRICE)return false;
   if(['rejected','invalid'].includes(clean(row.validationStatus).toLowerCase()))return false;
   if(row.returnMatchStatus&&['ambiguous','quantity-exceeds-purchase','unmatched'].includes(clean(row.returnMatchStatus)))return false;
   const purchaseDate=clean(row.purchaseInvoiceDate,8);
@@ -645,7 +645,7 @@ function eligibleSuggestionLayer(row, target, applicableDate) {
 }
 function suggestionFromLayers(rows=[], target={}, applicableDate='', affectedQuantityExact='') {
   const eligible=rows.filter(row=>eligibleSuggestionLayer(row,target,applicableDate));
-  const excludedPending=rows.filter(row=>identityMatches(row,target)&&row.layerKind==='purchase'&&clean(row.purchaseInvoiceDate,8)<=applicableDate&&clean(row.costStatus).toLowerCase()==='pending-purchase-price-correction');
+  const excludedPending=rows.filter(row=>identityMatches(row,target)&&row.layerKind==='purchase'&&clean(row.purchaseInvoiceDate,8)<=applicableDate&&clean(row.costStatus).toLowerCase()===canonicalLayerContract.PENDING_PURCHASE_PRICE);
   const excludedEvidence=excludedPending.map(row=>({purchaseLineIdentity:clean(row.purchaseLineIdentity,500),purchaseInvoiceNumber:Number(row.purchaseInvoiceNo||0),purchaseInvoiceDate:clean(row.purchaseInvoiceDate,8),quantityExact:clean(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,100),unitCostExact:clean(row.netUnitCostExact??row.netUnitCost??row.grossUnitCostExact??row.grossUnitCost,100),costStatus:clean(row.costStatus),sourceHash:clean(row.sourceHash,128)}));
   const excludedQuantity=excludedPending.reduce((sum,row)=>{try{return sum+accountingDecimal.parse(row.netPurchasedQuantityExact??row.netPurchasedQuantity??row.originalQuantityExact??row.originalQuantity,accountingDecimal.QUANTITY_SCALE);}catch(_){return sum;}},0n);
   const excluded={excludedPendingCount:excludedEvidence.length,excludedPendingQuantityExact:accountingDecimal.format(excludedQuantity,accountingDecimal.QUANTITY_SCALE),excludedPurchaseIds:[...new Set(excludedEvidence.map(row=>String(row.purchaseInvoiceNumber)))],excludedEvidence};

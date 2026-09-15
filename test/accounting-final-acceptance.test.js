@@ -408,7 +408,8 @@ test('source contracts prohibit invoices, Shaygan writes, source mutation, auto 
   const ui=fs.readFileSync(path.join(root,'public/assets/app.js'),'utf8');
   assert.doesNotMatch(source,/PutSaleInvoice|PutBuyInvoice|Invoice\s*\/\s*Put|shaygan\.|issueSale|issuePurchase/i);
   assert.doesNotMatch(source,/collection\(['"](?:saleSnapshotDatasetLines|saleInvoiceLines|supplierPurchaseLayers)['"]\)\.(?:update|insert|delete)/i);
-  assert.match(server,/FIFO_AUTHORIZED_ACCOUNTING_DECISION_REQUIRED/);
+  assert.match(server,/expectedBuildContextFingerprint/);
+  assert.match(server,/fifoShadowEngine\.resolveBuildContext/);
   assert.match(server,/accountingFinalAcceptance\.fifoRerunGate/);
   assert.match(ui,/HUMAN ACCOUNTING AUTHORITY REQUIRED/);
   const sellerPages=ui.match(/seller:\s*\[([^\]]*)\]/)?.[1]||'';

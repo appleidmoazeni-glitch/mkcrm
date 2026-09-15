@@ -6,6 +6,7 @@ const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 const saleSnapshot = require('./sale-snapshot');
 const decimal = require('./accounting-decimal');
 const readiness = require('./accounting-evidence-confidence');
+const fifoShadow = require('./fifo-shadow-engine');
 
 const INVESTIGATIONS = 'accountingEvidenceInvestigations';
 const RECOVERY = 'purchaseLayerRecoveryCandidates';
@@ -145,17 +146,17 @@ async function ensureIndexes(db) {
 }
 
 async function activeContext(db) {
-  const [sale, purchase, fifoState] = await Promise.all([
+  const [sale, purchase, activeFifo] = await Promise.all([
     saleSnapshot._activeDataset(db),
     purchaseLayerDataset.activeDataset(db),
-    db.collection('fifoDatasetState').findOne({ scopeKey:readiness.ALGORITHM_VERSION })
+    fifoShadow.activeDataset(db)
   ]);
-  if (!sale?.snapshotId || !purchase?.datasetId || !fifoState?.activeDatasetId) {
+  if (!sale?.snapshotId || !purchase?.datasetId || !activeFifo?.datasetId) {
     fail('ACCOUNTING_REVIEW_SOURCE_MISSING', 'Sale Snapshot، Purchase Dataset یا FIFO v2 فعال موجود نیست.', 409);
   }
-  const fifo = await db.collection('fifoDatasets').findOne({ datasetId:fifoState.activeDatasetId });
-  if (!fifo || fifo.status !== 'completed' || fifo.activationStatus !== 'validated-shadow') {
-    fail('ACCOUNTING_REVIEW_FIFO_INVALID', 'FIFO v2 فعال و validated-shadow نیست.', 409);
+  const fifo=activeFifo.dataset;
+  if (!fifo || fifo.status !== 'completed') {
+    fail('ACCOUNTING_REVIEW_FIFO_INVALID', 'مرجع canonical FIFO فعال و completed نیست.', 409);
   }
   return { sale, purchase, fifo };
 }

@@ -18,6 +18,7 @@ const DIAGNOSTICS = 'fifoDiagnostics';
 const EXCEPTIONS = 'fifoExceptions';
 const STATE = 'fifoDatasetState';
 const HUMAN_VALIDATIONS = 'fifoHumanValidationAudits';
+const BUILD_CONTEXTS = 'fifoBuildContexts';
 const SCOPE_KEY = 'fifo-shadow-v2-precision-evidence';
 const SCHEMA_VERSION = 4;
 const ALGORITHM_VERSION = 'fifo-shadow-v5-approved-opening-chronology';
@@ -248,7 +249,7 @@ function eligibleOfficial(row) {
   const unitCost = finite(row.netUnitCost ?? row.grossUnitCost);
   return row.layerKind === 'purchase' &&
     row.validationStatus !== 'rejected' &&
-    row.costStatus !== 'pending-purchase-price-correction' &&
+    row.costStatus !== canonicalLayerContract.PENDING_PURCHASE_PRICE &&
     quantity != null && quantity > 0 &&
     unitCost != null && unitCost > 0 &&
     validDate(row.purchaseInvoiceDate);
@@ -285,7 +286,7 @@ function classifyUnknownSource(sale, source, eligibleForSale, manuals) {
   if (unresolvedReturn) return 'purchase_return_affected';
   const futurePurchase = allMatches.some(row => row.layerKind === 'purchase' && validDate(row.purchaseInvoiceDate) && row.purchaseInvoiceDate > sale.saleDate);
   if (futurePurchase) return 'purchase_chronology_problem';
-  const pendingPurchasePrice = allMatches.some(row => row.layerKind === 'purchase' && row.costStatus === 'pending-purchase-price-correction');
+  const pendingPurchasePrice = allMatches.some(row => row.layerKind === 'purchase' && row.costStatus === canonicalLayerContract.PENDING_PURCHASE_PRICE);
   if (pendingPurchasePrice) return 'purchase_price_pending_correction';
   const invalidPurchase = allMatches.some(row => row.layerKind === 'purchase');
   if (invalidPurchase) return 'purchase_exists_but_invalid_cost';
@@ -373,7 +374,7 @@ function sourceFingerprintFor(result, source, pinned) {
 }
 
 function candidateFingerprintFor(dataset, sourceFingerprint, allocationFingerprint, manualResolutionSetFingerprint) {
-  return sha256(stableStringify({
+  const content={
     saleSnapshotId:clean(dataset.sourceSaleSnapshotId,100),
     purchaseDatasetId:clean(dataset.sourcePurchaseDatasetId,100),
     openingDatasetId:clean(dataset.sourceOpeningDatasetId,100),
@@ -384,7 +385,12 @@ function candidateFingerprintFor(dataset, sourceFingerprint, allocationFingerpri
     algorithmVersion:clean(dataset.algorithmVersion,100),
     canonicalSourceHash:clean(sourceFingerprint,64),
     allocationFingerprint:clean(allocationFingerprint,64)
-  }));
+  };
+  // Preserve replay compatibility for already-completed legacy Candidates.
+  // Versioned update Candidates bind the accounting cutoff explicitly even if
+  // no transaction happened between two cutoffs.
+  if(Number(dataset.fifoBuildContextVersion||0)>=1)content.calculationCutoff=clean(dataset.calculationCutoff||dataset.dateTo,8);
+  return sha256(stableStringify(content));
 }
 
 const indexReadyByDb = new WeakMap();
@@ -416,6 +422,8 @@ async function initializeIndexes(db) {
   await db.collection(STATE).createIndex({ scopeKey:1 }, { unique:true });
   await db.collection(HUMAN_VALIDATIONS).createIndex({ validationId:1 }, { unique:true });
   await db.collection(HUMAN_VALIDATIONS).createIndex({ datasetId:1, candidateFingerprint:1, result:1, createdAt:-1 });
+  await db.collection(BUILD_CONTEXTS).createIndex({ buildContextId:1 }, { unique:true });
+  await db.collection(BUILD_CONTEXTS).createIndex({ createdAt:-1 });
   return { ok:true, schemaVersion:SCHEMA_VERSION, algorithmVersion:ALGORITHM_VERSION };
 }
 async function ensureIndexes(db) {
@@ -651,6 +659,132 @@ async function activeDataset(db) {
   }
   if(!['validated-shadow','active-shadow'].includes(dataset.activationStatus))return null;
   return { datasetId:dataset.datasetId, dataset, state, authorityContractVersion:0 };
+}
+
+function governedSourceProjection(value = {}) {
+  return {
+    previousActiveFifoDatasetId:clean(value.previousActiveFifoDatasetId,100),
+    fifoAuthorityRevision:Number(value.fifoAuthorityRevision||0),
+    saleSnapshotId:clean(value.saleSnapshotId,100),
+    purchaseDatasetId:clean(value.purchaseDatasetId,100),
+    purchaseSourceFingerprint:clean(value.purchaseSourceFingerprint,64),
+    purchaseLayerFingerprint:clean(value.purchaseLayerFingerprint,64),
+    openingDatasetId:clean(value.openingDatasetId,100),
+    openingApprovalRevision:Number(value.openingApprovalRevision||0),
+    openingDatasetFingerprint:clean(value.openingDatasetFingerprint,64),
+    openingSourceFingerprint:clean(value.openingSourceFingerprint,64),
+    openingEligibilityFingerprint:clean(value.openingEligibilityFingerprint,64),
+    manualResolutionSetFingerprint:clean(value.manualResolutionSetFingerprint,64),
+    manualResolutionCount:Number(value.manualResolutionCount||0),
+    calculationCutoff:clean(value.calculationCutoff,8)
+  };
+}
+
+async function currentGovernedSources(db) {
+  const [active,saleActive,purchaseActive,openingAuthority,manualSet]=await Promise.all([
+    activeDataset(db),
+    saleSnapshot._activeDataset(db),
+    purchaseLayerDataset.activeDataset(db),
+    openingAccountingCostBasis.resolveOpeningAuthority(db,{}),
+    manualCostResolution.approvedSetFingerprint(db)
+  ]);
+  if(!active?.datasetId)fail('FIFO_ACTIVE_AUTHORITY_MISSING','مرجع فعال FIFO موجود یا معتبر نیست.',409);
+  if(!saleActive?.snapshotId||saleActive.snapshot?.status!=='completed')fail('FIFO_BUILD_SALE_AUTHORITY_MISSING','Sale Snapshot معتبر و فعال موجود نیست.',409);
+  if(!purchaseActive?.datasetId||purchaseActive.dataset?.status!=='completed')fail('FIFO_BUILD_PURCHASE_AUTHORITY_MISSING','Purchase Dataset معتبر و فعال موجود نیست.',409);
+  if(!openingAuthority?.datasetId||clean(openingAuthority.lifecycleStatus,30)!=='APPROVED')fail('FIFO_BUILD_OPENING_AUTHORITY_MISSING','Opening Dataset مصوب و یکتا موجود نیست.',409);
+  const openingFingerprints=openingAuthority.fingerprints||{};
+  return {
+    active,
+    saleActive,
+    purchaseActive,
+    openingAuthority,
+    manualSet,
+    base:governedSourceProjection({
+      previousActiveFifoDatasetId:active.datasetId,
+      fifoAuthorityRevision:active.state?.authorityRevision,
+      saleSnapshotId:saleActive.snapshotId,
+      purchaseDatasetId:purchaseActive.datasetId,
+      purchaseSourceFingerprint:purchaseActive.dataset?.sourceFingerprint,
+      purchaseLayerFingerprint:purchaseActive.dataset?.layerFingerprint,
+      openingDatasetId:openingAuthority.datasetId,
+      openingApprovalRevision:openingAuthority.revision,
+      openingDatasetFingerprint:openingFingerprints.dataset,
+      openingSourceFingerprint:openingFingerprints.source,
+      openingEligibilityFingerprint:openingFingerprints.eligibility,
+      manualResolutionSetFingerprint:manualSet.fingerprint,
+      manualResolutionCount:manualSet.count
+    })
+  };
+}
+
+async function resolveBuildContext(db, input = {}) {
+  await ensureIndexes(db);
+  const cutoff=clean(input.calculationCutoff||input.dateTo,8);
+  if(!validDate(cutoff))fail('FIFO_CALCULATION_CUTOFF_REQUIRED','تاریخ پایان محاسبات FIFO با قالب YYYYMMDD الزامی است.',400);
+  const sources=await currentGovernedSources(db);
+  const saleCutoff=clean(sources.saleActive.snapshot?.dateTo,8);
+  const purchaseCutoff=clean(sources.purchaseActive.dataset?.sourceDateTo,8);
+  if(validDate(saleCutoff)&&saleCutoff<cutoff)fail('FIFO_BUILD_SALE_CUTOFF_INCOMPLETE','Sale Snapshot فعال تاریخ پایان درخواستی را پوشش نمی‌دهد.',409,{saleSnapshotId:sources.base.saleSnapshotId,saleCutoff,calculationCutoff:cutoff});
+  if(validDate(purchaseCutoff)&&purchaseCutoff<cutoff)fail('FIFO_BUILD_PURCHASE_CUTOFF_INCOMPLETE','Purchase Dataset فعال تاریخ پایان درخواستی را پوشش نمی‌دهد.',409,{purchaseDatasetId:sources.base.purchaseDatasetId,purchaseCutoff,calculationCutoff:cutoff});
+  const projection=governedSourceProjection({...sources.base,calculationCutoff:cutoff});
+  const buildContextFingerprint=sha256(stableStringify(projection));
+  return {
+    ok:true,
+    readOnly:true,
+    buildContextId:`FCTX-${buildContextFingerprint.slice(0,20)}`,
+    buildContextVersion:1,
+    buildContextFingerprint,
+    ...projection,
+    sourceStatuses:{sale:'completed',purchase:'completed',opening:'APPROVED',manual:'approved-set'},
+    replayContract:'FULL_FINANCIAL_HISTORY_THROUGH_CUTOFF',
+    managementInputs:['calculationCutoff'],
+    technicalOnly:true
+  };
+}
+
+async function assertBuildContextCurrent(db, supplied = {}) {
+  const expected=clean(supplied.buildContextFingerprint,64);
+  if(!expected)fail('FIFO_BUILD_CONTEXT_REQUIRED','Build Context معتبر و تازه الزامی است.',409);
+  const current=await resolveBuildContext(db,{calculationCutoff:supplied.calculationCutoff});
+  if(current.buildContextFingerprint!==expected)fail('FIFO_BUILD_CONTEXT_STALE','مرجع مالی پس از نمایش صفحه تغییر کرده است؛ صفحه را تازه‌سازی کنید.',409,{expectedBuildContextFingerprint:expected,currentBuildContextFingerprint:current.buildContextFingerprint});
+  return current;
+}
+
+async function fifoFreshness(db, input = {}) {
+  await ensureIndexes(db);
+  const active=await activeDataset(db);
+  if(!active)return {ok:true,readOnly:true,activeFifoDatasetId:'',authorityRevision:0,lastFifoUpdatedAt:null,calculationCutoff:'',sourceFreshnessStatus:'MISSING',staleReasons:['ACTIVE_FIFO_MISSING'],fifoStatus:'فاقد FIFO فعال'};
+  const dataset=active.dataset,state=active.state||{},staleReasons=[];
+  let current=null;
+  try{current=await currentGovernedSources(db);}catch(error){staleReasons.push(error.code||'SOURCE_AUTHORITY_AMBIGUOUS');}
+  if(current){
+    if(clean(dataset.sourceSaleSnapshotId,100)!==current.base.saleSnapshotId)staleReasons.push('SALE_CHANGED');
+    if(clean(dataset.sourcePurchaseDatasetId,100)!==current.base.purchaseDatasetId||
+      (dataset.fifoBuildContextVersion&&clean(dataset.fifoBuildContext?.purchaseSourceFingerprint,64)!==current.base.purchaseSourceFingerprint)||
+      (dataset.fifoBuildContextVersion&&clean(dataset.fifoBuildContext?.purchaseLayerFingerprint,64)!==current.base.purchaseLayerFingerprint))staleReasons.push('PURCHASE_CHANGED');
+    if(clean(dataset.sourceOpeningDatasetId,100)!==current.base.openingDatasetId||Number(dataset.openingApprovalRevision||0)!==current.base.openingApprovalRevision||
+      clean(dataset.openingDatasetFingerprint,64)!==current.base.openingDatasetFingerprint||clean(dataset.openingSourceFingerprint,64)!==current.base.openingSourceFingerprint||clean(dataset.openingEligibilityFingerprint,64)!==current.base.openingEligibilityFingerprint)staleReasons.push('OPENING_CHANGED');
+    if(clean(dataset.manualResolutionSetFingerprint,64)!==current.base.manualResolutionSetFingerprint)staleReasons.push('MANUAL_COST_CHANGED');
+  }
+  const consumerFifoDatasetId=clean(input.consumerFifoDatasetId,100);
+  const sellerFinancialStale=Boolean(consumerFifoDatasetId&&consumerFifoDatasetId!==active.datasetId);
+  if(sellerFinancialStale)staleReasons.push('SELLER_FINANCIAL_FIFO_STALE');
+  const uniqueReasons=[...new Set(staleReasons)];
+  return {
+    ok:true,readOnly:true,
+    activeFifoDatasetId:active.datasetId,
+    authorityRevision:Number(state.authorityRevision||0),
+    lastFifoUpdatedAt:state.activatedAt||state.lastActivationAudit?.at||dataset.activatedAt||null,
+    calculationCutoff:clean(dataset.calculationCutoff||dataset.dateTo,8),
+    sourceFreshnessStatus:uniqueReasons.length?'STALE':'CURRENT',
+    staleReasons:uniqueReasons,
+    fifoStatus:uniqueReasons.length?'اطلاعات FIFO نیاز به به‌روزرسانی دارد':'به‌روز',
+    activeFifoFingerprint:clean(dataset.candidateFingerprint,64),
+    activeFifoStatus:dataset.status,
+    sellerFinancialStale,
+    sellerFinancialMessage:sellerFinancialStale?'این گزارش بر اساس آخرین FIFO نیست و نیاز به به‌روزرسانی دارد.':'',
+    currentSources:current?current.base:null
+  };
 }
 
 async function loadSources(db, pinned = {}) {
@@ -1552,24 +1686,28 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
   if (existing && !['failed', 'cancelled', 'completed_with_errors'].includes(existing.status)) {
     fail('FIFO_DATASET_IMMUTABLE', `Dataset با وضعیت ${existing.status} قابل Resume یا تغییر نیست.`, 409);
   }
+  let canonicalBuildContext=null;
+  if(!existing&&options.canonicalUpdate===true)canonicalBuildContext=await assertBuildContextCurrent(db,options.fifoBuildContext||{});
   const datasetId = existing?.datasetId || newDatasetId();
   await acquireLock(db, datasetId);
   const startedAt = new Date();
   const startedMs = Date.now();
   const heapStart = process.memoryUsage().heapUsed;
   const dates = normalizeJalaliRange({
-    dateFrom:existing?.dateFrom || options.dateFrom || '',
-    dateTo:existing?.dateTo || options.dateTo || ''
+    // dateFrom is intentionally blank for canonical versioned updates: the
+    // engine replays all financially required history through one cutoff.
+    dateFrom:existing?.dateFrom || (options.canonicalUpdate===true?'':options.dateFrom) || '',
+    dateTo:existing?.dateTo || canonicalBuildContext?.calculationCutoff || options.dateTo || ''
   });
   const requestedByActor = actor(requestedBy);
   const pinned = {
-    saleSnapshotId:existing?.sourceSaleSnapshotId || clean(options.saleSnapshotId, 100),
-    purchaseDatasetId:existing?.sourcePurchaseDatasetId || clean(options.purchaseDatasetId, 100),
-    openingDatasetId:existing?.sourceOpeningDatasetId || clean(options.openingDatasetId, 100),
+    saleSnapshotId:existing?.sourceSaleSnapshotId || canonicalBuildContext?.saleSnapshotId || clean(options.saleSnapshotId, 100),
+    purchaseDatasetId:existing?.sourcePurchaseDatasetId || canonicalBuildContext?.purchaseDatasetId || clean(options.purchaseDatasetId, 100),
+    openingDatasetId:existing?.sourceOpeningDatasetId || canonicalBuildContext?.openingDatasetId || clean(options.openingDatasetId, 100),
     openingFingerprints:{
-      dataset:clean(options.openingDatasetFingerprint,64),
-      source:clean(options.openingSourceFingerprint,64),
-      eligibility:clean(options.openingEligibilityFingerprint,64)
+      dataset:canonicalBuildContext?.openingDatasetFingerprint||clean(options.openingDatasetFingerprint,64),
+      source:canonicalBuildContext?.openingSourceFingerprint||clean(options.openingSourceFingerprint,64),
+      eligibility:canonicalBuildContext?.openingEligibilityFingerprint||clean(options.openingEligibilityFingerprint,64)
     }
   };
   let retryCount = Number(existing?.retryCount || 0);
@@ -1599,6 +1737,11 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
         activationStatus:'candidate',
         dateFrom:dates.dateFrom,
         dateTo:dates.dateTo,
+        calculationCutoff:dates.dateTo,
+        fifoBuildContextVersion:Number(canonicalBuildContext?.buildContextVersion||0),
+        fifoBuildContext:canonicalBuildContext?governedSourceProjection(canonicalBuildContext):null,
+        fifoBuildContextId:canonicalBuildContext?.buildContextId||'',
+        fifoBuildContextFingerprint:canonicalBuildContext?.buildContextFingerprint||'',
         sourceSaleSnapshotId:pinned.saleSnapshotId,
         sourcePurchaseDatasetId:pinned.purchaseDatasetId,
         sourceOpeningDatasetId:pinned.openingDatasetId,
@@ -1680,7 +1823,9 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       openingDatasetFingerprint:source.openingActive?.governance?.datasetFingerprint || '',
       openingSourceFingerprint:source.openingActive?.governance?.sourceFingerprint || '',
       openingEligibilityFingerprint:source.openingActive?.governance?.eligibilityFingerprint || '',
-      algorithmVersion:ALGORITHM_VERSION
+      algorithmVersion:ALGORITHM_VERSION,
+      fifoBuildContextVersion:Number(canonicalBuildContext?.buildContextVersion||existing?.fifoBuildContextVersion||0),
+      calculationCutoff:dates.dateTo
     }, sourceFingerprint, allocationFingerprint, manualResolutionSet.fingerprint);
     const deterministicPeer = await db.collection(DATASETS).findOne({
       datasetId:{ $ne:datasetId },
@@ -1742,6 +1887,11 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       manualResolutionCount:manualResolutionSet.count,
       allocationFingerprint,
       candidateFingerprint,
+      calculationCutoff:dates.dateTo,
+      fifoBuildContextVersion:Number(canonicalBuildContext?.buildContextVersion||existing?.fifoBuildContextVersion||0),
+      fifoBuildContext:canonicalBuildContext?governedSourceProjection(canonicalBuildContext):(existing?.fifoBuildContext||null),
+      fifoBuildContextId:canonicalBuildContext?.buildContextId||existing?.fifoBuildContextId||'',
+      fifoBuildContextFingerprint:canonicalBuildContext?.buildContextFingerprint||existing?.fifoBuildContextFingerprint||'',
       deterministicReplayVerified,
       deterministicPeerDatasetId:deterministicPeer?.datasetId || '',
       retryCount,
@@ -1765,6 +1915,9 @@ async function buildShadowDataset(db, options = {}, requestedBy = {}) {
       { $set:finalDoc }
     );
     if (!completed.matchedCount) fail('FIFO_ATOMIC_COMPLETION_FAILED', 'Candidate FIFO Shadow هم‌زمان تغییر کرده است.', 409);
+    if(canonicalBuildContext){
+      await db.collection(BUILD_CONTEXTS).updateOne({buildContextId:canonicalBuildContext.buildContextId},{$setOnInsert:{...canonicalBuildContext,datasetId,createdAt:startedAt,createdBy:requestedByActor,immutable:true}},{upsert:true});
+    }
     await diagnostic(db, datasetId, 'completed', {
       status:finalStatus,
       activationStatus,
@@ -1863,9 +2016,8 @@ async function status(db, datasetId = '') {
   const state = await db.collection(STATE).findOne({ scopeKey:SCOPE_KEY });
   const humanValidation=dataset?await qualifyingHumanValidation(db,dataset):null;
   const manualResolutionSet = await manualCostResolution.approvedSetFingerprint(db);
-  const staleReasons=[];
-  if (dataset && !dataset.manualResolutionSetFingerprint) staleReasons.push('legacy-dataset-without-manual-resolution-fingerprint');
-  else if (dataset && dataset.manualResolutionSetFingerprint !== manualResolutionSet.fingerprint) staleReasons.push('approved-manual-cost-set-changed');
+  const freshness=await fifoFreshness(db).catch(error=>({sourceFreshnessStatus:'STALE',staleReasons:[error.code||'SOURCE_AUTHORITY_AMBIGUOUS']}));
+  const staleReasons=[...(freshness.staleReasons||[])];
   return {
     ok:true,
     activeDatasetId:active?.datasetId || '',
@@ -1877,6 +2029,7 @@ async function status(db, datasetId = '') {
     dataset:dataset ? { ...dataset, isActive:dataset.datasetId === active?.datasetId, humanValidated:Boolean(humanValidation), humanValidation:humanValidation?{validationId:humanValidation.validationId,result:humanValidation.result,createdAt:humanValidation.createdAt,actor:humanValidation.actor}:null } : null,
     stale:staleReasons.length>0,
     staleReasons,
+    freshness,
     currentManualResolutionSetFingerprint:manualResolutionSet.fingerprint,
     activationAuthority:Number(state?.authorityContractVersion||0)>=1?{revision:Number(state?.authorityRevision||0),lastActivationAudit:state.lastActivationAudit||null}:null,
     shadowMode:!active,
@@ -2300,11 +2453,15 @@ module.exports = {
   EXCEPTIONS,
   STATE,
   HUMAN_VALIDATIONS,
+  BUILD_CONTEXTS,
   SCOPE_KEY,
   SCHEMA_VERSION,
   ALGORITHM_VERSION,
   ensureIndexes,
   activeDataset,
+  resolveBuildContext,
+  assertBuildContextCurrent,
+  fifoFreshness,
   recordHumanValidation,
   activationGate,
   activateDataset,

@@ -5085,6 +5085,18 @@ async function handleApi(req, res, pathname, query) {
         profitActivationAllowed:false
       });
     }
+    if(pathname==='/api/accounting/fifo-shadow/freshness'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.fifoFreshness(db,{consumerFifoDatasetId:query.consumerFifoDatasetId||''}));}
+      catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'FIFO_FRESHNESS_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/accounting/fifo-shadow/build-context'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting']))return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await fifoShadowEngine.resolveBuildContext(db,{calculationCutoff:query.calculationCutoff||query.dateTo||''}));}
+      catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'FIFO_BUILD_CONTEXT_FAILED',error:String(error.message||error),details:error.details||null});}
+    }
     if ((pathname === '/api/accounting/fifo-shadow/start' || pathname === '/api/accounting/fifo-shadow/resume') && req.method === 'POST') {
       if (!requireRole(req,res,['admin','accounting'])) return;
       const body=await collectBody(req);
@@ -5114,23 +5126,18 @@ async function handleApi(req, res, pathname, query) {
       };
       const db=await connectMongo();
       if (pathname.endsWith('/start')) {
-        if (!reviewSessionId) return sendJson(res,409,{ok:false,code:'FIFO_REVIEW_SESSION_REQUIRED',error:'شروع FIFO جدید فقط با Accounting Review Session frozen مجاز است.'});
-        let rerunGate;
-        try { rerunGate=await accountingFinalAcceptance.fifoRerunGate(db,reviewSessionId); }
-        catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'FIFO_RERUN_GATE_FAILED',error:String(error.message||error)});}
-        if (!rerunGate.allowed) return sendJson(res,409,{ok:false,code:'FIFO_AUTHORIZED_ACCOUNTING_DECISION_REQUIRED',error:'حداقل یک تصمیم انسانی مجاز قبل از FIFO rerun الزامی است.',gate:rerunGate});
-        request.saleSnapshotId=rerunGate.sourceSaleSnapshotId;
-        request.purchaseDatasetId=rerunGate.sourcePurchaseDatasetId;
-        request.accountingReviewContext={
-          sessionId:rerunGate.sessionId,
-          priorFifoDatasetId:rerunGate.priorFifoDatasetId,
-          approvedDecisionIds:rerunGate.approvedDecisionIds,
-          sourceSaleSnapshotId:rerunGate.sourceSaleSnapshotId,
-          sourcePurchaseDatasetId:rerunGate.sourcePurchaseDatasetId,
-          algorithmVersion:rerunGate.algorithmVersion,
-          expectedProjectedImpact:rerunGate.expectedProjectedImpact,
-          shadowOnly:true
-        };
+        const expectedBuildContextFingerprint=String(body.expectedBuildContextFingerprint||query.expectedBuildContextFingerprint||'').trim();
+        let buildContext;
+        try{buildContext=await fifoShadowEngine.resolveBuildContext(db,{calculationCutoff:dates.dateTo});}
+        catch(error){return sendJson(res,Number(error.statusCode||409),{ok:false,code:error.code||'FIFO_BUILD_CONTEXT_FAILED',error:String(error.message||error),details:error.details||null});}
+        if(!expectedBuildContextFingerprint||expectedBuildContextFingerprint!==buildContext.buildContextFingerprint)return sendJson(res,409,{ok:false,code:'FIFO_BUILD_CONTEXT_STALE',error:'منابع مالی یا cutoff پس از نمایش صفحه تغییر کرده است؛ صفحه را تازه‌سازی کنید.',currentBuildContextFingerprint:buildContext.buildContextFingerprint});
+        Object.assign(request,{
+          canonicalUpdate:true,
+          dateFrom:'',dateTo:buildContext.calculationCutoff,
+          saleSnapshotId:'',purchaseDatasetId:'',openingDatasetId:'',
+          reviewSessionId:'',accountingReviewContext:null,
+          fifoBuildContext:buildContext
+        });
       }
       if(fifoShadowJobManager.isRunning('fifo-shadow')){
         const running=fifoShadowJobManager.getRunning('fifo-shadow');

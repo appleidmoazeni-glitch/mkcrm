@@ -5,6 +5,10 @@ const CLASSIFICATION = Object.freeze({
   CANONICAL:'CANONICAL_PURCHASE_LAYER',
   LEGACY:'LEGACY_NONCANONICAL_PURCHASE_RECORD'
 });
+// Governed compatibility heuristic until Shaygan exposes an authoritative
+// purchase-price finalization flag. Consumers must use this shared state and
+// never infer accounting authority from raw cost===1 independently.
+const PENDING_PURCHASE_PRICE = 'pending-purchase-price-correction';
 
 function clean(value) { return String(value == null ? '' : value).trim(); }
 function normalizeOriginReference(value) {
@@ -43,6 +47,7 @@ function canonicalPurchaseReturnQuery(extra = {}) {
 module.exports = {
   VALID_LAYER_KINDS,
   CLASSIFICATION,
+  PENDING_PURCHASE_PRICE,
   isCanonicalPurchaseLayer,
   classifyPurchaseLayer,
   canonicalLayerQuery,

@@ -5,6 +5,7 @@ const shaygan = require('./shaygan');
 const decimal = require('./accounting-decimal');
 const { canonicalSaleDate } = require('./jalali-date');
 const openingResourceGovernor = require('./opening-extraction-resource-governor');
+const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 
 const COLLECTION = 'openingAccountingCostBasis';
 const DATASETS = 'openingAccountingEvidenceDatasets';
@@ -357,7 +358,7 @@ async function buildEligibilityPreview(db,dataset,input={}){
         const openingGuid=clean(opening.itemGuid,100),layerGuid=clean(layer.itemGuid,100);
         if(openingGuid&&layerGuid)return openingGuid===layerGuid;
         return clean(layer.itemCode,100)===clean(opening.itemCode,100);
-      }).filter(layer=>clean(layer.costStatus,100)!=='pending-purchase-price-correction'&&!['rejected','invalid'].includes(clean(layer.validationStatus,100)));
+      }).filter(layer=>clean(layer.costStatus,100)!==canonicalLayerContract.PENDING_PURCHASE_PRICE&&!['rejected','invalid'].includes(clean(layer.validationStatus,100)));
       const earlier=itemPurchases.filter(layer=>clean(layer.purchaseInvoiceDate,8)<=saleDate),later=itemPurchases.filter(layer=>clean(layer.purchaseInvoiceDate,8)>saleDate);
       const saleExposureExact=lineRows.reduce((sum,row)=>sum+decimal.parse(row.allocatedSaleValueExact||row.allocatedSaleValue||0,decimal.MONEY_SCALE),0n);
       rows.push({previewId:`OEL-${hash(`${dataset.datasetId}|${saleLineIdentity}`).slice(0,24)}`,datasetId:dataset.datasetId,fifoDatasetId,purchaseDatasetId,saleLineIdentity,saleInvoiceNo:Number(first.saleInvoiceNo||0),saleRow:Number(first.saleRow||first.row||0),saleDate,itemGuid:opening.itemGuid,itemCode:opening.itemCode,unknownQuantityExact:decimal.format(unknownQty,decimal.QUANTITY_SCALE),openingEligibleQuantityExact:decimal.format(eligible,decimal.QUANTITY_SCALE),remainingUnknownQuantityExact:decimal.format(unknownQty-eligible,decimal.QUANTITY_SCALE),saleExposureExact:decimal.format(saleExposureExact,decimal.MONEY_SCALE),earlierOfficialPurchaseAvailable:earlier.length>0,earlierOfficialPurchaseCount:earlier.length,laterPurchaseAvailable:later.length>0,laterPurchaseCount:later.length,officialPurchaseAllocationPreserved:lineRows.some(row=>row.sourceType!=='unknown_cost'),classification,openingEvidenceId:opening.evidenceId,openingSourceFingerprint:opening.sourceFingerprint,approvalStatus:'draft',readOnlyPreview:true,createdAt:now});
