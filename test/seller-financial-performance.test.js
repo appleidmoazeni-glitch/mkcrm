@@ -285,6 +285,14 @@ test('canonical UI has read-only Active FIFO lineage, explicit Candidate confirm
   assert.match(phase,/\['admin','accounting'\]\.includes\(userRole\(\)\)/);assert.doesNotMatch(phase,/seller-financial-performance\/rebuild/);assert.doesNotMatch(phase,/sfFifoCandidate/);
 });
 
+test('canonical Seller Financial page presents FIFO freshness and a clear stale-Candidate next action',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
+  for(const contract of ['sfFifoFreshness','renderCanonicalSellerFreshness','fifo-shadow/freshness?consumerFifoDatasetId=','آخرین به‌روزرسانی FIFO','محاسبات FIFO تا تاریخ','عملکرد فروشنده نیاز به به‌روزرسانی دارد','هشدار مدیریتی','اقدام بعدی','ساخت Read Model کاندیدا'])assert.ok(phase.includes(contract),`missing ${contract}`);
+  assert.match(phase,/selectedRunMeta\|\|buildContextCache\?\.latestCandidate/);
+  assert.match(phase,/sellerFinancialStale===true/);
+  assert.match(phase,/request!==freshnessGeneration/);
+});
+
 test('canonical seller financial renderer remains the final seller-profit route authority',()=>{
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
   const phaseStart=ui.lastIndexOf('/* Phase C final registry');
