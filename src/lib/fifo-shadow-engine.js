@@ -897,6 +897,14 @@ function allocateSources(datasetId, source, filters = {}) {
     .filter(row => !dates.dateTo || clean(row.saleDate) <= dates.dateTo)
     .sort(compareSales);
   const saleReturns = source.saleLines.filter(row => Number(row.saleInvoiceType) === 6).sort(compareSales);
+  const openingIdentitySet=new Set((source.openingRows||[]).filter(row=>(finite(row.openingQuantityExact)||0)>EPSILON).map(row=>identity(row.itemGuid)).filter(Boolean));
+  const manualOpeningCollision=source.manuals.find(row=>['opening_quantity','evidence_quantity','commercial_announced_quantity'].includes(row.resolutionScope)&&openingIdentitySet.has(identity(row.itemGuid)));
+  if(manualOpeningCollision){
+    const error=new Error('Manual Cost and approved Opening authority claim capacity for the same stable ItemGuid.');
+    error.code='MANUAL_COST_OPENING_CAPACITY_COLLISION';
+    error.statusCode=409;
+    throw error;
+  }
   const officialRows = source.purchaseLayers.filter(eligibleOfficial).sort(compareLayers).map(row => ({
     ...row,
     fifoRemainingQuantity:round(finite(row.netPurchasedQuantity ?? row.remainingQuantity ?? row.originalQuantity)),
@@ -909,9 +917,9 @@ function allocateSources(datasetId, source, filters = {}) {
     const available=finite(target.netPurchasedQuantity??target.remainingQuantity??target.originalQuantity)||0;
     const scoped=finite(manual.targetQuantityExact)||0;
     if(available<=EPSILON||scoped<=EPSILON||!validDate(target.purchaseInvoiceDate))continue;
-    officialRows.push({...target,validationStatus:'manual-cost-approved',netUnitCost:manual.manualCostExact??manual.manualCost,fifoRemainingQuantity:round(Math.min(available,scoped)),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],fifoSourceType:'approved_manual_purchase_layer',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:'purchase_layer',manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)});
+    officialRows.push({...target,validationStatus:'manual-cost-approved',netUnitCost:manual.manualCostExact??manual.manualCost,fifoRemainingQuantity:round(Math.min(available,scoped)),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],fifoSourceType:'approved_manual_purchase_layer',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:'purchase_layer',manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualSchemaVersion:Number(manual.schemaVersion||0),manualEffectiveFrom:clean(manual.effectiveFrom,8),manualEffectiveTo:clean(manual.effectiveTo,8),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)});
   }
-  for(const manual of source.manuals.filter(row=>['opening_quantity','evidence_quantity'].includes(row.resolutionScope))){
+  for(const manual of source.manuals.filter(row=>['opening_quantity','evidence_quantity','commercial_announced_quantity'].includes(row.resolutionScope))){
     const scoped=finite(manual.targetQuantityExact)||0;
     if(scoped<=EPSILON||!validDate(manual.effectiveFrom)||finite(manual.manualCostExact??manual.manualCost)<=0)continue;
     officialRows.push({
@@ -922,7 +930,7 @@ function allocateSources(datasetId, source, filters = {}) {
       itemGuid:clean(manual.itemGuid,100),itemCode:clean(manual.itemCode,100),itemDescription:'',
       netPurchasedQuantity:scoped,netUnitCost:manual.manualCostExact??manual.manualCost,
       fifoRemainingQuantity:round(scoped),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],
-      fifoSourceType:manual.resolutionScope==='opening_quantity'?'approved_manual_opening_quantity':'approved_manual_evidence_quantity',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:clean(manual.resolutionScope,50),manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)
+      fifoSourceType:manual.resolutionScope==='opening_quantity'?'approved_manual_opening_quantity':manual.resolutionScope==='commercial_announced_quantity'?'approved_commercial_announced_cost':'approved_manual_evidence_quantity',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:clean(manual.resolutionScope,50),manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualSchemaVersion:Number(manual.schemaVersion||0),manualEffectiveFrom:clean(manual.effectiveFrom,8),manualEffectiveTo:clean(manual.effectiveTo,8),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)
     });
   }
   for (const opening of source.openingRows || []) {
@@ -977,7 +985,7 @@ function allocateSources(datasetId, source, filters = {}) {
     target.purchaseReturnResolutionIds.push(clean(resolution.resolutionId, 100));
   }
   const officialIndex = indexRows(officialRows);
-  const manualIndex = indexRows(source.manuals.filter(row=>!row.resolutionScope||row.resolutionScope==='item'));
+  const manualIndex = indexRows(source.manuals.filter(row=>(!row.resolutionScope||row.resolutionScope==='item')&&row.legacyConsumptionReview?.status==='approved-for-fifo'));
   const allocations = [];
   const exceptions = [];
   const consumedByLayer = new Map();
@@ -1187,7 +1195,10 @@ function allocateSources(datasetId, source, filters = {}) {
     let sequence = 0;
     const eligibleForSale = matchingRows(officialIndex, sale)
       .filter(layer => layer.purchaseInvoiceDate <= sale.saleDate)
-      .sort(compareLayers);
+      .filter(layer=>!layer.manualEffectiveFrom||sale.saleDate>=layer.manualEffectiveFrom)
+      .filter(layer=>!layer.manualEffectiveTo||sale.saleDate<=layer.manualEffectiveTo)
+      .filter(layer=>!layer.manualResolutionId||Number(layer.manualSchemaVersion||0)<4||(identity(layer.itemGuid)&&identity(layer.itemGuid)===identity(sale.itemGuid)))
+      .sort((a,b)=>Number(Boolean(a.manualResolutionId))-Number(Boolean(b.manualResolutionId))||compareLayers(a,b));
 
     for (const layer of eligibleForSale) {
       if (need <= EPSILON) break;
@@ -1213,7 +1224,7 @@ function allocateSources(datasetId, source, filters = {}) {
         schemaVersion:SCHEMA_VERSION,
         algorithmVersion:ALGORITHM_VERSION,
         sourceType:layer.fifoSourceType||'official_purchase_layer',
-        costSourceType:layer.fifoSourceType==='approved_opening_accounting_cost'?'APPROVED_OPENING_ACCOUNTING_COST':(layer.fifoSourceType==='approved_manual_opening_quantity'?'MANUAL_COST_OPENING_BASIS':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'MANUAL_COST_HISTORICAL_EVIDENCE':(layer.fifoSourceType?'MANUAL_COST_PURCHASE_LAYER':'OFFICIAL_PURCHASE_LAYER'))),
+        costSourceType:layer.fifoSourceType==='approved_opening_accounting_cost'?'APPROVED_OPENING_ACCOUNTING_COST':(layer.fifoSourceType==='approved_commercial_announced_cost'?'COMMERCIAL_ANNOUNCED_COST':(layer.fifoSourceType==='approved_manual_opening_quantity'?'MANUAL_COST_OPENING_BASIS':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'MANUAL_COST_HISTORICAL_EVIDENCE':(layer.fifoSourceType?'MANUAL_COST_PURCHASE_LAYER':'OFFICIAL_PURCHASE_LAYER')))),
         sourceConfidence:layer.fifoSourceType==='approved_opening_accounting_cost'?'governed-approved-opening-accounting-cost':(layer.fifoSourceType==='approved_manual_opening_quantity'?'manual-approved-opening-basis':(layer.fifoSourceType==='approved_manual_evidence_quantity'?'manual-approved-bounded-historical-evidence':(layer.fifoSourceType?'manual-approved-purchase-line':'official'))),
         saleSnapshotId:source.saleActive.snapshotId,
         saleLineId,

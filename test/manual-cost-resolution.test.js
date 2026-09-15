@@ -68,6 +68,8 @@ function seedDb() {
     ],
     purchaseHistoryDiscoveryQueue:[],
     manualCostResolutions:[],
+    fifoDatasetState:[{scopeKey:'fifo-shadow-v2-precision-evidence',activeDatasetId:'FIFO-TEST'}],
+    fifoAllocations:[],
     appJobs:[
       { jobId:'J1', status:'completed', result:{ retryCount:1 } },
       { jobId:'J2', status:'completed', result:{ resumeCount:1 } }
@@ -78,9 +80,19 @@ function seedDb() {
 
 const accounting = { username:'accountant-1', role:'accounting' };
 const manager = { username:'manager-1', role:'manager' };
+function governedInput(value={}){
+  const itemCode=value.itemCode||'X';
+  return {...value,itemCode,itemGuid:value.itemGuid||('GUID-'+itemCode),manualCost:value.manualCost??1,sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',targetQuantityExact:value.targetQuantityExact||'1000.000000',effectiveFrom:value.effectiveFrom||'14050101',effectiveTo:value.effectiveTo||'14051229',commercialReference:value.commercialReference||'COM-TEST',reason:value.reason||'اعلام بازرگانی تست'};
+}
+const originalCreateDraft=service.createDraft.bind(service);
+function governedCreate(db,value,user){return originalCreateDraft(db,governedInput(value),user);}
+async function approvePending(db,pending,user=manager){
+  const preview=await service.impactPreview(db,pending.resolution.resolutionId,user);
+  return service.transition(db,pending.resolution.resolutionId,'approve',user,{revision:pending.resolution.revision,previewFingerprint:preview.previewFingerprint});
+}
 
 async function approvedManual(db, overrides = {}) {
-  const created = await service.createDraft(db, {
+  const created = await governedCreate(db, {
     itemGuid:'GUID-M',
     itemCode:'MANUAL',
     manualCost:800.5,
@@ -93,12 +105,12 @@ async function approvedManual(db, overrides = {}) {
     ...overrides
   }, accounting);
   const pending=await service.transition(db, created.resolution.resolutionId, 'submit', accounting, { revision:created.resolution.revision });
-  return service.transition(db, created.resolution.resolutionId, 'approve', manager, { revision:pending.resolution.revision });
+  return approvePending(db,pending,manager);
 }
 
 test('draft -> pending -> approved preserves immutable audit evidence', async () => {
   const db=seedDb();
-  const created=await service.createDraft(db,{
+  const created=await governedCreate(db,{
     itemCode:'MANUAL',itemGuid:'GUID-M',manualCost:'800.50',effectiveFrom:'۱۴۰۵/۰۱/۰۱',
     currency:'irr',sourceType:'historical_purchase',reason:'historical document',
     attachment:{name:'invoice.pdf',reference:'DOC-42',sha256:'a'.repeat(64)}
@@ -112,7 +124,7 @@ test('draft -> pending -> approved preserves immutable audit evidence', async ()
   assert.equal(created.resolution.auditLog[0].action,'created-draft');
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
   assert.equal(pending.resolution.status,'pending');
-  const approved=await service.transition(db,created.resolution.resolutionId,'approve',manager,{revision:pending.resolution.revision});
+  const approved=await approvePending(db,pending,manager);
   assert.equal(approved.resolution.status,'approved');
   assert.equal(approved.resolution.approvedBy.username,'manager-1');
   assert.deepEqual(approved.resolution.auditLog.map(row=>row.action),['created-draft','submit','approve']);
@@ -123,20 +135,20 @@ test('draft -> pending -> approved preserves immutable audit evidence', async ()
 });
 
 test('approved manual-cost fingerprint is canonical and changes only when approved evidence changes',async()=>{
-  const db=seedDb();const empty=await service.approvedSetFingerprint(db);const created=await service.createDraft(db,{itemCode:'X',manualCost:'951860416.64',effectiveFrom:'14050101',sourceType:'manual',reason:'evidence'},accounting);const draft=await service.approvedSetFingerprint(db);assert.equal(draft.fingerprint,empty.fingerprint);await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});await service.transition(db,created.resolution.resolutionId,'approve',manager,{revision:2});const approved=await service.approvedSetFingerprint(db);assert.notEqual(approved.fingerprint,empty.fingerprint);assert.equal(approved.count,1);
+  const db=seedDb();const empty=await service.approvedSetFingerprint(db);const created=await governedCreate(db,{itemCode:'X',manualCost:'951860416.64',effectiveFrom:'14050101',sourceType:'manual',reason:'evidence'},accounting);const draft=await service.approvedSetFingerprint(db);assert.equal(draft.fingerprint,empty.fingerprint);const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});await approvePending(db,pending);const approved=await service.approvedSetFingerprint(db);assert.notEqual(approved.fingerprint,empty.fingerprint);assert.equal(approved.count,1);
 });
 
 test('impact preview is read-only and bounds affected unresolved FIFO rows before activation',async()=>{
-  const db=seedDb();db.collection('fifoDatasetState').rows.push({scopeKey:'fifo-shadow-v2-precision-evidence',activeDatasetId:'FIFO-A'});db.collection('fifoAllocations').rows.push({datasetId:'FIFO-A',allocationId:'A-U',saleLineId:'SL-3',saleInvoiceType:2,saleInvoiceNo:3,saleDate:'14050112',sourceType:'unknown_cost',itemGuid:'GUID-U',itemCode:'UNKNOWN',quantityExact:'4.000000',allocatedSaleValueExact:'4000.00',allocatedCostAmountExact:null,sellerAccountNumber:'SELLER-1'});const created=await service.createDraft(db,{itemGuid:'GUID-U',itemCode:'UNKNOWN',manualCost:'750.25',effectiveFrom:'14050101',sourceType:'manual',reason:'documented'},accounting);const before=structuredClone(db.collection('fifoAllocations').rows);const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);assert.equal(preview.affected.saleLines,1);assert.equal(preview.projectedResolvedCostExact,'3001.00');assert.equal(preview.fifoProfitDeltaExact,null);assert.equal(preview.historicalDatasetMutated,false);assert.deepEqual(db.collection('fifoAllocations').rows,before);
+  const db=seedDb();db.collection('fifoDatasetState').rows[0].activeDatasetId='FIFO-A';db.collection('fifoAllocations').rows.push({datasetId:'FIFO-A',allocationId:'A-U',saleLineId:'SL-3',saleInvoiceType:2,saleInvoiceNo:3,saleDate:'14050112',sourceType:'unknown_cost',itemGuid:'GUID-U',itemCode:'UNKNOWN',quantityExact:'4.000000',allocatedSaleValueExact:'4000.00',allocatedCostAmountExact:null,sellerAccountNumber:'SELLER-1'});const created=await governedCreate(db,{itemGuid:'GUID-U',itemCode:'UNKNOWN',manualCost:'750.25',targetQuantityExact:'4',effectiveFrom:'14050101',effectiveTo:'14050131',reason:'documented'},accounting);const before=structuredClone(db.collection('fifoAllocations').rows);const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);assert.equal(preview.affected.saleLines,1);assert.equal(preview.projectedResolvedCostExact,'3001.00');assert.equal(preview.fifoProfitDeltaExact,null);assert.equal(preview.historicalDatasetMutated,false);assert.deepEqual(db.collection('fifoAllocations').rows,before);
 });
 
-test('purchase-layer scope requires exact target identity and quantity while item scope stays backward compatible',async()=>{
-  const db=seedDb();db.collection('supplierPurchaseLayers').rows[0].originalQuantity=2;const created=await service.createDraft(db,{resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-1',targetQuantityExact:'1.250000',itemGuid:'GUID-O',itemCode:'OFFICIAL',manualCost:'700.125',effectiveFrom:'14050101',sourceType:'historical_purchase'},accounting);assert.equal(created.resolution.resolutionScope,'purchase_layer');assert.equal(created.resolution.targetQuantityExact,'1.250000');await assert.rejects(service.createDraft(db,{resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-1',targetQuantityExact:'99',itemGuid:'GUID-O',manualCost:1,effectiveFrom:'14050101'},accounting),error=>error.code==='MANUAL_COST_TARGET_QUANTITY_EXCEEDS_LAYER');
+test('new Purchase-layer and item-scope Manual records are rejected in favor of canonical sources',async()=>{
+  const db=seedDb();await assert.rejects(service.createDraft(db,{resolutionScope:'purchase_layer',purchaseDatasetId:'PURCHASE-ACTIVE',purchaseLineIdentity:'P-1',targetQuantityExact:'1.25',itemGuid:'GUID-O',itemCode:'OFFICIAL',manualCost:'700.125',effectiveFrom:'14050101',effectiveTo:'14050131',sourceType:'historical_purchase'},accounting),error=>error.code==='MANUAL_COST_EVIDENCE_CLASS_REQUIRED');await assert.rejects(service.createDraft(db,{...governedInput({itemGuid:'GUID-O',itemCode:'OFFICIAL'}),resolutionScope:'item'},accounting),error=>error.code==='MANUAL_COST_UNBOUNDED_SCOPE_FORBIDDEN');
 });
 
 test('optimistic revision prevents silent overwrite', async () => {
   const db=seedDb();
-  const created=await service.createDraft(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101',sourceType:'manual'},accounting);
+  const created=await governedCreate(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101'},accounting);
   const updated=await service.updateDraft(db,created.resolution.resolutionId,{revision:1,manualCost:2},accounting);
   assert.equal(updated.resolution.manualCost,2);
   assert.equal(updated.resolution.revision,2);
@@ -149,24 +161,24 @@ test('optimistic revision prevents silent overwrite', async () => {
 test('seller cannot create or approve and creator cannot self-approve', async () => {
   const db=seedDb();
   await assert.rejects(
-    service.createDraft(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101',sourceType:'manual'},{username:'seller',role:'seller'}),
+    governedCreate(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101'},{username:'seller',role:'seller'}),
     error=>error.code==='MANUAL_COST_FORBIDDEN'&&error.statusCode===403
   );
-  const created=await service.createDraft(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101',sourceType:'manual'},accounting);
+  const created=await governedCreate(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101'},accounting);
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
   await assert.rejects(
     service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:pending.resolution.revision}),
     error=>error.code==='MANUAL_COST_FORBIDDEN'&&error.statusCode===403
   );
-  const approved=await service.transition(db,created.resolution.resolutionId,'approve',{username:'manager',role:'manager'},{revision:pending.resolution.revision});
+  const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);const approved=await service.transition(db,created.resolution.resolutionId,'approve',{username:'manager',role:'manager'},{revision:pending.resolution.revision,previewFingerprint:preview.previewFingerprint});
   assert.equal(approved.resolution.status,'approved');
 });
 
 test('overlapping active resolutions are rejected and no physical delete API exists', async () => {
   const db=seedDb();
-  await service.createDraft(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101',effectiveTo:'14050131',sourceType:'manual'},accounting);
+  await governedCreate(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101',effectiveTo:'14050131'},accounting);
   await assert.rejects(
-    service.createDraft(db,{itemCode:'X',manualCost:2,effectiveFrom:'14050115',effectiveTo:'14050201',sourceType:'manual'},accounting),
+    governedCreate(db,{itemCode:'X',manualCost:2,effectiveFrom:'14050115',effectiveTo:'14050201'},accounting),
     error=>error.code==='MANUAL_COST_OVERLAP'&&error.statusCode===409
   );
   assert.equal(service.delete,undefined);
@@ -205,13 +217,13 @@ test('only approved and effective manual cost changes readiness and coverage', a
 
 test('future, expired and rejected manual costs are not eligible', async () => {
   const db=seedDb();
-  const future=await service.createDraft(db,{itemCode:'MANUAL',itemGuid:'GUID-M',manualCost:5,effectiveFrom:'14050201',sourceType:'manual'},accounting);
+  const future=await governedCreate(db,{itemCode:'MANUAL',itemGuid:'GUID-M',manualCost:5,effectiveFrom:'14050201',effectiveTo:'14050228'},accounting);
   const futurePending=await service.transition(db,future.resolution.resolutionId,'submit',accounting,{revision:future.resolution.revision});
-  const futureApproved=await service.transition(db,future.resolution.resolutionId,'approve',manager,{revision:futurePending.resolution.revision});
+  const futureApproved=await approvePending(db,futurePending,manager);
   let readiness=await service.readiness(db,{});
   assert.equal(readiness.list.find(row=>row.itemCode==='MANUAL').coverage,'unknown');
   await service.transition(db,future.resolution.resolutionId,'expire',manager,{reason:'replaced',revision:futureApproved.resolution.revision});
-  const rejected=await service.createDraft(db,{itemCode:'UNKNOWN',itemGuid:'GUID-U',manualCost:5,effectiveFrom:'14050101',sourceType:'manual'},accounting);
+  const rejected=await governedCreate(db,{itemCode:'UNKNOWN',itemGuid:'GUID-U',manualCost:5,effectiveFrom:'14050101'},accounting);
   const rejectedPending=await service.transition(db,rejected.resolution.resolutionId,'submit',accounting,{revision:rejected.resolution.revision});
   await service.transition(db,rejected.resolution.resolutionId,'reject',manager,{reason:'insufficient evidence',revision:rejectedPending.resolution.revision});
   readiness=await service.readiness(db,{});
@@ -270,7 +282,7 @@ test('queue reuses bounded active-source cache and governed writes invalidate it
   const lines=db.collection('saleSnapshotDatasetLines'),original=lines.find.bind(lines);let reads=0;
   lines.find=(...args)=>{reads++;return original(...args);};
   await service.missingQueue(db,{coverage:'unknown'});await service.missingQueue(db,{coverage:'unknown'});assert.equal(reads,1);
-  await service.createDraft(db,{itemCode:'CACHE-INVALIDATION',manualCost:1,effectiveFrom:'14050101'},accounting);
+  await governedCreate(db,{itemCode:'CACHE-INVALIDATION',manualCost:1,effectiveFrom:'14050101'},accounting);
   await service.missingQueue(db,{coverage:'unknown'});assert.equal(reads,2);
 });
 
@@ -289,10 +301,10 @@ test('data health reports active datasets, retries, resumes and zero duplicates'
 });
 
 test('invalid amount, unsafe number, invalid date range and source type fail clearly', () => {
-  assert.throws(()=>service._validateDraft({itemCode:'X',manualCost:'NaN',effectiveFrom:'14050101',sourceType:'manual'}),error=>error.code==='MANUAL_COST_INVALID_AMOUNT');
-  assert.throws(()=>service._validateDraft({itemCode:'X',manualCost:Number.MAX_SAFE_INTEGER*2,effectiveFrom:'14050101',sourceType:'manual'}),error=>error.code==='MANUAL_COST_INVALID_AMOUNT');
-  assert.throws(()=>service._validateDraft({itemCode:'X',manualCost:1,effectiveFrom:'14050201',effectiveTo:'14050101',sourceType:'manual'}),error=>error.code==='MANUAL_COST_INVALID_RANGE');
-  assert.throws(()=>service._validateDraft({itemCode:'X',manualCost:1,effectiveFrom:'14050101',sourceType:'fifo'}),error=>error.code==='MANUAL_COST_INVALID_SOURCE');
+  assert.throws(()=>service._validateDraft(governedInput({manualCost:'NaN'})),error=>error.code==='MANUAL_COST_INVALID_AMOUNT');
+  assert.throws(()=>service._validateDraft(governedInput({manualCost:Number.MAX_SAFE_INTEGER*2})),error=>error.code==='MANUAL_COST_INVALID_AMOUNT');
+  assert.throws(()=>service._validateDraft(governedInput({manualCost:1,effectiveFrom:'14050201',effectiveTo:'14050101'})),error=>error.code==='MANUAL_COST_INVALID_RANGE');
+  assert.throws(()=>service._validateDraft({...governedInput({manualCost:1}),sourceType:'fifo'}),error=>error.code==='MANUAL_COST_INVALID_SOURCE');
 });
 
 test('route and UI contracts expose the governed module without purchase-layer mutation or financial activation', () => {
@@ -322,19 +334,19 @@ test('governed supersession preserves legacy evidence and resolves only inside t
   };
   db.collection('manualCostResolutions').rows.push(structuredClone(legacy));
   await assert.rejects(
-    service.createDraft(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',sourceType:'legacy_cost',reason:'bounded correction'},accounting),
+    governedCreate(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',reason:'bounded correction'},accounting),
     error=>error.code==='MANUAL_COST_OVERLAP'
   );
   await assert.rejects(
-    service.createDraft(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',sourceType:'legacy_cost',reason:'bounded correction',supersedesResolutionId:legacy.resolutionId},accounting),
-    error=>error.code==='MANUAL_COST_SUPERSESSION_EFFECTIVE_TO_REQUIRED'
+    service.createDraft(db,{...governedInput({itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',reason:'bounded correction',supersedesResolutionId:legacy.resolutionId}),effectiveTo:''},accounting),
+    error=>error.code==='MANUAL_COST_EFFECTIVE_TO_REQUIRED'
   );
-  const created=await service.createDraft(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',sourceType:'legacy_cost',reason:'بازه تیر ۱۴۰۵ طبق تصمیم انسانی',supersedesResolutionId:legacy.resolutionId},accounting);
+  const created=await governedCreate(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',reason:'بازه تیر ۱۴۰۵ طبق تصمیم انسانی',supersedesResolutionId:legacy.resolutionId},accounting);
   assert.equal(created.resolution.supersedesResolutionId,legacy.resolutionId);
   assert.match(created.resolution.contentHash,/^[a-f0-9]{64}$/);
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});
   await assert.rejects(service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:2}),error=>error.code==='MANUAL_COST_FORBIDDEN');
-  const approved=await service.transition(db,created.resolution.resolutionId,'approve',manager,{revision:pending.resolution.revision});
+  const approved=await approvePending(db,pending,manager);
   const unchanged=await service.getById(db,legacy.resolutionId);
   assert.deepEqual(unchanged,legacy);
   assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050515').map(row=>row.resolutionId),[approved.resolution.resolutionId]);

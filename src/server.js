@@ -4222,6 +4222,12 @@ async function handleApi(req, res, pathname, query) {
       const db=await connectMongo();
       return sendJson(res,200,await manualCostResolution.list(db,query));
     }
+    if(pathname==='/api/manual-cost-resolutions/legacy-audit'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager']))return;
+      const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.legacyItemScopeAudit(db,currentUser(req)));}
+      catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_LEGACY_AUDIT_FAILED',error:String(error.message||error)});}
+    }
     if(pathname==='/api/manual-cost-resolutions/assisted/suggestion'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await manualCostResolution.assistedSuggestion(db,query,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_SUGGESTION_FAILED',error:String(error.message||error)});}

@@ -12,17 +12,21 @@ const canonicalItemCatalog = require('./canonical-item-catalog');
 const canonicalLayerContract = require('./canonical-purchase-layer-contract');
 
 const COLLECTION = 'manualCostResolutions';
-const SCHEMA_VERSION = 3;
+const SCHEMA_VERSION = 4;
 const SOURCE_TYPES = Object.freeze([
   'manual',
   'opening_inventory',
   'historical_purchase',
   'opening_accounting_cost',
   'accounting_adjustment',
+  'commercial_announced_cost',
   'legacy_cost'
 ]);
 const STATUSES = Object.freeze(['draft', 'pending', 'approved', 'rejected', 'expired']);
-const RESOLUTION_SCOPES = Object.freeze(['item', 'purchase_layer', 'opening_quantity', 'evidence_quantity']);
+const RESOLUTION_SCOPES = Object.freeze(['item', 'purchase_layer', 'opening_quantity', 'evidence_quantity', 'commercial_announced_quantity']);
+const COMMERCIAL_SOURCE = 'commercial_announced_cost';
+const COMMERCIAL_SCOPE = 'commercial_announced_quantity';
+const LEGACY_UNBOUNDED_CLASS = 'LEGACY_UNBOUNDED_MANUAL_COST';
 const ASSISTED_WORKFLOW = 'accounting-assisted-v1';
 const ASSISTED_STATES = Object.freeze(['NEEDS_REVIEW','ACCOUNTING_REVIEW','APPROVED','DEFERRED','REJECTED']);
 const EDIT_ROLES = Object.freeze(['admin', 'accounting']);
@@ -67,7 +71,7 @@ function contentProjection(value = {}) {
     purchaseLineIdentity:clean(value.purchaseLineIdentity,500), targetQuantityExact:clean(value.targetQuantityExact,100),
     attachment:sanitizeAttachment(value.attachment), notes:clean(value.notes, 2000),
     supersedesResolutionId:clean(value.supersedesResolutionId,100),
-    sourceClass:clean(value.sourceClass,100),saleValueExposure:Number(value.saleValueExposure||0),affectedLineCount:Number(value.affectedLineCount||0),affectedQuantityExact:clean(value.affectedQuantityExact,100)
+    sourceClass:clean(value.sourceClass,100),evidenceClass:clean(value.evidenceClass,100),commercialReference:clean(value.commercialReference,500),saleValueExposure:Number(value.saleValueExposure||0),affectedLineCount:Number(value.affectedLineCount||0),affectedQuantityExact:clean(value.affectedQuantityExact,100)
   };
 }
 function contentHash(value) { return crypto.createHash('sha256').update(stable(contentProjection(value))).digest('hex'); }
@@ -150,7 +154,7 @@ function boundedAuditDetails(value = {}) {
 }
 function auditValueSnapshot(value) {
   if (value == null) return null;
-  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','sourceClass','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType','saleValueExposure','affectedLineCount','affectedQuantityExact'];
+  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','sourceClass','evidenceClass','commercialReference','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType','saleValueExposure','affectedLineCount','affectedQuantityExact'];
   const output = {};
   for (const field of fields) {
     if (value[field] === undefined) continue;
@@ -168,10 +172,12 @@ function auditEntry(action, by, details = {}) {
     details:boundedAuditDetails(details)
   };
 }
-function validateDraft(input = {}) {
+function validateDraft(input = {}, options = {}) {
+  const allowLegacy=options.allowLegacy===true;
   const itemGuid = clean(input.itemGuid, 100);
   const itemCode = clean(input.itemCode, 100);
-  if (!itemGuid && !itemCode) fail('MANUAL_COST_ITEM_REQUIRED', 'حداقل یکی از ItemGuid یا ItemCode الزامی است.');
+  if ((!itemGuid || !itemCode)&&!allowLegacy) fail('MANUAL_COST_STABLE_IDENTITY_REQUIRED', 'ItemGuid و ItemCode هر دو برای شواهد هزینه جدید الزامی هستند.');
+  if(!itemGuid&&!itemCode)fail('MANUAL_COST_ITEM_REQUIRED','حداقل یک هویت کالا برای رکورد Legacy الزامی است.');
   const manualCostInput = Object.prototype.hasOwnProperty.call(input, 'manualCost')
     ? input.manualCost
     : input.manualCostExact;
@@ -187,14 +193,20 @@ function validateDraft(input = {}) {
   if (!/^[A-Z]{3,8}$/.test(currency)) fail('MANUAL_COST_INVALID_CURRENCY', 'واحد پول معتبر نیست.');
   const resolutionScope=clean(input.resolutionScope||'item',50);
   if(!RESOLUTION_SCOPES.includes(resolutionScope))fail('MANUAL_COST_SCOPE_INVALID','Scope هزینه دستی معتبر نیست.');
+  if(resolutionScope==='item'&&!allowLegacy)fail('MANUAL_COST_UNBOUNDED_SCOPE_FORBIDDEN','ایجاد Manual Cost با دامنه نامحدود Item مجاز نیست.',409);
+  if(!allowLegacy&&(sourceType!==COMMERCIAL_SOURCE||resolutionScope!==COMMERCIAL_SCOPE))fail('MANUAL_COST_EVIDENCE_CLASS_REQUIRED','شواهد جدید هزینه باید از نوع قیمت اعلام بازرگانی و با ظرفیت محدود باشد.',409);
   const purchaseDatasetId=resolutionScope==='purchase_layer'?clean(input.purchaseDatasetId,100):'',purchaseLineIdentity=resolutionScope==='purchase_layer'?clean(input.purchaseLineIdentity,500):'';
   let targetQuantityExact='';
-  if(['purchase_layer','opening_quantity','evidence_quantity'].includes(resolutionScope)){
+  if(['purchase_layer','opening_quantity','evidence_quantity',COMMERCIAL_SCOPE].includes(resolutionScope)){
     if(resolutionScope==='purchase_layer'&&(!purchaseDatasetId||!purchaseLineIdentity))fail('MANUAL_COST_PURCHASE_LAYER_REQUIRED','Dataset و Purchase Line برای Scope لایه خرید الزامی است.');
     try{const qty=accountingDecimal.parse(input.targetQuantityExact??input.targetQuantity,accountingDecimal.QUANTITY_SCALE);if(qty<=0n)throw new Error();targetQuantityExact=accountingDecimal.format(qty,accountingDecimal.QUANTITY_SCALE);}catch(_){fail('MANUAL_COST_TARGET_QUANTITY_INVALID','Quantity هدف باید دقیق و بزرگ‌تر از صفر باشد.');}
   }
+  if(!allowLegacy&&!effectiveTo)fail('MANUAL_COST_EFFECTIVE_TO_REQUIRED','تاریخ پایان اثر برای هزینه جدید الزامی است.');
   const supersedesResolutionId=clean(input.supersedesResolutionId,100);
   const reason=clean(input.reason,1000);
+  const commercialReference=clean(input.commercialReference||input.sourceReference,500);
+  if(!allowLegacy&&!reason)fail('MANUAL_COST_REASON_REQUIRED','دلیل قیمت اعلام بازرگانی الزامی است.');
+  if(!allowLegacy&&!commercialReference)fail('MANUAL_COST_COMMERCIAL_REFERENCE_REQUIRED','مرجع یا توضیح اعلام بازرگانی الزامی است.');
   if(supersedesResolutionId&&!reason)fail('MANUAL_COST_SUPERSESSION_REASON_REQUIRED','دلیل اصلاح Resolution قدیمی برای supersession الزامی است.');
   if(supersedesResolutionId&&!effectiveTo)fail('MANUAL_COST_SUPERSESSION_EFFECTIVE_TO_REQUIRED','تاریخ پایان صریح برای supersession هزینه دستی الزامی است.');
   const normalized = {
@@ -209,7 +221,9 @@ function validateDraft(input = {}) {
     sourceType,
     attachment:sanitizeAttachment(input.attachment),
     notes:clean(input.notes, 2000),resolutionScope,purchaseDatasetId,purchaseLineIdentity,targetQuantityExact,
-    supersedesResolutionId
+    supersedesResolutionId,
+    commercialReference,
+    evidenceClass:sourceType===COMMERCIAL_SOURCE?'COMMERCIAL_ANNOUNCED_COST':''
   };
   return { ...normalized, contentHash:contentHash(normalized) };
 }
@@ -273,6 +287,37 @@ async function validateSupersession(db, candidate, excludedResolutionId = '') {
   if(!sameResolutionTarget(previous,candidate))fail('MANUAL_COST_SUPERSESSION_TARGET_MISMATCH','Resolution جدید و قبلی باید Target حسابداری یکسان داشته باشند.',409);
   return previous;
 }
+async function assertStableItemIdentity(db,candidate){
+  if(Number(candidate.schemaVersion||SCHEMA_VERSION)<SCHEMA_VERSION&&candidate.evidenceClass!=='COMMERCIAL_ANNOUNCED_COST')return;
+  const item=canonicalItemCatalog._sourceItem(candidate);
+  const guid=canonicalItemCatalog.canonicalItemGuid(item.itemGuid),code=canonicalItemCatalog.normalizedItemCode(item.itemCode);
+  const rows=await db.collection(canonicalItemCatalog.CATALOG).find({$or:[{canonicalItemGuid:guid},{itemGuid:item.itemGuid},{normalizedItemCode:code},{itemCode:item.itemCode}]}).toArray();
+  const guidRows=rows.filter(row=>canonicalItemCatalog.canonicalItemGuid(row.canonicalItemGuid||row.itemGuid)===guid);
+  const codeRows=rows.filter(row=>canonicalItemCatalog.normalizedItemCode(row.normalizedItemCode||row.itemCode)===code);
+  const resolved=canonicalItemCatalog._resolveExisting(item,guidRows,codeRows);
+  if(resolved.conflict)fail('MANUAL_COST_ITEM_IDENTITY_CONFLICT','ItemGuid و ItemCode با هویت canonical کالا تطابق ندارند.',409);
+}
+async function approvedOpeningCollision(db,candidate){
+  let authority;
+  try{authority=await openingCostBasis.resolveOpeningAuthority(db,{});}catch(error){
+    if(clean(error.code,100)==='OPENING_AUTHORITY_NOT_FOUND')return null;
+    throw error;
+  }
+  const rows=await db.collection(openingCostBasis.COLLECTION).find({
+    datasetId:authority.datasetId,status:{$in:['available','VALIDATED_CANDIDATE']},extractionComplete:true
+  }).toArray();
+  const collision=rows.find(row=>{
+    if(!key(row.itemGuid)||key(row.itemGuid)!==key(candidate.itemGuid))return false;
+    let quantity=0n;
+    try{quantity=accountingDecimal.parse(row.openingQuantityExact||0,accountingDecimal.QUANTITY_SCALE);}catch(_){return false;}
+    return quantity>0n&&overlaps(candidate.effectiveFrom,candidate.effectiveTo,clean(row.effectiveOpeningDate||row.openingDate,8),'');
+  });
+  return collision?{datasetId:authority.datasetId,evidenceId:clean(collision.evidenceId,100),itemGuid:clean(collision.itemGuid,100),openingQuantityExact:clean(collision.openingQuantityExact,100),effectiveOpeningDate:clean(collision.effectiveOpeningDate||collision.openingDate,8)}:null;
+}
+async function assertNoOpeningCollision(db,candidate){
+  const collision=await approvedOpeningCollision(db,candidate);
+  if(collision)fail('MANUAL_COST_OPENING_CAPACITY_COLLISION','ظرفیت Opening مصوب برای همین ItemGuid وجود دارد: '+collision.datasetId,409);
+}
 function approvedRowsFingerprint(rows = []) {
   const identities = rows.map(row => [
     clean(row.resolutionId,100), Number(row.revision||0), clean(row.contentHash,64) || contentHash({
@@ -304,10 +349,10 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     if (row.saleDate < resolution.effectiveFrom || (resolution.effectiveTo && row.saleDate > resolution.effectiveTo)) return false;
     if (resolution.status === 'approved' && row.manualResolutionId === resolution.resolutionId) return true;
     return row.sourceType === 'unknown_cost';
-  });
+  }).sort((a,b)=>clean(a.saleDate,8).localeCompare(clean(b.saleDate,8),'en')||Number(a.saleInvoiceNo||0)-Number(b.saleInvoiceNo||0)||Number(a.saleRow||0)-Number(b.saleRow||0)||clean(a.saleLineId,500).localeCompare(clean(b.saleLineId,500),'en'));
   const manualCostExact = resolution.manualCostExact || exactUnitCost(resolution.manualCost);
   const totalRequiredQuantity=rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.quantityExact??row.unknownQty??row.allocatedQty??0,accountingDecimal.QUANTITY_SCALE),0n);
-  const boundedScope=['purchase_layer','opening_quantity','evidence_quantity'].includes(clean(resolution.resolutionScope,50));
+  const boundedScope=['purchase_layer','opening_quantity','evidence_quantity',COMMERCIAL_SCOPE].includes(clean(resolution.resolutionScope,50));
   const capacity=boundedScope?accountingDecimal.parse(resolution.targetQuantityExact||0,accountingDecimal.QUANTITY_SCALE):totalRequiredQuantity;
   let remainingCapacity=capacity,projectedResolvedCost=0n,coveredQuantity=0n,saleValueExposure=0n;
   const coveredRows=[];
@@ -319,15 +364,40 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     projectedResolvedCost+=accountingDecimal.allocation(accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),manualCostExact).valueScaled;
     const rowSale=accountingDecimal.parse(row.allocatedSaleValueExact??row.allocatedSaleValue??0,accountingDecimal.MONEY_SCALE);
     saleValueExposure+=quantity>0n?accountingDecimal.divideRounded(rowSale*covered,quantity):0n;
-    coveredQuantity+=covered;remainingCapacity-=covered;coveredRows.push(row);
+    coveredQuantity+=covered;remainingCapacity-=covered;coveredRows.push({
+      row,
+      potentiallyCoveredQuantityExact:accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),
+      proposedCostExact:accountingDecimal.format(accountingDecimal.allocation(accountingDecimal.format(covered,accountingDecimal.QUANTITY_SCALE),manualCostExact).valueScaled,accountingDecimal.MONEY_SCALE)
+    });
   }
   const remainingUnknown=totalRequiredQuantity>coveredQuantity?totalRequiredQuantity-coveredQuantity:0n;
-  const saleLineIds=[...new Set(coveredRows.map(row=>row.saleLineId).filter(Boolean))];
-  const knownCostRows = saleLineIds.length
-    ? (await db.collection('fifoAllocations').find({datasetId,saleLineId:{$in:saleLineIds}}).toArray()).filter(row=>row.allocatedCostAmountExact!=null)
+  const saleLineIds=[...new Set(coveredRows.map(entry=>entry.row.saleLineId).filter(Boolean))];
+  const lineAllocations = saleLineIds.length
+    ? await db.collection('fifoAllocations').find({datasetId,saleLineId:{$in:saleLineIds}}).toArray()
     : [];
+  const knownCostRows = lineAllocations.filter(row=>row.allocatedCostAmountExact!=null);
   const oldKnownCost = knownCostRows.reduce((sum,row)=>sum+accountingDecimal.parse(row.allocatedCostAmountExact,accountingDecimal.MONEY_SCALE),0n);
-  const purchaseLayers = new Set(coveredRows.map(row => clean(row.purchaseLineIdentity,500)).filter(Boolean));
+  const purchaseLayers = new Set(coveredRows.map(entry => clean(entry.row.purchaseLineIdentity,500)).filter(Boolean));
+  const affectedLines=coveredRows.map(({row,potentiallyCoveredQuantityExact,proposedCostExact})=>{
+    const siblings=lineAllocations.filter(value=>value.saleLineId===row.saleLineId);
+    const currentCost=siblings.reduce((sum,value)=>value.allocatedCostAmountExact==null?sum:sum+accountingDecimal.parse(value.allocatedCostAmountExact,accountingDecimal.MONEY_SCALE),0n);
+    const hasKnown=siblings.some(value=>value.allocatedCostAmountExact!=null);
+    const hasUnknown=siblings.some(value=>value.sourceType==='unknown_cost'||value.allocatedCostAmountExact==null);
+    return {
+    saleLineId:clean(row.saleLineId,500),saleInvoiceType:Number(row.saleInvoiceType||0),saleInvoiceNo:Number(row.saleInvoiceNo||0),saleRow:Number(row.saleRow||0),saleDate:clean(row.saleDate,8),
+    itemGuid:clean(row.itemGuid,100),itemCode:clean(row.itemCode,100),sellerAccountNumber:clean(row.sellerAccountNumber,100),sellerName:clean(row.sellerName,200),storeName:clean(row.storeName,200),
+    currentProvenance:hasKnown&&hasUnknown?'PARTIAL':hasUnknown?'UNKNOWN':'PROVEN',currentFifoCostExact:accountingDecimal.format(currentCost,accountingDecimal.MONEY_SCALE),currentQuantityExact:clean(row.quantityExact??row.unknownQty??row.allocatedQty,100),potentiallyCoveredQuantityExact,proposedCostExact,
+    expectedNextFifoProvenance:'COMMERCIAL_ANNOUNCED_COST',activeFifoMutated:false
+  };});
+  const previewContract={
+    resolutionId:resolution.resolutionId,revision:Number(resolution.revision||0),
+    resolutionContentHash:resolution.contentHash || contentHash({ ...resolution, manualCostExact }),
+    activeFifoDatasetId:datasetId,evidenceClass:clean(resolution.evidenceClass||resolution.sourceClass||resolution.sourceType,100),
+    itemGuid:clean(resolution.itemGuid,100),itemCode:clean(resolution.itemCode,100),targetQuantityExact:clean(resolution.targetQuantityExact,100),
+    effectiveFrom:clean(resolution.effectiveFrom,8),effectiveTo:clean(resolution.effectiveTo,8),manualCostExact,
+    affectedLines:affectedLines.map(row=>[row.saleLineId,row.potentiallyCoveredQuantityExact,row.currentProvenance])
+  };
+  const previewFingerprint=crypto.createHash('sha256').update(stable(previewContract)).digest('hex');
   return {
     ok:true,
     resolutionId:resolution.resolutionId,
@@ -335,12 +405,12 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     status:resolution.status,
     datasetId,
     affected:{
-      purchaseLayers:purchaseLayers.size,
-      allocations:coveredRows.length,
-      saleLines:new Set(coveredRows.map(row => row.saleLineId)).size,
-      invoices:new Set(coveredRows.map(row => `${row.saleInvoiceType}:${row.saleInvoiceNo}`)).size,
-      sellers:new Set(coveredRows.map(row => clean(row.sellerAccountNumber,100)).filter(Boolean)).size,
-      productCategories:new Set(coveredRows.map(row => clean(row.officialProductCategoryName,300)).filter(Boolean)).size
+     purchaseLayers:purchaseLayers.size,
+     allocations:coveredRows.length,
+      saleLines:new Set(coveredRows.map(entry => entry.row.saleLineId)).size,
+      invoices:new Set(coveredRows.map(entry => entry.row.saleInvoiceType+':'+entry.row.saleInvoiceNo)).size,
+      sellers:new Set(coveredRows.map(entry => clean(entry.row.sellerAccountNumber,100)).filter(Boolean)).size,
+      productCategories:new Set(coveredRows.map(entry => clean(entry.row.officialProductCategoryName,300)).filter(Boolean)).size
     },
     quantity:{requiredExact:accountingDecimal.format(totalRequiredQuantity,accountingDecimal.QUANTITY_SCALE),capacityExact:accountingDecimal.format(capacity,accountingDecimal.QUANTITY_SCALE),coveredExact:accountingDecimal.format(coveredQuantity,accountingDecimal.QUANTITY_SCALE),remainingUnknownExact:accountingDecimal.format(remainingUnknown,accountingDecimal.QUANTITY_SCALE)},
     saleValueExposureExact:accountingDecimal.format(saleValueExposure,accountingDecimal.MONEY_SCALE),
@@ -349,7 +419,17 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     projectedNewKnownCostExact:accountingDecimal.format(oldKnownCost+projectedResolvedCost,accountingDecimal.MONEY_SCALE),
     fifoProfitDeltaExact:null,
     fifoProfitDeltaReason:'baseline-profit-is-unknown-for-unresolved-quantity',
-    activationRequired:true,
+    evidenceType:resolution.evidenceClass||resolution.sourceType,
+    evidence:{
+      itemGuid:clean(resolution.itemGuid,100),itemCode:clean(resolution.itemCode,100),
+      manualCostExact,targetQuantityExact:clean(resolution.targetQuantityExact,100),
+      effectiveFrom:clean(resolution.effectiveFrom,8),effectiveTo:clean(resolution.effectiveTo,8),
+      commercialReference:clean(resolution.commercialReference,500),reason:clean(resolution.reason,1000)
+    },
+    evidenceRevision:Number(resolution.revision||0),
+    previewFingerprint,
+    affectedLines,
+   activationRequired:true,
     historicalDatasetMutated:false,
     readOnly:true
   };
@@ -371,6 +451,7 @@ async function ensureNoDuplicate(db, candidate, excludedResolutionId = '') {
 async function createDraft(db, input, requestedBy) {
   assertRole(requestedBy?.role, EDIT_ROLES);
   const normalized = validateDraft(input);
+  await assertStableItemIdentity(db,normalized);
   await validatePurchaseLayerScope(db,normalized);
   await validateSupersession(db,normalized);
   await ensureNoDuplicate(db, normalized);
@@ -413,7 +494,8 @@ async function updateDraft(db, resolutionId, input, requestedBy) {
   if (!Number.isSafeInteger(expectedRevision) || expectedRevision !== Number(current.revision || 1)) {
     fail('MANUAL_COST_CONCURRENT_CHANGE', 'نسخه Resolution تغییر کرده است؛ دوباره بارگذاری کنید.', 409);
   }
-  const normalized = validateDraft({ ...current, ...input });
+  const normalized = validateDraft({ ...current, ...input },{allowLegacy:Number(current.schemaVersion||0)<SCHEMA_VERSION});
+  await assertStableItemIdentity(db,{...normalized,schemaVersion:Number(current.schemaVersion||0)});
   await validatePurchaseLayerScope(db,normalized);
   await validateSupersession(db,normalized,current.resolutionId);
   await ensureNoDuplicate(db, normalized, current.resolutionId);
@@ -454,8 +536,17 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
     fail('MANUAL_COST_SELF_APPROVAL', 'ایجادکننده نمی‌تواند Resolution خود را تأیید کند.', 403);
   }
   if(['submit','approve'].includes(action)){
+    await assertStableItemIdentity(db,current);
     await validateSupersession(db,current,current.resolutionId);
     await ensureNoDuplicate(db,current,current.resolutionId);
+    await assertNoOpeningCollision(db,current);
+  }
+  let approvalPreview=null;
+  if(action==='approve'){
+    approvalPreview=await impactPreview(db,current.resolutionId,requestedBy);
+    const expectedPreview=clean(options.previewFingerprint,64);
+    if(!expectedPreview)fail('MANUAL_COST_IMPACT_PREVIEW_REQUIRED','پیش‌نمایش اثر معتبر قبل از Approval الزامی است.',409);
+    if(expectedPreview!==approvalPreview.previewFingerprint)fail('MANUAL_COST_IMPACT_PREVIEW_STALE','پیش‌نمایش اثر با Revision یا lineage فعلی تطابق ندارد؛ دوباره بررسی کنید.',409);
   }
   const now = new Date();
   const patch = {
@@ -470,7 +561,7 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
       newValue:{ status:rule.to }
     })].slice(-200)
   };
-  if (action === 'approve') Object.assign(patch, { approvedBy:actor(requestedBy), approvedAt:now });
+  if (action === 'approve') Object.assign(patch, { approvedBy:actor(requestedBy), approvedAt:now, approvedImpactPreview:{fingerprint:approvalPreview.previewFingerprint,fifoDatasetId:approvalPreview.datasetId,resolutionContentHash:approvalPreview.resolutionContentHash,affected:approvalPreview.affected,quantity:approvalPreview.quantity,recordedAt:now} });
   if (action === 'reject') Object.assign(patch, { rejectedBy:actor(requestedBy), rejectedAt:now, rejectionReason:clean(reason, 1000) });
   if (action === 'expire') Object.assign(patch, { expiredBy:actor(requestedBy), expiredAt:now, expirationReason:clean(reason, 1000) });
   const result = await db.collection(COLLECTION).updateOne(
@@ -478,6 +569,7 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
     { $set:patch }
   );
   if (!result.matchedCount) fail('MANUAL_COST_CONCURRENT_CHANGE', 'وضعیت Resolution هم‌زمان تغییر کرده است؛ دوباره بارگذاری کنید.', 409);
+  if(action==='approve')await db.collection('fifoSourceInvalidations').insertOne({invalidationId:'FST-'+Date.now()+'-'+crypto.randomBytes(4).toString('hex'),reason:'approved-manual-cost-set-changed',resolutionId:current.resolutionId,manualCostContentHash:current.contentHash,previewFingerprint:approvalPreview.previewFingerprint,createdBy:actor(requestedBy),createdAt:now,immutable:true});
   invalidateReadinessCache(db);
   return { ok:true, resolution:await getById(db, resolutionId) };
 }
@@ -495,6 +587,23 @@ async function list(db, filters = {}) {
   const page = Math.max(1, Number(filters.page || 1));
   const pageSize = Math.max(1, Math.min(Number(filters.pageSize || 50), 200));
   return { ok:true, total, page, pageSize, list:rows.slice((page - 1) * pageSize, page * pageSize) };
+}
+async function legacyItemScopeAudit(db, requestedBy = {}) {
+  assertRole(requestedBy?.role,['admin','accounting','manager']);
+  const [rows,state]=await Promise.all([
+    db.collection(COLLECTION).find({status:'approved',deleted:{$ne:true}}).toArray(),
+    db.collection('fifoDatasetState').findOne({scopeKey:'fifo-shadow-v2-precision-evidence'})
+  ]);
+  const legacy=rows.filter(row=>(!row.resolutionScope||row.resolutionScope==='item')&&Number(row.schemaVersion||0)<SCHEMA_VERSION);
+  const superseded=new Set(rows.map(row=>clean(row.supersedesResolutionId,100)).filter(Boolean));
+  const allocations=state?.activeDatasetId?await db.collection('fifoAllocations').find({datasetId:state.activeDatasetId,manualResolutionId:{$in:legacy.map(row=>row.resolutionId)}}).toArray():[];
+  const list=legacy.map(row=>{
+    const used=allocations.filter(allocation=>allocation.manualResolutionId===row.resolutionId);
+    const bounded=Boolean(clean(row.targetQuantityExact||row.affectedQuantityExact,100)&&clean(row.effectiveFrom,8)&&clean(row.effectiveTo,8));
+    const classification=superseded.has(row.resolutionId)?'SUPERSEDED':used.length===0?'UNUSED':bounded?'SAFE_BOUNDED_BY_EXISTING_EVIDENCE':'REQUIRES_MANAGEMENT_REVIEW';
+    return {resolutionId:row.resolutionId,itemGuid:clean(row.itemGuid,100),itemCode:clean(row.itemCode,100),classification,legacyClass:LEGACY_UNBOUNDED_CLASS,activeFifoDatasetId:clean(state?.activeDatasetId,100),activeAllocationCount:used.length,activeQuantityExact:accountingDecimal.format(used.reduce((sum,item)=>sum+accountingDecimal.parse(item.quantityExact??item.allocatedQty??0,accountingDecimal.QUANTITY_SCALE),0n),accountingDecimal.QUANTITY_SCALE),effectiveFrom:clean(row.effectiveFrom,8),effectiveTo:clean(row.effectiveTo,8),targetQuantityExact:clean(row.targetQuantityExact,100),futureFifoEligible:row.legacyConsumptionReview?.status==='approved-for-fifo'};
+  });
+  return {ok:true,readOnly:true,total:list.length,requiresManagementReview:list.filter(row=>row.classification==='REQUIRES_MANAGEMENT_REVIEW').length,list};
 }
 function validAt(row, saleDate) {
   return row.status === 'approved' &&
@@ -524,6 +633,7 @@ function matchesOfficial(row, sale) {
 function matchesManual(row, sale) {
   const saleGuid = key(sale.itemGuid);
   const rowGuid = key(row.itemGuid);
+  if(Number(row.schemaVersion||0)>=SCHEMA_VERSION||row.evidenceClass==='COMMERCIAL_ANNOUNCED_COST')return Boolean(saleGuid&&rowGuid&&saleGuid===rowGuid);
   if (saleGuid) return (rowGuid && rowGuid === saleGuid) || (!rowGuid && key(row.itemCode) === key(sale.itemCode));
   return key(row.itemCode) === key(sale.itemCode);
 }
@@ -778,17 +888,7 @@ async function assistedDecision(db,input={},requestedBy={}) {
   const finalCostExact=exactUnitCost(finalInput);if(!finalCostExact)fail('MANUAL_COST_INVALID_AMOUNT','هزینه نهایی معتبر نیست.');
   const reason=clean(input.reason,1000);
   if((decision==='APPROVE_OVERRIDE'||!suggestion.available)&&!reason)fail('MANUAL_COST_DECISION_REASON_REQUIRED','برای مبلغ متفاوت یا ورود دستی، دلیل الزامی است.');
-  const boundedSource=['OPENING_ACCOUNTING_COST','HISTORICAL_PURCHASE_AVERAGE'].includes(suggestion.sourceClass);
-  const openingSource=suggestion.sourceClass==='OPENING_ACCOUNTING_COST';
-  const normalized=validateDraft({itemGuid:suggestion.target.itemGuid,itemCode:suggestion.target.itemCode,manualCostExact:finalCostExact,effectiveFrom:input.effectiveFrom,effectiveTo:input.effectiveTo||'',currency:'IRR',sourceType:openingSource?'opening_accounting_cost':(suggestion.available?'historical_purchase':'manual'),resolutionScope:openingSource?'opening_quantity':(suggestion.sourceClass==='HISTORICAL_PURCHASE_AVERAGE'?'evidence_quantity':(input.resolutionScope||'item')),purchaseDatasetId:input.purchaseDatasetId,purchaseLineIdentity:input.purchaseLineIdentity,targetQuantityExact:boundedSource?suggestion.eligibleTargetQuantityExact:input.targetQuantityExact,reason,notes:input.notes||''});
-  await validatePurchaseLayerScope(db,normalized);await ensureNoDuplicate(db,normalized);
-  const now=new Date(),suggested=suggestion.suggestedCostExact?accountingDecimal.parse(suggestion.suggestedCostExact,accountingDecimal.UNIT_COST_SCALE):null,final=accountingDecimal.parse(finalCostExact,accountingDecimal.UNIT_COST_SCALE),delta=suggested==null?null:final-suggested;
-  const decisionContentHash=crypto.createHash('sha256').update(stable({normalized,suggestionFingerprint:suggestion.sourceFingerprint,suggestedCostExact:suggestion.suggestedCostExact,finalCostExact,decisionType:decision})).digest('hex');
-  const doc={resolutionId:newResolutionId(),schemaVersion:SCHEMA_VERSION,...normalized,contentHash:decisionContentHash,workflowType:ASSISTED_WORKFLOW,assistedStatus:'APPROVED',status:'approved',revision:1,sourceClass:suggestion.sourceClass,suggestedCostExact:suggestion.suggestedCostExact,finalCostExact,deltaAmountExact:delta==null?null:accountingDecimal.format(delta,accountingDecimal.UNIT_COST_SCALE),deltaPercent:suggested&&suggested!==0n?Number((Number(delta)*100/Number(suggested)).toFixed(6)):null,decisionType:suggestion.available?(decision==='APPROVE_SUGGESTED'?'accepted-suggestion':'overridden'):'manual-entry',suggestionEvidence:suggestion,saleValueExposure:Number(input.saleValueExposure||0),affectedLineCount:Number(input.affectedLineCount||0),affectedQuantityExact:clean(input.affectedQuantityExact,100),createdBy:actor(requestedBy),approvedBy:actor(requestedBy),approvedAt:now,deleted:false,auditLog:[auditEntry('assisted-needs-review',requestedBy,{fromStatus:null,toStatus:'NEEDS_REVIEW'}),auditEntry('assisted-accounting-review',requestedBy,{fromStatus:'NEEDS_REVIEW',toStatus:'ACCOUNTING_REVIEW'}),auditEntry('assisted-approved',requestedBy,{reason,fromStatus:'ACCOUNTING_REVIEW',toStatus:'APPROVED',oldValue:{suggestedCostExact:suggestion.suggestedCostExact},newValue:{finalCostExact}})],createdAt:now,updatedAt:now};
-  await db.collection(COLLECTION).insertOne(doc);
-  invalidateReadinessCache(db);
-  await db.collection('fifoSourceInvalidations').insertOne({invalidationId:`FST-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,reason:'approved-manual-cost-set-changed',resolutionId:doc.resolutionId,manualCostContentHash:doc.contentHash,createdBy:actor(requestedBy),createdAt:now,immutable:true});
-  return {ok:true,resolution:doc,fifoStale:true,adminApprovalRequired:false};
+  fail('MANUAL_COST_ASSISTED_APPROVAL_RETIRED','تصمیم جدید هزینه باید به‌صورت Draft قیمت اعلام بازرگانی، Impact Preview و Approval مستقل ثبت شود.',409);
 }
 function assessSaleRow(row, context) {
   const officialRows = indexedRows(context, 'official', row, true).filter(layer => matchesOfficial(layer, row));
@@ -1115,6 +1215,9 @@ module.exports = {
   SOURCE_TYPES,
   STATUSES,
   RESOLUTION_SCOPES,
+  COMMERCIAL_SOURCE,
+  COMMERCIAL_SCOPE,
+  LEGACY_UNBOUNDED_CLASS,
   EDIT_ROLES,
   APPROVE_ROLES,
   ensureIndexes,
@@ -1122,6 +1225,7 @@ module.exports = {
   updateDraft,
   transition,
   list,
+  legacyItemScopeAudit,
   getById,
   missingQueue,
   cleanCaseCandidates,
@@ -1141,6 +1245,8 @@ module.exports = {
   _overlaps:overlaps,
   _effectiveRowsAt:effectiveRowsAt,
   _validateSupersession:validateSupersession,
+  _approvedOpeningCollision:approvedOpeningCollision,
+  _assertStableItemIdentity:assertStableItemIdentity,
   _contentHash:contentHash,
   _exactUnitCost:exactUnitCost,
   _approvedRowsFingerprint:approvedRowsFingerprint,

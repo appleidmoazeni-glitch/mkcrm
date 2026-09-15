@@ -5420,6 +5420,7 @@ async function pageSellerProfit(){
   let selectedResolutionRevision=0;
   let suggestionRequest=0;
   let reviewLineageMeta={openingDatasetId:'',openingApprovalStatus:''};
+  const manualCostPreviewFingerprints=new Map();
   async function json(url,options={}){
     const response=await fetch(url,{credentials:'include',headers:{'Content-Type':'application/json'},...options});
     const payload=await response.json().catch(()=>({ok:false,error:'پاسخ JSON معتبر نیست'}));
@@ -5472,6 +5473,11 @@ async function pageSellerProfit(){
       unknown_cost:'هزینه نامشخص'
     })[reason]||reason||'—';
   }
+  function manualEvidenceLabel(row){
+    if(row.evidenceClass==='COMMERCIAL_ANNOUNCED_COST'||row.sourceType==='commercial_announced_cost')return 'قیمت اعلام بازرگانی';
+    if((row.resolutionScope||'item')==='item')return 'هزینه دستی قدیمی — نیازمند بازبینی';
+    return 'شواهد هزینه تاریخی';
+  }
   async function loadQueue(){
     const box=q('#mcQueue'); if(!box)return;
     box.innerHTML='<div class="info">در حال ساخت صف از Snapshot فعال...</div>';
@@ -5505,7 +5511,7 @@ async function pageSellerProfit(){
           const labels={EXACT_OFFICIAL_PURCHASE_LAYER:'فاکتور خرید رسمی',OPENING_ACCOUNTING_COST:'قیمت میانگین موجودی ابتدای دوره',HISTORICAL_PURCHASE_AVERAGE:'میانگین موزون خریدهای معتبر',SOURCE_HISTORY_INCOMPLETE:'تاریخچه خرید هنوز کامل و بازبینی نشده',PENDING_PURCHASE_PRICE:'قیمت خرید موقت — قرنطینه',PURCHASE_RETURN_CONFLICT:'برگشت خرید حل‌نشده',NO_VALID_COST_BASIS:'بدون مأخذ پیشنهادی',CONFLICT_REQUIRES_REVIEW:'تعارض مأخذ — نیازمند بررسی'};
           const canDecide=['admin','accounting','purchase'].includes(userRole());
           const approvedOpening=suggestion.sourceClass==='OPENING_ACCOUNTING_COST'&&Boolean(suggestion.openingEvidenceDatasetId)&&suggestion.approvalStatus==='approved';
-          const canFinalize=canDecide&&suggestion.reviewOnly!==true&&suggestion.financialAuthority!==false&&!approvedOpening&&!['EXACT_OFFICIAL_PURCHASE_LAYER','SOURCE_HISTORY_INCOMPLETE','PENDING_PURCHASE_PRICE','PURCHASE_RETURN_CONFLICT','CONFLICT_REQUIRES_REVIEW'].includes(suggestion.sourceClass);
+          const canFinalize=false&&canDecide&&suggestion.reviewOnly!==true&&suggestion.financialAuthority!==false&&!approvedOpening&&!['EXACT_OFFICIAL_PURCHASE_LAYER','SOURCE_HISTORY_INCOMPLETE','PENDING_PURCHASE_PRICE','PURCHASE_RETURN_CONFLICT','CONFLICT_REQUIRES_REVIEW'].includes(suggestion.sourceClass);
           const roundedSuggested=suggestion.suggestedCostExact?Math.round(Number(suggestion.suggestedCostExact)):null;
           const openingWarehouses=(suggestion.warehouseEvidence||[]).map(value=>`<tr><td>${safe(value.warehouseNumber)}</td><td>${safe(value.openingQuantityExact)}</td><td>${safe(value.openingTotalValueExact)}</td><td>${safe(value.openingUnitCostExact)}</td><td>${safe(value.evidenceQuality)}</td></tr>`).join('');
           const lineage=suggestion.reviewLineage||{};
@@ -5533,7 +5539,7 @@ async function pageSellerProfit(){
       box.innerHTML=`<table class="table"><thead><tr><th>Resolution</th><th>کالا</th><th>هزینه</th><th>بازه</th><th>منبع</th><th>وضعیت</th><th>ایجادکننده / تأییدکننده</th><th>Audit</th><th></th></tr></thead><tbody>${(report.list||[]).map(row=>`<tr>
         <td><small>${safe(row.resolutionId)}</small></td><td>${safe(row.itemCode)}<br><small>${safe(row.itemGuid)}</small></td>
         <td>${safe(row.manualCostExact||row.manualCost)} ${safe(row.currency)}</td><td>${safe(row.effectiveFrom)} تا ${safe(row.effectiveTo||'باز')}</td>
-        <td>${safe(row.sourceType)}<br><small>${safe(row.resolutionScope||'item')} ${safe(row.purchaseLineIdentity||'')}</small>${row.supersedesResolutionId?`<br><small>جایگزین: ${safe(row.supersedesResolutionId)}</small>`:''}</td><td>${safe(row.status)}</td>
+        <td><b>${safe(manualEvidenceLabel(row))}</b>${row.supersedesResolutionId?`<br><small>جایگزین: ${safe(row.supersedesResolutionId)}</small>`:''}<details><summary>جزئیات فنی</summary><small>${safe(row.sourceType)} / ${safe(row.resolutionScope||'item')} ${safe(row.purchaseLineIdentity||'')}</small></details></td><td>${safe(row.status)}</td>
         <td>${safe(row.createdBy?.username||'')}<br><small>${safe(row.approvedBy?.username||'')}</small></td>
         <td><details><summary>${number((row.auditLog||[]).length)} رویداد</summary>${(row.auditLog||[]).map(event=>`<div class="small">${safe(event.action)} | ${safe(event.by?.username)} | ${safe(event.at)}</div>`).join('')}</details></td>
         <td>${actionButtons(row)} <button class="mini mc-preview" data-id="${safe(row.resolutionId)}">Impact Preview</button></td></tr>`).join('')||'<tr><td colspan="9">Resolution ثبت نشده است.</td></tr>'}</tbody></table>`;
@@ -5545,6 +5551,7 @@ async function pageSellerProfit(){
         q('#mcScope').value=row.resolutionScope||'item';q('#mcPurchaseDataset').value=row.purchaseDatasetId||'';q('#mcPurchaseLine').value=row.purchaseLineIdentity||'';q('#mcTargetQuantity').value=row.targetQuantityExact||'';
         q('#mcFrom').value=row.effectiveFrom||'';q('#mcTo').value=row.effectiveTo||'';q('#mcSource').value=row.sourceType||'manual';
         q('#mcReason').value=row.reason||'';q('#mcNotes').value=row.notes||'';q('#mcAttachment').value=row.attachment?.reference||'';q('#mcSupersedes').value=row.supersedesResolutionId||'';
+        if(q('#mcCommercialReference'))q('#mcCommercialReference').value=row.commercialReference||'';
         q('#mcItemCode').focus();
       });
       document.querySelectorAll('.mc-action').forEach(button=>button.onclick=async()=>{
@@ -5552,11 +5559,17 @@ async function pageSellerProfit(){
         if(['reject','expire'].includes(button.dataset.action))reason=prompt('علت این تصمیم را ثبت کنید:')||'';
         if(['reject','expire'].includes(button.dataset.action)&&!reason)return;
         try{
-          await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`,{method:'POST',body:JSON.stringify({reason,revision:Number(button.dataset.revision||0)})});
+          let previewFingerprint='';
+          if(button.dataset.action==='approve'){
+            const preview=await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/impact-preview`);
+            previewFingerprint=preview.previewFingerprint||'';manualCostPreviewFingerprints.set(button.dataset.id,previewFingerprint);
+            if(!confirm(`قیمت اعلام بازرگانی: ${preview.evidenceType||'—'}\nردیف‌های فروش تحت اثر: ${preview.affected?.saleLines||0}\nمقدار قابل پوشش: ${preview.quantity?.coveredExact||0}\nActive FIFO تغییر نمی‌کند. Approval را ثبت می‌کنید؟`))return;
+          }
+          await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/${button.dataset.action}`,{method:'POST',body:JSON.stringify({reason,revision:Number(button.dataset.revision||0),previewFingerprint})});
           await refreshAll();
         }catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}
       });
-      document.querySelectorAll('.mc-preview').forEach(button=>button.onclick=async()=>{try{const report=await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/impact-preview`);q('#mcFormMsg').innerHTML=`<div class="info"><b>اثر تصمیم</b><div class="row four"><div>فاکتورهای تحت تأثیر: <b>${number(report.affected?.invoices)}</b></div><div>ردیف‌های فروش: <b>${number(report.affected?.saleLines)}</b></div><div>فروشندگان: <b>${number(report.affected?.sellers)}</b></div><div>کل مقدار نیازمند هزینه: <b>${safe(report.quantity?.requiredExact)}</b></div><div>مقدار قابل پوشش: <b>${safe(report.quantity?.coveredExact)}</b></div><div>مقدار باقی‌مانده Unknown: <b>${safe(report.quantity?.remainingUnknownExact)}</b></div><div>Sale Value Exposure: <b>${safe(report.saleValueExposureExact)} ریال</b></div><div>Projected resolved cost: <b>${safe(report.projectedResolvedCostExact)} ریال</b></div></div><div class="warn">FIFO فعال بدون تغییر می‌ماند؛ اعمال این Evidence نیازمند FIFO Candidate جدید است.</div><details><summary>جزئیات فنی</summary><pre>${safe(JSON.stringify(report,null,2))}</pre></details></div>`;}catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}});
+      document.querySelectorAll('.mc-preview').forEach(button=>button.onclick=async()=>{try{const report=await json(`/api/manual-cost-resolutions/${encodeURIComponent(button.dataset.id)}/impact-preview`);const evidence=report.evidence||{};const affectedRows=(report.affectedLines||[]).map(row=>`<tr><td>${safe(row.saleInvoiceNo)}</td><td><small>${safe(row.saleLineId)}</small></td><td>${safe(row.saleDate)}</td><td>${safe(row.sellerName||row.sellerAccountNumber)}</td><td>${safe(row.storeName)}</td><td>${safe(row.potentiallyCoveredQuantityExact)}</td><td>${safe(row.currentProvenance)}</td><td>${safe(row.currentFifoCostExact)} ریال</td><td>${safe(row.proposedCostExact)} ریال</td><td>${safe(row.expectedNextFifoProvenance)}</td></tr>`).join('');q('#mcFormMsg').innerHTML=`<div class="info"><b>پیش‌نمایش اثر — ${safe(report.evidenceType)}</b><div class="row four"><div>کالا: <b>${safe(evidence.itemCode)}</b><br><small>${safe(evidence.itemGuid)}</small></div><div>قیمت: <b>${safe(evidence.manualCostExact)} ریال</b></div><div>مقدار مصوب: <b>${safe(evidence.targetQuantityExact)}</b></div><div>بازه اثر: <b>${safe(evidence.effectiveFrom)} تا ${safe(evidence.effectiveTo)}</b></div><div>فاکتورهای تحت تأثیر: <b>${number(report.affected?.invoices)}</b></div><div>ردیف‌های فروش: <b>${number(report.affected?.saleLines)}</b></div><div>فروشندگان: <b>${number(report.affected?.sellers)}</b></div><div>کل مقدار نیازمند هزینه: <b>${safe(report.quantity?.requiredExact)}</b></div><div>مقدار قابل پوشش: <b>${safe(report.quantity?.coveredExact)}</b></div><div>مقدار باقی‌مانده Unknown: <b>${safe(report.quantity?.remainingUnknownExact)}</b></div><div>Sale Value Exposure: <b>${safe(report.saleValueExposureExact)} ریال</b></div><div>Projected resolved cost: <b>${safe(report.projectedResolvedCostExact)} ریال</b></div></div><div class="table-wrap"><table class="table"><thead><tr><th>فاکتور</th><th>Sale Line</th><th>تاریخ</th><th>فروشنده</th><th>فروشگاه</th><th>مقدار قابل پوشش</th><th>وضعیت فعلی</th><th>هزینه فعلی FIFO</th><th>هزینه پیشنهادی</th><th>وضعیت پس از Build</th></tr></thead><tbody>${affectedRows||'<tr><td colspan="10">هیچ ردیف فروش واجد شرایطی وجود ندارد.</td></tr>'}</tbody></table></div><div class="warn">FIFO فعال بدون تغییر می‌ماند؛ اعمال این Evidence نیازمند FIFO Candidate جدید است.</div><details><summary>جزئیات فنی</summary><pre>${safe(JSON.stringify(report,null,2))}</pre></details></div>`;}catch(error){q('#mcFormMsg').innerHTML=`<div class="error">${safe(error.message)}</div>`;}});
     }catch(error){box.innerHTML=`<div class="error">${safe(error.message)}</div>`;}
   }
   async function loadHealth(){
@@ -5620,8 +5633,10 @@ async function pageSellerProfit(){
         <div id="mcQueue"></div><div id="mcAssistedDetail" class="mt"></div></div></div>
       <div class="card"><div class="card-header"><h5 id="mcResolutionId">Resolution جدید</h5></div><div class="card-body">
         <div class="warn">Manual Cost هرگز لایه رسمی نیست؛ فقط در نبود لایه رسمی معتبر و پس از Approval برای FIFO آینده eligible خواهد بود.</div>
-        <div class="row four"><div class="form-group"><label>ItemCode</label><input id="mcItemCode"></div><div class="form-group"><label>ItemGuid</label><input id="mcItemGuid"></div><div class="form-group"><label>هزینه دستی دقیق (ریال)</label><input id="mcCost" inputmode="decimal"></div><div class="form-group"><label>Scope</label><select id="mcScope"><option value="item">Item (Legacy fallback)</option><option value="purchase_layer">Purchase Layer (ترجیحی)</option></select></div></div><div class="row four"><div class="form-group"><label>Purchase Dataset ID</label><input id="mcPurchaseDataset"></div><div class="form-group"><label>Purchase Line Identity</label><input id="mcPurchaseLine"></div><div class="form-group"><label>Target Quantity</label><input id="mcTargetQuantity" inputmode="decimal"></div><div class="form-group"><label>نوع منبع</label><select id="mcSource"><option value="manual">manual</option><option value="opening_inventory">opening_inventory</option><option value="historical_purchase">historical_purchase</option><option value="accounting_adjustment">accounting_adjustment</option><option value="legacy_cost">legacy_cost</option></select></div></div>
-        <div class="row four"><div class="form-group"><label>شروع اثر</label><input id="mcFrom" placeholder="14050101"></div><div class="form-group"><label>پایان اثر (اختیاری)</label><input id="mcTo"></div><div class="form-group"><label>مرجع پیوست</label><input id="mcAttachment" placeholder="شماره سند یا URL داخلی"></div><div class="form-group"><label>علت</label><input id="mcReason"></div></div>
+        <div class="row four"><div class="form-group"><label>ItemCode</label><input id="mcItemCode"></div><div class="form-group"><label>ItemGuid پایدار</label><input id="mcItemGuid"></div><div class="form-group"><label>قیمت اعلام بازرگانی (ریال)</label><input id="mcCost" inputmode="decimal"></div><div class="form-group"><label>مقدار هدف</label><input id="mcTargetQuantity" inputmode="decimal"></div></div>
+        <input id="mcScope" type="hidden" value="commercial_announced_quantity"><input id="mcSource" type="hidden" value="commercial_announced_cost"><input id="mcPurchaseDataset" type="hidden"><input id="mcPurchaseLine" type="hidden">
+        <div class="row four"><div class="form-group"><label>شروع اثر</label><input id="mcFrom" placeholder="14050101"></div><div class="form-group"><label>پایان اثر (الزامی)</label><input id="mcTo" placeholder="14050131"></div><div class="form-group"><label>مرجع اعلام بازرگانی</label><input id="mcCommercialReference" placeholder="شماره نامه/تیکت/اعلام"></div><div class="form-group"><label>علت (الزامی)</label><input id="mcReason"></div></div>
+        <div class="form-group"><label>مرجع پیوست</label><input id="mcAttachment" placeholder="شماره سند یا URL داخلی"></div>
         <div class="form-group"><label>Supersedes Resolution ID (فقط اصلاح governed؛ تاریخ شروع و پایان الزامی)</label><input id="mcSupersedes" placeholder="MCOST-..."></div>
         <div class="form-group"><label>یادداشت</label><textarea id="mcNotes"></textarea></div><div class="actions"><button class="btn green" id="mcSave">ذخیره Draft</button><button class="btn" id="mcClear">فرم جدید</button></div><div id="mcFormMsg"></div>
       </div></div>
@@ -5632,9 +5647,9 @@ async function pageSellerProfit(){
     if(['manager','purchase'].includes(userRole())&&q('#mcSave'))q('#mcSave').closest('.card').style.display='none';
     q('#mcApply').onclick=()=>{queuePage=1;loadQueue();};
     q('#mcExport').onclick=()=>{location.href='/api/accounting/missing-purchase-costs/export?'+queryString({page:'',pageSize:''});};
-    q('#mcClear').onclick=()=>{selectedResolutionId='';selectedResolutionRevision=0;q('#mcResolutionId').textContent='Resolution جدید';['#mcItemCode','#mcItemGuid','#mcCost','#mcPurchaseDataset','#mcPurchaseLine','#mcTargetQuantity','#mcFrom','#mcTo','#mcAttachment','#mcReason','#mcNotes','#mcSupersedes'].forEach(id=>{q(id).value='';});q('#mcScope').value='item';};
+    q('#mcClear').onclick=()=>{selectedResolutionId='';selectedResolutionRevision=0;q('#mcResolutionId').textContent='Resolution جدید';['#mcItemCode','#mcItemGuid','#mcCost','#mcPurchaseDataset','#mcPurchaseLine','#mcTargetQuantity','#mcFrom','#mcTo','#mcCommercialReference','#mcAttachment','#mcReason','#mcNotes','#mcSupersedes'].forEach(id=>{q(id).value='';});q('#mcScope').value='commercial_announced_quantity';q('#mcSource').value='commercial_announced_cost';};
     q('#mcSave').onclick=async()=>{
-      const body={revision:selectedResolutionRevision,itemCode:q('#mcItemCode').value,itemGuid:q('#mcItemGuid').value,manualCost:q('#mcCost').value,resolutionScope:q('#mcScope').value,purchaseDatasetId:q('#mcPurchaseDataset').value,purchaseLineIdentity:q('#mcPurchaseLine').value,targetQuantityExact:q('#mcTargetQuantity').value,effectiveFrom:q('#mcFrom').value,effectiveTo:q('#mcTo').value,sourceType:q('#mcSource').value,currency:'IRR',reason:q('#mcReason').value,notes:q('#mcNotes').value,supersedesResolutionId:q('#mcSupersedes').value,attachment:q('#mcAttachment').value?{reference:q('#mcAttachment').value}:null};
+      const body={revision:selectedResolutionRevision,itemCode:q('#mcItemCode').value,itemGuid:q('#mcItemGuid').value,manualCost:q('#mcCost').value,resolutionScope:'commercial_announced_quantity',targetQuantityExact:q('#mcTargetQuantity').value,effectiveFrom:q('#mcFrom').value,effectiveTo:q('#mcTo').value,sourceType:'commercial_announced_cost',commercialReference:q('#mcCommercialReference').value,currency:'IRR',reason:q('#mcReason').value,notes:q('#mcNotes').value,supersedesResolutionId:q('#mcSupersedes').value,attachment:q('#mcAttachment').value?{reference:q('#mcAttachment').value}:null};
       try{
         const response=await json(selectedResolutionId?`/api/manual-cost-resolutions/${encodeURIComponent(selectedResolutionId)}`:'/api/manual-cost-resolutions',{method:selectedResolutionId?'PUT':'POST',body:JSON.stringify(body)});
         selectedResolutionId=response.resolution.resolutionId;selectedResolutionRevision=Number(response.resolution.revision||1);q('#mcResolutionId').textContent=`ویرایش ${selectedResolutionId}`;
