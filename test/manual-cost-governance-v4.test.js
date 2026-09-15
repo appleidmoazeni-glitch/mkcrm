@@ -57,6 +57,27 @@ test('impact preview is line-bounded, immutable, and approval is bound to its fi
   assert.deepEqual(store.collection('fifoAllocations').rows,before);
 });
 
+test('approved impact preview matches the next FIFO candidate allocation effect',async()=>{
+  const store=db();
+  const submitted=await pending(store);
+  const preview=await manual.impactPreview(store,submitted.resolution.resolutionId,manager);
+  const approved=await manual.transition(store,submitted.resolution.resolutionId,'approve',manager,{revision:submitted.resolution.revision,previewFingerprint:preview.previewFingerprint});
+  const source=fifoSource([approved.resolution]);
+  source.saleLines=source.saleLines.slice(0,1);
+  source.saleLines[0].qty=3;
+  source.saleLines[0].saleValue=3000;
+  const allocations=fifo._allocateSources('FIFO-N',source).allocations;
+  const commercial=allocations.find(row=>row.costSourceType==='COMMERCIAL_ANNOUNCED_COST');
+  const unresolved=allocations.find(row=>row.sourceType==='unknown_cost');
+  assert.equal(commercial.saleLineId,preview.affectedLines[0].saleLineId);
+  assert.equal(commercial.quantityExact,preview.affectedLines[0].potentiallyCoveredQuantityExact);
+  assert.equal(commercial.allocatedCostAmountExact,preview.projectedResolvedCostExact);
+  assert.equal(commercial.manualResolutionId,approved.resolution.resolutionId);
+  assert.equal(commercial.manualRevision,approved.resolution.revision);
+  assert.equal(commercial.manualContentHash,approved.resolution.contentHash);
+  assert.equal(unresolved.quantityExact,'1.000000');
+});
+
 test('preview becomes stale when active FIFO lineage changes',async()=>{
   const store=db(),submitted=await pending(store),preview=await manual.impactPreview(store,submitted.resolution.resolutionId,manager);
   store.collection('fifoDatasetState').rows[0].activeDatasetId='FIFO-B';
