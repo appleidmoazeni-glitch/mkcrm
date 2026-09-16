@@ -39,7 +39,10 @@ function fixture({fullyCovered=false}={}){
     manualCostResolutions:[],fifoSourceInvalidations:[],
     fifoDatasetState:[{scopeKey:'fifo-shadow-v2-precision-evidence',activeDatasetId:'FIFO-A'}],
     fifoDatasets:[{datasetId:'FIFO-A',status:'completed',activationStatus:'active',calculationCutoff:'14050531',activatedAt:new Date('2026-09-15T10:00:00Z')}],
-    fifoAllocations:[{datasetId:'FIFO-A',allocationId:'U-11',saleLineId:'SL-11',saleInvoiceType:2,saleInvoiceNo:11,saleRow:1,saleDate:'14050111',sourceType:'unknown_cost',itemGuid:'GUID-X',itemCode:'X',quantityExact:'1.000000',allocatedSaleValueExact:'1000.00',allocatedCostAmountExact:null}]
+    fifoAllocations:[
+      {datasetId:'FIFO-A',allocationId:'O-10',saleLineId:'SL-10',saleInvoiceType:2,saleInvoiceNo:10,saleRow:1,saleDate:'14050110',sourceType:'approved_opening_accounting_cost',costSourceType:'APPROVED_OPENING_ACCOUNTING_COST',itemGuid:'',itemCode:'X',quantityExact:'15.000000',allocatedSaleValueExact:'15000.00',allocatedCostAmountExact:'948058907.55'},
+      ...(fullyCovered?[{datasetId:'FIFO-A',allocationId:'O-11',saleLineId:'SL-11',saleInvoiceType:2,saleInvoiceNo:11,saleRow:1,saleDate:'14050111',sourceType:'approved_opening_accounting_cost',costSourceType:'APPROVED_OPENING_ACCOUNTING_COST',itemGuid:'',itemCode:'X',quantityExact:'1.000000',allocatedSaleValueExact:'1000.00',allocatedCostAmountExact:'63203927.17'}]:[{datasetId:'FIFO-A',allocationId:'U-11',saleLineId:'SL-11',saleInvoiceType:2,saleInvoiceNo:11,saleRow:1,saleDate:'14050111',sourceType:'unknown_cost',itemGuid:'',itemCode:'X',quantityExact:'1.000000',allocatedSaleValueExact:'1000.00',allocatedCostAmountExact:null}])
+    ]
   });
 }
 
@@ -85,6 +88,8 @@ for(const role of ['admin','accounting','purchase'])test(`${role} may complete t
   assert.equal(stored.targetQuantityExact,'1.000000');
   assert.equal(stored.openingCoveredQuantityExact,'15.000000');
   assert.equal(stored.managementDecisionClass,'COMMERCIAL_ANNOUNCED_COST_REFERENCING_OPENING');
+  assert.deepEqual(stored.affectedSaleLinePopulation,[{saleLineId:'SL-11',saleInvoiceNo:11,saleRow:1,saleDate:'14050111',quantityExact:'1.000000'}]);
+  assert.equal(stored.approvedImpactPreview.affectedLines[0].saleLineId,'SL-11');
   assert.deepEqual(stored.auditLog.map(row=>row.action),['created-draft','submit','approve']);
   assert.equal(db.collection('fifoSourceInvalidations').rows.length,1);
   assert.deepEqual(db.collection('fifoAllocations').rows,before);
@@ -97,11 +102,37 @@ test('fully covered Opening exposure and non-operational role fail closed',async
   await assert.rejects(manual.managementReview(db,{itemGuid:'GUID-X',itemCode:'X'},actors.manager),error=>error.code==='MANUAL_COST_FORBIDDEN');
 });
 
+test('return-restored Opening capacity blocks the exact production-style false Manual Cost scope',async()=>{
+  const db=fixture();
+  db.collection('saleSnapshotDatasetHeaders').rows=[{snapshotId:'SALE-A',invTyp:2,invNo:2399},{snapshotId:'SALE-A',invTyp:2,invNo:2764},{snapshotId:'SALE-A',invTyp:6,invNo:10},{snapshotId:'SALE-A',invTyp:6,invNo:49}];
+  db.collection('saleSnapshotDatasetLines').rows=[
+    {snapshotId:'SALE-A',saleLineId:'SL-2-2399-005-8915SSW103',saleInvoiceType:2,saleInvoiceNo:2399,saleDate:'14050303',row:5,itemGuid:'GUID-X',itemCode:'X',itemName:'کالای X',qty:1,saleValue:1000},
+    {snapshotId:'SALE-A',saleLineId:'SL-2-2764-004-8915SSW103',saleInvoiceType:2,saleInvoiceNo:2764,saleDate:'14050311',row:4,itemGuid:'GUID-X',itemCode:'X',itemName:'کالای X',qty:1,saleValue:1000}
+  ];
+  db.collection('openingAccountingEligibilityPreview').rows=[
+    {datasetId:'OPEN-A',saleLineIdentity:'SL-2-2399-005-8915SSW103',saleInvoiceNo:2399,saleRow:5,saleDate:'14050303',itemGuid:'GUID-X',itemCode:'X',unknownQuantityExact:'1.000000',openingEligibleQuantityExact:'0.000000',remainingUnknownQuantityExact:'1.000000'},
+    {datasetId:'OPEN-A',saleLineIdentity:'SL-2-2764-004-8915SSW103',saleInvoiceNo:2764,saleRow:4,saleDate:'14050311',itemGuid:'GUID-X',itemCode:'X',unknownQuantityExact:'1.000000',openingEligibleQuantityExact:'0.000000',remainingUnknownQuantityExact:'1.000000'}
+  ];
+  db.collection('fifoAllocations').rows=[
+    {datasetId:'FIFO-A',allocationId:'O-2399',saleLineId:'SL-2-2399-005-8915SSW103',saleInvoiceType:2,saleInvoiceNo:2399,saleRow:5,saleDate:'14050303',sourceType:'approved_opening_accounting_cost',costSourceType:'APPROVED_OPENING_ACCOUNTING_COST',itemGuid:'',itemCode:'X',quantityExact:'1.000000',allocatedSaleValueExact:'1000.00',allocatedCostAmountExact:'100.00'},
+    {datasetId:'FIFO-A',allocationId:'O-2764',saleLineId:'SL-2-2764-004-8915SSW103',saleInvoiceType:2,saleInvoiceNo:2764,saleRow:4,saleDate:'14050311',sourceType:'approved_opening_accounting_cost',costSourceType:'APPROVED_OPENING_ACCOUNTING_COST',itemGuid:'',itemCode:'X',quantityExact:'1.000000',allocatedSaleValueExact:'1000.00',allocatedCostAmountExact:'100.00'},
+    {datasetId:'FIFO-A',allocationId:'R-10',saleLineId:'SL-6-10',saleInvoiceType:6,saleInvoiceNo:10,saleRow:1,saleDate:'14050116',sourceType:'sale_return_reversal',costSourceType:'APPROVED_OPENING_ACCOUNTING_COST',itemGuid:'',itemCode:'X',quantityExact:'-1.000000',allocatedSaleValueExact:'-1000.00',allocatedCostAmountExact:'-100.00'},
+    {datasetId:'FIFO-A',allocationId:'R-49',saleLineId:'SL-6-49',saleInvoiceType:6,saleInvoiceNo:49,saleRow:1,saleDate:'14050221',sourceType:'sale_return_reversal',costSourceType:'APPROVED_OPENING_ACCOUNTING_COST',itemGuid:'',itemCode:'X',quantityExact:'-1.000000',allocatedSaleValueExact:'-1000.00',allocatedCostAmountExact:'-100.00'}
+  ];
+  const review=await manual.managementReview(db,{itemGuid:'GUID-X',itemCode:'X'},actors.admin);
+  assert.equal(review.exposure.unresolvedQuantityExact,'0.000000');
+  assert.equal(review.actionAllowed,false);
+  assert.ok(review.blockers.includes('OPENING_AUTHORITY_ALREADY_COVERS_EXPOSURE'));
+  assert.deepEqual(review.technicalDetails.coveredLines.map(row=>row.saleLineId),['SL-2-2399-005-8915SSW103','SL-2-2764-004-8915SSW103']);
+  await assert.rejects(manual.managementApprove(db,{itemGuid:'GUID-X',itemCode:'X',reviewFingerprint:review.reviewFingerprint,finalCost:'100'},actors.admin),error=>error.code==='MANUAL_COST_MANAGEMENT_BLOCKED');
+  assert.equal(db.collection('manualCostResolutions').rows.length,0);
+});
+
 test('stale review and retry with a different amount are rejected',async()=>{
   const db=fixture(),review=await manual.managementReview(db,{itemGuid:'GUID-X',itemCode:'X'},actors.accounting);
-  db.collection('saleSnapshotDatasetLines').rows[1].saleValue=1200;
+  db.collection('fifoAllocations').rows.find(row=>row.saleLineId==='SL-11').quantityExact='0.500000';
   await assert.rejects(manual.managementApprove(db,{itemGuid:'GUID-X',itemCode:'X',reviewFingerprint:review.reviewFingerprint,finalCost:'100'},actors.accounting),error=>error.code==='MANUAL_COST_MANAGEMENT_REVIEW_STALE');
-  db.collection('saleSnapshotDatasetLines').rows[1].saleValue=1000;
+  db.collection('fifoAllocations').rows.find(row=>row.saleLineId==='SL-11').quantityExact='1.000000';
   const current=await manual.managementReview(db,{itemGuid:'GUID-X',itemCode:'X'},actors.accounting);
   await manual.managementApprove(db,{itemGuid:'GUID-X',itemCode:'X',reviewFingerprint:current.reviewFingerprint,finalCost:'100'},actors.accounting);
   await assert.rejects(manual.managementApprove(db,{itemGuid:'GUID-X',itemCode:'X',reviewFingerprint:current.reviewFingerprint,finalCost:'101'},actors.accounting),error=>error.code==='MANUAL_COST_MANAGEMENT_RETRY_AMOUNT_MISMATCH');
@@ -126,6 +157,7 @@ test('canonical UI exposes one editable financial field and keeps technical scop
   const source=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');
   assert.match(source,/Review → Set Cost → Approve → FIFO Update/);
   assert.match(source,/مبلغ نهایی مورد تایید/);
+  assert.match(source,/هزینه این کالا توسط منبع مالی معتبر پوشش داده شده است/);
   assert.match(source,/ItemCode \/ ItemGuid/);
   assert.match(source,/جزئیات فنی و ممیزی/);
   assert.match(source,/manual-cost-resolutions\/management\/review/);

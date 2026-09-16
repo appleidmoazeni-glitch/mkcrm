@@ -62,6 +62,22 @@ function stable(value) {
   if (value && typeof value === 'object') return `{${Object.keys(value).sort().map(field => `${JSON.stringify(field)}:${stable(value[field])}`).join(',')}}`;
   return JSON.stringify(value);
 }
+function sanitizeAffectedSaleLinePopulation(value = []) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(0, 5000).map(row => ({
+    saleLineId:clean(row?.saleLineId || row?.saleLineIdentity, 500),
+    saleInvoiceNo:Number(row?.saleInvoiceNo || 0),
+    saleRow:Number(row?.saleRow || 0),
+    saleDate:clean(row?.saleDate, 8),
+    quantityExact:clean(row?.quantityExact || row?.unresolvedQuantityExact, 100)
+  })).filter(row => row.saleLineId && positiveQuantity(row.quantityExact));
+}
+function affectedPopulationFingerprint(value = []) {
+  const rows=sanitizeAffectedSaleLinePopulation(value).map(row=>[
+    row.saleLineId,row.saleInvoiceNo,row.saleRow,row.saleDate,row.quantityExact
+  ]).sort((a,b)=>a[0].localeCompare(b[0],'en'));
+  return crypto.createHash('sha256').update(stable(rows)).digest('hex');
+}
 function contentProjection(value = {}) {
   return {
     itemGuid:clean(value.itemGuid, 100), itemCode:clean(value.itemCode, 100),
@@ -73,7 +89,8 @@ function contentProjection(value = {}) {
     attachment:sanitizeAttachment(value.attachment), notes:clean(value.notes, 2000),
     supersedesResolutionId:clean(value.supersedesResolutionId,100),
     sourceClass:clean(value.sourceClass,100),evidenceClass:clean(value.evidenceClass,100),commercialReference:clean(value.commercialReference,500),saleValueExposure:Number(value.saleValueExposure||0),affectedLineCount:Number(value.affectedLineCount||0),affectedQuantityExact:clean(value.affectedQuantityExact,100),
-    scopeDerivationFingerprint:clean(value.scopeDerivationFingerprint,64),openingDatasetId:clean(value.openingDatasetId,100),openingEvidenceId:clean(value.openingEvidenceId,100),openingCoveredQuantityExact:clean(value.openingCoveredQuantityExact,100),managementDecisionClass:clean(value.managementDecisionClass,100)
+    scopeDerivationFingerprint:clean(value.scopeDerivationFingerprint,64),openingDatasetId:clean(value.openingDatasetId,100),openingEvidenceId:clean(value.openingEvidenceId,100),openingCoveredQuantityExact:clean(value.openingCoveredQuantityExact,100),managementDecisionClass:clean(value.managementDecisionClass,100),
+    affectedSaleLinePopulation:sanitizeAffectedSaleLinePopulation(value.affectedSaleLinePopulation),affectedSaleLinePopulationFingerprint:clean(value.affectedSaleLinePopulationFingerprint,64),activeFifoDatasetId:clean(value.activeFifoDatasetId,100)
   };
 }
 function contentHash(value) { return crypto.createHash('sha256').update(stable(contentProjection(value))).digest('hex'); }
@@ -156,11 +173,12 @@ function boundedAuditDetails(value = {}) {
 }
 function auditValueSnapshot(value) {
   if (value == null) return null;
-  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','sourceClass','evidenceClass','commercialReference','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType','saleValueExposure','affectedLineCount','affectedQuantityExact','scopeDerivationFingerprint','openingDatasetId','openingEvidenceId','openingCoveredQuantityExact','managementDecisionClass'];
+  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','sourceClass','evidenceClass','commercialReference','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType','saleValueExposure','affectedLineCount','affectedQuantityExact','scopeDerivationFingerprint','openingDatasetId','openingEvidenceId','openingCoveredQuantityExact','managementDecisionClass','affectedSaleLinePopulation','affectedSaleLinePopulationFingerprint','activeFifoDatasetId'];
   const output = {};
   for (const field of fields) {
     if (value[field] === undefined) continue;
     if (field === 'attachment') output[field] = sanitizeAttachment(value[field]);
+    else if(field==='affectedSaleLinePopulation')output[field]=sanitizeAffectedSaleLinePopulation(value[field]);
     else if (typeof value[field] === 'number') output[field] = Number(value[field]);
     else output[field] = clean(value[field], field === 'notes' ? 2000 : 1000);
   }
@@ -230,8 +248,16 @@ function validateDraft(input = {}, options = {}) {
     openingDatasetId:clean(input.openingDatasetId,100),
     openingEvidenceId:clean(input.openingEvidenceId,100),
     openingCoveredQuantityExact:clean(input.openingCoveredQuantityExact,100),
-    managementDecisionClass:clean(input.managementDecisionClass,100)
+    managementDecisionClass:clean(input.managementDecisionClass,100),
+    affectedSaleLinePopulation:sanitizeAffectedSaleLinePopulation(input.affectedSaleLinePopulation),
+    affectedSaleLinePopulationFingerprint:clean(input.affectedSaleLinePopulationFingerprint,64),
+    activeFifoDatasetId:clean(input.activeFifoDatasetId,100)
   };
+  if(normalized.affectedSaleLinePopulation.length){
+    const fingerprint=affectedPopulationFingerprint(normalized.affectedSaleLinePopulation);
+    if(normalized.affectedSaleLinePopulationFingerprint&&normalized.affectedSaleLinePopulationFingerprint!==fingerprint)fail('MANUAL_COST_AFFECTED_POPULATION_FINGERPRINT_MISMATCH','Fingerprint جمعیت Sale Line با Scope ارسالی تطابق ندارد.',409);
+    normalized.affectedSaleLinePopulationFingerprint=fingerprint;
+  }
   return { ...normalized, contentHash:contentHash(normalized) };
 }
 function overlaps(aFrom, aTo, bFrom, bTo) {
@@ -326,12 +352,8 @@ async function assertNoOpeningCollision(db,candidate){
   if(!collision)return;
   const datasetId=clean(candidate.openingDatasetId,100),evidenceId=clean(candidate.openingEvidenceId,100),scopeFingerprint=clean(candidate.scopeDerivationFingerprint,64);
   if(datasetId===collision.datasetId&&evidenceId===collision.evidenceId&&scopeFingerprint){
-    const rows=await db.collection(openingCostBasis.ELIGIBILITY).find({datasetId,$or:[{itemGuid:clean(candidate.itemGuid,100)},{itemCode:clean(candidate.itemCode,100)}]}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1}).limit(5000).toArray();
-    const eligible=rows.filter(row=>clean(row.saleDate,8)>=clean(candidate.effectiveFrom,8)&&clean(row.saleDate,8)<=clean(candidate.effectiveTo,8)&&accountingDecimal.parse(row.remainingUnknownQuantityExact||0,accountingDecimal.QUANTITY_SCALE)>0n);
-    const remaining=eligible.reduce((sum,row)=>sum+accountingDecimal.parse(row.remainingUnknownQuantityExact||0,accountingDecimal.QUANTITY_SCALE),0n);
-    const contract={datasetId,evidenceId,itemGuid:clean(candidate.itemGuid,100),itemCode:clean(candidate.itemCode,100),effectiveFrom:clean(candidate.effectiveFrom,8),effectiveTo:clean(candidate.effectiveTo,8),targetQuantityExact:clean(candidate.targetQuantityExact,100),openingCoveredQuantityExact:clean(candidate.openingCoveredQuantityExact,100),remainingLines:eligible.map(row=>[clean(row.saleLineIdentity,500),clean(row.saleDate,8),clean(row.remainingUnknownQuantityExact,100)])};
-    const replay=crypto.createHash('sha256').update(stable(contract)).digest('hex');
-    if(replay===scopeFingerprint&&accountingDecimal.parse(candidate.targetQuantityExact||0,accountingDecimal.QUANTITY_SCALE)<=remaining)return;
+    await assertCurrentAffectedPopulation(db,candidate);
+    return;
   }
   fail('MANUAL_COST_OPENING_CAPACITY_COLLISION','ظرفیت Opening مصوب برای همین ItemGuid وجود دارد و Scope باقی‌مانده قابل اثبات نیست: '+collision.datasetId,409);
 }
@@ -348,24 +370,100 @@ async function approvedSetFingerprint(db) {
   const rows = await allRows(db.collection(COLLECTION), { status:'approved', deleted:{ $ne:true } });
   return approvedRowsFingerprint(rows);
 }
+function allocationIdentityMatches(row,target){
+  const targetGuid=key(target.itemGuid),rowGuid=key(row.itemGuid),targetCode=key(target.itemCode),rowCode=key(row.itemCode);
+  if(targetGuid&&rowGuid)return targetGuid===rowGuid;
+  return Boolean(targetCode&&rowCode===targetCode&&!rowGuid);
+}
+async function activeFifoEconomicExposure(db,target={}){
+  const state=await db.collection('fifoDatasetState').findOne({scopeKey:'fifo-shadow-v2-precision-evidence'}),datasetId=clean(state?.activeDatasetId,100);
+  if(!datasetId)fail('MANUAL_COST_ACTIVE_FIFO_REQUIRED','برای محاسبه Scope اقتصادی، FIFO فعال الزامی است.',409);
+  const queryParts=[];
+  if(clean(target.itemGuid,100))queryParts.push({itemGuid:clean(target.itemGuid,100)});
+  if(clean(target.itemCode,100))queryParts.push({itemCode:clean(target.itemCode,100)});
+  const candidates=queryParts.length?await db.collection('fifoAllocations').find({datasetId,$or:queryParts}).toArray():[];
+  const rows=candidates.filter(row=>Number(row.saleInvoiceType||0)===2&&allocationIdentityMatches(row,target));
+  const byLine=new Map();
+  for(const row of rows){
+    const saleLineId=clean(row.saleLineId,500);if(!saleLineId)continue;
+    const group=byLine.get(saleLineId)||{saleLineId,saleInvoiceNo:Number(row.saleInvoiceNo||0),saleRow:Number(row.saleRow||0),saleDate:clean(row.saleDate,8),itemGuid:clean(row.itemGuid||target.itemGuid,100),itemCode:clean(row.itemCode||target.itemCode,100),sellerAccountNumber:clean(row.sellerAccountNumber,100),sellerName:clean(row.sellerName,200),storeName:clean(row.storeName,200),itemDescription:clean(row.itemDescription,500),unknownQuantity:0n,coveredQuantity:0n,openingQuantity:0n,purchaseQuantity:0n,saleValue:0n,sources:new Set()};
+    const quantity=accountingDecimal.parse(row.quantityExact??row.unknownQty??row.allocatedQty??0,accountingDecimal.QUANTITY_SCALE);
+    const value=accountingDecimal.parse(row.allocatedSaleValueExact??row.allocatedSaleValue??0,accountingDecimal.MONEY_SCALE);
+    const unknown=row.sourceType==='unknown_cost'||row.allocatedCostAmountExact==null;
+    if(unknown)group.unknownQuantity+=quantity;
+    else{
+      group.coveredQuantity+=quantity;group.sources.add(clean(row.costSourceType||row.sourceType,100));
+      if(clean(row.costSourceType,100)==='APPROVED_OPENING_ACCOUNTING_COST'||clean(row.sourceType,100)==='approved_opening_accounting_cost')group.openingQuantity+=quantity;
+      else group.purchaseQuantity+=quantity;
+    }
+    group.saleValue+=value;byLine.set(saleLineId,group);
+  }
+  const groups=[...byLine.values()].sort((a,b)=>a.saleDate.localeCompare(b.saleDate,'en')||a.saleInvoiceNo-b.saleInvoiceNo||a.saleRow-b.saleRow||a.saleLineId.localeCompare(b.saleLineId,'en'));
+  const population=groups.filter(row=>row.unknownQuantity>0n).map(row=>({saleLineId:row.saleLineId,saleInvoiceNo:row.saleInvoiceNo,saleRow:row.saleRow,saleDate:row.saleDate,quantityExact:accountingDecimal.format(row.unknownQuantity,accountingDecimal.QUANTITY_SCALE)}));
+  const total=(field)=>groups.reduce((sum,row)=>sum+row[field],0n);
+  return {
+    datasetId,
+    requiredQuantityExact:accountingDecimal.format(total('unknownQuantity')+total('coveredQuantity'),accountingDecimal.QUANTITY_SCALE),
+    unresolvedQuantityExact:accountingDecimal.format(total('unknownQuantity'),accountingDecimal.QUANTITY_SCALE),
+    coveredQuantityExact:accountingDecimal.format(total('coveredQuantity'),accountingDecimal.QUANTITY_SCALE),
+    openingCoveredQuantityExact:accountingDecimal.format(total('openingQuantity'),accountingDecimal.QUANTITY_SCALE),
+    purchaseCoveredQuantityExact:accountingDecimal.format(total('purchaseQuantity'),accountingDecimal.QUANTITY_SCALE),
+    saleValueExposureExact:accountingDecimal.format(groups.filter(row=>row.unknownQuantity>0n).reduce((sum,row)=>sum+row.saleValue,0n),accountingDecimal.MONEY_SCALE),
+    affectedSaleLinePopulation:population,
+    affectedSaleLinePopulationFingerprint:affectedPopulationFingerprint(population),
+    coveredLines:groups.filter(row=>row.coveredQuantity>0n).map(row=>({saleLineId:row.saleLineId,saleInvoiceNo:row.saleInvoiceNo,saleRow:row.saleRow,saleDate:row.saleDate,quantityExact:accountingDecimal.format(row.coveredQuantity,accountingDecimal.QUANTITY_SCALE),openingQuantityExact:accountingDecimal.format(row.openingQuantity,accountingDecimal.QUANTITY_SCALE),purchaseQuantityExact:accountingDecimal.format(row.purchaseQuantity,accountingDecimal.QUANTITY_SCALE),sources:[...row.sources].sort()})),
+    lineCount:population.length,
+    invoiceCount:new Set(population.map(row=>row.saleInvoiceNo)).size,
+    itemDescription:groups.find(row=>row.itemDescription)?.itemDescription||''
+  };
+}
+async function assertCurrentAffectedPopulation(db,resolution){
+  const expected=sanitizeAffectedSaleLinePopulation(resolution.affectedSaleLinePopulation);
+  if(!expected.length)fail('MANUAL_COST_AFFECTED_POPULATION_REQUIRED','Manual Cost جدید باید به جمعیت دقیق Sale Lineهای فاقد هزینه متصل باشد.',409);
+  const fingerprint=affectedPopulationFingerprint(expected);
+  if(fingerprint!==clean(resolution.affectedSaleLinePopulationFingerprint,64))fail('MANUAL_COST_AFFECTED_POPULATION_FINGERPRINT_MISMATCH','جمعیت Sale Line یا Fingerprint آن تغییر کرده است.',409);
+  const current=await activeFifoEconomicExposure(db,resolution);
+  const currentByLine=new Map(current.affectedSaleLinePopulation.map(row=>[row.saleLineId,row]));
+  for(const row of expected){
+    const actual=currentByLine.get(row.saleLineId);
+    if(!actual||accountingDecimal.parse(actual.quantityExact,accountingDecimal.QUANTITY_SCALE)<accountingDecimal.parse(row.quantityExact,accountingDecimal.QUANTITY_SCALE))fail('MANUAL_COST_EXPOSURE_ALREADY_COVERED','Opening/Purchase یا lineage فعلی، Exposure انتخاب‌شده را پوشش داده یا Quantity آن را تغییر داده است.',409);
+  }
+  const expectedQuantity=expected.reduce((sum,row)=>sum+accountingDecimal.parse(row.quantityExact,accountingDecimal.QUANTITY_SCALE),0n);
+  if(expectedQuantity!==accountingDecimal.parse(resolution.targetQuantityExact||0,accountingDecimal.QUANTITY_SCALE))fail('MANUAL_COST_SCOPE_POPULATION_MISMATCH','Quantity مصوب با جمعیت frozen Sale Line تطابق ندارد.',409);
+  return current;
+}
 async function impactPreview(db, resolutionId, requestedBy = {}) {
   assertRole(requestedBy?.role, ['admin','accounting','purchase','manager']);
   const resolution = await getById(db, resolutionId);
   const state = await db.collection('fifoDatasetState').findOne({ scopeKey:'fifo-shadow-v2-precision-evidence' });
   const datasetId = clean(state?.activeDatasetId, 100);
   if (!datasetId) return { ok:true, resolutionId:resolution.resolutionId, datasetId:'', affected:{ purchaseLayers:0, allocations:0, saleLines:0, invoices:0, sellers:0, productCategories:0 }, blocker:'FIFO_ACTIVE_DATASET_MISSING', readOnly:true };
-  const identityQuery=clean(resolution.itemGuid,100)?{itemGuid:clean(resolution.itemGuid,100)}:{itemCode:clean(resolution.itemCode,100)};
+  if(clean(resolution.activeFifoDatasetId,100)&&clean(resolution.activeFifoDatasetId,100)!==datasetId)fail('MANUAL_COST_IMPACT_PREVIEW_STALE','FIFO فعال از زمان Review تغییر کرده است؛ Scope باید دوباره محاسبه شود.',409);
+  const expectedPopulation=sanitizeAffectedSaleLinePopulation(resolution.affectedSaleLinePopulation);
+  if(Number(resolution.schemaVersion||0)>=SCHEMA_VERSION&&resolution.evidenceClass==='COMMERCIAL_ANNOUNCED_COST')await assertCurrentAffectedPopulation(db,resolution);
+  const identityParts=[];if(clean(resolution.itemGuid,100))identityParts.push({itemGuid:clean(resolution.itemGuid,100)});if(clean(resolution.itemCode,100))identityParts.push({itemCode:clean(resolution.itemCode,100)});
+  const identityQuery=identityParts.length===1?identityParts[0]:{$or:identityParts};
   const dateQuery={};
   if(resolution.effectiveFrom)dateQuery.$gte=resolution.effectiveFrom;
   if(resolution.effectiveTo)dateQuery.$lte=resolution.effectiveTo;
   const query={datasetId,...identityQuery};
   if(Object.keys(dateQuery).length)query.saleDate=dateQuery;
   const candidates = await db.collection('fifoAllocations').find(query).toArray();
+  const expectedByLine=new Map(expectedPopulation.map(row=>[row.saleLineId,row]));
+  const expectedLineIds=new Set(expectedByLine.keys());
   const rows = candidates.filter(row => {
-    if (!matchesManual(resolution, row)) return false;
+    if(!allocationIdentityMatches(row,resolution))return false;
+    if(expectedLineIds.size&&!expectedLineIds.has(clean(row.saleLineId,500)))return false;
+    if (!(expectedLineIds.size?allocationIdentityMatches(row,resolution):matchesManual(resolution, row))) return false;
     if (row.saleDate < resolution.effectiveFrom || (resolution.effectiveTo && row.saleDate > resolution.effectiveTo)) return false;
     if (resolution.status === 'approved' && row.manualResolutionId === resolution.resolutionId) return true;
     return row.sourceType === 'unknown_cost';
+  }).map(row=>{
+    const expected=expectedByLine.get(clean(row.saleLineId,500));
+    if(!expected)return row;
+    const sourceQuantity=accountingDecimal.parse(row.quantityExact??row.unknownQty??row.allocatedQty??0,accountingDecimal.QUANTITY_SCALE),boundedQuantity=accountingDecimal.parse(expected.quantityExact,accountingDecimal.QUANTITY_SCALE),sourceSale=accountingDecimal.parse(row.allocatedSaleValueExact??row.allocatedSaleValue??0,accountingDecimal.MONEY_SCALE);
+    const boundedSale=sourceQuantity>0n?accountingDecimal.divideRounded(sourceSale*boundedQuantity,sourceQuantity):0n;
+    return {...row,quantityExact:expected.quantityExact,allocatedSaleValueExact:accountingDecimal.format(boundedSale,accountingDecimal.MONEY_SCALE)};
   }).sort((a,b)=>clean(a.saleDate,8).localeCompare(clean(b.saleDate,8),'en')||Number(a.saleInvoiceNo||0)-Number(b.saleInvoiceNo||0)||Number(a.saleRow||0)-Number(b.saleRow||0)||clean(a.saleLineId,500).localeCompare(clean(b.saleLineId,500),'en'));
   const manualCostExact = resolution.manualCostExact || exactUnitCost(resolution.manualCost);
   const totalRequiredQuantity=rows.reduce((sum,row)=>sum+accountingDecimal.parse(row.quantityExact??row.unknownQty??row.allocatedQty??0,accountingDecimal.QUANTITY_SCALE),0n);
@@ -388,6 +486,10 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     });
   }
   const remainingUnknown=totalRequiredQuantity>coveredQuantity?totalRequiredQuantity-coveredQuantity:0n;
+  if(Number(resolution.schemaVersion||0)>=SCHEMA_VERSION&&resolution.evidenceClass==='COMMERCIAL_ANNOUNCED_COST'){
+    if(!coveredRows.length||coveredQuantity<=0n)fail('MANUAL_COST_IMPACT_EMPTY','پیش‌نمایش اثر فاقد Sale Line یا Quantity قابل پوشش است.',409);
+    if(coveredQuantity!==capacity||totalRequiredQuantity!==capacity||remainingUnknown!==0n)fail('MANUAL_COST_SCOPE_POPULATION_MISMATCH','جمعیت پیش‌نمایش با Scope unresolved مشتق‌شده تطابق ندارد.',409);
+  }
   const saleLineIds=[...new Set(coveredRows.map(entry=>entry.row.saleLineId).filter(Boolean))];
   const lineAllocations = saleLineIds.length
     ? await db.collection('fifoAllocations').find({datasetId,saleLineId:{$in:saleLineIds}}).toArray()
@@ -412,7 +514,8 @@ async function impactPreview(db, resolutionId, requestedBy = {}) {
     activeFifoDatasetId:datasetId,evidenceClass:clean(resolution.evidenceClass||resolution.sourceClass||resolution.sourceType,100),
     itemGuid:clean(resolution.itemGuid,100),itemCode:clean(resolution.itemCode,100),targetQuantityExact:clean(resolution.targetQuantityExact,100),
     effectiveFrom:clean(resolution.effectiveFrom,8),effectiveTo:clean(resolution.effectiveTo,8),manualCostExact,
-    affectedLines:affectedLines.map(row=>[row.saleLineId,row.potentiallyCoveredQuantityExact,row.currentProvenance])
+    affectedLines:affectedLines.map(row=>[row.saleLineId,row.potentiallyCoveredQuantityExact,row.currentProvenance]),
+    affectedSaleLinePopulationFingerprint:clean(resolution.affectedSaleLinePopulationFingerprint,64)
   };
   const previewFingerprint=crypto.createHash('sha256').update(stable(previewContract)).digest('hex');
   return {
@@ -575,7 +678,7 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
       newValue:{ status:rule.to }
     })].slice(-200)
   };
-  if (action === 'approve') Object.assign(patch, { approvedBy:actor(requestedBy), approvedAt:now, approvedImpactPreview:{fingerprint:approvalPreview.previewFingerprint,fifoDatasetId:approvalPreview.datasetId,resolutionContentHash:approvalPreview.resolutionContentHash,affected:approvalPreview.affected,quantity:approvalPreview.quantity,recordedAt:now} });
+  if (action === 'approve') Object.assign(patch, { approvedBy:actor(requestedBy), approvedAt:now, approvedImpactPreview:{fingerprint:approvalPreview.previewFingerprint,fifoDatasetId:approvalPreview.datasetId,resolutionContentHash:approvalPreview.resolutionContentHash,affected:approvalPreview.affected,quantity:approvalPreview.quantity,affectedLines:approvalPreview.affectedLines.map(row=>({saleLineId:row.saleLineId,potentiallyCoveredQuantityExact:row.potentiallyCoveredQuantityExact})),affectedSaleLinePopulationFingerprint:clean(current.affectedSaleLinePopulationFingerprint,64),recordedAt:now} });
   if (action === 'reject') Object.assign(patch, { rejectedBy:actor(requestedBy), rejectedAt:now, rejectionReason:clean(reason, 1000) });
   if (action === 'expire') Object.assign(patch, { expiredBy:actor(requestedBy), expiredAt:now, expirationReason:clean(reason, 1000) });
   const result = await db.collection(COLLECTION).updateOne(
@@ -919,21 +1022,26 @@ async function managementReview(db,input={},requestedBy={}) {
     const previous=await getById(db,supersedesResolutionId);
     if(previous.status!=='approved'||previous.deleted===true)fail('MANUAL_COST_SUPERSEDED_NOT_APPROVED','فقط هزینه مصوب و حذف‌نشده قابل اصلاح است.',409);
     if(![COMMERCIAL_SCOPE,'evidence_quantity','opening_quantity','purchase_layer'].includes(clean(previous.resolutionScope,50))||!positiveQuantity(previous.targetQuantityExact)||!previous.effectiveFrom||!previous.effectiveTo)fail('MANUAL_COST_CORRECTION_SCOPE_UNSAFE','هزینه قدیمی Scope محدود و قابل اثبات ندارد؛ اصلاح مدیریتی خودکار مجاز نیست.',409);
-    const scope={itemGuid:clean(previous.itemGuid,100),itemCode:clean(previous.itemCode,100),targetQuantityExact:clean(previous.targetQuantityExact,100),effectiveFrom:clean(previous.effectiveFrom,8),effectiveTo:clean(previous.effectiveTo,8),purchaseDatasetId:clean(previous.purchaseDatasetId,100),resolutionScope:clean(previous.resolutionScope,50),scopeDerivationFingerprint:clean(previous.scopeDerivationFingerprint,64),openingDatasetId:clean(previous.openingDatasetId,100),openingEvidenceId:clean(previous.openingEvidenceId,100),openingCoveredQuantityExact:clean(previous.openingCoveredQuantityExact,100)};
+    const scope={itemGuid:clean(previous.itemGuid,100),itemCode:clean(previous.itemCode,100),targetQuantityExact:clean(previous.targetQuantityExact,100),effectiveFrom:clean(previous.effectiveFrom,8),effectiveTo:clean(previous.effectiveTo,8),purchaseDatasetId:clean(previous.purchaseDatasetId,100),resolutionScope:clean(previous.resolutionScope,50),scopeDerivationFingerprint:clean(previous.scopeDerivationFingerprint,64),openingDatasetId:clean(previous.openingDatasetId,100),openingEvidenceId:clean(previous.openingEvidenceId,100),openingCoveredQuantityExact:clean(previous.openingCoveredQuantityExact,100),affectedSaleLinePopulation:sanitizeAffectedSaleLinePopulation(previous.affectedSaleLinePopulation),affectedSaleLinePopulationFingerprint:clean(previous.affectedSaleLinePopulationFingerprint,64),activeFifoDatasetId:clean(previous.activeFifoDatasetId,100)};
     const reviewFingerprint=crypto.createHash('sha256').update(stable({mode:'SUPERSEDE_APPROVED',supersedesResolutionId,contentHash:clean(previous.contentHash,64),revision:Number(previous.revision||0),scope})).digest('hex');
     return {ok:true,readOnly:true,mode:'SUPERSEDE_APPROVED',actionAllowed:true,item:{itemGuid:scope.itemGuid,itemCode:scope.itemCode,itemDescription:''},exposure:{requiredQuantityExact:scope.targetQuantityExact,openingCoveredQuantityExact:scope.openingCoveredQuantityExact||'0.000000',unresolvedQuantityExact:scope.targetQuantityExact,affectedInvoiceCount:Number(previous.approvedImpactPreview?.affected?.invoices||0),affectedLineCount:Number(previous.approvedImpactPreview?.affected?.saleLines||previous.affectedLineCount||0),saleValueExposure:Number(previous.saleValueExposure||0),effectiveFrom:scope.effectiveFrom,effectiveTo:scope.effectiveTo},proposal:{available:true,sourceClass:'COMMERCIAL_ANNOUNCED_COST',sourceLabel:managementSourceLabel(previous.managementDecisionClass||'COMMERCIAL_ANNOUNCED_COST'),suggestedCostExact:clean(previous.manualCostExact||previous.manualCost,100),currentApprovedCostExact:clean(previous.manualCostExact||previous.manualCost,100)},scope,reviewFingerprint,supersedesResolutionId,technicalDetails:{previousResolutionId:previous.resolutionId,previousContentHash:previous.contentHash,previousRevision:Number(previous.revision||0),previousManagementDecisionClass:clean(previous.managementDecisionClass,100)},blockers:[]};
   }
   const identity=await resolveManagementIdentity(db,input),itemGuid=identity.itemGuid,itemCode=identity.itemCode;
-  const queue=await missingQueue(db,{coverage:'unknown',page:1,pageSize:5000,export:true});
+  const [queue,economic]=await Promise.all([missingQueue(db,{coverage:'unknown',page:1,pageSize:5000,export:true}),activeFifoEconomicExposure(db,{itemGuid,itemCode})]);
   const row=(queue.list||[]).find(value=>key(value.itemCode)===key(itemCode)&&(!clean(value.itemGuid,100)||key(value.itemGuid)===key(itemGuid)));
-  if(!row)fail('MANUAL_COST_EXPOSURE_NOT_FOUND','Exposure انتخاب‌شده دیگر در صف هزینه نامشخص وجود ندارد؛ صفحه را بازخوانی کنید.',409);
-  const suggestion=await assistedSuggestion(db,{itemGuid,itemCode,applicableDate:row.firstSaleDate,reviewDateTo:row.lastSaleDate,affectedQuantityExact:String(row.saleQuantity||0),purchaseDatasetId:queue.activePurchaseLayerDatasetId},requestedBy);
+  if(!row&&positiveQuantity(economic.unresolvedQuantityExact))fail('MANUAL_COST_EXPOSURE_NOT_FOUND','Exposure فاقد هزینه در FIFO فعال وجود دارد اما در Queue canonical قابل تطبیق نیست.',409);
+  let suggestion;
+  if(row)suggestion=await assistedSuggestion(db,{itemGuid,itemCode,applicableDate:row.firstSaleDate,reviewDateTo:row.lastSaleDate,affectedQuantityExact:String(row.saleQuantity||0),purchaseDatasetId:queue.activePurchaseLayerDatasetId},requestedBy);
+  else{
+    const collision=await approvedOpeningCollision(db,{itemGuid,itemCode,effectiveFrom:'00000000',effectiveTo:'99999999'}),basis=collision?await db.collection(openingCostBasis.COLLECTION).findOne({datasetId:collision.datasetId,evidenceId:collision.evidenceId}):null;
+    suggestion={sourceClass:basis?'OPENING_ACCOUNTING_COST':'EXACT_OFFICIAL_PURCHASE_LAYER',available:Boolean(basis?.openingUnitCostExact),suggestedCostExact:clean(basis?.openingUnitCostExact,100),approvalStatus:basis?'approved':'',openingEvidenceDatasetId:clean(basis?.datasetId,100),evidenceId:clean(basis?.evidenceId,100),sourceFingerprint:clean(basis?.sourceFingerprint,64)};
+  }
   const openingApproved=suggestion.sourceClass==='OPENING_ACCOUNTING_COST'&&suggestion.approvalStatus==='approved';
-  const remainingRows=(suggestion.eligibilityPreview?.rows||[]).filter(value=>positiveQuantity(value.remainingUnknownQuantityExact));
-  const effectiveFrom=clean(remainingRows[0]?.saleDate||row.firstSaleDate,8),effectiveTo=clean(remainingRows[remainingRows.length-1]?.saleDate||row.lastSaleDate,8);
-  const requiredQuantityExact=clean(suggestion.totalRequiredQuantityExact,100)||accountingDecimal.format(accountingDecimal.parse(row.saleQuantity||0,accountingDecimal.QUANTITY_SCALE),accountingDecimal.QUANTITY_SCALE);
-  const openingCoveredQuantityExact=openingApproved?(clean(suggestion.eligibleTargetQuantityExact,100)||'0.000000'):'0.000000';
-  const unresolvedQuantityExact=openingApproved?(clean(suggestion.remainingUnknownQuantityExact,100)||'0.000000'):requiredQuantityExact;
+  const population=economic.affectedSaleLinePopulation;
+  const effectiveFrom=clean(population[0]?.saleDate||economic.coveredLines[0]?.saleDate||row?.firstSaleDate,8),effectiveTo=clean(population[population.length-1]?.saleDate||economic.coveredLines[economic.coveredLines.length-1]?.saleDate||row?.lastSaleDate,8);
+  const requiredQuantityExact=economic.requiredQuantityExact;
+  const openingCoveredQuantityExact=economic.openingCoveredQuantityExact;
+  const unresolvedQuantityExact=economic.unresolvedQuantityExact;
   const blockers=[];
   if(suggestion.reviewOnly===true||suggestion.financialAuthority===false)blockers.push('OPENING_EVIDENCE_NOT_APPROVED');
   if(suggestion.sourceClass==='EXACT_OFFICIAL_PURCHASE_LAYER')blockers.push('OFFICIAL_PURCHASE_PRECEDENCE');
@@ -942,12 +1050,12 @@ async function managementReview(db,input={},requestedBy={}) {
   if(suggestion.sourceClass==='PURCHASE_RETURN_CONFLICT')blockers.push('PURCHASE_RETURN_CONFLICT');
   if(suggestion.sourceClass==='CONFLICT_REQUIRES_REVIEW')blockers.push('SOURCE_CONFLICT');
   if(!positiveQuantity(unresolvedQuantityExact))blockers.push('OPENING_AUTHORITY_ALREADY_COVERS_EXPOSURE');
-  const scopeContract={datasetId:openingApproved?clean(suggestion.openingEvidenceDatasetId,100):'',evidenceId:openingApproved?clean(suggestion.evidenceId,100):'',itemGuid,itemCode,effectiveFrom,effectiveTo,targetQuantityExact:unresolvedQuantityExact,openingCoveredQuantityExact,remainingLines:remainingRows.map(value=>[clean(value.saleLineIdentity,500),clean(value.saleDate,8),clean(value.remainingUnknownQuantityExact,100)])};
+  const scopeContract={activeFifoDatasetId:economic.datasetId,datasetId:openingApproved?clean(suggestion.openingEvidenceDatasetId,100):'',evidenceId:openingApproved?clean(suggestion.evidenceId,100):'',itemGuid,itemCode,effectiveFrom,effectiveTo,targetQuantityExact:unresolvedQuantityExact,openingCoveredQuantityExact,affectedSaleLinePopulationFingerprint:economic.affectedSaleLinePopulationFingerprint,remainingLines:population.map(value=>[value.saleLineId,value.saleDate,value.quantityExact])};
   const scopeDerivationFingerprint=crypto.createHash('sha256').update(stable(scopeContract)).digest('hex');
-  const scope={itemGuid,itemCode,targetQuantityExact:unresolvedQuantityExact,effectiveFrom,effectiveTo,purchaseDatasetId:queue.activePurchaseLayerDatasetId,resolutionScope:COMMERCIAL_SCOPE,scopeDerivationFingerprint,openingDatasetId:scopeContract.datasetId,openingEvidenceId:scopeContract.evidenceId,openingCoveredQuantityExact};
-  const reviewContract={mode:'NEW_EXPOSURE',saleSnapshotId:queue.activeSnapshotId,purchaseDatasetId:queue.activePurchaseLayerDatasetId,itemGuid,itemCode,saleLineCount:Number(row.saleLineCount||0),saleCount:Number(row.saleCount||0),saleQuantity:Number(row.saleQuantity||0),saleValue:Number(row.saleAmount||0),firstSaleDate:row.firstSaleDate,lastSaleDate:row.lastSaleDate,sourceClass:suggestion.sourceClass,sourceFingerprint:clean(suggestion.sourceFingerprint,64),scope};
+  const scope={itemGuid,itemCode,targetQuantityExact:unresolvedQuantityExact,effectiveFrom,effectiveTo,purchaseDatasetId:queue.activePurchaseLayerDatasetId,resolutionScope:COMMERCIAL_SCOPE,scopeDerivationFingerprint,openingDatasetId:scopeContract.datasetId,openingEvidenceId:scopeContract.evidenceId,openingCoveredQuantityExact,affectedSaleLinePopulation:population,affectedSaleLinePopulationFingerprint:economic.affectedSaleLinePopulationFingerprint,activeFifoDatasetId:economic.datasetId};
+  const reviewContract={mode:'NEW_EXPOSURE',activeFifoDatasetId:economic.datasetId,saleSnapshotId:queue.activeSnapshotId,purchaseDatasetId:queue.activePurchaseLayerDatasetId,itemGuid,itemCode,saleLineCount:population.length,saleCount:economic.invoiceCount,saleQuantity:unresolvedQuantityExact,saleValue:economic.saleValueExposureExact,firstSaleDate:effectiveFrom,lastSaleDate:effectiveTo,sourceClass:suggestion.sourceClass,sourceFingerprint:clean(suggestion.sourceFingerprint,64),scope};
   const reviewFingerprint=crypto.createHash('sha256').update(stable(reviewContract)).digest('hex');
-  return {ok:true,readOnly:true,mode:'NEW_EXPOSURE',actionAllowed:blockers.length===0,item:{itemGuid,itemCode,itemDescription:row.itemDescription},exposure:{requiredQuantityExact,openingCoveredQuantityExact,unresolvedQuantityExact,affectedInvoiceCount:Number(row.saleCount||0),affectedLineCount:Number(row.saleLineCount||0),saleValueExposure:Number(row.saleAmount||0),effectiveFrom,effectiveTo},proposal:{available:Boolean(suggestion.available&&suggestion.suggestedCostExact),sourceClass:suggestion.sourceClass,sourceLabel:managementSourceLabel(suggestion.sourceClass),suggestedCostExact:clean(suggestion.suggestedCostExact,100)||null},scope,reviewFingerprint,supersedesResolutionId:'',technicalDetails:{saleSnapshotId:queue.activeSnapshotId,purchaseDatasetId:queue.activePurchaseLayerDatasetId,openingDatasetId:clean(suggestion.openingEvidenceDatasetId,100),openingEvidenceId:clean(suggestion.evidenceId,100),sourceFingerprint:clean(suggestion.sourceFingerprint,64),reviewLineage:suggestion.reviewLineage||null,eligibilityPreview:suggestion.eligibilityPreview||null},blockers:[...new Set(blockers)]};
+  return {ok:true,readOnly:true,mode:'NEW_EXPOSURE',actionAllowed:blockers.length===0,item:{itemGuid,itemCode,itemDescription:row?.itemDescription||economic.itemDescription},exposure:{requiredQuantityExact,coveredQuantityExact:economic.coveredQuantityExact,openingCoveredQuantityExact,purchaseCoveredQuantityExact:economic.purchaseCoveredQuantityExact,unresolvedQuantityExact,affectedInvoiceCount:economic.invoiceCount,affectedLineCount:population.length,saleValueExposure:Number(economic.saleValueExposureExact||0),effectiveFrom,effectiveTo},proposal:{available:Boolean(suggestion.available&&suggestion.suggestedCostExact)&&positiveQuantity(unresolvedQuantityExact),sourceClass:suggestion.sourceClass,sourceLabel:managementSourceLabel(suggestion.sourceClass),suggestedCostExact:clean(suggestion.suggestedCostExact,100)||null},scope,reviewFingerprint,supersedesResolutionId:'',technicalDetails:{activeFifoDatasetId:economic.datasetId,saleSnapshotId:queue.activeSnapshotId,purchaseDatasetId:queue.activePurchaseLayerDatasetId,openingDatasetId:clean(suggestion.openingEvidenceDatasetId,100),openingEvidenceId:clean(suggestion.evidenceId,100),sourceFingerprint:clean(suggestion.sourceFingerprint,64),affectedSaleLinePopulation:population,affectedSaleLinePopulationFingerprint:economic.affectedSaleLinePopulationFingerprint,coveredLines:economic.coveredLines,reviewLineage:suggestion.reviewLineage||null,eligibilityPreview:suggestion.eligibilityPreview||null},blockers:[...new Set(blockers)]};
 }
 
 async function managementApprove(db,input={},requestedBy={}) {
@@ -963,7 +1071,7 @@ async function managementApprove(db,input={},requestedBy={}) {
   let resolution=await db.collection(COLLECTION).findOne({commercialReference});
   if(resolution&&clean(resolution.manualCostExact||resolution.manualCost,100)!==finalCostExact)fail('MANUAL_COST_MANAGEMENT_RETRY_AMOUNT_MISMATCH','برای این Review قبلاً مبلغ دیگری ثبت شده است؛ وضعیت را بازخوانی کنید.',409);
   if(!resolution){
-    const created=await createDraft(db,{itemGuid:review.scope.itemGuid,itemCode:review.scope.itemCode,manualCost:finalCostExact,resolutionScope:review.scope.resolutionScope,targetQuantityExact:review.scope.targetQuantityExact,effectiveFrom:review.scope.effectiveFrom,effectiveTo:review.scope.effectiveTo,sourceType:COMMERCIAL_SOURCE,commercialReference,currency:'IRR',reason,notes:'Created by management Review → Set Cost → Approve workflow.',supersedesResolutionId:review.supersedesResolutionId,affectedQuantityExact:review.exposure.unresolvedQuantityExact,affectedLineCount:review.exposure.affectedLineCount,saleValueExposure:review.exposure.saleValueExposure,purchaseDatasetId:review.scope.purchaseDatasetId,scopeDerivationFingerprint:review.scope.scopeDerivationFingerprint,openingDatasetId:review.scope.openingDatasetId,openingEvidenceId:review.scope.openingEvidenceId,openingCoveredQuantityExact:review.scope.openingCoveredQuantityExact,managementDecisionClass:decisionClass},requestedBy);
+    const created=await createDraft(db,{itemGuid:review.scope.itemGuid,itemCode:review.scope.itemCode,manualCost:finalCostExact,resolutionScope:review.scope.resolutionScope,targetQuantityExact:review.scope.targetQuantityExact,effectiveFrom:review.scope.effectiveFrom,effectiveTo:review.scope.effectiveTo,sourceType:COMMERCIAL_SOURCE,commercialReference,currency:'IRR',reason,notes:'Created by management Review → Set Cost → Approve workflow.',supersedesResolutionId:review.supersedesResolutionId,affectedQuantityExact:review.exposure.unresolvedQuantityExact,affectedLineCount:review.exposure.affectedLineCount,saleValueExposure:review.exposure.saleValueExposure,purchaseDatasetId:review.scope.purchaseDatasetId,scopeDerivationFingerprint:review.scope.scopeDerivationFingerprint,openingDatasetId:review.scope.openingDatasetId,openingEvidenceId:review.scope.openingEvidenceId,openingCoveredQuantityExact:review.scope.openingCoveredQuantityExact,managementDecisionClass:decisionClass,affectedSaleLinePopulation:review.scope.affectedSaleLinePopulation,affectedSaleLinePopulationFingerprint:review.scope.affectedSaleLinePopulationFingerprint,activeFifoDatasetId:review.scope.activeFifoDatasetId},requestedBy);
     resolution=created.resolution;
   }
   if(resolution.status==='draft')resolution=(await transition(db,resolution.resolutionId,'submit',requestedBy,{revision:resolution.revision,reason})).resolution;

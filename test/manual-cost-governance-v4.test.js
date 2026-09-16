@@ -9,7 +9,7 @@ const fifo=require('../src/lib/fifo-shadow-engine');
 const accounting={username:'accounting-a',role:'accounting'};
 const manager={username:'admin-b',role:'admin'};
 function input(overrides={}){
-  return {itemGuid:'GUID-X',itemCode:'X',manualCostExact:'125.500000',targetQuantityExact:'2.000000',effectiveFrom:'14050101',effectiveTo:'14050131',sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',commercialReference:'COM-42',reason:'اعلام مکتوب بازرگانی',...overrides};
+  return {itemGuid:'GUID-X',itemCode:'X',manualCostExact:'125.500000',targetQuantityExact:'2.000000',effectiveFrom:'14050101',effectiveTo:'14050131',sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',commercialReference:'COM-42',reason:'اعلام مکتوب بازرگانی',activeFifoDatasetId:'FIFO-A',affectedSaleLinePopulation:[{saleLineId:'SL-1',saleInvoiceNo:1,saleRow:1,saleDate:'14050110',quantityExact:'2.000000'}],...overrides};
 }
 function db(){
   return new MemoryDb({
@@ -90,6 +90,19 @@ test('approved Opening authority blocks overlapping Manual capacity',async()=>{
   store.collection('openingAccountingCostBasis').rows.push({datasetId:'OPEN-A',evidenceId:'OE-1',status:'VALIDATED_CANDIDATE',extractionComplete:true,itemGuid:'GUID-X',itemCode:'X',openingQuantityExact:'5.000000',effectiveOpeningDate:'14040101'});
   const created=await manual.createDraft(store,input(),accounting);
   await assert.rejects(manual.transition(store,created.resolution.resolutionId,'submit',accounting,{revision:1}),error=>error.code==='MANUAL_COST_OPENING_CAPACITY_COLLISION');
+});
+
+test('FIFO keeps Opening collision fail-closed while allowing exact line-bound unresolved capacity',()=>{
+  const manual={resolutionId:'M-BOUND',schemaVersion:4,revision:1,contentHash:'bound',status:'approved',itemGuid:'GUID-X',itemCode:'X',manualCostExact:'100.000000',targetQuantityExact:'1.000000',effectiveFrom:'14050101',effectiveTo:'14050231',sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',evidenceClass:'COMMERCIAL_ANNOUNCED_COST',affectedSaleLinePopulationFingerprint:'f'.repeat(64),affectedSaleLinePopulation:[{saleLineId:'SL-2',saleDate:'14050210',quantityExact:'1.000000'}]};
+  const source=fifoSource([manual]);
+  source.openingActive={datasetId:'OPEN-A'};
+  source.openingRows=[{datasetId:'OPEN-A',evidenceId:'OE-1',itemGuid:'GUID-X',itemCode:'X',openingQuantityExact:'1.000000',openingUnitCostExact:'50.000000',effectiveOpeningDate:'14040101'}];
+  const allocations=fifo._allocateSources('FIFO-N',source).allocations;
+  assert.equal(allocations.find(row=>row.saleLineId==='SL-1').costSourceType,'APPROVED_OPENING_ACCOUNTING_COST');
+  assert.equal(allocations.find(row=>row.saleLineId==='SL-2').manualResolutionId,'M-BOUND');
+  const overlapping=structuredClone(source);
+  overlapping.manuals[0].affectedSaleLinePopulation=[{saleLineId:'SL-1',saleDate:'14050110',quantityExact:'1.000000'}];
+  assert.throws(()=>fifo._allocateSources('FIFO-X',overlapping),error=>error.code==='MANUAL_COST_OPENING_CAPACITY_COLLISION');
 });
 
 function fifoSource(manualRows,purchaseLayers=[]){

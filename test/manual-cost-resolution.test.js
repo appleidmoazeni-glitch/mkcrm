@@ -69,7 +69,12 @@ function seedDb() {
     purchaseHistoryDiscoveryQueue:[],
     manualCostResolutions:[],
     fifoDatasetState:[{scopeKey:'fifo-shadow-v2-precision-evidence',activeDatasetId:'FIFO-TEST'}],
-    fifoAllocations:[],
+    fifoAllocations:[
+      {datasetId:'FIFO-TEST',allocationId:'A-O',saleLineId:'SL-1',saleInvoiceType:2,saleInvoiceNo:1,saleRow:1,saleDate:'14050110',sourceType:'official_purchase_layer',costSourceType:'OFFICIAL_PURCHASE_LAYER',itemGuid:'GUID-O',itemCode:'OFFICIAL',quantityExact:'2.000000',allocatedSaleValueExact:'2000.00',allocatedCostAmountExact:'1400.00'},
+      {datasetId:'FIFO-TEST',allocationId:'A-M',saleLineId:'SL-2',saleInvoiceType:2,saleInvoiceNo:2,saleRow:1,saleDate:'14050111',sourceType:'unknown_cost',itemGuid:'GUID-M',itemCode:'MANUAL',quantityExact:'3.000000',allocatedSaleValueExact:'3000.00',allocatedCostAmountExact:null},
+      {datasetId:'FIFO-TEST',allocationId:'A-U',saleLineId:'SL-3',saleInvoiceType:2,saleInvoiceNo:3,saleRow:1,saleDate:'14050112',sourceType:'unknown_cost',itemGuid:'GUID-U',itemCode:'UNKNOWN',quantityExact:'4.000000',allocatedSaleValueExact:'4000.00',allocatedCostAmountExact:null},
+      {datasetId:'FIFO-TEST',allocationId:'A-X',saleLineId:'SL-X',saleInvoiceType:2,saleInvoiceNo:4,saleRow:1,saleDate:'14050110',sourceType:'unknown_cost',itemGuid:'GUID-X',itemCode:'X',quantityExact:'1.000000',allocatedSaleValueExact:'1000.00',allocatedCostAmountExact:null}
+    ],
     appJobs:[
       { jobId:'J1', status:'completed', result:{ retryCount:1 } },
       { jobId:'J2', status:'completed', result:{ resumeCount:1 } }
@@ -82,7 +87,9 @@ const accounting = { username:'accountant-1', role:'accounting' };
 const manager = { username:'manager-1', role:'manager' };
 function governedInput(value={}){
   const itemCode=value.itemCode||'X';
-  return {...value,itemCode,itemGuid:value.itemGuid||('GUID-'+itemCode),manualCost:value.manualCost??1,sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',targetQuantityExact:value.targetQuantityExact||'1000.000000',effectiveFrom:value.effectiveFrom||'14050101',effectiveTo:value.effectiveTo||'14051229',commercialReference:value.commercialReference||'COM-TEST',reason:value.reason||'اعلام بازرگانی تست'};
+  const population={OFFICIAL:{saleLineId:'SL-1',saleInvoiceNo:1,saleDate:'14050110',quantityExact:'2.000000'},MANUAL:{saleLineId:'SL-2',saleInvoiceNo:2,saleDate:'14050111',quantityExact:'3.000000'},UNKNOWN:{saleLineId:'SL-3',saleInvoiceNo:3,saleDate:'14050112',quantityExact:'4.000000'},X:{saleLineId:'SL-X',saleInvoiceNo:4,saleDate:'14050110',quantityExact:'1.000000'}}[itemCode]||{saleLineId:'SL-'+itemCode,saleInvoiceNo:99,saleDate:'14050110',quantityExact:'1.000000'};
+  const targetQuantityExact=value.targetQuantityExact||population.quantityExact;
+  return {...value,itemCode,itemGuid:value.itemGuid||('GUID-'+itemCode),manualCost:value.manualCost??1,sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',targetQuantityExact,effectiveFrom:value.effectiveFrom||'14050101',effectiveTo:value.effectiveTo||'14051229',commercialReference:value.commercialReference||'COM-TEST',reason:value.reason||'اعلام بازرگانی تست',activeFifoDatasetId:value.activeFifoDatasetId||'FIFO-TEST',affectedSaleLinePopulation:value.affectedSaleLinePopulation||[{...population,quantityExact:targetQuantityExact}]};
 }
 const originalCreateDraft=service.createDraft.bind(service);
 function governedCreate(db,value,user){return originalCreateDraft(db,governedInput(value),user);}
@@ -139,7 +146,7 @@ test('approved manual-cost fingerprint is canonical and changes only when approv
 });
 
 test('impact preview is read-only and bounds affected unresolved FIFO rows before activation',async()=>{
-  const db=seedDb();db.collection('fifoDatasetState').rows[0].activeDatasetId='FIFO-A';db.collection('fifoAllocations').rows.push({datasetId:'FIFO-A',allocationId:'A-U',saleLineId:'SL-3',saleInvoiceType:2,saleInvoiceNo:3,saleDate:'14050112',sourceType:'unknown_cost',itemGuid:'GUID-U',itemCode:'UNKNOWN',quantityExact:'4.000000',allocatedSaleValueExact:'4000.00',allocatedCostAmountExact:null,sellerAccountNumber:'SELLER-1'});const created=await governedCreate(db,{itemGuid:'GUID-U',itemCode:'UNKNOWN',manualCost:'750.25',targetQuantityExact:'4',effectiveFrom:'14050101',effectiveTo:'14050131',reason:'documented'},accounting);const before=structuredClone(db.collection('fifoAllocations').rows);const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);assert.equal(preview.affected.saleLines,1);assert.equal(preview.projectedResolvedCostExact,'3001.00');assert.equal(preview.fifoProfitDeltaExact,null);assert.equal(preview.historicalDatasetMutated,false);assert.deepEqual(db.collection('fifoAllocations').rows,before);
+  const db=seedDb();db.collection('fifoDatasetState').rows[0].activeDatasetId='FIFO-A';db.collection('fifoAllocations').rows.push({datasetId:'FIFO-A',allocationId:'A-U2',saleLineId:'SL-3',saleInvoiceType:2,saleInvoiceNo:3,saleDate:'14050112',sourceType:'unknown_cost',itemGuid:'GUID-U',itemCode:'UNKNOWN',quantityExact:'4.000000',allocatedSaleValueExact:'4000.00',allocatedCostAmountExact:null,sellerAccountNumber:'SELLER-1'});const created=await governedCreate(db,{itemGuid:'GUID-U',itemCode:'UNKNOWN',manualCost:'750.25',targetQuantityExact:'4',effectiveFrom:'14050101',effectiveTo:'14050131',reason:'documented',activeFifoDatasetId:'FIFO-A'},accounting);const before=structuredClone(db.collection('fifoAllocations').rows);const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);assert.equal(preview.affected.saleLines,1);assert.equal(preview.projectedResolvedCostExact,'3001.00');assert.equal(preview.fifoProfitDeltaExact,null);assert.equal(preview.historicalDatasetMutated,false);assert.deepEqual(db.collection('fifoAllocations').rows,before);
 });
 
 test('new Purchase-layer and item-scope Manual records are rejected in favor of canonical sources',async()=>{
@@ -187,9 +194,11 @@ test('overlapping active resolutions are rejected and no physical delete API exi
   assert.equal(list.list[0].deleted,false);
 });
 
-test('official source always has priority over approved manual source', async () => {
+test('official source blocks overlapping approved manual source', async () => {
   const db=seedDb();
-  await approvedManual(db,{itemCode:'OFFICIAL',itemGuid:'GUID-O',manualCost:1});
+  const created=await governedCreate(db,{itemCode:'OFFICIAL',itemGuid:'GUID-O',manualCost:1},accounting);
+  const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
+  await assert.rejects(approvePending(db,pending),error=>error.code==='MANUAL_COST_EXPOSURE_ALREADY_COVERED');
   const readiness=await service.readiness(db,{dateFrom:'14050101',dateTo:'14050131'});
   const official=readiness.list.find(row=>row.itemCode==='OFFICIAL');
   assert.equal(official.coverage,'official');
@@ -220,10 +229,14 @@ test('future, expired and rejected manual costs are not eligible', async () => {
   const db=seedDb();
   const future=await governedCreate(db,{itemCode:'MANUAL',itemGuid:'GUID-M',manualCost:5,effectiveFrom:'14050201',effectiveTo:'14050228'},accounting);
   const futurePending=await service.transition(db,future.resolution.resolutionId,'submit',accounting,{revision:future.resolution.revision});
-  const futureApproved=await approvePending(db,futurePending,accounting);
+  await assert.rejects(approvePending(db,futurePending,accounting),error=>error.code==='MANUAL_COST_IMPACT_EMPTY');
+  await service.transition(db,future.resolution.resolutionId,'reject',accounting,{reason:'no bounded exposure',revision:futurePending.resolution.revision});
+  const valid=await governedCreate(db,{itemCode:'MANUAL',itemGuid:'GUID-M',manualCost:5,effectiveFrom:'14050101',effectiveTo:'14050131',commercialReference:'COM-VALID'},accounting);
+  const validPending=await service.transition(db,valid.resolution.resolutionId,'submit',accounting,{revision:valid.resolution.revision});
+  const validApproved=await approvePending(db,validPending,accounting);
   let readiness=await service.readiness(db,{});
-  assert.equal(readiness.list.find(row=>row.itemCode==='MANUAL').coverage,'unknown');
-  await service.transition(db,future.resolution.resolutionId,'expire',accounting,{reason:'replaced',revision:futureApproved.resolution.revision});
+  assert.equal(readiness.list.find(row=>row.itemCode==='MANUAL').coverage,'manual');
+  await service.transition(db,valid.resolution.resolutionId,'expire',accounting,{reason:'replaced',revision:validApproved.resolution.revision});
   const rejected=await governedCreate(db,{itemCode:'UNKNOWN',itemGuid:'GUID-U',manualCost:5,effectiveFrom:'14050101'},accounting);
   const rejectedPending=await service.transition(db,rejected.resolution.resolutionId,'submit',accounting,{revision:rejected.resolution.revision});
   await service.transition(db,rejected.resolution.resolutionId,'reject',accounting,{reason:'insufficient evidence',revision:rejectedPending.resolution.revision});
@@ -342,7 +355,7 @@ test('governed supersession preserves legacy evidence and resolves only inside t
     service.createDraft(db,{...governedInput({itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',reason:'bounded correction',supersedesResolutionId:legacy.resolutionId}),effectiveTo:''},accounting),
     error=>error.code==='MANUAL_COST_EFFECTIVE_TO_REQUIRED'
   );
-  const created=await governedCreate(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050501',effectiveTo:'14050531',reason:'بازه تیر ۱۴۰۵ طبق تصمیم انسانی',supersedesResolutionId:legacy.resolutionId},accounting);
+  const created=await governedCreate(db,{itemGuid:'GUID-M',itemCode:'MANUAL',manualCost:'612310000',effectiveFrom:'14050101',effectiveTo:'14050131',reason:'بازه فروردین ۱۴۰۵ طبق تصمیم انسانی',supersedesResolutionId:legacy.resolutionId},accounting);
   assert.equal(created.resolution.supersedesResolutionId,legacy.resolutionId);
   assert.match(created.resolution.contentHash,/^[a-f0-9]{64}$/);
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});
@@ -350,9 +363,9 @@ test('governed supersession preserves legacy evidence and resolves only inside t
   const approved=await approvePending(db,pending,accounting);
   const unchanged=await service.getById(db,legacy.resolutionId);
   assert.deepEqual(unchanged,legacy);
-  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050515').map(row=>row.resolutionId),[approved.resolution.resolutionId]);
-  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050430'),[]);
-  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050601'),[]);
+  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050115').map(row=>row.resolutionId),[approved.resolution.resolutionId]);
+  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14041229'),[]);
+  assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050201'),[]);
   assert.deepEqual(approved.resolution.auditLog.map(row=>row.action),['created-draft','submit','approve']);
   assert.equal(approved.resolution.approvedBy.username,'accountant-1');
 });

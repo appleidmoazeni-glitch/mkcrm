@@ -898,7 +898,7 @@ function allocateSources(datasetId, source, filters = {}) {
     .sort(compareSales);
   const saleReturns = source.saleLines.filter(row => Number(row.saleInvoiceType) === 6).sort(compareSales);
   const openingIdentitySet=new Set((source.openingRows||[]).filter(row=>(finite(row.openingQuantityExact)||0)>EPSILON).map(row=>identity(row.itemGuid)).filter(Boolean));
-  const manualOpeningCollision=source.manuals.find(row=>['opening_quantity','evidence_quantity','commercial_announced_quantity'].includes(row.resolutionScope)&&openingIdentitySet.has(identity(row.itemGuid)));
+  const manualOpeningCollision=source.manuals.find(row=>['opening_quantity','evidence_quantity','commercial_announced_quantity'].includes(row.resolutionScope)&&openingIdentitySet.has(identity(row.itemGuid))&&(!Array.isArray(row.affectedSaleLinePopulation)||!row.affectedSaleLinePopulation.length||!clean(row.affectedSaleLinePopulationFingerprint,64)));
   if(manualOpeningCollision){
     const error=new Error('Manual Cost and approved Opening authority claim capacity for the same stable ItemGuid.');
     error.code='MANUAL_COST_OPENING_CAPACITY_COLLISION';
@@ -931,6 +931,7 @@ function allocateSources(datasetId, source, filters = {}) {
       netPurchasedQuantity:scoped,netUnitCost:manual.manualCostExact??manual.manualCost,
       fifoRemainingQuantity:round(scoped),confirmedReturnAdjustmentQuantity:0,purchaseReturnResolutionIds:[],
       fifoSourceType:manual.resolutionScope==='opening_quantity'?'approved_manual_opening_quantity':manual.resolutionScope==='commercial_announced_quantity'?'approved_commercial_announced_cost':'approved_manual_evidence_quantity',manualResolutionId:clean(manual.resolutionId,100),manualCostScope:clean(manual.resolutionScope,50),manualRevision:Number(manual.revision||0),manualContentHash:clean(manual.contentHash,64),manualSchemaVersion:Number(manual.schemaVersion||0),manualEffectiveFrom:clean(manual.effectiveFrom,8),manualEffectiveTo:clean(manual.effectiveTo,8),manualCreatedBy:actor(manual.createdBy||{}),manualApprovedBy:actor(manual.approvedBy||{}),manualApprovedAt:manual.approvedAt||null,manualCostExact:clean(manual.manualCostExact??manual.manualCost,100)
+      ,manualAffectedSaleLineIds:Array.isArray(manual.affectedSaleLinePopulation)?manual.affectedSaleLinePopulation.map(row=>clean(row.saleLineId||row.saleLineIdentity,500)).filter(Boolean):[]
     });
   }
   for (const opening of source.openingRows || []) {
@@ -1198,6 +1199,7 @@ function allocateSources(datasetId, source, filters = {}) {
       .filter(layer=>!layer.manualEffectiveFrom||sale.saleDate>=layer.manualEffectiveFrom)
       .filter(layer=>!layer.manualEffectiveTo||sale.saleDate<=layer.manualEffectiveTo)
       .filter(layer=>!layer.manualResolutionId||Number(layer.manualSchemaVersion||0)<4||(identity(layer.itemGuid)&&identity(layer.itemGuid)===identity(sale.itemGuid)))
+      .filter(layer=>!layer.manualResolutionId||!layer.manualAffectedSaleLineIds?.length||layer.manualAffectedSaleLineIds.includes(saleLineId))
       .sort((a,b)=>Number(Boolean(a.manualResolutionId))-Number(Boolean(b.manualResolutionId))||compareLayers(a,b));
 
     for (const layer of eligibleForSale) {
@@ -1450,6 +1452,13 @@ function allocateSources(datasetId, source, filters = {}) {
     }));
   }
 
+  for(const manual of source.manuals.filter(row=>['opening_quantity','evidence_quantity','commercial_announced_quantity'].includes(row.resolutionScope)&&openingIdentitySet.has(identity(row.itemGuid))&&Array.isArray(row.affectedSaleLinePopulation)&&row.affectedSaleLinePopulation.length)){
+    const expected=new Map(manual.affectedSaleLinePopulation.map(row=>[clean(row.saleLineId||row.saleLineIdentity,500),round(finite(row.quantityExact||row.unresolvedQuantityExact)||0)]));
+    const actual=new Map();
+    for(const row of allocations.filter(row=>clean(row.manualResolutionId,100)===clean(manual.resolutionId,100)))actual.set(clean(row.saleLineId,500),round((actual.get(clean(row.saleLineId,500))||0)+(finite(row.quantityExact??row.allocatedQty)||0)));
+    const mismatch=[...expected].some(([saleLineId,quantity])=>quantity<=EPSILON||Math.abs((actual.get(saleLineId)||0)-quantity)>EPSILON)||[...actual.keys()].some(saleLineId=>!expected.has(saleLineId));
+    if(mismatch){const error=new Error('Manual Cost and approved Opening authority claim capacity for the same stable ItemGuid.');error.code='MANUAL_COST_OPENING_CAPACITY_COLLISION';error.statusCode=409;throw error;}
+  }
   return { dates, sales, officialRows, purchaseReturns, saleReturns, allocations, exceptions, consumedByLayer };
 }
 
