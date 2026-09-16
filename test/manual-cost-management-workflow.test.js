@@ -109,11 +109,14 @@ test('default work queue uses the same canonical return-aware exposure as Review
   assert.equal(partialQueue.list[0].itemCode,'X');
   assert.equal(partialQueue.list[0].actionableQuantityExact,'1.000000');
   assert.equal(partialQueue.list[0].saleQuantity,1);
+  assert.equal(partialQueue.eligibilitySummary.actionableCount,1);
+  assert.equal(partialQueue.eligibilitySummary.fullyCoveredCount,0);
   const partialReview=await manual.managementReview(partialDb,{itemGuid:'GUID-X',itemCode:'X'},actors.admin);
   assert.equal(partialQueue.list[0].actionableQuantityExact,partialReview.exposure.unresolvedQuantityExact);
 
   const coveredDb=fixture({fullyCovered:true}),coveredQueue=await manual.missingQueue(coveredDb,{coverage:'unknown'});
   assert.equal(coveredQueue.total,0);
+  assert.equal(coveredQueue.eligibilitySummary.fullyCoveredCount,1);
   const coveredReview=await manual.managementReview(coveredDb,{itemGuid:'GUID-X',itemCode:'X'},actors.admin);
   assert.equal(coveredReview.exposure.unresolvedQuantityExact,'0.000000');
 });

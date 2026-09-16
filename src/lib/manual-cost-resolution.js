@@ -1309,6 +1309,14 @@ async function missingQueue(db, filters = {}) {
       fifoAllocationCreated:false
     };
   });
+  const legacyUnknownRows=rows.filter(row=>row.coverage==='unknown');
+  const eligibilitySummary={
+    previousUnknownCount:legacyUnknownRows.length,
+    actionableCount:legacyUnknownRows.filter(row=>row.actionable===true).length,
+    fullyCoveredCount:legacyUnknownRows.filter(row=>row.actionable!==true&&!row.canonicalIdentityConflict&&Number(row.canonicalRequiredQuantityExact)>0&&Number(row.actionableQuantityExact)===0).length,
+    identityConflictCount:legacyUnknownRows.filter(row=>row.canonicalIdentityConflict===true).length,
+    noEconomicPopulationCount:legacyUnknownRows.filter(row=>row.actionable!==true&&!row.canonicalIdentityConflict&&Number(row.canonicalRequiredQuantityExact)===0).length
+  };
   if(clean(filters.coverage||'unknown')==='unknown')rows=rows.filter(row=>row.actionable===true);
   rows = applyQueueFilters(rows, filters);
   queueSort(rows, filters.sort, filters.direction);
@@ -1323,6 +1331,7 @@ async function missingQueue(db, filters = {}) {
     activePurchaseLayerDatasetId:context.purchaseActive?.datasetId || '',
     openingDatasetId:clean(openingDataset?.datasetId,100),
     openingApprovalStatus:clean(openingDataset?.approvalStatus,50),
+    eligibilitySummary,
     total,
     page,
     pageSize,
