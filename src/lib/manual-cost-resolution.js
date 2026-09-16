@@ -375,16 +375,10 @@ function allocationIdentityMatches(row,target){
   if(targetGuid&&rowGuid)return targetGuid===rowGuid;
   return Boolean(targetCode&&rowCode===targetCode&&!rowGuid);
 }
-async function activeFifoEconomicExposure(db,target={}){
-  const state=await db.collection('fifoDatasetState').findOne({scopeKey:'fifo-shadow-v2-precision-evidence'}),datasetId=clean(state?.activeDatasetId,100);
-  if(!datasetId)fail('MANUAL_COST_ACTIVE_FIFO_REQUIRED','برای محاسبه Scope اقتصادی، FIFO فعال الزامی است.',409);
-  const queryParts=[];
-  if(clean(target.itemGuid,100))queryParts.push({itemGuid:clean(target.itemGuid,100)});
-  if(clean(target.itemCode,100))queryParts.push({itemCode:clean(target.itemCode,100)});
-  const candidates=queryParts.length?await db.collection('fifoAllocations').find({datasetId,$or:queryParts}).toArray():[];
-  const rows=candidates.filter(row=>Number(row.saleInvoiceType||0)===2&&allocationIdentityMatches(row,target));
+function economicExposureFromAllocationRows(rows=[],target={},datasetId='',governedRows=[]){
+  const candidates=rows.filter(row=>Number(row.saleInvoiceType||0)===2&&allocationIdentityMatches(row,target));
   const byLine=new Map();
-  for(const row of rows){
+  for(const row of candidates){
     const saleLineId=clean(row.saleLineId,500);if(!saleLineId)continue;
     const group=byLine.get(saleLineId)||{saleLineId,saleInvoiceNo:Number(row.saleInvoiceNo||0),saleRow:Number(row.saleRow||0),saleDate:clean(row.saleDate,8),itemGuid:clean(row.itemGuid||target.itemGuid,100),itemCode:clean(row.itemCode||target.itemCode,100),sellerAccountNumber:clean(row.sellerAccountNumber,100),sellerName:clean(row.sellerName,200),storeName:clean(row.storeName,200),itemDescription:clean(row.itemDescription,500),unknownQuantity:0n,coveredQuantity:0n,openingQuantity:0n,purchaseQuantity:0n,saleValue:0n,sources:new Set()};
     const quantity=accountingDecimal.parse(row.quantityExact??row.unknownQty??row.allocatedQty??0,accountingDecimal.QUANTITY_SCALE);
@@ -398,6 +392,21 @@ async function activeFifoEconomicExposure(db,target={}){
     }
     group.saleValue+=value;byLine.set(saleLineId,group);
   }
+  const governedByLine=new Map();
+  for(const resolution of governedRows){
+    if(!sameIdentity(resolution,target)||clean(resolution.activeFifoDatasetId,100)!==datasetId)continue;
+    const population=sanitizeAffectedSaleLinePopulation(resolution.affectedSaleLinePopulation);
+    if(!population.length||affectedPopulationFingerprint(population)!==clean(resolution.affectedSaleLinePopulationFingerprint,64))continue;
+    for(const row of population){
+      const quantity=accountingDecimal.parse(row.quantityExact,accountingDecimal.QUANTITY_SCALE);
+      governedByLine.set(row.saleLineId,(governedByLine.get(row.saleLineId)||0n)+quantity);
+    }
+  }
+  for(const [saleLineId,claimed] of governedByLine){
+    const group=byLine.get(saleLineId);if(!group||group.unknownQuantity<=0n)continue;
+    const applied=claimed<group.unknownQuantity?claimed:group.unknownQuantity;
+    group.unknownQuantity-=applied;group.coveredQuantity+=applied;group.governedQuantity=(group.governedQuantity||0n)+applied;group.sources.add('APPROVED_MANUAL_COST_PENDING_FIFO');
+  }
   const groups=[...byLine.values()].sort((a,b)=>a.saleDate.localeCompare(b.saleDate,'en')||a.saleInvoiceNo-b.saleInvoiceNo||a.saleRow-b.saleRow||a.saleLineId.localeCompare(b.saleLineId,'en'));
   const population=groups.filter(row=>row.unknownQuantity>0n).map(row=>({saleLineId:row.saleLineId,saleInvoiceNo:row.saleInvoiceNo,saleRow:row.saleRow,saleDate:row.saleDate,quantityExact:accountingDecimal.format(row.unknownQuantity,accountingDecimal.QUANTITY_SCALE)}));
   const total=(field)=>groups.reduce((sum,row)=>sum+row[field],0n);
@@ -408,6 +417,7 @@ async function activeFifoEconomicExposure(db,target={}){
     coveredQuantityExact:accountingDecimal.format(total('coveredQuantity'),accountingDecimal.QUANTITY_SCALE),
     openingCoveredQuantityExact:accountingDecimal.format(total('openingQuantity'),accountingDecimal.QUANTITY_SCALE),
     purchaseCoveredQuantityExact:accountingDecimal.format(total('purchaseQuantity'),accountingDecimal.QUANTITY_SCALE),
+    governedCoveredQuantityExact:accountingDecimal.format(groups.reduce((sum,row)=>sum+(row.governedQuantity||0n),0n),accountingDecimal.QUANTITY_SCALE),
     saleValueExposureExact:accountingDecimal.format(groups.filter(row=>row.unknownQuantity>0n).reduce((sum,row)=>sum+row.saleValue,0n),accountingDecimal.MONEY_SCALE),
     affectedSaleLinePopulation:population,
     affectedSaleLinePopulationFingerprint:affectedPopulationFingerprint(population),
@@ -417,12 +427,28 @@ async function activeFifoEconomicExposure(db,target={}){
     itemDescription:groups.find(row=>row.itemDescription)?.itemDescription||''
   };
 }
+async function activeFifoEconomicExposureContext(db,options={}){
+  const state=await db.collection('fifoDatasetState').findOne({scopeKey:'fifo-shadow-v2-precision-evidence'}),datasetId=clean(state?.activeDatasetId,100);
+  if(!datasetId)fail('MANUAL_COST_ACTIVE_FIFO_REQUIRED','برای محاسبه Scope اقتصادی، FIFO فعال الزامی است.',409);
+  const [allocations,approved]=await Promise.all([
+    db.collection('fifoAllocations').find({datasetId}).toArray(),
+    options.includeGovernedEvidence===false?Promise.resolve([]):allRows(db.collection(COLLECTION),{status:'approved',deleted:{$ne:true}})
+  ]);
+  const superseded=new Set(approved.map(row=>clean(row.supersedesResolutionId,100)).filter(Boolean));
+  const excluded=new Set([clean(options.excludeResolutionId,100),...(options.excludeResolutionIds||[]).map(value=>clean(value,100))].filter(Boolean));
+  const governedRows=approved.filter(row=>!excluded.has(clean(row.resolutionId,100))&&!superseded.has(clean(row.resolutionId,100)));
+  return {datasetId,allocations,governedRows};
+}
+async function activeFifoEconomicExposure(db,target={},options={}){
+  const context=options.context||await activeFifoEconomicExposureContext(db,options);
+  return economicExposureFromAllocationRows(context.allocations,target,context.datasetId,context.governedRows);
+}
 async function assertCurrentAffectedPopulation(db,resolution){
   const expected=sanitizeAffectedSaleLinePopulation(resolution.affectedSaleLinePopulation);
   if(!expected.length)fail('MANUAL_COST_AFFECTED_POPULATION_REQUIRED','Manual Cost جدید باید به جمعیت دقیق Sale Lineهای فاقد هزینه متصل باشد.',409);
   const fingerprint=affectedPopulationFingerprint(expected);
   if(fingerprint!==clean(resolution.affectedSaleLinePopulationFingerprint,64))fail('MANUAL_COST_AFFECTED_POPULATION_FINGERPRINT_MISMATCH','جمعیت Sale Line یا Fingerprint آن تغییر کرده است.',409);
-  const current=await activeFifoEconomicExposure(db,resolution);
+  const current=await activeFifoEconomicExposure(db,resolution,{excludeResolutionIds:[resolution.resolutionId,resolution.supersedesResolutionId]});
   const currentByLine=new Map(current.affectedSaleLinePopulation.map(row=>[row.saleLineId,row]));
   for(const row of expected){
     const actual=currentByLine.get(row.saleLineId);
@@ -843,6 +869,7 @@ async function loadReadinessContext(db) {
     manual,
     saleRows,
     legacyLayers,
+    catalogRows,
     catalogByCode:new Map(catalogRows.map(row=>[key(row.itemCode),row])),
     catalogByGuid:new Map(catalogRows.filter(row=>key(row.itemGuid)).map(row=>[key(row.itemGuid),row])),
     ...indexes,
@@ -1060,10 +1087,17 @@ async function managementReview(db,input={},requestedBy={}) {
 
 async function managementApprove(db,input={},requestedBy={}) {
   assertRole(requestedBy?.role,MANAGEMENT_ROLES);
+  const requestedReviewFingerprint=clean(input.reviewFingerprint,64),requestedCostExact=exactUnitCost(input.finalCost);
+  if(!requestedCostExact)fail('MANUAL_COST_INVALID_AMOUNT','مبلغ نهایی مورد تأیید باید معتبر و بزرگ‌تر از صفر باشد.');
+  const existing=requestedReviewFingerprint?await db.collection(COLLECTION).findOne({commercialReference:`MANAGEMENT_REVIEW:${requestedReviewFingerprint}`}):null;
+  if(existing){
+    if(clean(existing.manualCostExact||existing.manualCost,100)!==requestedCostExact)fail('MANUAL_COST_MANAGEMENT_RETRY_AMOUNT_MISMATCH','برای این Review قبلاً مبلغ دیگری ثبت شده است؛ وضعیت را بازخوانی کنید.',409);
+    if(existing.status==='approved')return {ok:true,message:'هزینه قبلاً ثبت و تأیید شده است.',resolutionId:existing.resolutionId,approvedAmountExact:existing.manualCostExact,quantityCoveredExact:existing.targetQuantityExact,evidenceType:managementSourceLabel(existing.managementDecisionClass||existing.evidenceClass),affectedExposure:{lineCount:Number(existing.affectedLineCount||0),saleValue:Number(existing.saleValueExposure||0),effectiveFrom:existing.effectiveFrom,effectiveTo:existing.effectiveTo},actor:existing.approvedBy,timestamp:existing.approvedAt,fifoImpactState:'منتظر به‌روزرسانی FIFO',activeFifoMutated:false,supersedesResolutionId:existing.supersedesResolutionId||'',idempotent:true};
+  }
   const review=await managementReview(db,{itemGuid:input.itemGuid,itemCode:input.itemCode,supersedesResolutionId:input.supersedesResolutionId},requestedBy);
-  if(clean(input.reviewFingerprint,64)!==review.reviewFingerprint)fail('MANUAL_COST_MANAGEMENT_REVIEW_STALE','پیش‌نمایش تصمیم تغییر کرده است؛ دوباره Review کنید.',409);
+  if(requestedReviewFingerprint!==review.reviewFingerprint)fail('MANUAL_COST_MANAGEMENT_REVIEW_STALE','پیش‌نمایش تصمیم تغییر کرده است؛ دوباره Review کنید.',409);
   if(!review.actionAllowed)fail('MANUAL_COST_MANAGEMENT_BLOCKED','این Exposure به‌دلیل تقدم یا تعارض مأخذ قابل ثبت نیست.',409);
-  const finalCostExact=exactUnitCost(input.finalCost);if(!finalCostExact)fail('MANUAL_COST_INVALID_AMOUNT','مبلغ نهایی مورد تأیید باید معتبر و بزرگ‌تر از صفر باشد.');
+  const finalCostExact=requestedCostExact;
   if(review.mode==='SUPERSEDE_APPROVED'&&finalCostExact===review.proposal.currentApprovedCostExact)fail('MANUAL_COST_AMOUNT_UNCHANGED','مبلغ اصلاحی با مبلغ مصوب فعلی برابر است.',409);
   const reason=review.mode==='SUPERSEDE_APPROVED'?`اصلاح مبلغ مصوب ${review.supersedesResolutionId}: ${review.proposal.currentApprovedCostExact} → ${finalCostExact}`:`تصمیم مدیریت برای ${review.exposure.unresolvedQuantityExact} واحد exposure فاقد هزینه؛ مبنا: ${review.proposal.sourceLabel}`;
   const decisionClass=managementDecisionClass(review);
@@ -1169,7 +1203,9 @@ function queueSort(rows, sort, direction) {
 }
 async function missingQueue(db, filters = {}) {
   const dates = normalizeJalaliRange({ dateFrom:filters.dateFrom || '', dateTo:filters.dateTo || '' });
-  const [context,openingDataset] = await Promise.all([loadReadinessContext(db),latestOpeningReviewDataset(db)]);
+  const [context,openingDataset,economicContext] = await Promise.all([
+    loadReadinessContext(db),latestOpeningReviewDataset(db),activeFifoEconomicExposureContext(db)
+  ]);
   const inventoryRows = await allRows(db.collection('itemInventoryCatalog'), {});
   const inventory = new Map();
   for (const row of inventoryRows) {
@@ -1225,10 +1261,35 @@ async function missingQueue(db, filters = {}) {
     for (const layer of matchingLayers) {
       if (layer.supplierAccountNumber || layer.supplierName) group.suppliers.add(clean(`${layer.supplierAccountNumber || ''} ${layer.supplierName || ''}`));
     }
+    const normalizedCode=canonicalItemCatalog.normalizedItemCode(group.itemCode);
+    const canonicalGuids=[...new Set((context.catalogRows||[])
+      .filter(row=>canonicalItemCatalog.normalizedItemCode(row.normalizedItemCode||row.itemCode)===normalizedCode)
+      .map(row=>canonicalItemCatalog.canonicalItemGuid(row.canonicalItemGuid||row.itemGuid)).filter(Boolean))];
+    const groupGuid=canonicalItemCatalog.canonicalItemGuid(group.itemGuid);
+    const itemGuid=groupGuid||(canonicalGuids.length===1?canonicalGuids[0]:'');
+    const identityConflict=!itemGuid||(!groupGuid&&canonicalGuids.length!==1);
+    const economic=identityConflict?null:economicExposureFromAllocationRows(economicContext.allocations,{itemGuid,itemCode:group.itemCode},economicContext.datasetId,economicContext.governedRows);
+    const population=economic?.affectedSaleLinePopulation||[];
     return {
       ...group,
-      saleCount:group.saleInvoiceIds.size,
+      itemGuid:itemGuid||clean(group.itemGuid),
+      saleCount:economic?.invoiceCount??group.saleInvoiceIds.size,
       saleInvoiceIds:undefined,
+      saleLineCount:economic?.lineCount??group.saleLineCount,
+      saleQuantity:economic?Number(economic.unresolvedQuantityExact):group.saleQuantity,
+      saleAmount:economic?Number(economic.saleValueExposureExact):group.saleAmount,
+      firstSaleDate:population[0]?.saleDate||group.firstSaleDate,
+      lastSaleDate:population[population.length-1]?.saleDate||group.lastSaleDate,
+      actionableQuantityExact:economic?.unresolvedQuantityExact||'0.000000',
+      canonicalRequiredQuantityExact:economic?.requiredQuantityExact||'0.000000',
+      canonicalCoveredQuantityExact:economic?.coveredQuantityExact||'0.000000',
+      canonicalOpeningCoveredQuantityExact:economic?.openingCoveredQuantityExact||'0.000000',
+      canonicalPurchaseCoveredQuantityExact:economic?.purchaseCoveredQuantityExact||'0.000000',
+      canonicalGovernedCoveredQuantityExact:economic?.governedCoveredQuantityExact||'0.000000',
+      canonicalAffectedSaleLinePopulationFingerprint:economic?.affectedSaleLinePopulationFingerprint||'',
+      canonicalEligibilityDatasetId:economicContext.datasetId,
+      canonicalIdentityConflict:identityConflict,
+      actionable:Boolean(economic&&positiveQuantity(economic.unresolvedQuantityExact)),
       stores:[...group.stores].filter(Boolean),
       category:[...group.categories].filter(Boolean).join('، '),
       brand:[...group.brands].filter(Boolean).join('، '),
@@ -1239,6 +1300,7 @@ async function missingQueue(db, filters = {}) {
       fifoAllocationCreated:false
     };
   });
+  if(clean(filters.coverage||'unknown')==='unknown')rows=rows.filter(row=>row.actionable===true);
   rows = applyQueueFilters(rows, filters);
   queueSort(rows, filters.sort, filters.direction);
   const total = rows.length;
@@ -1246,7 +1308,8 @@ async function missingQueue(db, filters = {}) {
   const pageSize = Math.max(1, Math.min(Number(filters.pageSize || 50), filters.export === true ? 5000 : 500));
   return {
     ok:true,
-    source:'active-sale-snapshot-plus-active-purchase-layer-dataset-plus-approved-manual-cost',
+    source:'active-fifo-canonical-economic-exposure',
+    activeFifoDatasetId:economicContext.datasetId,
     activeSnapshotId:context.saleActive.snapshotId || '',
     activePurchaseLayerDatasetId:context.purchaseActive?.datasetId || '',
     openingDatasetId:clean(openingDataset?.datasetId,100),

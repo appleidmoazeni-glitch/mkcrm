@@ -102,6 +102,31 @@ test('fully covered Opening exposure and non-operational role fail closed',async
   await assert.rejects(manual.managementReview(db,{itemGuid:'GUID-X',itemCode:'X'},actors.manager),error=>error.code==='MANUAL_COST_FORBIDDEN');
 });
 
+test('default work queue uses the same canonical return-aware exposure as Review',async()=>{
+  const partialDb=fixture(),partialQueue=await manual.missingQueue(partialDb,{coverage:'unknown'});
+  assert.equal(partialQueue.activeFifoDatasetId,'FIFO-A');
+  assert.equal(partialQueue.total,1);
+  assert.equal(partialQueue.list[0].itemCode,'X');
+  assert.equal(partialQueue.list[0].actionableQuantityExact,'1.000000');
+  assert.equal(partialQueue.list[0].saleQuantity,1);
+  const partialReview=await manual.managementReview(partialDb,{itemGuid:'GUID-X',itemCode:'X'},actors.admin);
+  assert.equal(partialQueue.list[0].actionableQuantityExact,partialReview.exposure.unresolvedQuantityExact);
+
+  const coveredDb=fixture({fullyCovered:true}),coveredQueue=await manual.missingQueue(coveredDb,{coverage:'unknown'});
+  assert.equal(coveredQueue.total,0);
+  const coveredReview=await manual.managementReview(coveredDb,{itemGuid:'GUID-X',itemCode:'X'},actors.admin);
+  assert.equal(coveredReview.exposure.unresolvedQuantityExact,'0.000000');
+});
+
+test('approved governed evidence leaves the actionable queue while batch FIFO update remains deferred',async()=>{
+  const db=fixture(),review=await manual.managementReview(db,{itemGuid:'GUID-X',itemCode:'X'},actors.purchase);
+  await manual.managementApprove(db,{itemGuid:'GUID-X',itemCode:'X',reviewFingerprint:review.reviewFingerprint,finalCost:'63203927.17'},actors.purchase);
+  const queue=await manual.missingQueue(db,{coverage:'unknown'});
+  assert.equal(queue.total,0);
+  assert.equal(db.collection('fifoDatasetState').rows[0].activeDatasetId,'FIFO-A');
+  assert.equal(db.collection('fifoSourceInvalidations').rows.length,1);
+});
+
 test('return-restored Opening capacity blocks the exact production-style false Manual Cost scope',async()=>{
   const db=fixture();
   db.collection('saleSnapshotDatasetHeaders').rows=[{snapshotId:'SALE-A',invTyp:2,invNo:2399},{snapshotId:'SALE-A',invTyp:2,invNo:2764},{snapshotId:'SALE-A',invTyp:6,invNo:10},{snapshotId:'SALE-A',invTyp:6,invNo:49}];
