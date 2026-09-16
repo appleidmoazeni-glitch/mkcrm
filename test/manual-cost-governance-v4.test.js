@@ -7,7 +7,7 @@ const manual=require('../src/lib/manual-cost-resolution');
 const fifo=require('../src/lib/fifo-shadow-engine');
 
 const accounting={username:'accounting-a',role:'accounting'};
-const manager={username:'manager-b',role:'manager'};
+const manager={username:'admin-b',role:'admin'};
 function input(overrides={}){
   return {itemGuid:'GUID-X',itemCode:'X',manualCostExact:'125.500000',targetQuantityExact:'2.000000',effectiveFrom:'14050101',effectiveTo:'14050131',sourceType:'commercial_announced_cost',resolutionScope:'commercial_announced_quantity',commercialReference:'COM-42',reason:'اعلام مکتوب بازرگانی',...overrides};
 }

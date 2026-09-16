@@ -29,9 +29,10 @@ const COMMERCIAL_SCOPE = 'commercial_announced_quantity';
 const LEGACY_UNBOUNDED_CLASS = 'LEGACY_UNBOUNDED_MANUAL_COST';
 const ASSISTED_WORKFLOW = 'accounting-assisted-v1';
 const ASSISTED_STATES = Object.freeze(['NEEDS_REVIEW','ACCOUNTING_REVIEW','APPROVED','DEFERRED','REJECTED']);
-const EDIT_ROLES = Object.freeze(['admin', 'accounting']);
-const APPROVE_ROLES = Object.freeze(['admin', 'manager']);
-const ASSISTED_FINALIZE_ROLES = Object.freeze(['admin','accounting','purchase']);
+const MANAGEMENT_ROLES = Object.freeze(['admin','accounting','purchase']);
+const EDIT_ROLES = MANAGEMENT_ROLES;
+const APPROVE_ROLES = MANAGEMENT_ROLES;
+const ASSISTED_FINALIZE_ROLES = MANAGEMENT_ROLES;
 const SOURCE_CLASSES = Object.freeze(['EXACT_OFFICIAL_PURCHASE_LAYER','OPENING_ACCOUNTING_COST','HISTORICAL_PURCHASE_AVERAGE','SOURCE_HISTORY_INCOMPLETE','NO_VALID_COST_BASIS','CONFLICT_REQUIRES_REVIEW']);
 let cachedGitMetadata;
 const readinessCache = new WeakMap();
@@ -71,7 +72,8 @@ function contentProjection(value = {}) {
     purchaseLineIdentity:clean(value.purchaseLineIdentity,500), targetQuantityExact:clean(value.targetQuantityExact,100),
     attachment:sanitizeAttachment(value.attachment), notes:clean(value.notes, 2000),
     supersedesResolutionId:clean(value.supersedesResolutionId,100),
-    sourceClass:clean(value.sourceClass,100),evidenceClass:clean(value.evidenceClass,100),commercialReference:clean(value.commercialReference,500),saleValueExposure:Number(value.saleValueExposure||0),affectedLineCount:Number(value.affectedLineCount||0),affectedQuantityExact:clean(value.affectedQuantityExact,100)
+    sourceClass:clean(value.sourceClass,100),evidenceClass:clean(value.evidenceClass,100),commercialReference:clean(value.commercialReference,500),saleValueExposure:Number(value.saleValueExposure||0),affectedLineCount:Number(value.affectedLineCount||0),affectedQuantityExact:clean(value.affectedQuantityExact,100),
+    scopeDerivationFingerprint:clean(value.scopeDerivationFingerprint,64),openingDatasetId:clean(value.openingDatasetId,100),openingEvidenceId:clean(value.openingEvidenceId,100),openingCoveredQuantityExact:clean(value.openingCoveredQuantityExact,100),managementDecisionClass:clean(value.managementDecisionClass,100)
   };
 }
 function contentHash(value) { return crypto.createHash('sha256').update(stable(contentProjection(value))).digest('hex'); }
@@ -154,7 +156,7 @@ function boundedAuditDetails(value = {}) {
 }
 function auditValueSnapshot(value) {
   if (value == null) return null;
-  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','sourceClass','evidenceClass','commercialReference','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType','saleValueExposure','affectedLineCount','affectedQuantityExact'];
+  const fields = ['itemGuid','itemCode','manualCost','manualCostExact','suggestedCostExact','finalCostExact','contentHash','resolutionScope','purchaseDatasetId','purchaseLineIdentity','targetQuantityExact','effectiveFrom','effectiveTo','currency','reason','sourceType','sourceClass','evidenceClass','commercialReference','attachment','notes','supersedesResolutionId','status','assistedStatus','workflowType','decisionType','saleValueExposure','affectedLineCount','affectedQuantityExact','scopeDerivationFingerprint','openingDatasetId','openingEvidenceId','openingCoveredQuantityExact','managementDecisionClass'];
   const output = {};
   for (const field of fields) {
     if (value[field] === undefined) continue;
@@ -223,7 +225,12 @@ function validateDraft(input = {}, options = {}) {
     notes:clean(input.notes, 2000),resolutionScope,purchaseDatasetId,purchaseLineIdentity,targetQuantityExact,
     supersedesResolutionId,
     commercialReference,
-    evidenceClass:sourceType===COMMERCIAL_SOURCE?'COMMERCIAL_ANNOUNCED_COST':''
+    evidenceClass:sourceType===COMMERCIAL_SOURCE?'COMMERCIAL_ANNOUNCED_COST':'',
+    scopeDerivationFingerprint:clean(input.scopeDerivationFingerprint,64),
+    openingDatasetId:clean(input.openingDatasetId,100),
+    openingEvidenceId:clean(input.openingEvidenceId,100),
+    openingCoveredQuantityExact:clean(input.openingCoveredQuantityExact,100),
+    managementDecisionClass:clean(input.managementDecisionClass,100)
   };
   return { ...normalized, contentHash:contentHash(normalized) };
 }
@@ -316,7 +323,17 @@ async function approvedOpeningCollision(db,candidate){
 }
 async function assertNoOpeningCollision(db,candidate){
   const collision=await approvedOpeningCollision(db,candidate);
-  if(collision)fail('MANUAL_COST_OPENING_CAPACITY_COLLISION','ظرفیت Opening مصوب برای همین ItemGuid وجود دارد: '+collision.datasetId,409);
+  if(!collision)return;
+  const datasetId=clean(candidate.openingDatasetId,100),evidenceId=clean(candidate.openingEvidenceId,100),scopeFingerprint=clean(candidate.scopeDerivationFingerprint,64);
+  if(datasetId===collision.datasetId&&evidenceId===collision.evidenceId&&scopeFingerprint){
+    const rows=await db.collection(openingCostBasis.ELIGIBILITY).find({datasetId,$or:[{itemGuid:clean(candidate.itemGuid,100)},{itemCode:clean(candidate.itemCode,100)}]}).sort({saleDate:1,saleInvoiceNo:1,saleRow:1}).limit(5000).toArray();
+    const eligible=rows.filter(row=>clean(row.saleDate,8)>=clean(candidate.effectiveFrom,8)&&clean(row.saleDate,8)<=clean(candidate.effectiveTo,8)&&accountingDecimal.parse(row.remainingUnknownQuantityExact||0,accountingDecimal.QUANTITY_SCALE)>0n);
+    const remaining=eligible.reduce((sum,row)=>sum+accountingDecimal.parse(row.remainingUnknownQuantityExact||0,accountingDecimal.QUANTITY_SCALE),0n);
+    const contract={datasetId,evidenceId,itemGuid:clean(candidate.itemGuid,100),itemCode:clean(candidate.itemCode,100),effectiveFrom:clean(candidate.effectiveFrom,8),effectiveTo:clean(candidate.effectiveTo,8),targetQuantityExact:clean(candidate.targetQuantityExact,100),openingCoveredQuantityExact:clean(candidate.openingCoveredQuantityExact,100),remainingLines:eligible.map(row=>[clean(row.saleLineIdentity,500),clean(row.saleDate,8),clean(row.remainingUnknownQuantityExact,100)])};
+    const replay=crypto.createHash('sha256').update(stable(contract)).digest('hex');
+    if(replay===scopeFingerprint&&accountingDecimal.parse(candidate.targetQuantityExact||0,accountingDecimal.QUANTITY_SCALE)<=remaining)return;
+  }
+  fail('MANUAL_COST_OPENING_CAPACITY_COLLISION','ظرفیت Opening مصوب برای همین ItemGuid وجود دارد و Scope باقی‌مانده قابل اثبات نیست: '+collision.datasetId,409);
 }
 function approvedRowsFingerprint(rows = []) {
   const identities = rows.map(row => [
@@ -332,7 +349,7 @@ async function approvedSetFingerprint(db) {
   return approvedRowsFingerprint(rows);
 }
 async function impactPreview(db, resolutionId, requestedBy = {}) {
-  assertRole(requestedBy?.role, ['admin','accounting','manager']);
+  assertRole(requestedBy?.role, ['admin','accounting','purchase','manager']);
   const resolution = await getById(db, resolutionId);
   const state = await db.collection('fifoDatasetState').findOne({ scopeKey:'fifo-shadow-v2-precision-evidence' });
   const datasetId = clean(state?.activeDatasetId, 100);
@@ -531,9 +548,6 @@ async function transition(db, resolutionId, action, requestedBy, input = {}) {
   const rule = transitions[action];
   if (!rule || !rule.from.includes(current.status)) {
     fail('MANUAL_COST_INVALID_TRANSITION', `انتقال وضعیت ${current.status} با عملیات ${action} مجاز نیست.`, 409);
-  }
-  if (action === 'approve' && clean(current.createdBy?.username) === clean(requestedBy?.username)) {
-    fail('MANUAL_COST_SELF_APPROVAL', 'ایجادکننده نمی‌تواند Resolution خود را تأیید کند.', 403);
   }
   if(['submit','approve'].includes(action)){
     await assertStableItemIdentity(db,current);
@@ -865,6 +879,115 @@ async function assistedSuggestion(db,input={},requestedBy={}) {
   const requiredExact=clean(input.affectedQuantityExact,100)?accountingDecimal.format(accountingDecimal.parse(input.affectedQuantityExact,accountingDecimal.QUANTITY_SCALE),accountingDecimal.QUANTITY_SCALE):'0.000000';
   if(!history.complete)return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:false,...openingReviewContext,historyCompleteness:history.state,sourceClass:'SOURCE_HISTORY_INCOMPLETE',available:false,manualCostRequired:false,method:'BOUNDED_PURCHASE_HISTORY_RECOVERY_REQUIRED',suggestedCostExact:null,purchaseCount:0,quantityBasisExact:'0.000000',totalRequiredQuantityExact:requiredExact,eligibleTargetQuantityExact:'0.000000',remainingUnknownQuantityExact:requiredExact,sourceFingerprint:crypto.createHash('sha256').update(stable({target,historyState:history.state})).digest('hex'),remediation:'QUEUE_CANONICAL_PURCHASE_HISTORY_RECOVERY'};
   return {ok:true,readOnly:true,purchaseDatasetId:datasetId,applicableDate,target,evidenceComplete:true,...openingReviewContext,sourceClass:'NO_VALID_COST_BASIS',...historical};
+}
+
+function managementSourceLabel(sourceClass='') {
+  return ({OPENING_ACCOUNTING_COST:'قیمت موجودی ابتدای دوره مصوب',HISTORICAL_PURCHASE_AVERAGE:'پیشنهاد میانگین خرید تاریخی',NO_VALID_COST_BASIS:'تعیین هزینه دستی برای exposure فاقد پیشنهاد معتبر',COMMERCIAL_ANNOUNCED_COST:'قیمت اعلام بازرگانی',COMMERCIAL_ANNOUNCED_COST_REFERENCING_OPENING:'قیمت اعلام بازرگانی با مرجع Opening مصوب',COMMERCIAL_ANNOUNCED_COST_REFERENCING_HISTORICAL_AVERAGE:'قیمت اعلام بازرگانی با مرجع میانگین خرید تاریخی',MANUAL_COST_NO_VALID_PROPOSAL:'تعیین هزینه دستی بدون پیشنهاد معتبر'})[sourceClass]||sourceClass;
+}
+
+function managementDecisionClass(review={}) {
+  if(review.mode==='SUPERSEDE_APPROVED')return clean(review.technicalDetails?.previousManagementDecisionClass,100)||'COMMERCIAL_ANNOUNCED_COST';
+  if(review.proposal?.sourceClass==='OPENING_ACCOUNTING_COST')return 'COMMERCIAL_ANNOUNCED_COST_REFERENCING_OPENING';
+  if(review.proposal?.sourceClass==='HISTORICAL_PURCHASE_AVERAGE')return 'COMMERCIAL_ANNOUNCED_COST_REFERENCING_HISTORICAL_AVERAGE';
+  if(review.proposal?.sourceClass==='NO_VALID_COST_BASIS')return 'MANUAL_COST_NO_VALID_PROPOSAL';
+  return 'COMMERCIAL_ANNOUNCED_COST';
+}
+
+function positiveQuantity(value) {
+  try{return accountingDecimal.parse(value||0,accountingDecimal.QUANTITY_SCALE)>0n;}catch(_){return false;}
+}
+
+async function resolveManagementIdentity(db,input={}) {
+  const requestedGuid=canonicalItemCatalog.canonicalItemGuid(input.itemGuid),requestedCode=canonicalItemCatalog.canonicalItemCode(input.itemCode);
+  const normalizedCode=canonicalItemCatalog.normalizedItemCode(requestedCode);
+  if(!requestedCode)fail('MANUAL_COST_STABLE_IDENTITY_REQUIRED','انتخاب Queue باید ItemCode پایدار داشته باشد.',409);
+  const queryParts=[{normalizedItemCode:normalizedCode},{itemCode:requestedCode}];
+  if(requestedGuid)queryParts.push({canonicalItemGuid:requestedGuid},{itemGuid:requestedGuid});
+  const rows=await db.collection(canonicalItemCatalog.CATALOG).find({$or:queryParts}).toArray();
+  const codeRows=rows.filter(row=>canonicalItemCatalog.normalizedItemCode(row.normalizedItemCode||row.itemCode)===normalizedCode);
+  const guidRows=requestedGuid?rows.filter(row=>canonicalItemCatalog.canonicalItemGuid(row.canonicalItemGuid||row.itemGuid)===requestedGuid):[];
+  const resolved=canonicalItemCatalog._resolveExisting({itemGuid:requestedGuid,itemCode:requestedCode},guidRows,codeRows);
+  const resolvedGuid=canonicalItemCatalog.canonicalItemGuid(resolved.existing?.canonicalItemGuid||resolved.existing?.itemGuid);
+  if(resolved.conflict||!resolvedGuid)fail('MANUAL_COST_ITEM_IDENTITY_CONFLICT','ItemCode صف به یک ItemGuid یکتای canonical متصل نیست؛ تعیین هزینه تا رفع تعارض هویت مجاز نیست.',409);
+  return {itemGuid:resolvedGuid,itemCode:canonicalItemCatalog.canonicalItemCode(resolved.existing?.itemCode||requestedCode)};
+}
+
+async function managementReview(db,input={},requestedBy={}) {
+  assertRole(requestedBy?.role,MANAGEMENT_ROLES);
+  const supersedesResolutionId=clean(input.supersedesResolutionId,100);
+  if(supersedesResolutionId){
+    const previous=await getById(db,supersedesResolutionId);
+    if(previous.status!=='approved'||previous.deleted===true)fail('MANUAL_COST_SUPERSEDED_NOT_APPROVED','فقط هزینه مصوب و حذف‌نشده قابل اصلاح است.',409);
+    if(![COMMERCIAL_SCOPE,'evidence_quantity','opening_quantity','purchase_layer'].includes(clean(previous.resolutionScope,50))||!positiveQuantity(previous.targetQuantityExact)||!previous.effectiveFrom||!previous.effectiveTo)fail('MANUAL_COST_CORRECTION_SCOPE_UNSAFE','هزینه قدیمی Scope محدود و قابل اثبات ندارد؛ اصلاح مدیریتی خودکار مجاز نیست.',409);
+    const scope={itemGuid:clean(previous.itemGuid,100),itemCode:clean(previous.itemCode,100),targetQuantityExact:clean(previous.targetQuantityExact,100),effectiveFrom:clean(previous.effectiveFrom,8),effectiveTo:clean(previous.effectiveTo,8),purchaseDatasetId:clean(previous.purchaseDatasetId,100),resolutionScope:clean(previous.resolutionScope,50),scopeDerivationFingerprint:clean(previous.scopeDerivationFingerprint,64),openingDatasetId:clean(previous.openingDatasetId,100),openingEvidenceId:clean(previous.openingEvidenceId,100),openingCoveredQuantityExact:clean(previous.openingCoveredQuantityExact,100)};
+    const reviewFingerprint=crypto.createHash('sha256').update(stable({mode:'SUPERSEDE_APPROVED',supersedesResolutionId,contentHash:clean(previous.contentHash,64),revision:Number(previous.revision||0),scope})).digest('hex');
+    return {ok:true,readOnly:true,mode:'SUPERSEDE_APPROVED',actionAllowed:true,item:{itemGuid:scope.itemGuid,itemCode:scope.itemCode,itemDescription:''},exposure:{requiredQuantityExact:scope.targetQuantityExact,openingCoveredQuantityExact:scope.openingCoveredQuantityExact||'0.000000',unresolvedQuantityExact:scope.targetQuantityExact,affectedInvoiceCount:Number(previous.approvedImpactPreview?.affected?.invoices||0),affectedLineCount:Number(previous.approvedImpactPreview?.affected?.saleLines||previous.affectedLineCount||0),saleValueExposure:Number(previous.saleValueExposure||0),effectiveFrom:scope.effectiveFrom,effectiveTo:scope.effectiveTo},proposal:{available:true,sourceClass:'COMMERCIAL_ANNOUNCED_COST',sourceLabel:managementSourceLabel(previous.managementDecisionClass||'COMMERCIAL_ANNOUNCED_COST'),suggestedCostExact:clean(previous.manualCostExact||previous.manualCost,100),currentApprovedCostExact:clean(previous.manualCostExact||previous.manualCost,100)},scope,reviewFingerprint,supersedesResolutionId,technicalDetails:{previousResolutionId:previous.resolutionId,previousContentHash:previous.contentHash,previousRevision:Number(previous.revision||0),previousManagementDecisionClass:clean(previous.managementDecisionClass,100)},blockers:[]};
+  }
+  const identity=await resolveManagementIdentity(db,input),itemGuid=identity.itemGuid,itemCode=identity.itemCode;
+  const queue=await missingQueue(db,{coverage:'unknown',page:1,pageSize:5000,export:true});
+  const row=(queue.list||[]).find(value=>key(value.itemCode)===key(itemCode)&&(!clean(value.itemGuid,100)||key(value.itemGuid)===key(itemGuid)));
+  if(!row)fail('MANUAL_COST_EXPOSURE_NOT_FOUND','Exposure انتخاب‌شده دیگر در صف هزینه نامشخص وجود ندارد؛ صفحه را بازخوانی کنید.',409);
+  const suggestion=await assistedSuggestion(db,{itemGuid,itemCode,applicableDate:row.firstSaleDate,reviewDateTo:row.lastSaleDate,affectedQuantityExact:String(row.saleQuantity||0),purchaseDatasetId:queue.activePurchaseLayerDatasetId},requestedBy);
+  const openingApproved=suggestion.sourceClass==='OPENING_ACCOUNTING_COST'&&suggestion.approvalStatus==='approved';
+  const remainingRows=(suggestion.eligibilityPreview?.rows||[]).filter(value=>positiveQuantity(value.remainingUnknownQuantityExact));
+  const effectiveFrom=clean(remainingRows[0]?.saleDate||row.firstSaleDate,8),effectiveTo=clean(remainingRows[remainingRows.length-1]?.saleDate||row.lastSaleDate,8);
+  const requiredQuantityExact=clean(suggestion.totalRequiredQuantityExact,100)||accountingDecimal.format(accountingDecimal.parse(row.saleQuantity||0,accountingDecimal.QUANTITY_SCALE),accountingDecimal.QUANTITY_SCALE);
+  const openingCoveredQuantityExact=openingApproved?(clean(suggestion.eligibleTargetQuantityExact,100)||'0.000000'):'0.000000';
+  const unresolvedQuantityExact=openingApproved?(clean(suggestion.remainingUnknownQuantityExact,100)||'0.000000'):requiredQuantityExact;
+  const blockers=[];
+  if(suggestion.reviewOnly===true||suggestion.financialAuthority===false)blockers.push('OPENING_EVIDENCE_NOT_APPROVED');
+  if(suggestion.sourceClass==='EXACT_OFFICIAL_PURCHASE_LAYER')blockers.push('OFFICIAL_PURCHASE_PRECEDENCE');
+  if(suggestion.sourceClass==='SOURCE_HISTORY_INCOMPLETE')blockers.push('SOURCE_HISTORY_INCOMPLETE');
+  if(suggestion.sourceClass==='PENDING_PURCHASE_PRICE')blockers.push('PENDING_PURCHASE_PRICE');
+  if(suggestion.sourceClass==='PURCHASE_RETURN_CONFLICT')blockers.push('PURCHASE_RETURN_CONFLICT');
+  if(suggestion.sourceClass==='CONFLICT_REQUIRES_REVIEW')blockers.push('SOURCE_CONFLICT');
+  if(!positiveQuantity(unresolvedQuantityExact))blockers.push('OPENING_AUTHORITY_ALREADY_COVERS_EXPOSURE');
+  const scopeContract={datasetId:openingApproved?clean(suggestion.openingEvidenceDatasetId,100):'',evidenceId:openingApproved?clean(suggestion.evidenceId,100):'',itemGuid,itemCode,effectiveFrom,effectiveTo,targetQuantityExact:unresolvedQuantityExact,openingCoveredQuantityExact,remainingLines:remainingRows.map(value=>[clean(value.saleLineIdentity,500),clean(value.saleDate,8),clean(value.remainingUnknownQuantityExact,100)])};
+  const scopeDerivationFingerprint=crypto.createHash('sha256').update(stable(scopeContract)).digest('hex');
+  const scope={itemGuid,itemCode,targetQuantityExact:unresolvedQuantityExact,effectiveFrom,effectiveTo,purchaseDatasetId:queue.activePurchaseLayerDatasetId,resolutionScope:COMMERCIAL_SCOPE,scopeDerivationFingerprint,openingDatasetId:scopeContract.datasetId,openingEvidenceId:scopeContract.evidenceId,openingCoveredQuantityExact};
+  const reviewContract={mode:'NEW_EXPOSURE',saleSnapshotId:queue.activeSnapshotId,purchaseDatasetId:queue.activePurchaseLayerDatasetId,itemGuid,itemCode,saleLineCount:Number(row.saleLineCount||0),saleCount:Number(row.saleCount||0),saleQuantity:Number(row.saleQuantity||0),saleValue:Number(row.saleAmount||0),firstSaleDate:row.firstSaleDate,lastSaleDate:row.lastSaleDate,sourceClass:suggestion.sourceClass,sourceFingerprint:clean(suggestion.sourceFingerprint,64),scope};
+  const reviewFingerprint=crypto.createHash('sha256').update(stable(reviewContract)).digest('hex');
+  return {ok:true,readOnly:true,mode:'NEW_EXPOSURE',actionAllowed:blockers.length===0,item:{itemGuid,itemCode,itemDescription:row.itemDescription},exposure:{requiredQuantityExact,openingCoveredQuantityExact,unresolvedQuantityExact,affectedInvoiceCount:Number(row.saleCount||0),affectedLineCount:Number(row.saleLineCount||0),saleValueExposure:Number(row.saleAmount||0),effectiveFrom,effectiveTo},proposal:{available:Boolean(suggestion.available&&suggestion.suggestedCostExact),sourceClass:suggestion.sourceClass,sourceLabel:managementSourceLabel(suggestion.sourceClass),suggestedCostExact:clean(suggestion.suggestedCostExact,100)||null},scope,reviewFingerprint,supersedesResolutionId:'',technicalDetails:{saleSnapshotId:queue.activeSnapshotId,purchaseDatasetId:queue.activePurchaseLayerDatasetId,openingDatasetId:clean(suggestion.openingEvidenceDatasetId,100),openingEvidenceId:clean(suggestion.evidenceId,100),sourceFingerprint:clean(suggestion.sourceFingerprint,64),reviewLineage:suggestion.reviewLineage||null,eligibilityPreview:suggestion.eligibilityPreview||null},blockers:[...new Set(blockers)]};
+}
+
+async function managementApprove(db,input={},requestedBy={}) {
+  assertRole(requestedBy?.role,MANAGEMENT_ROLES);
+  const review=await managementReview(db,{itemGuid:input.itemGuid,itemCode:input.itemCode,supersedesResolutionId:input.supersedesResolutionId},requestedBy);
+  if(clean(input.reviewFingerprint,64)!==review.reviewFingerprint)fail('MANUAL_COST_MANAGEMENT_REVIEW_STALE','پیش‌نمایش تصمیم تغییر کرده است؛ دوباره Review کنید.',409);
+  if(!review.actionAllowed)fail('MANUAL_COST_MANAGEMENT_BLOCKED','این Exposure به‌دلیل تقدم یا تعارض مأخذ قابل ثبت نیست.',409);
+  const finalCostExact=exactUnitCost(input.finalCost);if(!finalCostExact)fail('MANUAL_COST_INVALID_AMOUNT','مبلغ نهایی مورد تأیید باید معتبر و بزرگ‌تر از صفر باشد.');
+  if(review.mode==='SUPERSEDE_APPROVED'&&finalCostExact===review.proposal.currentApprovedCostExact)fail('MANUAL_COST_AMOUNT_UNCHANGED','مبلغ اصلاحی با مبلغ مصوب فعلی برابر است.',409);
+  const reason=review.mode==='SUPERSEDE_APPROVED'?`اصلاح مبلغ مصوب ${review.supersedesResolutionId}: ${review.proposal.currentApprovedCostExact} → ${finalCostExact}`:`تصمیم مدیریت برای ${review.exposure.unresolvedQuantityExact} واحد exposure فاقد هزینه؛ مبنا: ${review.proposal.sourceLabel}`;
+  const decisionClass=managementDecisionClass(review);
+  const commercialReference=`MANAGEMENT_REVIEW:${review.reviewFingerprint}`;
+  let resolution=await db.collection(COLLECTION).findOne({commercialReference});
+  if(resolution&&clean(resolution.manualCostExact||resolution.manualCost,100)!==finalCostExact)fail('MANUAL_COST_MANAGEMENT_RETRY_AMOUNT_MISMATCH','برای این Review قبلاً مبلغ دیگری ثبت شده است؛ وضعیت را بازخوانی کنید.',409);
+  if(!resolution){
+    const created=await createDraft(db,{itemGuid:review.scope.itemGuid,itemCode:review.scope.itemCode,manualCost:finalCostExact,resolutionScope:review.scope.resolutionScope,targetQuantityExact:review.scope.targetQuantityExact,effectiveFrom:review.scope.effectiveFrom,effectiveTo:review.scope.effectiveTo,sourceType:COMMERCIAL_SOURCE,commercialReference,currency:'IRR',reason,notes:'Created by management Review → Set Cost → Approve workflow.',supersedesResolutionId:review.supersedesResolutionId,affectedQuantityExact:review.exposure.unresolvedQuantityExact,affectedLineCount:review.exposure.affectedLineCount,saleValueExposure:review.exposure.saleValueExposure,purchaseDatasetId:review.scope.purchaseDatasetId,scopeDerivationFingerprint:review.scope.scopeDerivationFingerprint,openingDatasetId:review.scope.openingDatasetId,openingEvidenceId:review.scope.openingEvidenceId,openingCoveredQuantityExact:review.scope.openingCoveredQuantityExact,managementDecisionClass:decisionClass},requestedBy);
+    resolution=created.resolution;
+  }
+  if(resolution.status==='draft')resolution=(await transition(db,resolution.resolutionId,'submit',requestedBy,{revision:resolution.revision,reason})).resolution;
+  if(resolution.status==='pending'){
+    const preview=await impactPreview(db,resolution.resolutionId,requestedBy);
+    resolution=(await transition(db,resolution.resolutionId,'approve',requestedBy,{revision:resolution.revision,reason,previewFingerprint:preview.previewFingerprint})).resolution;
+  }
+  if(resolution.status!=='approved')fail('MANUAL_COST_MANAGEMENT_INCOMPLETE','فرآیند governed به Approval نرسید؛ رکورد ایمن و غیرفعال برای بررسی حفظ شد.',409);
+  return {ok:true,message:'هزینه ثبت و تایید شد.',resolutionId:resolution.resolutionId,approvedAmountExact:resolution.manualCostExact,quantityCoveredExact:resolution.targetQuantityExact,evidenceType:managementSourceLabel(resolution.managementDecisionClass||resolution.evidenceClass),affectedExposure:{lineCount:Number(resolution.affectedLineCount||0),saleValue:Number(resolution.saleValueExposure||0),effectiveFrom:resolution.effectiveFrom,effectiveTo:resolution.effectiveTo},actor:resolution.approvedBy,timestamp:resolution.approvedAt,fifoImpactState:'منتظر به‌روزرسانی FIFO',activeFifoMutated:false,supersedesResolutionId:resolution.supersedesResolutionId||''};
+}
+
+async function managementArchive(db,filters={},requestedBy={}) {
+  assertRole(requestedBy?.role,['admin','accounting','purchase','manager']);
+  let rows=await allRows(db.collection(COLLECTION),{});
+  const search=key(filters.search),status=clean(filters.status,50);
+  if(status)rows=rows.filter(row=>row.status===status);
+  if(search)rows=rows.filter(row=>[row.resolutionId,row.itemCode,row.itemGuid,row.reason,row.createdBy?.username].some(value=>key(value).includes(search)));
+  rows.sort((a,b)=>new Date(b.updatedAt||0)-new Date(a.updatedAt||0));
+  const report={ok:true,total:rows.length,list:rows},state=await db.collection('fifoDatasetState').findOne({scopeKey:'fifo-shadow-v2-precision-evidence'}),datasetId=clean(state?.activeDatasetId,100);
+  const dataset=datasetId?await db.collection('fifoDatasets').findOne({datasetId}):null;
+  const ids=report.list.map(row=>row.resolutionId),allocations=datasetId&&ids.length?await db.collection('fifoAllocations').find({datasetId,manualResolutionId:{$in:ids}}).toArray():[];
+  const applied=new Set(allocations.map(row=>clean(row.manualResolutionId,100))),supersededBy=new Map();
+  for(const row of report.list)if(row.supersedesResolutionId)supersededBy.set(clean(row.supersedesResolutionId,100),row.resolutionId);
+  return {...report,readOnly:true,activeFifoDatasetId:datasetId,lastFifoUpdate:dataset?.activatedAt||dataset?.completedAt||dataset?.createdAt||null,calculationCutoff:clean(dataset?.calculationCutoff,8),list:report.list.map(row=>({...row,currentAmountExact:clean(row.manualCostExact||row.manualCost,100),sourceLabel:managementSourceLabel(row.managementDecisionClass||(row.evidenceClass==='COMMERCIAL_ANNOUNCED_COST'?'COMMERCIAL_ANNOUNCED_COST':row.sourceClass||row.sourceType)),coveredQuantityExact:clean(row.targetQuantityExact||row.affectedQuantityExact,100),lastCorrectionId:supersededBy.get(row.resolutionId)||'',fifoImpactState:row.status!=='approved'?'در انتظار تکمیل حاکمیت':supersededBy.has(row.resolutionId)?'جایگزین‌شده':applied.has(row.resolutionId)?'اعمال‌شده در FIFO':'منتظر به‌روزرسانی FIFO',appliedInActiveFifo:applied.has(row.resolutionId)}))};
 }
 async function assistedDecision(db,input={},requestedBy={}) {
   assertRole(requestedBy?.role,ASSISTED_FINALIZE_ROLES);
@@ -1218,6 +1341,7 @@ module.exports = {
   COMMERCIAL_SOURCE,
   COMMERCIAL_SCOPE,
   LEGACY_UNBOUNDED_CLASS,
+  MANAGEMENT_ROLES,
   EDIT_ROLES,
   APPROVE_ROLES,
   ensureIndexes,
@@ -1235,6 +1359,9 @@ module.exports = {
   dataHealth,
   assistedSuggestion,
   assistedDecision,
+  managementReview,
+  managementApprove,
+  managementArchive,
   approvedSetFingerprint,
   impactPreview,
   _validAt:validAt,

@@ -3826,6 +3826,7 @@ function stagingReadOnlyOperation(req, pathname) {
     'POST /api/sale-snapshot/start': 'sale-snapshot.start',
     'POST /api/sale-snapshot/resume': 'sale-snapshot.resume',
     'POST /api/manual-cost-resolutions': 'manual-cost-resolutions.create',
+    'POST /api/manual-cost-resolutions/management/approve': 'manual-cost-resolutions.workflow',
     'POST /api/accounting/fifo-shadow/start': 'fifo-shadow.start',
     'POST /api/accounting/fifo-shadow/resume': 'fifo-shadow.resume',
     'POST /api/accounting/profit-ledger/init': 'profit-ledger.init',
@@ -4232,6 +4233,18 @@ async function handleApi(req, res, pathname, query) {
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       try{return sendJson(res,200,await manualCostResolution.assistedSuggestion(db,query,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_SUGGESTION_FAILED',error:String(error.message||error)});}
     }
+    if(pathname==='/api/manual-cost-resolutions/management/review'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','purchase']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.managementReview(db,query,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_MANAGEMENT_REVIEW_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/manual-cost-resolutions/management/approve'&&req.method==='POST'){
+      if(!requireRole(req,res,['admin','accounting','purchase']))return;const body=await collectBody(req),db=await connectMongo();
+      try{return sendJson(res,201,await manualCostResolution.managementApprove(db,body,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_MANAGEMENT_APPROVAL_FAILED',error:String(error.message||error)});}
+    }
+    if(pathname==='/api/manual-cost-resolutions/management/archive'&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','purchase','manager']))return;const db=await connectMongo();
+      try{return sendJson(res,200,await manualCostResolution.managementArchive(db,query,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_MANAGEMENT_ARCHIVE_FAILED',error:String(error.message||error)});}
+    }
     if(pathname==='/api/accounting/opening-accounting-evidence/candidates'&&req.method==='GET'){
       if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();
       return sendJson(res,200,await openingAccountingCostBasis.listCandidates(db,query));
@@ -4271,7 +4284,7 @@ async function handleApi(req, res, pathname, query) {
       try{return sendJson(res,201,await manualCostResolution.assistedDecision(db,body,currentUser(req)));}catch(error){return sendJson(res,Number(error.statusCode||400),{ok:false,code:error.code||'MANUAL_COST_DECISION_FAILED',error:String(error.message||error)});}
     }
     if (pathname === '/api/manual-cost-resolutions' && req.method === 'POST') {
-      if (!requireRole(req,res,['admin','accounting'])) return;
+      if (!requireRole(req,res,['admin','accounting','purchase'])) return;
       const body=await collectBody(req);
       const db=await connectMongo();
       try {
@@ -4298,7 +4311,7 @@ async function handleApi(req, res, pathname, query) {
       }
     }
     if (manualCostMatch && ['PUT','PATCH'].includes(req.method) && !manualCostMatch[2]) {
-      if (!requireRole(req,res,['admin','accounting'])) return;
+      if (!requireRole(req,res,['admin','accounting','purchase'])) return;
       const body=await collectBody(req);
       const db=await connectMongo();
       try {
@@ -4308,7 +4321,7 @@ async function handleApi(req, res, pathname, query) {
       }
     }
     if (manualCostMatch && req.method === 'POST' && manualCostMatch[2]) {
-      if (!requireRole(req,res,manualCostMatch[2]==='submit'?['admin','accounting']:['admin','manager'])) return;
+      if (!requireRole(req,res,['admin','accounting','purchase'])) return;
       const body=await collectBody(req);
       const db=await connectMongo();
       try {

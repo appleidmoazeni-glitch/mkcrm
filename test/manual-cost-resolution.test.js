@@ -86,7 +86,7 @@ function governedInput(value={}){
 }
 const originalCreateDraft=service.createDraft.bind(service);
 function governedCreate(db,value,user){return originalCreateDraft(db,governedInput(value),user);}
-async function approvePending(db,pending,user=manager){
+async function approvePending(db,pending,user=accounting){
   const preview=await service.impactPreview(db,pending.resolution.resolutionId,user);
   return service.transition(db,pending.resolution.resolutionId,'approve',user,{revision:pending.resolution.revision,previewFingerprint:preview.previewFingerprint});
 }
@@ -105,7 +105,7 @@ async function approvedManual(db, overrides = {}) {
     ...overrides
   }, accounting);
   const pending=await service.transition(db, created.resolution.resolutionId, 'submit', accounting, { revision:created.resolution.revision });
-  return approvePending(db,pending,manager);
+  return approvePending(db,pending,accounting);
 }
 
 test('draft -> pending -> approved preserves immutable audit evidence', async () => {
@@ -124,9 +124,9 @@ test('draft -> pending -> approved preserves immutable audit evidence', async ()
   assert.equal(created.resolution.auditLog[0].action,'created-draft');
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
   assert.equal(pending.resolution.status,'pending');
-  const approved=await approvePending(db,pending,manager);
+  const approved=await approvePending(db,pending,accounting);
   assert.equal(approved.resolution.status,'approved');
-  assert.equal(approved.resolution.approvedBy.username,'manager-1');
+  assert.equal(approved.resolution.approvedBy.username,'accountant-1');
   assert.deepEqual(approved.resolution.auditLog.map(row=>row.action),['created-draft','submit','approve']);
   assert.equal(approved.resolution.auditLog[0].details.oldValue,null);
   assert.equal(approved.resolution.auditLog[0].details.newValue.manualCost,800.5);
@@ -158,7 +158,7 @@ test('optimistic revision prevents silent overwrite', async () => {
   );
 });
 
-test('seller cannot create or approve and creator cannot self-approve', async () => {
+test('seller is forbidden while accounting may self-approve after a bound preview', async () => {
   const db=seedDb();
   await assert.rejects(
     governedCreate(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101'},{username:'seller',role:'seller'}),
@@ -167,11 +167,12 @@ test('seller cannot create or approve and creator cannot self-approve', async ()
   const created=await governedCreate(db,{itemCode:'X',manualCost:1,effectiveFrom:'14050101'},accounting);
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:created.resolution.revision});
   await assert.rejects(
-    service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:pending.resolution.revision}),
+    service.transition(db,created.resolution.resolutionId,'approve',{username:'seller',role:'seller'},{revision:pending.resolution.revision}),
     error=>error.code==='MANUAL_COST_FORBIDDEN'&&error.statusCode===403
   );
-  const preview=await service.impactPreview(db,created.resolution.resolutionId,manager);const approved=await service.transition(db,created.resolution.resolutionId,'approve',{username:'manager',role:'manager'},{revision:pending.resolution.revision,previewFingerprint:preview.previewFingerprint});
+  const preview=await service.impactPreview(db,created.resolution.resolutionId,accounting);const approved=await service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:pending.resolution.revision,previewFingerprint:preview.previewFingerprint});
   assert.equal(approved.resolution.status,'approved');
+  assert.equal(approved.resolution.approvedBy.username,'accountant-1');
 });
 
 test('overlapping active resolutions are rejected and no physical delete API exists', async () => {
@@ -219,13 +220,13 @@ test('future, expired and rejected manual costs are not eligible', async () => {
   const db=seedDb();
   const future=await governedCreate(db,{itemCode:'MANUAL',itemGuid:'GUID-M',manualCost:5,effectiveFrom:'14050201',effectiveTo:'14050228'},accounting);
   const futurePending=await service.transition(db,future.resolution.resolutionId,'submit',accounting,{revision:future.resolution.revision});
-  const futureApproved=await approvePending(db,futurePending,manager);
+  const futureApproved=await approvePending(db,futurePending,accounting);
   let readiness=await service.readiness(db,{});
   assert.equal(readiness.list.find(row=>row.itemCode==='MANUAL').coverage,'unknown');
-  await service.transition(db,future.resolution.resolutionId,'expire',manager,{reason:'replaced',revision:futureApproved.resolution.revision});
+  await service.transition(db,future.resolution.resolutionId,'expire',accounting,{reason:'replaced',revision:futureApproved.resolution.revision});
   const rejected=await governedCreate(db,{itemCode:'UNKNOWN',itemGuid:'GUID-U',manualCost:5,effectiveFrom:'14050101'},accounting);
   const rejectedPending=await service.transition(db,rejected.resolution.resolutionId,'submit',accounting,{revision:rejected.resolution.revision});
-  await service.transition(db,rejected.resolution.resolutionId,'reject',manager,{reason:'insufficient evidence',revision:rejectedPending.resolution.revision});
+  await service.transition(db,rejected.resolution.resolutionId,'reject',accounting,{reason:'insufficient evidence',revision:rejectedPending.resolution.revision});
   readiness=await service.readiness(db,{});
   assert.equal(readiness.list.find(row=>row.itemCode==='MANUAL').coverage,'unknown');
   assert.equal(readiness.list.find(row=>row.itemCode==='UNKNOWN').coverage,'unknown');
@@ -345,13 +346,13 @@ test('governed supersession preserves legacy evidence and resolves only inside t
   assert.equal(created.resolution.supersedesResolutionId,legacy.resolutionId);
   assert.match(created.resolution.contentHash,/^[a-f0-9]{64}$/);
   const pending=await service.transition(db,created.resolution.resolutionId,'submit',accounting,{revision:1});
-  await assert.rejects(service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:2}),error=>error.code==='MANUAL_COST_FORBIDDEN');
-  const approved=await approvePending(db,pending,manager);
+  await assert.rejects(service.transition(db,created.resolution.resolutionId,'approve',accounting,{revision:2}),error=>error.code==='MANUAL_COST_IMPACT_PREVIEW_REQUIRED');
+  const approved=await approvePending(db,pending,accounting);
   const unchanged=await service.getById(db,legacy.resolutionId);
   assert.deepEqual(unchanged,legacy);
   assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050515').map(row=>row.resolutionId),[approved.resolution.resolutionId]);
   assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050430'),[]);
   assert.deepEqual(service._effectiveRowsAt([unchanged,approved.resolution],'14050601'),[]);
   assert.deepEqual(approved.resolution.auditLog.map(row=>row.action),['created-draft','submit','approve']);
-  assert.equal(approved.resolution.approvedBy.username,'manager-1');
+  assert.equal(approved.resolution.approvedBy.username,'accountant-1');
 });
