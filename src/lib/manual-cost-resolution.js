@@ -437,11 +437,20 @@ async function activeFifoEconomicExposureContext(db,options={}){
   const superseded=new Set(approved.map(row=>clean(row.supersedesResolutionId,100)).filter(Boolean));
   const excluded=new Set([clean(options.excludeResolutionId,100),...(options.excludeResolutionIds||[]).map(value=>clean(value,100))].filter(Boolean));
   const governedRows=approved.filter(row=>!excluded.has(clean(row.resolutionId,100))&&!superseded.has(clean(row.resolutionId,100)));
-  return {datasetId,allocations,governedRows};
+  const allocationsByGuid=new Map(),allocationsByCode=new Map();
+  for(const row of allocations){addToIndex(allocationsByGuid,key(row.itemGuid),row);addToIndex(allocationsByCode,key(row.itemCode),row);}
+  return {datasetId,allocations,allocationsByGuid,allocationsByCode,governedRows};
+}
+function economicExposureFromContext(context,target={}){
+  const candidates=[...new Set([
+    ...(key(target.itemGuid)?context.allocationsByGuid.get(key(target.itemGuid))||[]:[]),
+    ...(key(target.itemCode)?context.allocationsByCode.get(key(target.itemCode))||[]:[])
+  ])];
+  return economicExposureFromAllocationRows(candidates,target,context.datasetId,context.governedRows);
 }
 async function activeFifoEconomicExposure(db,target={},options={}){
   const context=options.context||await activeFifoEconomicExposureContext(db,options);
-  return economicExposureFromAllocationRows(context.allocations,target,context.datasetId,context.governedRows);
+  return economicExposureFromContext(context,target);
 }
 async function assertCurrentAffectedPopulation(db,resolution){
   const expected=sanitizeAffectedSaleLinePopulation(resolution.affectedSaleLinePopulation);
@@ -1268,7 +1277,7 @@ async function missingQueue(db, filters = {}) {
     const groupGuid=canonicalItemCatalog.canonicalItemGuid(group.itemGuid);
     const itemGuid=groupGuid||(canonicalGuids.length===1?canonicalGuids[0]:'');
     const identityConflict=!itemGuid||(!groupGuid&&canonicalGuids.length!==1);
-    const economic=identityConflict?null:economicExposureFromAllocationRows(economicContext.allocations,{itemGuid,itemCode:group.itemCode},economicContext.datasetId,economicContext.governedRows);
+    const economic=identityConflict?null:economicExposureFromContext(economicContext,{itemGuid,itemCode:group.itemCode});
     const population=economic?.affectedSaleLinePopulation||[];
     return {
       ...group,
