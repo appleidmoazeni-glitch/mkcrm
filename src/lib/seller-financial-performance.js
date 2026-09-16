@@ -696,9 +696,77 @@ async function governanceCoverage(db,requestedBy={}) {
 function candidateFingerprintOf(run={}) {return clean(run.candidateFingerprint||run.resultFingerprint,64);}
 async function requireCandidate(db,runId) {
   const id=clean(runId,100);const run=await db.collection(RUNS).findOne({runId:id});
-  if(!run||run.status!=='completed'||run.activationStatus!=='validated-candidate'||run.candidateOnly!==true||run.active===true||run.nonPayable===false)fail('SELLER_FINANCIAL_CANDIDATE_INVALID','Only a completed inactive non-payable Seller Financial Candidate is eligible.',409);
+  if(!run||run.status!=='completed'||run.activationStatus!=='validated-candidate'||run.candidateOnly!==true||run.active===true||run.nonPayable!==true)fail('SELLER_FINANCIAL_CANDIDATE_INVALID','Only a completed inactive non-payable Seller Financial Candidate is eligible.',409);
   const fingerprint=candidateFingerprintOf(run);if(!SHA256_HEX.test(fingerprint))fail('SELLER_FINANCIAL_CANDIDATE_FINGERPRINT_INVALID','Candidate fingerprint is missing or invalid.',409);
   return {run,fingerprint};
+}
+
+function candidateStructureBlockers(run={}) {
+  const blockers=[];
+  if(run.status!=='completed')blockers.push('SELLER_FINANCIAL_CANDIDATE_NOT_COMPLETED');
+  if(run.activationStatus!=='validated-candidate')blockers.push('SELLER_FINANCIAL_CANDIDATE_NOT_VALIDATED');
+  if(run.candidateOnly!==true||run.active===true)blockers.push('SELLER_FINANCIAL_CANDIDATE_NOT_INACTIVE');
+  if(run.nonPayable!==true)blockers.push('SELLER_FINANCIAL_CANDIDATE_PAYABLE_STATE_INVALID');
+  if(!SHA256_HEX.test(candidateFingerprintOf(run)))blockers.push('SELLER_FINANCIAL_CANDIDATE_FINGERPRINT_INVALID');
+  return blockers;
+}
+
+function candidateFifoBlockers(run={},activeFifo={}) {
+  const blockers=[];
+  if(!activeFifo.datasetId)blockers.push('SELLER_FINANCIAL_ACTIVE_FIFO_MISSING');
+  if(clean(run.sourceFifoDatasetId,100)!==clean(activeFifo.datasetId,100))blockers.push('SELLER_FINANCIAL_CANDIDATE_FIFO_STALE');
+  if(Number(run.sourceFifoAuthorityRevision)!==Number(activeFifo.authorityRevision))blockers.push('SELLER_FINANCIAL_CANDIDATE_FIFO_REVISION_STALE');
+  if(clean(run.sourceFifoSourceFingerprint,64)!==clean(activeFifo.sourceFingerprint,64)||clean(run.sourceFifoAllocationFingerprint,64)!==clean(activeFifo.allocationFingerprint,64)||clean(run.sourceFifoCandidateFingerprint,64)!==clean(activeFifo.candidateFingerprint,64))blockers.push('SELLER_FINANCIAL_CANDIDATE_FIFO_FINGERPRINT_STALE');
+  return blockers;
+}
+
+function assertCandidateFifoAuthority(run,activeFifo,code='SELLER_FINANCIAL_VALIDATION_FIFO_AUTHORITY_CHANGED') {
+  const blockers=candidateFifoBlockers(run,activeFifo);
+  if(blockers.length)fail(code,'Active FIFO authority or fingerprints changed after Candidate build; refresh and review Seller Financial.',409,{blockers,currentActiveFifoDatasetId:activeFifo?.datasetId||'',currentFifoAuthorityRevision:Number(activeFifo?.authorityRevision||0)});
+  return activeFifo;
+}
+
+async function candidateGovernanceState(db,runId,requestedBy={}) {
+  const current=requireRole(requestedBy,READ_ROLES);const id=clean(runId,100);
+  const run=await db.collection(RUNS).findOne({runId:id});
+  if(!run)fail('SELLER_FINANCIAL_RUN_NOT_FOUND','Seller Financial Run was not found.',404);
+  const fingerprint=candidateFingerprintOf(run),structureBlockers=candidateStructureBlockers(run);
+  let activeFifo=null,authorityError='';
+  try{activeFifo=await resolveActiveFifoLineage(db);}catch(error){authorityError=clean(error.code||error.message,200);}
+  const fifoBlockers=activeFifo?candidateFifoBlockers(run,activeFifo):[authorityError||'SELLER_FINANCIAL_ACTIVE_FIFO_MISSING'];
+  const [state,validations]=await Promise.all([
+    db.collection(STATE).findOne({scopeKey:SCOPE_KEY}),
+    db.collection(HUMAN_VALIDATIONS).find({runId:id,candidateFingerprint:fingerprint}).toArray()
+  ]);
+  validations.sort((left,right)=>new Date(right.createdAt||0)-new Date(left.createdAt||0));
+  const latestValidation=validations[0]||null;
+  const qualifyingPass=validations.find(row=>row.result==='PASS'&&row.immutable===true)||null;
+  const independentActor=clean(run.createdBy?.username,100)!==current.username;
+  const canValidateRole=VALIDATE_ROLES.includes(current.role),canActivateRole=ACTIVATE_ROLES.includes(current.role);
+  const commonBlockers=[...new Set([...structureBlockers,...fifoBlockers])];
+  const validationBlockers=[...commonBlockers];
+  if(!canValidateRole)validationBlockers.push('SELLER_FINANCIAL_VALIDATION_ROLE_REQUIRED');
+  if(!independentActor)validationBlockers.push('SELLER_FINANCIAL_SELF_VALIDATION_FORBIDDEN');
+  const activationBlockers=[...commonBlockers];
+  if(!canActivateRole)activationBlockers.push('SELLER_FINANCIAL_ACTIVATION_ROLE_REQUIRED');
+  if(!qualifyingPass)activationBlockers.push('SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED');
+  const currentActiveSellerFinancialId=clean(state?.activeRunId,100);
+  return {
+    ok:true,readOnly:true,
+    run:{runId:run.runId,status:run.status,active:Boolean(run.active),candidateOnly:Boolean(run.candidateOnly),nonPayable:run.nonPayable===true,activationStatus:clean(run.activationStatus,50),sourceFifoDatasetId:clean(run.sourceFifoDatasetId,100),sourceFifoAuthorityRevision:Number(run.sourceFifoAuthorityRevision||0),candidateFingerprint:fingerprint,createdBy:run.createdBy||null},
+    activeFifo,
+    currentActiveSellerFinancialId,
+    humanValidationState:qualifyingPass?'HUMAN_VALIDATED':latestValidation?.result==='FAIL'?'HUMAN_FAILED':'NOT_VALIDATED',
+    humanValidation:qualifyingPass||latestValidation||null,
+    activationState:run.active?'ACTIVE':clean(run.activationStatus||'inactive',50).toUpperCase(),
+    canHumanValidate:validationBlockers.length===0,
+    canActivate:activationBlockers.length===0,
+    roleContract:{validateRoles:VALIDATE_ROLES,activateRoles:ACTIVATE_ROLES,currentRole:current.role},
+    validationBlockers:[...new Set(validationBlockers)],
+    activationBlockers:[...new Set(activationBlockers)],
+    expectedPreviousActiveSellerFinancialId:currentActiveSellerFinancialId,
+    resultContract:{humanValidationActivates:false,commissionCreated:false,payrollAuthorityCreated:false,activationChangesOnlySellerFinancialAuthority:true}
+  };
 }
 
 async function recordHumanValidation(db,runId,input={},requestedBy={}) {
@@ -707,6 +775,7 @@ async function recordHumanValidation(db,runId,input={},requestedBy={}) {
   if(expected!==fingerprint)fail('SELLER_FINANCIAL_VALIDATION_FINGERPRINT_STALE','Exact Candidate fingerprint is required.',409);
   if(!reason||!['PASS','FAIL'].includes(result))fail('SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED','PASS/FAIL and a Human validation reason are required.',400);
   if(clean(run.createdBy?.username,100)===current.username)fail('SELLER_FINANCIAL_SELF_VALIDATION_FORBIDDEN','Candidate creator cannot record its Human validation.',403);
+  assertCandidateFifoAuthority(run,await resolveActiveFifoLineage(db));
   const existing=await db.collection(HUMAN_VALIDATIONS).findOne({runId:run.runId,candidateFingerprint:fingerprint,result,'actor.username':current.username});
   if(existing)return {ok:true,idempotent:true,validation:existing};
   const createdAt=new Date(),validation={validationId:newId('SFHVAL'),action:'HUMAN_VALIDATE_SELLER_FINANCIAL',runId:run.runId,candidateFingerprint:fingerprint,result,reason,actor:current,createdAt,immutable:true};
@@ -735,4 +804,4 @@ async function activateCandidate(db,runId,input={},requestedBy={}) {
   return {ok:true,activationPerformed:true,activationAudit:audit,previousActiveSellerFinancialId,newActiveSellerFinancialId:run.runId,nonPayable:true,commissionCreated:false};
 }
 
-module.exports={RUNS,LINES,SUMMARIES,STATE,LOCKS,VERIFICATIONS,HUMAN_VALIDATIONS,ACTIVATION_AUDITS,SCOPE_KEY,SCHEMA_VERSION,ALGORITHM_VERSION,MODULE_VERSION,READ_ROLES,BUILD_ROLES,VALIDATE_ROLES,ACTIVATE_ROLES,COLLECTIONS,ensureIndexes,activeRun,resolveActiveFifoLineage,assertCanonicalBuildBinding,buildContext,buildReadModel,recordHumanValidation,activateCandidate,listLines,listInvoices,listInvoiceLines,listSummaries,totals,categoryTotals,filterOptions,lineDrilldown,listRuns,status,freshness,fingerprintIntegrity,deepVerify,listVerifications,discountStatusReport,governanceCoverage,_humanAuditView:humanAuditView,_sourceBundle:sourceBundle,_fastSourceMetadata:fastSourceMetadata,_sourceRecency:sourceRecency,_buildProjectedLines:buildProjectedLines,_buildSummaries:buildSummaries,_queryFromFilters:queryFromFilters,_canonicalLineFingerprint:canonicalLineFingerprint,_canonicalSummaryFingerprint:canonicalSummaryFingerprint};
+module.exports={RUNS,LINES,SUMMARIES,STATE,LOCKS,VERIFICATIONS,HUMAN_VALIDATIONS,ACTIVATION_AUDITS,SCOPE_KEY,SCHEMA_VERSION,ALGORITHM_VERSION,MODULE_VERSION,READ_ROLES,BUILD_ROLES,VALIDATE_ROLES,ACTIVATE_ROLES,COLLECTIONS,ensureIndexes,activeRun,resolveActiveFifoLineage,assertCanonicalBuildBinding,buildContext,buildReadModel,candidateGovernanceState,recordHumanValidation,activateCandidate,listLines,listInvoices,listInvoiceLines,listSummaries,totals,categoryTotals,filterOptions,lineDrilldown,listRuns,status,freshness,fingerprintIntegrity,deepVerify,listVerifications,discountStatusReport,governanceCoverage,_humanAuditView:humanAuditView,_sourceBundle:sourceBundle,_fastSourceMetadata:fastSourceMetadata,_sourceRecency:sourceRecency,_buildProjectedLines:buildProjectedLines,_buildSummaries:buildSummaries,_queryFromFilters:queryFromFilters,_canonicalLineFingerprint:canonicalLineFingerprint,_canonicalSummaryFingerprint:canonicalSummaryFingerprint};

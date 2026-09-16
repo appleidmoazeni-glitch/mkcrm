@@ -263,10 +263,16 @@ test('canonical Candidate duplicate guard returns the existing immutable Candida
 test('separate activation requires independent fingerprint-bound Human PASS and immutable audit',async()=>{
   const db=dbSeed(),binding=bindActiveCandidate(db);for(const fact of db.collection('fifoProfitFacts').rows)Object.assign(fact,{candidateOnly:true,active:false,nonPayable:true,profitFactsDatasetId:'PFACT-CANDIDATE'});
   const admin={username:'admin',role:'admin'},built=await service.buildReadModel(db,binding,admin);
+  const before=await service.candidateGovernanceState(db,built.runId,manager);
+  assert.equal(before.readOnly,true);assert.equal(before.humanValidationState,'NOT_VALIDATED');assert.equal(before.canHumanValidate,true);assert.equal(before.canActivate,false);assert.ok(before.activationBlockers.includes('SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED'));
+  const accountingView=await service.candidateGovernanceState(db,built.runId,accounting);assert.equal(accountingView.canHumanValidate,false);assert.equal(accountingView.canActivate,false);assert.ok(accountingView.validationBlockers.includes('SELLER_FINANCIAL_VALIDATION_ROLE_REQUIRED'));
   await assert.rejects(service.activateCandidate(db,built.runId,{candidateFingerprint:built.candidateFingerprint,humanValidationId:'missing',expectedPreviousActiveSellerFinancialId:'',reason:'activate'},manager),error=>error.code==='SELLER_FINANCIAL_HUMAN_VALIDATION_REQUIRED');
   await assert.rejects(service.recordHumanValidation(db,built.runId,{candidateFingerprint:built.candidateFingerprint,result:'PASS',reason:'self validation'},admin),error=>error.code==='SELLER_FINANCIAL_SELF_VALIDATION_FORBIDDEN');
   const validation=await service.recordHumanValidation(db,built.runId,{candidateFingerprint:built.candidateFingerprint,result:'PASS',reason:'Human validation cards completed independently'},manager);
+  const after=await service.candidateGovernanceState(db,built.runId,manager);assert.equal(after.humanValidationState,'HUMAN_VALIDATED');assert.equal(after.humanValidation.validationId,validation.validation.validationId);assert.equal(after.canActivate,true);assert.equal(after.resultContract.humanValidationActivates,false);assert.equal(after.resultContract.commissionCreated,false);
   db.collection('fifoDatasetState').rows[0].authorityRevision=8;
+  const stale=await service.candidateGovernanceState(db,built.runId,manager);assert.equal(stale.canHumanValidate,false);assert.equal(stale.canActivate,false);assert.ok(stale.validationBlockers.includes('SELLER_FINANCIAL_CANDIDATE_FIFO_REVISION_STALE'));
+  await assert.rejects(service.recordHumanValidation(db,built.runId,{candidateFingerprint:built.candidateFingerprint,result:'FAIL',reason:'stale authority must fail closed'},manager),error=>error.code==='SELLER_FINANCIAL_VALIDATION_FIFO_AUTHORITY_CHANGED');
   await assert.rejects(service.activateCandidate(db,built.runId,{candidateFingerprint:built.candidateFingerprint,humanValidationId:validation.validation.validationId,expectedPreviousActiveSellerFinancialId:'',reason:'activate stale Candidate'},manager),error=>error.code==='SELLER_FINANCIAL_ACTIVATION_FIFO_AUTHORITY_CHANGED');
   db.collection('fifoDatasetState').rows[0].authorityRevision=7;
   const activated=await service.activateCandidate(db,built.runId,{candidateFingerprint:built.candidateFingerprint,humanValidationId:validation.validation.validationId,expectedPreviousActiveSellerFinancialId:'',reason:'Management-authorized authority transition'},manager);
@@ -283,6 +289,13 @@ test('canonical UI has read-only Active FIFO lineage, explicit Candidate confirm
   const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
   for(const contract of ['sfCandidateBuild','ساخت Read Model کاندیدا','seller-financial-performance/build-context','expectedActiveFifoDatasetId','expectedFifoAuthorityRevision','expectedFifoSourceFingerprint','expectedFifoAllocationFingerprint','expectedFifoCandidateFingerprint','Inactive','Candidate Only','Non-Payable','Commission','Separate governed action','CURRENT ACTIVE SELLER FINANCIAL','LATEST CANDIDATE'])assert.match(phase,new RegExp(contract));
   assert.match(phase,/\['admin','accounting'\]\.includes\(userRole\(\)\)/);assert.doesNotMatch(phase,/seller-financial-performance\/rebuild/);assert.doesNotMatch(phase,/sfFifoCandidate/);
+});
+
+test('canonical UI binds existing Seller Financial Human Validation and Activation governance contracts',()=>{
+  const ui=fs.readFileSync(path.join(__dirname,'../public/assets/app.js'),'utf8');const phase=ui.slice(ui.lastIndexOf('/* Phase C final registry'));
+  for(const contract of ['sfGovernance','Governance — Human Validation و Activation','ثبت Human PASS','فعال‌سازی عملکرد مالی فروشندگان','/human-validation','/activate','candidateFingerprint','humanValidationId','expectedPreviousActiveSellerFinancialId','Human Validation این Run را فعال نمی‌کند.','Commission یا Payroll ایجاد نمی‌شود.','این اقدام فقط Seller Financial authority را تغییر می‌دهد.','FIFO بازسازی نمی‌شود.'])assert.ok(phase.includes(contract),`missing ${contract}`);
+  assert.match(phase,/roleContract\?\.validateRoles/);assert.match(phase,/roleContract\?\.activateRoles/);assert.match(phase,/value\.canActivate\?'':'disabled'/);
+  assert.doesNotMatch(phase,/seller-financial-performance\/rebuild/);
 });
 
 test('canonical Seller Financial page presents FIFO freshness and a clear stale-Candidate next action',()=>{

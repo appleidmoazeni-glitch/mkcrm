@@ -4504,6 +4504,11 @@ async function handleApi(req, res, pathname, query) {
       }catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_CANDIDATE_BUILD_FAILED');}
     }
     const sellerFinancialCandidateLifecycle=pathname.match(/^\/api\/accounting\/seller-financial-performance\/candidates\/([^/]+)\/(human-validation|activate)$/);
+    const sellerFinancialCandidateGovernance=pathname.match(/^\/api\/accounting\/seller-financial-performance\/candidates\/([^/]+)\/governance$/);
+    if(sellerFinancialCandidateGovernance&&req.method==='GET'){
+      if(!requireRole(req,res,['admin','accounting','manager','purchase']))return;const db=await connectMongo();const runId=decodeURIComponent(sellerFinancialCandidateGovernance[1]);
+      try{return sendJson(res,200,await sellerFinancialPerformance.candidateGovernanceState(db,runId,currentUser(req)));}catch(error){return sendLedgerError(error,'SELLER_FINANCIAL_GOVERNANCE_STATE_FAILED');}
+    }
     if(sellerFinancialCandidateLifecycle&&req.method==='POST'){
       const action=sellerFinancialCandidateLifecycle[2];if(!requireRole(req,res,action==='human-validation'?['admin','manager']:['admin','manager']))return;const body=await collectBody(req);const db=await connectMongo();const runId=decodeURIComponent(sellerFinancialCandidateLifecycle[1]);
       try{return sendJson(res,action==='human-validation'?201:200,action==='human-validation'?await sellerFinancialPerformance.recordHumanValidation(db,runId,body,currentUser(req)):await sellerFinancialPerformance.activateCandidate(db,runId,body,currentUser(req)));}catch(error){return sendLedgerError(error,action==='human-validation'?'SELLER_FINANCIAL_HUMAN_VALIDATION_FAILED':'SELLER_FINANCIAL_ACTIVATION_FAILED');}
